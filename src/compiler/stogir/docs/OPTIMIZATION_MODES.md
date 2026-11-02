@@ -9,7 +9,8 @@ their existing behavior.
 | --- | --- |
 | 0 | Explicit unsupported diagnostic. Upstream's distinct CFG/de-SSA/fast-allocation path is not implemented. |
 | 1 | Existing preparation, scheduling, matching, liveness, allocation and emission path, without SCCP. This is the options default. |
-| 2, 3 | Rooted SCCP analysis, owned rewrite and incremental scalar cleanup, followed by the same native pipeline. |
+| 2 | Rooted SCCP analysis, owned rewrite and incremental scalar cleanup, followed by the same native pipeline. |
+| 3 | Level 2 plus automatic guarded integer loop vector prefixes, followed by the same native pipeline. |
 
 The gate at levels above one follows pinned dstogov/ir
 `92171d0a4a36b0acf707f2dea7998de615dd4acd`, `ir.h:ir_jit_compile`.
@@ -29,4 +30,11 @@ mode/reference text comparisons, byte-identical object output through both
 public paths, native JIT and linked AOT answers, and constant-pool ownership
 checks after both source graphs have been freed. These are standalone feature
 checks, not a compiler delivery or a performance acceptance result. Coil's CLI
-optimization level is not yet connected to these APIs.
+optimization level is connected to these APIs in its backend worktree.
+
+The O3 vector extension visits original loop headers once and rebuilds facts after
+each edit. It neither retries scalar cleanup nor visits newly generated headers.
+Unsupported loops remain scalar. See [LOOP_VECTORIZATION.md](LOOP_VECTORIZATION.md).
+Automatic selection and public O3 execution pass the captured stencil checksum
+matrix (24 additional checks, 60 total), with AddressSanitizer. This extension
+is additional to upstream and has no upstream mode-parity claim.

@@ -1,0 +1,597 @@
+;;; Guarded vector-prefix construction on the compact graph. This is an
+;;; independent extension, not an upstream IR vectorizer port. Caller roots
+;;; retain their references; the original counted loop becomes scalar cleanup.
+(module stogir.loop-vectorize)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.adjacency" :as adjacency)
+(import "stogir.loop-shape" :as shape)
+(import "stogir.loop-affine" :as affine)
+(import "stogir.loop-data" :as data)
+(import "stogir.loop-guard" :as guard)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.uses" :as uses)
+(import "stogir.bitset" :as bits)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+(defstruct State
+  [(error (slice u8))
+   (values (ArrayList i32))
+   (invariants (ArrayList i32))
+   (literals (ArrayList i32))
+   (element i32)
+   (vector i32)])
+
+(defn zeros [(size i64) (a (dyn Allocator))] (-> (ArrayList i32))
+  (let [(mut result) (ArrayList::new [i32] a)]
+    (for [i 0 size] (push! (mut result) 0))
+    result))
+
+(defn release! [(state (mut State))] (-> void)
+  (free! (mut (.values state)))
+  (free! (mut (.invariants state)))
+  (free! (mut (.literals state))))
+
+(defn require [(state (mut State)) (value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (set! (.error state) message) 0)))
+
+(defn emit! [(graph (mut g/Graph))
+             (state (mut State))
+             (opcode i32)
+             (ty i32)
+             (inputs (slice i32))] (-> i32)
+  (if (!= (.error state) "")
+      0
+      (require (mut state) (b/emit! (mut graph) opcode ty inputs))))
+
+(defn constant! [(graph (mut g/Graph)) (state (mut State)) (ty i32) (value u64)]
+  (-> i32)
+  (if (!= (.error state) "")
+      0
+      (require (mut state) (b/scalar-constant! (mut graph) ty value 8))))
+
+(defn convert! [(graph (mut g/Graph))
+                (state (mut State))
+                (reference i32)
+                (ty i32)] (-> i32)
+  (if (!= (.error state) "")
+      0
+      (match (g/lookup graph reference)
+        (None [] (set! (.error state) "vector conversion source missing") 0)
+        (Some [value]
+              (if (= (cast i32 (n/type-id value)) ty)
+                  reference
+                  (require (mut state)
+                           (b/conversion! (mut graph)
+                                          (if (> (types/size (cast i32
+                                                                   (n/type-id value))
+                                                             8)
+                                                 (types/size ty 8))
+                                              35
+                                              36)
+                                          ty
+                                          8
+                                          reference)))))))
+
+;;; Positive SPLAT nodes allow ordinary GCM to place invariant broadcasts.
+(defn broadcast! [(graph (mut g/Graph)) (state (mut State)) (reference i32)]
+  (-> i32)
+  (let [scalar (convert! (mut graph) (mut state) reference (.element state))]
+    (emit! (mut graph) (mut state) 63 (.vector state) [scalar])))
+
+(defn value! [(source g/Graph)
+              (graph (mut g/Graph))
+              (state (mut State))
+              (prepared pipeline/Prepared)
+              (ownership (ArrayList i32))
+              (loop shape/Loop)
+              (reference i32)] (-> i32)
+  (if (!= (.error state) "")
+      0
+      (if (< reference 0)
+          (let [index (- -1 (cast i64 reference))
+                (mut result) (get (.literals state) index)]
+            (when (= result 0)
+              (set! result (broadcast! (mut graph) (mut state) reference))
+              (set! (mut (.literals state)) index result))
+            result)
+          (let [(mut result) (get (.values state) (cast i64 reference))]
+            (when (= result 0)
+              (if (shape/invariant? prepared ownership loop reference)
+                  (do
+                    (set! result (get (.invariants state) (cast i64 reference)))
+                    (when (= result 0)
+                      (set! result
+                            (broadcast! (mut graph) (mut state) reference))
+                      (set! (mut (.invariants state))
+                            (cast i64 reference)
+                            result)))
+                  (set! (.error state)
+                        "vector data dependency is not available in schedule order")))
+            result))))
+
+;;; Demand only store-value dependencies. Address expressions have a separate
+;;; affine pointer plan, and are not accidentally lifted into vector arithmetic.
+(defn demands [(graph g/Graph)
+               (prepared pipeline/Prepared)
+               (ownership (ArrayList i32))
+               (loop shape/Loop)
+               (a (dyn Allocator))] (-> bits/Bits)
+  (let [(mut result) (bits/create (len (.instructions graph)) a)
+        (mut work) (ArrayList::new [i32] a)
+        (mut cursor) 0]
+    (for r (.memory loop)
+      (let [node (get (.instructions graph) (cast i64 r))]
+        (when (= (n/opcode node) 93) (push! (mut work) (.op3 node)))))
+    (while (< cursor (len work))
+      (let [r (get work cursor)]
+        (when (and (> r 0)
+                   (bits/add! (mut result) (cast i64 r))
+                   (!= r (.induction loop))
+                   (not (shape/invariant? prepared ownership loop r)))
+          (let [node (get (.instructions graph) (cast i64 r))
+                opcode (cast i32 (n/opcode node))]
+            (when (!= opcode 91)
+              (push! (mut work) (.op1 node))
+              (when (data/wrapping-binary? opcode)
+                (push! (mut work) (.op2 node)))))))
+      (set! cursor (+ cursor 1)))
+    (free! (mut work))
+    result))
+
+(defn patch! [(graph (mut g/Graph))
+              (state (mut State))
+              (r i32)
+              (position i32)
+              (value i32)]
+  (-> void)
+  (when (= (.error state) "")
+    (require (mut state) (b/patch! (mut graph) r position value))))
+
+;;; All source facts describe the immutable input. Appends may relocate graph
+;;; storage; only signed refs survive. Failure discards the owned working graph.
+(defn construct [(source g/Graph)
+                 (prepared pipeline/Prepared)
+                 (ownership (ArrayList i32))
+                 (loop shape/Loop)
+                 (accesses (ArrayList affine/Access))
+                 (plan guard/Plan)
+                 (unroll i32)
+                 (a (dyn Allocator))] (-> (Result g/Graph (slice u8)))
+  (let [(mut graph) (g/duplicate source a)
+        bytes (.element-bytes loop)
+        element (cast i32 (match bytes (1 2) (2 3) (4 4) (_ 5)))
+        lanes (/ (: 16 i32) bytes)
+        chunk (* lanes unroll)
+        (mut state)
+          (State
+            :error ""
+            :values (zeros (len (.instructions source)) a)
+            :invariants (zeros (len (.instructions source)) a)
+            :literals (zeros (len (.constants source)) a)
+            :element element
+            :vector (types/vector-type element lanes))
+        (mut needed) (demands source prepared ownership loop a)
+        (mut pointers) (ArrayList::new [i32] a)
+        one (constant! (mut graph) (mut state) 5 1)
+        zero (constant! (mut graph) (mut state) 5 0)
+        width (constant! (mut graph) (mut state) 5 (cast u64 bytes))
+        stride (constant! (mut graph) (mut state) 5 (cast u64 (* chunk bytes)))
+        first (convert! (mut graph) (mut state) (.initial loop) 5)
+        last (convert! (mut graph) (mut state) (.bound loop) 5)
+        distance (emit! (mut graph) (mut state) 27 5 [last first])
+        chunks
+          (emit! (mut graph)
+                 (mut state)
+                 50
+                 5
+                 [distance
+                  (constant! (mut graph)
+                             (mut state)
+                             5
+                             (cast u64
+                                   (if (= chunk 2)
+                                       1
+                                       (if (= chunk 4)
+                                           2
+                                           (if (= chunk 8)
+                                               3
+                                               (if (= chunk 16)
+                                                   4
+                                                   (if (= chunk 32) 5 6)))))))])
+        covered
+          (emit! (mut graph)
+                 (mut state)
+                 28
+                 5
+                 [chunks (constant! (mut graph) (mut state) 5 (cast u64 chunk))])
+        cleanup-value
+          (convert! (mut graph)
+                    (mut state)
+                    (emit! (mut graph) (mut state) 26 5 [first covered])
+                    (cast i32
+                          (n/type-id (get (.instructions source)
+                                          (cast i64 (.induction loop))))))
+        predicate
+          (require (mut state)
+                   (guard/emit! (mut graph)
+                                plan
+                                (.initial loop)
+                                (.bound loop)
+                                chunk
+                                a))
+        original-entry (get (.instructions source) (cast i64 (.entry loop)))
+        vector-yes
+          (emit! (mut graph) (mut state) 107 0 [(.entry loop) (: 0 i32)])
+        scalar-no
+          (emit! (mut graph) (mut state) 108 0 [(.entry loop) (: 0 i32)])
+        vector-entry (emit! (mut graph) (mut state) 114 0 [vector-yes])
+        scalar-entry (emit! (mut graph) (mut state) 114 0 [scalar-no])
+        header
+          (if (= (.error state) "")
+              (require (mut state) (b/loop-begin! (mut graph) vector-entry))
+              0)
+        counter
+          (if (= (.error state) "")
+              (require (mut state) (b/loop-phi! (mut graph) header chunks))
+              0)
+        first-offset (emit! (mut graph) (mut state) 28 5 [first width])
+        (mut vector-iv) (: 0 i32)
+        (mut control) header]
+    (for group (.groups plan)
+      (let [base (convert! (mut graph) (mut state) (.base group) 6)
+            address (emit! (mut graph) (mut state) 26 6 [base first-offset])]
+        (push! (mut pointers)
+               (if (= (.error state) "")
+                   (require (mut state)
+                            (b/loop-phi! (mut graph) header address))
+                   0))))
+    (when (bits/contains? needed (cast i64 (.induction loop)))
+      (let [(mut payload) (ArrayList::new [u8] a)]
+        (for [lane 0 (cast i64 lanes)]
+          (for [i 0 (cast i64 bytes)]
+            (push! (mut payload)
+                   (cast u8 (>> (cast u64 lane) (cast u64 (* i 8)))))))
+        (let [ramp
+                (if (= (.error state) "")
+                    (require (mut state)
+                             (b/vector-constant! (mut graph)
+                                                 (.vector state)
+                                                 8
+                                                 (slice payload)))
+                    0)
+              initial (broadcast! (mut graph) (mut state) (.initial loop))
+              initial-vector
+                (emit! (mut graph)
+                       (mut state)
+                       26
+                       (.vector state)
+                       [initial ramp])]
+          (when (= (.error state) "")
+            (set! vector-iv
+                  (require (mut state)
+                           (b/loop-phi! (mut graph) header initial-vector)))))
+        (free! (mut payload))))
+    (for [part 0 (cast i64 unroll)]
+      (for [i 0 (len (.values state))] (set! (mut (.values state)) i 0))
+      (when (> vector-iv 0)
+        (let [iv
+                (if (= part 0)
+                    vector-iv
+                    (emit! (mut graph)
+                           (mut state)
+                           26
+                           (.vector state)
+                           [vector-iv
+                            (broadcast! (mut graph)
+                                        (mut state)
+                                        (constant! (mut graph)
+                                                   (mut state)
+                                                   element
+                                                   (cast u64
+                                                         (* part
+                                                            (cast i64 lanes)))))]))]
+          (set! (mut (.values state)) (cast i64 (.induction loop)) iv)))
+      (for r (.nodes (.schedule prepared))
+        (when (bits/contains? (.members loop)
+                              (cast i64 (get ownership (cast i64 r))))
+          (let [node (get (.instructions source) (cast i64 r))
+                opcode (cast i32 (n/opcode node))
+                (mut output) (: 0 i32)]
+            (if (or (= opcode 91) (= opcode 93))
+                (let [(mut group-index) (: -1 i64)
+                      (mut offset) (: 0 i64)]
+                  (for access accesses
+                    (when (= (.reference access) r)
+                      (set! offset (+ (.offset access) (* part 16)))
+                      (for [i 0 (len (.groups plan))]
+                        (when (= (.base (get (.groups plan) i)) (.base access))
+                          (set! group-index i)))))
+                  (if (< group-index 0)
+                      (set! (.error state) "vector memory footprint missing")
+                      (let [base (get pointers group-index)
+                            address
+                              (if (= offset 0)
+                                  base
+                                  (emit! (mut graph)
+                                         (mut state)
+                                         26
+                                         6
+                                         [base
+                                          (constant! (mut graph)
+                                                     (mut state)
+                                                     5
+                                                     (cast u64 offset))]))]
+                        (if (= opcode 91)
+                            (do
+                              (set! output
+                                    (emit! (mut graph)
+                                           (mut state)
+                                           91
+                                           (.vector state)
+                                           [control address]))
+                              (set! control output))
+                            (set! control
+                                  (emit! (mut graph)
+                                         (mut state)
+                                         93
+                                         0
+                                         [control
+                                          address
+                                          (value! source
+                                                  (mut graph)
+                                                  (mut state)
+                                                  prepared
+                                                  ownership
+                                                  loop
+                                                  (.op3 node))]))))))
+                (when (and (bits/contains? needed (cast i64 r))
+                           (!= r (.induction loop))
+                           (not (shape/invariant? prepared ownership loop r)))
+                  (let [left
+                          (value! source
+                                  (mut graph)
+                                  (mut state)
+                                  prepared
+                                  ownership
+                                  loop
+                                  (.op1 node))]
+                    (cond (data/wrapping-binary? opcode)
+                            (set! output
+                                  (emit! (mut graph)
+                                         (mut state)
+                                         opcode
+                                         (.vector state)
+                                         [left
+                                          (value! source
+                                                  (mut graph)
+                                                  (mut state)
+                                                  prepared
+                                                  ownership
+                                                  loop
+                                                  (.op2 node))]))
+                          (or (= opcode 31) (= opcode 45))
+                            (set! output
+                                  (emit! (mut graph)
+                                         (mut state)
+                                         opcode
+                                         (.vector state)
+                                         [left]))
+                          (= opcode 68)
+                            (set! output
+                                  (emit! (mut graph)
+                                         (mut state)
+                                         68
+                                         (.vector state)
+                                         [left (.op2 node)]))
+                          (or (= opcode 33)
+                              (= opcode 34)
+                              (= opcode 35)
+                              (= opcode 36))
+                            (set! output left)
+                          (= opcode 49)
+                            (match (data/shift source r bytes)
+                              (None []
+                                    (set! (.error state)
+                                          "unsupported vector shift"))
+                              (Some [amount]
+                                    (set! output
+                                          (emit! (mut graph)
+                                                 (mut state)
+                                                 49
+                                                 (.vector state)
+                                                 [left
+                                                  (constant! (mut graph)
+                                                             (mut state)
+                                                             5
+                                                             (cast u64 amount))]))))
+                          :else
+                            (set! (.error state)
+                                  "unsupported demanded vector operation")))))
+            (when (> output 0) (set! (mut (.values state)) (cast i64 r) output))))))
+    (let [next (emit! (mut graph) (mut state) 27 5 [counter one])
+          remaining (emit! (mut graph) (mut state) 15 1 [next zero])
+          branch (emit! (mut graph) (mut state) 116 0 [control remaining])
+          back-yes (emit! (mut graph) (mut state) 107 0 [branch (: 0 i32)])
+          done-no (emit! (mut graph) (mut state) 108 0 [branch (: 0 i32)])
+          back (emit! (mut graph) (mut state) 115 0 [back-yes])
+          done (emit! (mut graph) (mut state) 114 0 [done-no])
+          join (emit! (mut graph) (mut state) 112 0 [scalar-entry done])
+          initial
+            (emit! (mut graph)
+                   (mut state)
+                   67
+                   (cast i32
+                         (n/type-id (get (.instructions source)
+                                         (cast i64 (.induction loop)))))
+                   [join (.initial loop) cleanup-value])
+          join-end (emit! (mut graph) (mut state) 114 0 [join])]
+      (patch! (mut graph) (mut state) header 2 back)
+      (patch! (mut graph) (mut state) counter 3 next)
+      (for pointer pointers
+        (let [next-pointer (emit! (mut graph) (mut state) 26 6 [pointer stride])]
+          (patch! (mut graph) (mut state) pointer 3 next-pointer)))
+      (when (> vector-iv 0)
+        (let [increment
+                (broadcast! (mut graph)
+                            (mut state)
+                            (constant! (mut graph)
+                                       (mut state)
+                                       element
+                                       (cast u64 chunk)))
+              next-iv
+                (emit! (mut graph)
+                       (mut state)
+                       26
+                       (.vector state)
+                       [vector-iv increment])]
+          (patch! (mut graph) (mut state) vector-iv 3 next-iv)))
+      (when (= (.error state) "")
+        (when (not (g/rewrite-inputs! (mut graph)
+                                      (.entry loop)
+                                      116
+                                      0
+                                      [(.op1 original-entry) predicate]))
+          (set! (.error state) "vector dispatch rewrite failed")))
+      (patch! (mut graph)
+              (mut state)
+              (.header loop)
+              (.entry-slot loop)
+              join-end)
+      (patch! (mut graph)
+              (mut state)
+              (.induction loop)
+              (+ (.entry-slot loop) 1)
+              initial))
+    (when (= (.error state) "")
+      (match (rewrite/validate graph 8 a)
+        (Err [message] (set! (.error state) message))
+        (Ok [_] 0)))
+    (free! (mut pointers))
+    (bits/release! (mut needed))
+    (let [error (.error state)]
+      (release! (mut state))
+      (if (= error "") (Ok graph) (do (g/release! (mut graph)) (Err error))))))
+
+;;; None is a supported scalar fallback decision, never another code generator.
+(defn vectorize [(source g/Graph)
+                 (entry i32)
+                 (roots (slice i32))
+                 (header i32)
+                 (unroll i32)
+                 (a (dyn Allocator))]
+  (-> (Result (Option g/Graph) (slice u8)))
+  (if (not (or (= unroll 1) (= unroll 2) (= unroll 4)))
+      (Err "vector unroll must be one, two or four")
+      (match (pipeline/prepare source entry roots a)
+        (Err [message] (Err message))
+        (Ok [prepared]
+            (let [(mut prepared) prepared
+                  (mut pred) (adjacency/build (.blocks prepared) true a)
+                  (mut succ) (adjacency/build (.blocks prepared) false a)
+                  (mut ownership) (shape/owners prepared a)
+                  (mut edges) (uses/build source a)
+                  (mut result) (Ok [(Option g/Graph) (slice u8)] (None))]
+              (if (or (not (g/contains? source header)) (<= header 0))
+                  (set! result (Err "vector loop header missing"))
+                  (match (shape/recognize source
+                                          prepared
+                                          pred
+                                          succ
+                                          ownership
+                                          roots
+                                          header
+                                          a)
+                    (None [] 0)
+                    (Some [loop]
+                          (let [(mut loop) loop]
+                            (when (= (n/opcode (get (.instructions source)
+                                                    (cast i64 (.entry loop))))
+                                     114)
+                              (match (data/analyze source
+                                                   prepared
+                                                   ownership
+                                                   loop
+                                                   edges
+                                                   a)
+                                (None [] 0)
+                                (Some [flags]
+                                      (let [(mut flags) flags
+                                            (mut facts)
+                                              (affine/build source
+                                                            prepared
+                                                            ownership
+                                                            loop
+                                                            a)]
+                                        (match (affine/accesses source
+                                                                loop
+                                                                facts
+                                                                a)
+                                          (None [] 0)
+                                          (Some [accesses]
+                                                (let [(mut accesses) accesses]
+                                                  (match (guard/build (slice accesses)
+                                                                      (.element-bytes loop)
+                                                                      a)
+                                                    (None [] 0)
+                                                    (Some [plan]
+                                                          (let [(mut plan) plan]
+                                                            (set! result
+                                                                  (match (construct source
+                                                                                    prepared
+                                                                                    ownership
+                                                                                    loop
+                                                                                    accesses
+                                                                                    plan
+                                                                                    unroll
+                                                                                    a)
+                                                                    (Err [message]
+                                                                         (Err message))
+                                                                    (Ok [graph]
+                                                                        (Ok (Some graph)))))
+                                                            (guard/release! (mut plan)))))
+                                                  (free! (mut accesses)))))
+                                        (free! (mut facts))
+                                        (free! (mut flags))))))
+                            (shape/release! (mut loop))))))
+              (uses/release! (mut edges))
+              (free! (mut ownership))
+              (adjacency/release! (mut pred))
+              (adjacency/release! (mut succ))
+              (pipeline/release! (mut prepared))
+              result)))))
+
+;;; Visit only headers that existed in the input, once each. Newly appended
+;;; vector headers are excluded and an original cleanup header is never retried.
+;;; Facts are rebuilt after each successful edit; rejected loops leave no copy.
+(defn optimize [(source g/Graph)
+                (entry i32)
+                (roots (slice i32))
+                (unroll i32)
+                (a (dyn Allocator))]
+  (-> (Result (Option g/Graph) (slice u8)))
+  (let [(mut working) source
+        (mut owned) false
+        (mut error) ""
+        limit (len (.instructions source))]
+    (for [index 1 limit]
+      (when (= error "")
+        (let [opcode (n/opcode (get (.instructions source) index))]
+          (when (or (= opcode 112) (= opcode 113))
+            (match (vectorize working entry roots (cast i32 index) unroll a)
+              (Err [message] (set! error message))
+              (Ok [candidate]
+                  (match candidate
+                    (None [] 0)
+                    (Some [replacement]
+                          (when owned (g/release! (mut working)))
+                          (set! working replacement)
+                          (set! owned true)))))))))
+    (if (!= error "")
+        (do (when owned (g/release! (mut working))) (Err error))
+        (if owned (Ok (Some working)) (Ok (None))))))

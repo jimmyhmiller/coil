@@ -1,0 +1,218 @@
+;;; Runtime memory-dependence guards for an additional vectorization pass.
+;;; Pure scalar predicates are emitted into the existing graph before matching.
+(module stogir.loop-guard)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.loop-affine" :as affine)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+(defstruct Group [(base i32) (minimum i64) (maximum i64) (write bool)])
+
+(defstruct Plan [(groups (ArrayList Group)) (bytes i32)])
+
+(defn release! [(plan (mut Plan))] (-> void)
+  (free! (mut (.groups plan))))
+
+;;; Group read-only footprints by base. A writing base must be pointwise: all
+;;; offsets equal. Differing offsets on a writing base may carry dependencies
+;;; across iterations and are outside this transform's current supported family.
+(defn build [(accesses (slice affine/Access)) (bytes i32) (a (dyn Allocator))]
+  (-> (Option Plan))
+  (let [(mut groups) (ArrayList::new [Group] a)
+        (mut accepted) (or (= bytes 1) (= bytes 2) (= bytes 4) (= bytes 8))]
+    (for access accesses
+      (when (or (<= (.base access) 0)
+                (< (.offset access) -281474976710656)
+                (> (.offset access) 281474976710656))
+        (set! accepted false))
+      (let [(mut found) (: -1 i64)]
+        (for [i 0 (len groups)]
+          (when (= (.base (get groups i)) (.base access)) (set! found i)))
+        (if (< found 0)
+            (push! (mut groups)
+                   (Group
+                     :base (.base access)
+                     :minimum (.offset access)
+                     :maximum (.offset access)
+                     :write (.write access)))
+            (let [(mut group) (get groups found)]
+              (when (< (.offset access) (.minimum group))
+                (set! (.minimum group) (.offset access)))
+              (when (> (.offset access) (.maximum group))
+                (set! (.maximum group) (.offset access)))
+              (set! (.write group) (or (.write group) (.write access)))
+              (set! (mut groups) found group)))))
+    (when (= (len groups) 0) (set! accepted false))
+    (for group groups
+      (when (and (.write group) (!= (.minimum group) (.maximum group)))
+        (set! accepted false)))
+    (if accepted
+        (Some (Plan :groups groups :bytes bytes))
+        (do (free! (mut groups)) (None)))))
+
+;;; Graph mutation errors propagate to the owning transform, which discards its
+;;; working graph. Public guard inputs are validated before the first append.
+(defstruct State [(error (slice u8))])
+
+(defn require [(state (mut State)) (value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (set! (.error state) message) 0)))
+
+(defn literal! [(graph (mut g/Graph)) (state (mut State)) (bits u64)] (-> i32)
+  (if (= (.error state) "")
+      (require (mut state) (b/scalar-constant! (mut graph) 5 bits 8))
+      0))
+
+(defn binary! [(graph (mut g/Graph))
+               (state (mut State))
+               (opcode i32)
+               (ty i32)
+               (left i32)
+               (right i32)] (-> i32)
+  (if (= (.error state) "")
+      (require (mut state) (b/emit! (mut graph) opcode ty [left right]))
+      0))
+
+(defn unsigned! [(graph (mut g/Graph)) (state (mut State)) (reference i32)]
+  (-> i32)
+  (if (!= (.error state) "")
+      0
+      (match (g/lookup graph reference)
+        (None [] (set! (.error state) "guard input missing") 0)
+        (Some [value]
+              (if (= (n/type-id value) 5)
+                  reference
+                  (require (mut state)
+                           (b/conversion! (mut graph) 36 5 8 reference)))))))
+
+(defn input? [(graph g/Graph) (reference i32) (address bool)] (-> bool)
+  (match (g/lookup graph reference)
+    (None [] false)
+    (Some [value]
+          (let [ty (n/type-id value)]
+            (and (not (op/terminator? (cast i32 (n/opcode value))))
+                 (!= (n/opcode value) 70)
+                 (!= (n/opcode value) 72)
+                 (or (= ty 5) (= ty 11) (and address (= ty 6))))))))
+
+;;; Safe subset: all physical addresses are in [0,2^48); endpoints may equal
+;;; 2^48. Initial/bound are nonnegative and scaled indices are <=2^48. Static
+;;; offsets are bounded by +/-2^48. Thus mathematical sums lie in [-2^48,3*2^48]
+;;; and cannot wrap through 2^64 into an accepted range. Negative unsigned wraps
+;;; fail the endpoint checks. Tagged/high addresses conservatively use scalar.
+;;;
+;;; Envelopes are [base + initial*bytes + min, base + bound*bytes + max).
+;;; Distinct groups with a write require disjoint envelopes. Base-reference
+;;; inequality alone never establishes independence. The predicate is pure: no
+;;; invalid-path address is dereferenced while evaluating any check.
+(defn emit! [(graph (mut g/Graph))
+             (plan Plan)
+             (initial i32)
+             (bound i32)
+             (chunk i32)
+             (a (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [(mut state) (State :error "")
+        (mut valid)
+          (and (>= chunk 2)
+               (<= chunk 64)
+               (input? graph initial false)
+               (input? graph bound false)
+               (or (= (.bytes plan) 1)
+                   (= (.bytes plan) 2)
+                   (= (.bytes plan) 4)
+                   (= (.bytes plan) 8))
+               (> (len (.groups plan)) 0))]
+    (for group (.groups plan)
+      (when (or (not (input? graph (.base group) true))
+                (> (.minimum group) (.maximum group))
+                (< (.minimum group) -281474976710656)
+                (> (.maximum group) 281474976710656)
+                (and (.write group) (!= (.minimum group) (.maximum group))))
+        (set! valid false)))
+    (if (not valid)
+        (Err "invalid vector memory guard inputs or plan")
+        (let [limit (literal! (mut graph) (mut state) 281474976710656)
+              scale (literal! (mut graph) (mut state) (cast u64 (.bytes plan)))
+              index-limit
+                (literal! (mut graph)
+                          (mut state)
+                          (/ (: 281474976710656 u64) (cast u64 (.bytes plan))))
+              first (unsigned! (mut graph) (mut state) initial)
+              last (unsigned! (mut graph) (mut state) bound)
+              first-offset (binary! (mut graph) (mut state) 28 5 first scale)
+              last-offset (binary! (mut graph) (mut state) 28 5 last scale)
+              count (binary! (mut graph) (mut state) 27 5 last first)
+              minimum (literal! (mut graph) (mut state) (cast u64 chunk))
+              ordered (binary! (mut graph) (mut state) 21 1 last first)
+              enough (binary! (mut graph) (mut state) 21 1 count minimum)
+              first-valid
+                (binary! (mut graph) (mut state) 22 1 first index-limit)
+              last-valid (binary! (mut graph) (mut state) 22 1 last index-limit)
+              (mut predicate)
+                (binary! (mut graph) (mut state) 47 1 ordered enough)
+              (mut starts) (ArrayList::new [i32] a)
+              (mut ends) (ArrayList::new [i32] a)]
+          (set! predicate
+                (binary! (mut graph) (mut state) 47 1 predicate first-valid))
+          (set! predicate
+                (binary! (mut graph) (mut state) 47 1 predicate last-valid))
+          (for group (.groups plan)
+            (let [base (unsigned! (mut graph) (mut state) (.base group))
+                  base-valid (binary! (mut graph) (mut state) 20 1 base limit)
+                  start-base
+                    (binary! (mut graph) (mut state) 26 5 base first-offset)
+                  end-base
+                    (binary! (mut graph) (mut state) 26 5 base last-offset)
+                  low
+                    (literal! (mut graph)
+                              (mut state)
+                              (cast u64 (.minimum group)))
+                  high
+                    (literal! (mut graph)
+                              (mut state)
+                              (cast u64 (.maximum group)))
+                  start (binary! (mut graph) (mut state) 26 5 start-base low)
+                  end (binary! (mut graph) (mut state) 26 5 end-base high)
+                  start-valid (binary! (mut graph) (mut state) 20 1 start limit)
+                  end-valid (binary! (mut graph) (mut state) 22 1 end limit)]
+              (push! (mut starts) start)
+              (push! (mut ends) end)
+              (set! predicate
+                    (binary! (mut graph) (mut state) 47 1 predicate base-valid))
+              (set! predicate
+                    (binary! (mut graph) (mut state) 47 1 predicate start-valid))
+              (set! predicate
+                    (binary! (mut graph) (mut state) 47 1 predicate end-valid))))
+          (for [i 0 (len (.groups plan))]
+            (for [j (+ i 1) (len (.groups plan))]
+              (when (or (.write (get (.groups plan) i))
+                        (.write (get (.groups plan) j)))
+                (let [before
+                        (binary! (mut graph)
+                                 (mut state)
+                                 22
+                                 1
+                                 (get ends i)
+                                 (get starts j))
+                      after
+                        (binary! (mut graph)
+                                 (mut state)
+                                 22
+                                 1
+                                 (get ends j)
+                                 (get starts i))
+                      disjoint
+                        (binary! (mut graph) (mut state) 46 1 before after)]
+                  (set! predicate
+                        (binary! (mut graph)
+                                 (mut state)
+                                 47
+                                 1
+                                 predicate
+                                 disjoint))))))
+          (free! (mut starts))
+          (free! (mut ends))
+          (if (= (.error state) "") (Ok predicate) (Err (.error state)))))))

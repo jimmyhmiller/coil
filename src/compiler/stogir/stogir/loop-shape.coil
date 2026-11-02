@@ -1,0 +1,366 @@
+;;; Counted, single-path natural-loop facts over the existing graph and CFG.
+;;; This is an additional optimizer analysis, not an upstream vectorizer port.
+(module stogir.loop-shape)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.opcode" :as op)
+(import "stogir.cfg" :as cfg)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.adjacency" :as adjacency)
+(import "stogir.dominators" :as dom)
+(import "stogir.bitset" :as bits)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Option Some None])
+
+(defstruct Loop
+  [(header i32)
+   (entry i32)
+   (back i32)
+   (entry-slot i32)
+   (back-slot i32)
+   (induction i32)
+   (initial i32)
+   (next i32)
+   (bound i32)
+   (predicate i32)
+   (branch i32)
+   (inside i32)
+   (outside i32)
+   (members bits/Bits)
+   (body (ArrayList i32))
+   (memory (ArrayList i32))
+   (element-bytes i32)])
+
+(defn release! [(loop (mut Loop))] (-> void)
+  (bits/release! (mut (.members loop)))
+  (free! (mut (.body loop)))
+  (free! (mut (.memory loop))))
+
+(defn owners [(prepared pipeline/Prepared) (a (dyn Allocator))]
+  (-> (ArrayList i32))
+  (let [(mut result) (ArrayList::new [i32] a)]
+    (for [i 0 (len (.membership (.blocks prepared)))] (push! (mut result) 0))
+    (for block (.starts (.blocks prepared))
+      (let [range (get (.ranges (.schedule prepared)) (cast i64 block))]
+        (for [i (.offset range) (+ (.offset range) (.count range))]
+          (set! (mut result)
+                (cast i64 (get (.nodes (.schedule prepared)) i))
+                block))))
+    result))
+
+(defn invariant? [(prepared pipeline/Prepared)
+                  (ownership (ArrayList i32))
+                  (loop Loop)
+                  (reference i32)] (-> bool)
+  (if (< reference 0)
+      true
+      (if (or (= reference 0) (>= (cast i64 reference) (len ownership)))
+          false
+          (let [block (get ownership (cast i64 reference))]
+            (and (> block 0)
+                 (not (bits/contains? (.members loop) (cast i64 block)))
+                 (dom/dominates? (.idom prepared) block (.header loop)))))))
+
+(defn literal-one? [(graph g/Graph) (reference i32)] (-> bool)
+  (if (>= reference 0)
+      false
+      (match (g/lookup graph reference)
+        (None [] false)
+        (Some [value]
+              (and (types/integer? (cast i32 (n/type-id value)))
+                   (= (n/constant-bits value) 1))))))
+
+;;; Input graphs have already passed structural/Phi verification and scheduling.
+;;; Only representation-preserving integer copies are transparent here.
+(defn identity [(graph g/Graph) (reference i32)] (-> i32)
+  (let [(mut current) reference
+        (mut steps) 0
+        (mut done) false]
+    (while (and (> current 0) (not done) (< steps (len (.instructions graph))))
+      (let [value (get (.instructions graph) (cast i64 current))]
+        (if (= (n/opcode value) 68)
+            (set! current (.op1 value))
+            (set! done true)))
+      (set! steps (+ steps 1)))
+    current))
+
+(defn data-width [(graph g/Graph) (reference i32)] (-> i32)
+  (match (g/lookup graph reference)
+    (None [] 0)
+    (Some [value]
+          (let [ty (cast i32 (n/type-id value))]
+            (if (and (types/integer? ty) (!= ty 1) (!= ty 6))
+                (types/scalar-size ty 8)
+                0)))))
+
+(defn end-of [(prepared pipeline/Prepared) (block i32)] (-> i32)
+  (let [range (get (.ranges (.schedule prepared)) (cast i64 block))]
+    (if (= (.count range) 0)
+        0
+        (get (.nodes (.schedule prepared))
+             (+ (.offset range) (- (.count range) 1))))))
+
+;;; None means a legal graph outside this pass's supported loop family.
+;;; No source names, trip-count constants, or benchmark-specific patterns enter
+;;; recognition. Nested control, extra loop-carried state, volatile/atomic/call
+;;; effects and mixed-width memory retain their scalar loop.
+(defn recognize-core [(graph g/Graph)
+                      (prepared pipeline/Prepared)
+                      (predecessors adjacency/Index)
+                      (successors adjacency/Index)
+                      (ownership (ArrayList i32))
+                      (roots (slice i32))
+                      (header i32)
+                      (a (dyn Allocator))] (-> (Option Loop))
+  (let [header-node (get (.instructions graph) (cast i64 header))
+        incoming (get (.ranges predecessors) (cast i64 header))
+        outgoing (get (.ranges successors) (cast i64 header))
+        (mut accepted)
+          (and (or (= (n/opcode header-node) 112)
+                   (= (n/opcode header-node) 113))
+               (= (get (.arities graph) (cast i64 header)) 2)
+               (= (.count incoming) 2)
+               (= (.count outgoing) 2))
+        (mut loop)
+          (Loop
+            :header header
+            :entry 0
+            :back 0
+            :entry-slot 0
+            :back-slot 0
+            :induction 0
+            :initial 0
+            :next 0
+            :bound 0
+            :predicate 0
+            :branch 0
+            :inside 0
+            :outside 0
+            :members (bits/create (len (.instructions graph)) a)
+            :body (ArrayList::new [i32] a)
+            :memory (ArrayList::new [i32] a)
+            :element-bytes 0)
+        (mut work) (ArrayList::new [i32] a)]
+    (when accepted
+      (for [i 0 (.count incoming)]
+        (let [edge
+                (get (.edges (.blocks prepared))
+                     (get (.edges predecessors) (+ (.offset incoming) i)))]
+          (if (dom/dominates? (.idom prepared) header (.from edge))
+              (if (!= (.back loop) 0)
+                  (set! accepted false)
+                  (do
+                    (set! (.back loop) (.source edge))
+                    (set! (.back-slot loop) (.position edge))
+                    (push! (mut work) (.from edge))))
+              (if (!= (.entry loop) 0)
+                  (set! accepted false)
+                  (do
+                    (set! (.entry loop) (.source edge))
+                    (set! (.entry-slot loop) (.position edge)))))))
+      (when (or (= (.entry loop) 0) (= (.back loop) 0)) (set! accepted false)))
+    (when accepted
+      (bits/add! (mut (.members loop)) (cast i64 header))
+      (let [(mut cursor) 0]
+        (while (and accepted (< cursor (len work)))
+          (let [block (get work cursor)]
+            (unless (bits/contains? (.members loop) (cast i64 block))
+              (if (not (dom/dominates? (.idom prepared) header block))
+                  (set! accepted false)
+                  (do
+                    (bits/add! (mut (.members loop)) (cast i64 block))
+                    (let [range (get (.ranges predecessors) (cast i64 block))]
+                      (for [i 0 (.count range)]
+                        (push! (mut work)
+                               (.from (get (.edges (.blocks prepared))
+                                           (get (.edges predecessors)
+                                                (+ (.offset range) i)))))))))))
+          (set! cursor (+ cursor 1)))))
+    (when accepted
+      (set! (.branch loop) (end-of prepared header))
+      (when (or (= (.branch loop) 0)
+                (!= (n/opcode (get (.instructions graph)
+                                   (cast i64 (.branch loop))))
+                    116))
+        (set! accepted false))
+      (for [i 0 (.count outgoing)]
+        (let [edge
+                (get (.edges (.blocks prepared))
+                     (get (.edges successors) (+ (.offset outgoing) i)))]
+          (if (bits/contains? (.members loop) (cast i64 (.to edge)))
+              (if (!= (.inside loop) 0)
+                  (set! accepted false)
+                  (set! (.inside loop) (.to edge)))
+              (if (!= (.outside loop) 0)
+                  (set! accepted false)
+                  (set! (.outside loop) (.to edge))))))
+      (when (or (= (.inside loop) 0) (= (.outside loop) 0))
+        (set! accepted false)))
+    (when accepted
+      (let [range (get (.ranges (.schedule prepared)) (cast i64 header))
+            (mut phis) 0]
+        (for [i (.offset range) (+ (.offset range) (.count range))]
+          (let [reference (get (.nodes (.schedule prepared)) i)
+                value (get (.instructions graph) (cast i64 reference))]
+            (when (= (n/opcode value) 67)
+              (set! phis (+ phis 1))
+              (set! (.induction loop) reference))
+            (when (and (op/control? (cast i32 (n/opcode value)))
+                       (!= reference header)
+                       (!= reference (.branch loop)))
+              (set! accepted false))))
+        (when (!= phis 1) (set! accepted false))))
+    (when accepted
+      (let [iv (get (.instructions graph) (cast i64 (.induction loop)))
+            ty (cast i32 (n/type-id iv))
+            initial
+              (match (g/operand graph
+                                (.induction loop)
+                                (+ (.entry-slot loop) 1))
+                (Some [r] r)
+                (None [] 0))
+            next
+              (match (g/operand graph (.induction loop) (+ (.back-slot loop) 1))
+                (Some [r] r)
+                (None [] 0))
+            step (identity graph next)]
+        (set! (.initial loop) initial)
+        (set! (.next loop) next)
+        (when (or (not (or (= ty 5) (= ty 11)))
+                  (not (invariant? prepared ownership loop initial))
+                  (<= step 0))
+          (set! accepted false))
+        (when accepted
+          (let [value (get (.instructions graph) (cast i64 step))]
+            (unless (and (= (n/opcode value) 26)
+                         (or (and (= (identity graph (.op1 value))
+                                     (.induction loop))
+                                  (literal-one? graph (.op2 value)))
+                             (and (= (identity graph (.op2 value))
+                                     (.induction loop))
+                                  (literal-one? graph (.op1 value)))))
+              (set! accepted false))))))
+    (when accepted
+      (let [condition
+              (identity graph
+                        (.op2 (get (.instructions graph)
+                                   (cast i64 (.branch loop)))))
+            value
+              (if (> condition 0)
+                  (get (.instructions graph) (cast i64 condition))
+                  (n/make 0 0 0 0 0 0))
+            opcode (cast i32 (n/opcode value))
+            true-inside
+              (= (n/opcode (get (.instructions graph)
+                                (cast i64 (.inside loop))))
+                 107)
+            direct (= (identity graph (.op1 value)) (.induction loop))
+            reverse (= (identity graph (.op2 value)) (.induction loop))]
+        (cond (and direct true-inside (or (= opcode 16) (= opcode 20)))
+                (do
+                  (set! (.predicate loop) opcode)
+                  (set! (.bound loop) (.op2 value)))
+              (and direct (not true-inside) (or (= opcode 17) (= opcode 21)))
+                (do
+                  (set! (.predicate loop) (- opcode 1))
+                  (set! (.bound loop) (.op2 value)))
+              (and reverse true-inside (or (= opcode 19) (= opcode 23)))
+                (do
+                  (set! (.predicate loop) (- opcode 3))
+                  (set! (.bound loop) (.op1 value)))
+              (and reverse (not true-inside) (or (= opcode 18) (= opcode 22)))
+                (do
+                  (set! (.predicate loop) (- opcode 2))
+                  (set! (.bound loop) (.op1 value)))
+              :else (set! accepted false))
+        (when (and accepted
+                   (not (invariant? prepared ownership loop (.bound loop))))
+          (set! accepted false))))
+    (when accepted
+      (clear! (mut work))
+      (let [(mut current) (.inside loop)]
+        (while (and accepted (!= current header))
+          (if (or (not (bits/contains? (.members loop) (cast i64 current)))
+                  (>= (len work) (len (.starts (.blocks prepared)))))
+              (set! accepted false)
+              (let [incoming-body
+                      (get (.ranges predecessors) (cast i64 current))
+                    next (get (.ranges successors) (cast i64 current))
+                    range
+                      (get (.ranges (.schedule prepared)) (cast i64 current))]
+                (push! (mut work) current)
+                (when (or (!= (.count incoming-body) 1) (!= (.count next) 1))
+                  (set! accepted false))
+                (for [i (.offset range) (+ (.offset range) (.count range))]
+                  (let [reference (get (.nodes (.schedule prepared)) i)
+                        value (get (.instructions graph) (cast i64 reference))
+                        opcode (cast i32 (n/opcode value))]
+                    (push! (mut (.body loop)) reference)
+                    (when (or (= opcode 91) (= opcode 93))
+                      (let [width
+                              (data-width graph
+                                          (if (= opcode 91)
+                                              reference
+                                              (.op3 value)))]
+                        (when (or (= width 0)
+                                  (and (!= (.element-bytes loop) 0)
+                                       (!= (.element-bytes loop) width)))
+                          (set! accepted false))
+                        (set! (.element-bytes loop) width)
+                        (push! (mut (.memory loop)) reference)))
+                    (when (and (or (= opcode 67)
+                                   (and (>= opcode 79) (<= opcode 130)))
+                               (not (or (= opcode 91)
+                                        (= opcode 93)
+                                        (= opcode 106)
+                                        (= opcode 107)
+                                        (= opcode 108)
+                                        (= opcode 112)
+                                        (= opcode 114)
+                                        (= opcode 115))))
+                      (set! accepted false))))
+                (when accepted
+                  (set! current
+                        (.to (get (.edges (.blocks prepared))
+                                  (get (.edges successors) (.offset next)))))))))))
+    (when accepted
+      (let [(mut stores) 0]
+        (for reference (.memory loop)
+          (when (= (n/opcode (get (.instructions graph) (cast i64 reference)))
+                   93)
+            (set! stores (+ stores 1))))
+        (when (= stores 0) (set! accepted false)))
+      (for root roots
+        (when (and (> root 0)
+                   (bits/contains? (.members loop)
+                                   (cast i64 (get ownership (cast i64 root))))
+                   (!= (n/type-id (get (.instructions graph) (cast i64 root)))
+                       0))
+          (set! accepted false))))
+    (free! (mut work))
+    (if accepted (Some loop) (do (release! (mut loop)) (None)))))
+
+(defn recognize [(graph g/Graph)
+                 (prepared pipeline/Prepared)
+                 (predecessors adjacency/Index)
+                 (successors adjacency/Index)
+                 (ownership (ArrayList i32))
+                 (roots (slice i32))
+                 (header i32)
+                 (a (dyn Allocator))] (-> (Option Loop))
+  (let [value (get (.instructions graph) (cast i64 header))]
+    (if (and (or (= (n/opcode value) 112) (= (n/opcode value) 113))
+             (= (get (.arities graph) (cast i64 header)) 2)
+             (= (.count (get (.ranges predecessors) (cast i64 header))) 2)
+             (= (.count (get (.ranges successors) (cast i64 header))) 2))
+        (recognize-core graph
+                        prepared
+                        predecessors
+                        successors
+                        ownership
+                        roots
+                        header
+                        a)
+        (None))))

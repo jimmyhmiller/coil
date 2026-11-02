@@ -1,0 +1,161 @@
+;;; Legality of per-lane integer data lifting, including wide containers around
+;;; explicit truncations. Only low-bit homomorphisms may change arithmetic width.
+(module stogir.loop-data)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.opcode" :as op)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.loop-shape" :as shape)
+(import "stogir.loop-affine" :as affine)
+(import "stogir.uses" :as uses)
+(import "stogir.bitset" :as bits)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Option Some None])
+
+(defn width [(graph g/Graph) (reference i32)] (-> i32)
+  (match (g/lookup graph reference)
+    (None [] 0)
+    (Some [value]
+          (let [ty (cast i32 (n/type-id value))]
+            (if (types/integer? ty) (types/scalar-size ty 8) 0)))))
+
+(defn literal? [(graph g/Graph) (reference i32) (bytes i32)] (-> bool)
+  (if (>= reference 0)
+      false
+      (match (g/lookup graph reference)
+        (None [] false)
+        (Some [value]
+              (and (>= (n/opcode value) 1)
+                   (<= (n/opcode value) 13)
+                   (>= (width graph reference) bytes))))))
+
+(defn available? [(graph g/Graph)
+                  (flags (ArrayList bool))
+                  (reference i32)
+                  (bytes i32)] (-> bool)
+  (if (< reference 0)
+      (literal? graph reference bytes)
+      (and (> reference 0)
+           (< (cast i64 reference) (len flags))
+           (get flags (cast i64 reference)))))
+
+;;; Left shifts commute with truncation only when the original effective count
+;;; fits the demanded width. In particular a 64-bit shift by 32 cannot silently
+;;; become a 32-bit shift by zero. Variable counts retain the scalar loop.
+(defn shift [(graph g/Graph) (reference i32) (bytes i32)] (-> (Option i32))
+  (let [value (get (.instructions graph) (cast i64 reference))
+        original (width graph reference)]
+    (match (affine/integer graph (.op2 value))
+      (None [] (None))
+      (Some [count]
+            (let [effective (& count (cast i64 (- (* original 8) 1)))]
+              (if (< effective (cast i64 (* bytes 8)))
+                  (Some (cast i32 effective))
+                  (None)))))))
+
+(defn wrapping-binary? [(opcode i32)] (-> bool)
+  (or (= opcode 26)
+      (= opcode 27)
+      (= opcode 28)
+      (= opcode 46)
+      (= opcode 47)
+      (= opcode 48)))
+
+(defn flags [(graph g/Graph)
+             (prepared pipeline/Prepared)
+             (ownership (ArrayList i32))
+             (loop shape/Loop)
+             (a (dyn Allocator))]
+  (-> (ArrayList bool))
+  (let [(mut result) (ArrayList::new [bool] a)
+        bytes (.element-bytes loop)]
+    (for [i 0 (len (.instructions graph))] (push! (mut result) false))
+    (for reference (.nodes (.schedule prepared))
+      (let [value (get (.instructions graph) (cast i64 reference))
+            opcode (cast i32 (n/opcode value))
+            original (width graph reference)
+            (mut supported) false]
+        (when (>= original bytes)
+          (cond (= reference (.induction loop)) (set! supported true)
+                (shape/invariant? prepared ownership loop reference)
+                  (set! supported true)
+                (= opcode 91) (set! supported (= original bytes))
+                (wrapping-binary? opcode)
+                  (set! supported
+                        (and (!= (n/type-id value) 1)
+                             (available? graph result (.op1 value) bytes)
+                             (available? graph result (.op2 value) bytes)))
+                (or (= opcode 31) (= opcode 45))
+                  (set! supported
+                        (and (!= (n/type-id value) 1)
+                             (available? graph result (.op1 value) bytes)))
+                (or (= opcode 33)
+                    (= opcode 34)
+                    (= opcode 35)
+                    (= opcode 36)
+                    (= opcode 68))
+                  (set! supported
+                        (and (!= (n/type-id value) 1)
+                             (>= (width graph (.op1 value)) bytes)
+                             (available? graph result (.op1 value) bytes)))
+                (= opcode 49)
+                  (match (shift graph reference bytes)
+                    (None [] 0)
+                    (Some [_]
+                          (set! supported
+                                (available? graph result (.op1 value) bytes))))
+                :else 0))
+        (set! (mut result) (cast i64 reference) supported)))
+    result))
+
+;;; A vector prefix skips most scalar body executions. Only the induction Phi
+;;; is guaranteed to be reconstructed by entering scalar cleanup. Any other
+;;; live-out value forbids this transformation, even if its arithmetic is liftable.
+(defn closed? [(graph g/Graph)
+               (prepared pipeline/Prepared)
+               (ownership (ArrayList i32))
+               (loop shape/Loop)
+               (edges uses/Uses)]
+  (-> bool)
+  (let [(mut accepted) true]
+    (for reference (.nodes (.schedule prepared))
+      (when (and (!= reference (.induction loop))
+                 (bits/contains? (.members loop)
+                                 (cast i64 (get ownership (cast i64 reference))))
+                 (!= (n/type-id (get (.instructions graph) (cast i64 reference)))
+                     0))
+        (let [range (get (.ranges edges) (cast i64 reference))]
+          (for [i (.offset range) (+ (.offset range) (.count range))]
+            (let [edge (get (.edges edges) i)
+                  user (.user edge)
+                  block (get ownership (cast i64 user))
+                  kind
+                    (op/operand-kind (cast i32
+                                           (n/opcode (get (.instructions graph)
+                                                          (cast i64 user))))
+                                     (.operand edge))]
+              (when (and (> block 0)
+                         (or (= kind "def") (= kind "ref") (= kind "arg"))
+                         (not (bits/contains? (.members loop) (cast i64 block))))
+                (set! accepted false)))))))
+    accepted))
+
+(defn analyze [(graph g/Graph)
+               (prepared pipeline/Prepared)
+               (ownership (ArrayList i32))
+               (loop shape/Loop)
+               (edges uses/Uses)
+               (a (dyn Allocator))] (-> (Option (ArrayList bool)))
+  (let [(mut result) (flags graph prepared ownership loop a)
+        (mut accepted) (closed? graph prepared ownership loop edges)]
+    (for reference (.memory loop)
+      (let [value (get (.instructions graph) (cast i64 reference))]
+        (when (and (= (n/opcode value) 93)
+                   (not (available? graph
+                                    result
+                                    (.op3 value)
+                                    (.element-bytes loop))))
+          (set! accepted false))))
+    (if accepted (Some result) (do (free! (mut result)) (None)))))

@@ -1,0 +1,179 @@
+;;; Checked affine memory facts for counted-loop vectorization. Coefficients
+;;; describe original graph references; no alternative executable IR is built.
+(module stogir.loop-affine)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.loop-shape" :as shape)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Option Some None])
+
+(defstruct Affine [(valid bool) (base i32) (scale i64) (offset i64)])
+
+(defstruct Access [(reference i32) (base i32) (offset i64) (write bool)])
+
+(defn invalid [] (-> Affine)
+  (Affine
+    :valid false
+    :base 0
+    :scale 0
+    :offset 0))
+
+(defn checked [(base i32) (scale i128) (offset i128)] (-> Affine)
+  (if (or (< scale -9223372036854775808)
+          (> scale 9223372036854775807)
+          (< offset -9223372036854775808)
+          (> offset 9223372036854775807))
+      (invalid)
+      (Affine
+        :valid true
+        :base base
+        :scale (cast i64 scale)
+        :offset (cast i64 offset))))
+
+(defn integer [(graph g/Graph) (reference i32)] (-> (Option i64))
+  (if (>= reference 0)
+      (None)
+      (match (g/lookup graph reference)
+        (None [] (None))
+        (Some [value]
+              (let [ty (cast i32 (n/type-id value))
+                    width (* 8 (types/scalar-size ty 8))
+                    payload (cast i128 (n/constant-bits value))]
+                (if (or (< (n/opcode value) 1)
+                        (> (n/opcode value) 13)
+                        (not (types/integer? ty))
+                        (<= width 0))
+                    (None)
+                    (let [number
+                            (if (and (types/signed? ty)
+                                     (>= payload
+                                         (<< (: 1 i128) (cast i128 (- width 1)))))
+                                (- payload (<< (: 1 i128) (cast i128 width)))
+                                payload)]
+                      (if (> number 9223372036854775807)
+                          (None)
+                          (Some (cast i64 number))))))))))
+
+(defn get-value [(graph g/Graph) (facts (ArrayList Affine)) (reference i32)]
+  (-> Affine)
+  (if (< reference 0)
+      (match (integer graph reference)
+        (None [] (invalid))
+        (Some [value] (checked 0 0 (cast i128 value))))
+      (if (or (= reference 0) (>= (cast i64 reference) (len facts)))
+          (invalid)
+          (get facts (cast i64 reference)))))
+
+(defn add-sub [(left Affine) (right Affine) (subtract bool)] (-> Affine)
+  (if (or (not (.valid left))
+          (not (.valid right))
+          (and subtract (!= (.base right) 0))
+          (and (not subtract) (!= (.base left) 0) (!= (.base right) 0)))
+      (invalid)
+      (let [sign (if subtract (: -1 i128) 1)]
+        (checked (if (!= (.base left) 0) (.base left) (.base right))
+                 (+ (cast i128 (.scale left))
+                    (* sign (cast i128 (.scale right))))
+                 (+ (cast i128 (.offset left))
+                    (* sign (cast i128 (.offset right))))))))
+
+(defn multiply [(value Affine) (factor i128)] (-> Affine)
+  (if (or (not (.valid value))
+          (and (!= (.base value) 0) (!= factor 0) (!= factor 1)))
+      (invalid)
+      (checked (if (= factor 0) 0 (.base value))
+               (* factor (cast i128 (.scale value)))
+               (* factor (cast i128 (.offset value))))))
+
+(defn product [(left Affine) (right Affine)] (-> Affine)
+  (if (and (.valid right) (= (.base right) 0) (= (.scale right) 0))
+      (multiply left (cast i128 (.offset right)))
+      (if (and (.valid left) (= (.base left) 0) (= (.scale left) 0))
+          (multiply right (cast i128 (.offset left)))
+          (invalid))))
+
+;;; Scheduled dependency order avoids recursive descent through deep DAGs.
+;;; Loop-invariant 64-bit values are opaque bases only when they dominate the
+;;; header. Arithmetic involving the IV remains checked affine integer math.
+(defn build [(graph g/Graph)
+             (prepared pipeline/Prepared)
+             (ownership (ArrayList i32))
+             (loop shape/Loop)
+             (a (dyn Allocator))]
+  (-> (ArrayList Affine))
+  (let [(mut facts) (ArrayList::new [Affine] a)]
+    (for [i 0 (len (.instructions graph))] (push! (mut facts) (invalid)))
+    (for reference (.nodes (.schedule prepared))
+      (let [value (get (.instructions graph) (cast i64 reference))
+            opcode (cast i32 (n/opcode value))
+            ty (cast i32 (n/type-id value))
+            (mut fact) (invalid)]
+        (cond (= reference (.induction loop)) (set! fact (checked 0 1 0))
+              (shape/invariant? prepared ownership loop reference)
+                (when (= (types/size ty 8) 8)
+                  (set! fact (checked reference 0 0))
+                  (when (= opcode 36)
+                    (let [source
+                            (match (g/lookup graph (.op1 value))
+                              (Some [node] node)
+                              (None [] (n/make 0 0 0 0 0 0)))
+                          input (get-value graph facts (.op1 value))]
+                      (when (and (= (types/size (cast i32 (n/type-id source)) 8)
+                                    8)
+                                 (.valid input))
+                        (set! fact input)))))
+              (and (types/integer? ty) (= (types/scalar-size ty 8) 8))
+                (let [left (get-value graph facts (.op1 value))
+                      right (get-value graph facts (.op2 value))]
+                  (cond (= opcode 26) (set! fact (add-sub left right false))
+                        (= opcode 27) (set! fact (add-sub left right true))
+                        (= opcode 28) (set! fact (product left right))
+                        (= opcode 36)
+                          (match (g/lookup graph (.op1 value))
+                            (None [] 0)
+                            (Some [source]
+                                  (when (= (types/size (cast i32
+                                                             (n/type-id source))
+                                                       8)
+                                           8)
+                                    (set! fact left))))
+                        (= opcode 49)
+                          (when (and (.valid right)
+                                     (= (.base right) 0)
+                                     (= (.scale right) 0))
+                            (set! fact
+                                  (multiply left
+                                            (<< (: 1 i128)
+                                                (cast i128
+                                                      (& (.offset right) 63))))))
+                        :else 0))
+              :else 0)
+        (set! (mut facts) (cast i64 reference) fact)))
+    facts))
+
+;;; All memory accesses must have unit element stride and one invariant base.
+;;; Aliasing between these footprints is checked by runtime versioning later;
+;;; recognition never assumes distinct parameter/base references are disjoint.
+(defn accesses [(graph g/Graph)
+                (loop shape/Loop)
+                (facts (ArrayList Affine))
+                (a (dyn Allocator))] (-> (Option (ArrayList Access)))
+  (let [(mut result) (ArrayList::new [Access] a)
+        (mut accepted) true]
+    (for reference (.memory loop)
+      (let [value (get (.instructions graph) (cast i64 reference))
+            address (get-value graph facts (.op2 value))]
+        (if (or (not (.valid address))
+                (= (.base address) 0)
+                (!= (.scale address) (cast i64 (.element-bytes loop))))
+            (set! accepted false)
+            (push! (mut result)
+                   (Access
+                     :reference reference
+                     :base (.base address)
+                     :offset (.offset address)
+                     :write (= (n/opcode value) 93))))))
+    (if accepted (Some result) (do (free! (mut result)) (None)))))
