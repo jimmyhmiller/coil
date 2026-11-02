@@ -285,3 +285,6 @@ yet ported and retains the existing RPO. See LOOP_BLOCK_ORDER.md.
 
 Indexed opcode metadata follows pinned upstream `ir.h` opcode order and the
 numeric table approach. See OPCODE_METADATA.md for representation and oracle.
+
+Finalized per-value location indexing follows upstream virtual-value interval
+ownership and split-child linkage. See LOCATION_INDEX.md for representation.

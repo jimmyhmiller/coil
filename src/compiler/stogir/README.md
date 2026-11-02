@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`0fc663a`, on 2026-11-02. The independent library remains maintained in that
+`4ff76d2`, on 2026-11-02. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 
@@ -32,3 +32,6 @@ and [pressure buffers](docs/PRESSURE_BUFFER.md) for coverage and limits.
 
 Indexed opcode shape and operand metadata preserves the string API and generated
 code. See [metadata validation](docs/OPCODE_METADATA.md).
+
+Finalized split-child locations use per-value indexing for CFG and contiguous
+transfer reconciliation. See [location indexing](docs/LOCATION_INDEX.md).
