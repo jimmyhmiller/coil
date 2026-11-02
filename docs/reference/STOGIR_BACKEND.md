@@ -169,3 +169,7 @@ source program then reaches the separately recorded i128 CIR type gap. Native
 JIT and linked AOT pressure fixtures execute correctly with the fix. Immediate
 required uses remain protected. Repeated CSE invalidation skips an already-empty
 map, avoiding repeated capacity scans during rewrites.
+
+The [rewrite/pressure validation checkpoint](../validation/STOGIR_GRAPH_REWRITES.md)
+records stable storage, the initial-owner spill correction, native before/after
+evidence and installed checks. SCCP is still not enabled.
