@@ -126,3 +126,26 @@ block order and loop-alignment choices. This verifies this scheduling core;
 it does not establish parity for the still-incomplete surrounding optimizer,
 loop analysis, allocator or optional entry modes. No C wrapper is linked into
 or shipped with the Coil library/backend.
+
+### SCCP value domain and worklist
+
+`stogir.sccp-values` ports the combined constant/copy lattice operations from
+pinned `ir_sccp.c`: identity lookup, circular copy-partition insertion and
+splitting, constant/copy/long-constant meets, use notification and backward
+input discovery. The original 16-byte union representation is retained through
+`stogir.node`; payload equality is bitwise. This is analysis metadata over the
+existing graph, not a replacement instruction representation.
+
+`stogir.bitqueue` adapts pinned `ir_private.h`'s deduplicating bit worklist,
+including rewinding for newly added lower references. It reuses the library
+bitset; nonzero-word discovery now uses trailing-zero count, as upstream does,
+instead of a loop over individual bits. Bounds handling remains independent
+Coil API behavior. Domain internals require valid references and lattice
+preconditions, like upstream's internal functions.
+
+The recorded differential calls the unmodified pinned static lattice functions
+from a temporary reference-only C translation unit. It normalizes the LAST_OP
+sentinel (126 upstream, 131 here due to appended atomic operations) and inactive
+union fields. No C wrapper ships or participates in JIT/AOT. The SCCP analyzer,
+transformation, iterative optimizer and optimization-level policy are not yet
+implemented or connected by this checkpoint.

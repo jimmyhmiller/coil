@@ -12,7 +12,7 @@ and module transport lets the engines consume the same native lowering while
 remaining distinct code generators. LLVM retains its existing lowering path.
 
 The library is a separately declared package, vendored under
-`src/compiler/stogir` at revision `8c0cab3`. Its [README](../../src/compiler/stogir/README.md),
+`src/compiler/stogir` at revision `3463e54`. Its [README](../../src/compiler/stogir/README.md),
 [LICENSE](../../src/compiler/stogir/LICENSE), [NOTICE](../../src/compiler/stogir/NOTICE)
 and provenance preserve credit to coil-stogir and Dmitry Stogov's IR. No per-file
 license headers are added by the integration.
@@ -133,3 +133,18 @@ The [block-layout checkpoint](../benchmarks/STOGIR_BLOCK_LAYOUT.md) records
 compiler `60174544`: 4.85× faster codegen and 9.68× LLVM runtime on the unchanged
 workload. Both active criteria remain unmet. Its 59-case scheduler differential,
 212 standalone checks, 65 linked consumers and Coil FAST 49/49 pass.
+
+## SCCP value-domain prerequisite
+
+The vendored library now includes the combined constant/copy lattice from
+pinned `ir_sccp.c`, using 16-byte cells and circular copy partitions. Its
+deduplicating bit worklist supports backward discovery and lower-reference
+insertions. The shared bitset now finds the first bit in a nonzero word using
+trailing-zero count, following upstream.
+
+The domain differential matches 179,554 state/queue observations across 13
+traces, including forward/reverse dependent-partition splits, exact floating
+payloads, symbolic and long constants. This does not enable SCCP: its analyzer,
+graph transformation, follow-up iterative optimization, mutable compilation
+ownership and optimization-level policy remain pending. Current `-O3` behavior
+must not be represented as upstream optimized-pipeline parity.
