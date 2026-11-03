@@ -480,3 +480,22 @@ The existing JIT rewrite suite includes a three-way switch whose first two PHI
 inputs differ and whose last value is a forward BITCAST, with both immediate and
 delayed final predecessors. The old code left that live value top and rewrite
 failed. Both graph rewrites now verify and execute identically before/after.
+
+### Iterative scalar conversion restarts
+
+The iterative fold worklist now applies pinned ir_fold.h's nested TRUNC/SEXT/ZEXT
+and BITCAST restart rules, plus SEXT of an AND with a clear sign bit or a nonzero
+effective logical right shift. Some TRUNC/extension pairs were already folded by
+construction; module expansion and SSA rewrites expose new pairs afterward.
+Instruction references/types and protected roots are preserved, and maintained
+uses are updated before affected nodes/users are requeued. Only nested candidate
+ZEXT/BITCAST nodes get additional SCCP work seeds.
+
+BOOL views are excluded because our byte-backed BOOL conversions canonicalize
+nonzero bytes. Floating views are preserved unless both operations are bitcasts.
+Shift counts use the IR's masked effective count, so shifting by a whole word
+cannot incorrectly turn signed extension into zero extension. The existing JIT
+iterative-fold suite exercises two pointer widths, rooted/shared observations,
+use-list reconstruction, explicit rewrite/guard counts, raw FP/NaN payloads and
+signed/high-bit inputs against the scalar conversion oracle. Native execution is
+checked on the implemented 64-bit target; 32-bit cases verify graph/type policy.
