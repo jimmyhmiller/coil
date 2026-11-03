@@ -210,3 +210,24 @@ the stogir-built compiler runs substantially slower on compiler workloads.
 See [full measurements](../benchmarks/STOGIR_COMPILER.md) for phases, sample
 ranges, load qualifications, binary disassembly and validation. Historical
 checkpoint statements above describe their original revisions.
+
+## Cross-block field promotion and scalar Always policy
+
+The library now constructs typed SSA values across joins and loops for supported
+nonescaping ALLOCA fields. It preserves CFG predecessor positions, resets
+loop-local allocation lifetimes, and retains the complete allocation when any
+path is uninitialized. The discovery algorithm uses explicit demand-driven work
+frames; it is documented separately from upstream's dominance-frontier walk.
+
+Shared native CIR lowering also accepts closed conditional scalar expressions
+marked Always. It validates every nested expression, rejects lexical/control
+escapes, caches immutable-body eligibility, tracks active callees to break
+recursive cycles, and bounds the callee to 64 AST nodes, cumulative expansion
+to 16,384 nodes per function and nesting to 16. Default/Hint/Never policy is
+unchanged. This extends existing language-annotation lowering; it is not general
+module-level IR inlining. Aggregate signatures still use normal calls.
+
+Timing mode includes eligibility and outermost inlined-body lowering spans in
+the native codegen sum, aggregated once per source function. Nested spans are
+not counted twice. Those optimizer costs are no longer hidden in IR creation;
+older reports did not charge them and retain their original timing definition.
