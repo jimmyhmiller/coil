@@ -508,3 +508,12 @@ The bit layout is local to this port, not upstream's numeric flag layout.
 The string shape API remains available. Placement and SCCP query scalar flags
 instead of constructing shape slices. All 131 entries and invalid opcodes are
 checked against the preexisting independent string oracle.
+
+### Integer-literal PHI conversion
+
+The existing empty-diamond rewrite now accepts arbitrary integer literals,
+following the constant-input subset of pinned ir_sccp.c:ir_optimize_phi's COND
+conversion. Existing closed-control, use-count and movable-condition exclusions
+remain. Boolean COPY/NOT/ZEXT shortcuts are restricted to actual 0/1 choices;
+other values remain typed COND nodes. Stable observable END/BEGIN references and
+maintained def-use lists are preserved. No effectful arm is speculated.
