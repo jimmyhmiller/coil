@@ -633,3 +633,21 @@ pipeline retains ALLOCA and fails the regression. ASAN and stogir-built tests
 pass; affected mem2ssa/iteration/control/module/atomic/rewrite/seed suites pass
 ASAN. The overlap guard fixture now roots its overlapping value: an unobserved
 read is legitimately dead and should not masquerade as an incompatible view.
+
+### Empty static allocation cleanup after promotion
+
+A private undef object's last reads can become dead only after another object's
+stores are promoted away. The incremental removal kernel now also eliminates a
+positive constant-size ALLOCA with only its control successor left. This is an
+explicit local extension of mem2ssa's empty private-object removal into the
+cleanup worklist, not attributed to upstream's dead-LOAD case. Allocation values
+and roots must be unused. A lazily cached function-level proof rejects explicit
+stack frees/block scopes, frame or register access, varargs, guards/snapshots,
+assembly and exit calls. Dynamic/zero/negative sizes stay intact. No repeated
+SCCP or memory pass is introduced; promotion skips candidates already removed.
+
+The late-undef regression fails with the preceding dead-load-only pipeline.
+Native before/after results, exact uses, rooted storage, balanced AFREE,
+observed FRAME_ADDR and unknown-size allocation retention are checked. ASAN and
+stogir-built checks pass, with the existing 2640 stack/free variants, frame,
+mem2ssa, iterative folds, module execution and 112 atomic graphs passing ASAN.
