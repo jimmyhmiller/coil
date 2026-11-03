@@ -386,3 +386,14 @@ signed/unsigned type. Shared/rooted fields and neighboring shift distances are
 unchanged. This is a Coil rule related to pinned ir_fold.h's conversion/shift
 families, not a claimed translation of an identical upstream pattern. Scalar
 SEXT nodes seed iterative folding analogously to existing TRUNC conversions.
+
+### Shared post-allocation emission location resolver
+
+The existing immutable per-parent split-child index is now borrowed by an explicit
+`locations.View` threaded through all normal AArch64 emission helpers. One view
+is shared by the main function body; it neither constructs an index nor owns
+allocation storage. Finalized allocation retains the index and parts until
+emission finishes. The full-scan public interfaces remain compatibility wrappers
+and a differential oracle, including negative-parent lookup behavior. This is
+independent Coil plumbing for the existing location policy guided by ir_ra.c and
+ir_aarch64.dasc; no new allocation or emission decisions are introduced.
