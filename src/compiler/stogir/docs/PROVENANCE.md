@@ -304,3 +304,12 @@ placement and renaming walks. It uses only the compact graph. Uninitialized
 paths reject promotion for the complete allocation; loop-local allocation
 boundaries reset incoming values. This is not a claim of full mem2ssa parity
 (VAR promotion and broader aggregate layouts remain open).
+
+### Empty boolean control diamonds
+
+`boolean-diamond` adapts the conservative constant-0/1 subset of
+`ir_sccp.c:ir_optimize_phi` and the typed boolean COND folds in `ir_fold.h`.
+It preserves this implementation's observable control roots with an END/BEGIN
+boundary and maintains exact use lists. Nonempty arms, multiple Phis, overflow
+and RLOAD-dependent conditions remain excluded. Inverted wide integer results
+retain COND; this does not claim the full upstream IF-conversion/folding surface.
