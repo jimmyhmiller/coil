@@ -6,7 +6,7 @@ The compiler provider uses linear Kahn elimination of actual direct CALL edges a
 
 After expansion, the module worklist records newly introduced import dependencies and revisits newly cloned calls. The existing 512-cell total growth budget remains in force: positive growth consumes budget, while zero-growth expansion cannot add a CALL and removes one. All structural analyses still run after graph optimization, and provider work stays in backend timing.
 
-The existing stogir-register-results CLI fixture now covers wrapper chains retaining a Never call, calls inside a loop, self recursion, mutual recursion and a caller of a recursive function that remain callable. The candidate builds and the fixture passes under LLVM, TPDE and stogir, including preservation of its observable infinite arm. FAST and installation are pending; this component is not globally installed or pushed yet.
+The existing stogir-register-results CLI fixture now covers wrapper chains retaining a Never call, calls inside a loop, self recursion, mutual recursion and a caller of a recursive function that remain callable. The candidate builds and the fixture passes under LLVM, TPDE and stogir, including preservation of its observable infinite arm. FAST passes 49/49 in 221.9 s (the existing objects memory warning is 1.60 GB). Official global installation completed for source f3a88fae. Off-checkout module execution passes and all 144 installed SDK modules match the standalone component.
 
 
 ## Matched AVec diagnostic
