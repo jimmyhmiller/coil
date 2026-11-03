@@ -24,3 +24,10 @@ One excluded warmup plus five alternating measured process runs, the same opaque
 This is **23.58% less stogir runtime**, leaving a **1.60x** gap to LLVM. The checker shrinks from 152 to 43 graph cells and is inlined with its non-returning branch intact. Saved general registers are gone from the hot kernel; the frame retains FP/LR for the cold call. New object size is 14,492 bytes versus 14,372 previously. Single small kernel generation diagnostics are 0.012286 s stogir and 0.038820 s LLVM; these are not full compiler acceptance timings.
 
 Raw samples and identities: `avec-cold-path/never-return-results.json`. The earlier LLVM kernel used a different stdlib; compare the current matched objects when judging backend runtime.
+
+
+## Broad-suite observation-contract regression
+
+The c6eed721 kernel/backend fixtures passed, but stogir compilation of the complete module-execution suite rejected a legitimate observed COPY value in `generate-matched`. FAST was deliberately stopped after six passing steps and did not establish a pass. No installation/push occurred.
+
+The corrected inliner accepts all valid positive observed roots, including values retained by SCCP. A PARAM mapped to a literal actual argument gets a positive COPY root; duplicate observations reuse that mapping. The existing conservative budget includes the original PARAM cell. The new ASAN regression checks linked answers, duplicate root identity, one-cell growth, Never/zero-budget fallback and a three-cell budget. Restoring strict-control validation fails this regression. Rebuilt candidate and broader backend checks are required before delivery.
