@@ -1,0 +1,320 @@
+;;; Late IF simplification and CFG reachability follow pinned ir_sccp.c and
+;;; ir_cfg.c. Preserve compact references and explicit observations. See NOTICE.
+(module stogir.iter-control)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.conditional" :as conditional)
+(import "stogir.dead-code" :as dead)
+(import "stogir.terminal" :as terminal)
+(import "stogir.uses" :as uses)
+(import "stogir.bitqueue" :as q)
+(import "stogir.bitset" :as bits)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn input [(graph g/Graph) (ref i32) (position i32)] (-> i32)
+  (match (g/operand graph ref position) (Some [value] value) (None [] 0)))
+
+(defn rewrite! [(graph (mut g/Graph))
+                (edges (mut uses/Uses))
+                (queue (mut q/Queue))
+                (ref i32)
+                (opcode u8)
+                (ty u8)
+                (auxiliary u16)
+                (inputs (slice i32))] (-> void)
+  (dead/detach! graph (mut edges) (mut queue) ref)
+  (unless (g/rewrite-inputs-with-aux! (mut graph)
+                                      ref
+                                      opcode
+                                      ty
+                                      (if (= (op/input-count (cast i32 opcode))
+                                             -1)
+                                          (cast u16 (len inputs))
+                                          auxiliary)
+                                      inputs)
+    (panic "iterative control rewrite failed"))
+  (for [i 0 (len inputs)]
+    (let [source (get inputs i)]
+      (when (and (> source 0)
+                 (uses/edge-code? (op/operand-code (cast i32 opcode)
+                                                   (cast i32 (+ i 1)))))
+        (uses/add! (mut edges)
+                   source
+                   (uses/Use :user ref :operand (cast i32 (+ i 1)))))))
+  (q/add! (mut queue) (cast i64 ref))
+  (let [range (get (.ranges edges) (cast i64 ref))]
+    (for [i (.offset range) (+ (.offset range) (.count range))]
+      (q/add! (mut queue) (cast i64 (.user (get (.edges edges) i)))))))
+
+;;; BEGIN(0) is transient unreachable control, as in upstream. It is removed
+;;; before validation/CFG consumers; do not expose an unfinished graph.
+(defn fold-if! [(graph (mut g/Graph))
+                (edges (mut uses/Uses))
+                (queue (mut q/Queue))
+                (ref i32)] (-> bool)
+  (let [node (get (.instructions graph) (cast i64 ref))
+        previous (.op1 node)
+        (mut yes) (: 0 i32)
+        (mut no) (: 0 i32)
+        (mut good) (= (n/opcode node) 116)
+        condition (.op2 node)]
+    (when good
+      (let [range (get (.ranges edges) (cast i64 ref))]
+        (unless (= (.count range) 2) (set! good false))
+        (for [i (.offset range) (+ (.offset range) (.count range))]
+          (let [edge (get (.edges edges) i)
+                user (.user edge)
+                projection (get (.instructions graph) (cast i64 user))]
+            (if (and (= (.operand edge) 1) (= (.op1 projection) ref))
+                (case (n/opcode projection)
+                  107 (set! yes user)
+                  108 (set! no user)
+                  (set! good false))
+                (set! good false)))))
+      (when (or (= yes 0) (= no 0)) (set! good false)))
+    (if (not good)
+        false
+        (match (conditional/truth graph condition)
+          (None [] false)
+          (Some [truth]
+                (rewrite! (mut graph)
+                          (mut edges)
+                          (mut queue)
+                          ref
+                          114
+                          0
+                          0
+                          [previous])
+                (rewrite! (mut graph)
+                          (mut edges)
+                          (mut queue)
+                          yes
+                          106
+                          0
+                          0
+                          [(if truth ref 0) (: 0 i32)])
+                (rewrite! (mut graph)
+                          (mut edges)
+                          (mut queue)
+                          no
+                          106
+                          0
+                          0
+                          [(if truth 0 ref) (: 0 i32)])
+                true)))))
+
+(defn mark! [(set (mut bits/Bits)) (work (mut q/Queue)) (ref i32)] (-> void)
+  (unless (bits/contains? set (cast i64 ref))
+    (bits/add! (mut set) (cast i64 ref))
+    (q/add! (mut work) (cast i64 ref))))
+
+(defn previous-live [(graph g/Graph) (removed bits/Bits) (ref i32)] (-> i32)
+  (let [(mut current) ref]
+    (while (and (> current 0) (bits/contains? removed (cast i64 current)))
+      (set! current (terminal/previous graph current)))
+    current))
+
+;;; One control-only reachability rebuild after the affected-node fold phase.
+;;; This mirrors upstream's invalidated CFG-reachability boundary, not another
+;;; SCCP analysis. Cycles with no live entry are unreachable without special
+;;; backedge guesses. All def-use mutations update exact operand positions.
+(defn prune! [(graph (mut g/Graph))
+              (roots (mut (ArrayList i32)))
+              (edges (mut uses/Uses))
+              (queue (mut q/Queue))
+              (protected (mut bits/Bits))
+              (a (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [size (len (.instructions graph))
+        (mut reachable) (bits/create size a)
+        (mut removed) (bits/create size a)
+        (mut work) (q/create size a)
+        (mut positions) (ArrayList::new [i32] a)
+        (mut phis) (ArrayList::new [i32] a)
+        (mut inputs) (ArrayList::new [i32] a)
+        (mut changes) (: 0 i32)
+        (mut error) ""
+        (mut r) (: 1 i64)]
+    (mark! (mut reachable) (mut work) 1)
+    ; External entries and computed-goto labels can be entered independently.
+    (while (< r size)
+      (let [node (get (.instructions graph) r)
+            arity (get (.arities graph) r)]
+        (when (or (= (n/opcode node) 105)
+                  (and (= (n/opcode node) 106) (!= (.op2 node) 0)))
+          (mark! (mut reachable) (mut work) (cast i32 r)))
+        (set! r (+ r (/ (+ (cast i64 arity) 4) 4)))))
+    (set! r (q/pop! (mut work)))
+    (while (>= r 0)
+      (let [range (get (.ranges edges) r)]
+        (for [i (.offset range) (+ (.offset range) (.count range))]
+          (let [edge (get (.edges edges) i)
+                user (.user edge)
+                opcode
+                  (cast i32
+                        (n/opcode (get (.instructions graph) (cast i64 user))))]
+            (when (and (op/control? opcode)
+                       (= (op/operand-code opcode (.operand edge))
+                          op/OPERAND-SRC))
+              (mark! (mut reachable) (mut work) user)))))
+      (set! r (q/pop! (mut work))))
+    (set! r 1)
+    (while (< r size)
+      (let [node (get (.instructions graph) r)
+            opcode (cast i32 (n/opcode node))
+            arity (get (.arities graph) r)]
+        (when (or (and (op/control? opcode) (not (bits/contains? reachable r)))
+                  (and (= opcode 67)
+                       (not (bits/contains? reachable (cast i64 (.op1 node))))))
+          (mark! (mut removed) (mut work) (cast i32 r)))
+        (set! r (+ r (/ (+ (cast i64 arity) 4) 4)))))
+    ; Repair reachable merge/Phi correspondence before tracing dead data uses.
+    (set! r 1)
+    (while (and (< r size) (= error ""))
+      (let [node (get (.instructions graph) r)
+            opcode (n/opcode node)
+            auxiliary (n/auxiliary node)
+            arity (get (.arities graph) r)]
+        (when (and (or (= opcode 112) (= opcode 113))
+                   (bits/contains? reachable r))
+          (clear! (mut positions))
+          (for [i 1 (+ (cast i64 arity) 1)]
+            (let [source (input graph (cast i32 r) (cast i32 i))]
+              (when (bits/contains? reachable (cast i64 source))
+                (push! (mut positions) (cast i32 i)))))
+          (when (< (len positions) (cast i64 arity))
+            (when (= (len positions) 0)
+              (set! error "reachable merge has no live predecessor"))
+            (clear! (mut phis))
+            (let [range (get (.ranges edges) r)]
+              (for [i (.offset range) (+ (.offset range) (.count range))]
+                (let [user (.user (get (.edges edges) i))]
+                  (when (= (n/opcode (get (.instructions graph) (cast i64 user)))
+                           67)
+                    (push! (mut phis) user)))))
+            (for phi phis
+              (when (= error "")
+                (let [value (get (.instructions graph) (cast i64 phi))
+                      ty (n/type-id value)]
+                  (unless (= (get (.arities graph) (cast i64 phi)) (+ arity 1))
+                    (set! error "iterative merge/Phi arity mismatch"))
+                  (clear! (mut inputs))
+                  (unless (= (len positions) 1)
+                    (push! (mut inputs) (cast i32 r)))
+                  (for position positions
+                    (push! (mut inputs) (input graph phi (+ position 1))))
+                  (if (= (len positions) 1)
+                      (do
+                        (push! (mut inputs) 0)
+                        (rewrite! (mut graph)
+                                  (mut edges)
+                                  (mut queue)
+                                  phi
+                                  68
+                                  ty
+                                  0
+                                  (slice inputs)))
+                      (rewrite! (mut graph)
+                                (mut edges)
+                                (mut queue)
+                                phi
+                                67
+                                ty
+                                0
+                                (slice inputs)))
+                  (set! changes (+ changes 1)))))
+            (when (= error "")
+              (clear! (mut inputs))
+              (for position positions
+                (push! (mut inputs) (input graph (cast i32 r) position)))
+              (when (= (len positions) 1) (push! (mut inputs) 0))
+              (rewrite! (mut graph)
+                        (mut edges)
+                        (mut queue)
+                        (cast i32 r)
+                        (if (= (len positions) 1) (: 106 u8) opcode)
+                        0
+                        (if (= (len positions) 1) (: 0 u16) auxiliary)
+                        (slice inputs))
+              (set! changes (+ changes 1)))))
+        (set! r (+ r (/ (+ (cast i64 arity) 4) 4)))))
+    ; A value derived from an unreachable definition is also unreachable.
+    ; Live merge inputs were repaired above; terminal links are metadata.
+    (set! r (q/pop! (mut work)))
+    (while (and (>= r 0) (= error ""))
+      (when (and (bits/contains? protected r)
+                 (!= (& (op/properties (cast i32
+                                             (n/opcode (get (.instructions graph)
+                                                            r))))
+                        op/FLAG-DATA)
+                     0))
+        (set! error "observable iterative data root is unreachable"))
+      (let [range (get (.ranges edges) r)]
+        (for [i (.offset range) (+ (.offset range) (.count range))]
+          (let [edge (get (.edges edges) i)
+                user (.user edge)
+                node (get (.instructions graph) (cast i64 user))]
+            (unless (or (bits/contains? removed (cast i64 user))
+                        (= (op/operand-code (cast i32 (n/opcode node))
+                                            (.operand edge))
+                           op/OPERAND-RET))
+              (if (or (op/control? (cast i32 (n/opcode node)))
+                      (= (n/opcode node) 67))
+                  (set! error
+                        "reachable instruction depends on unreachable value")
+                  (mark! (mut removed) (mut work) user))))))
+      (set! r (q/pop! (mut work))))
+    (when (= error "")
+      ; Unlink unreachable terminals while their old previous links still exist.
+      (set! r 1)
+      (while (< r size)
+        (let [node (get (.instructions graph) r)
+              opcode (n/opcode node)
+              ty (n/type-id node)
+              auxiliary (n/auxiliary node)
+              arity (get (.arities graph) r)]
+          (when (and (not (bits/contains? removed r))
+                     (or (= opcode 104) (terminal/chain? (cast i32 opcode))))
+            (let [position (if (= opcode 104) (: 1 i32) 3)
+                  old (input graph (cast i32 r) position)
+                  new (previous-live graph removed old)]
+              (when (!= old new)
+                (clear! (mut inputs))
+                (for [i 1 (+ (cast i64 arity) 1)]
+                  (push! (mut inputs)
+                         (if (= i (cast i64 position))
+                             new
+                             (input graph (cast i32 r) (cast i32 i)))))
+                (rewrite! (mut graph)
+                          (mut edges)
+                          (mut queue)
+                          (cast i32 r)
+                          opcode
+                          ty
+                          auxiliary
+                          (slice inputs)))))
+          (set! r (+ r (/ (+ (cast i64 arity) 4) 4)))))
+      (let [(mut kept) (: 0 i64)]
+        (for root roots
+          (unless (bits/contains? removed (cast i64 root))
+            (set! (mut roots) kept root)
+            (set! kept (+ kept 1))))
+        (while (> (len roots) kept) (pop! (mut roots))))
+      (set! r 1)
+      (while (< r size)
+        (let [arity (get (.arities graph) r)]
+          (when (bits/contains? removed r)
+            (bits/remove! (mut protected) r)
+            (rewrite! (mut graph) (mut edges) (mut queue) (cast i32 r) 0 0 0 [])
+            (set! changes (+ changes 1)))
+          (set! r (+ r (/ (+ (cast i64 arity) 4) 4))))))
+    (free! (mut positions))
+    (free! (mut phis))
+    (free! (mut inputs))
+    (q/release! (mut work))
+    (bits/release! (mut reachable))
+    (bits/release! (mut removed))
+    (if (= error "") (Ok changes) (Err error))))
