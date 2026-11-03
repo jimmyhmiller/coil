@@ -517,3 +517,26 @@ conversion. Existing closed-control, use-count and movable-condition exclusions
 remain. Boolean COPY/NOT/ZEXT shortcuts are restricted to actual 0/1 choices;
 other values remain typed COND nodes. Stable observable END/BEGIN references and
 maintained def-use lists are preserved. No effectful arm is speculated.
+
+### Shared integer diamond values
+
+The PHI-to-COND rewrite no longer requires exactly one use of the PHI value.
+Pinned ir_sccp.c:ir_optimize_phi does not impose that restriction: the replacement
+keeps the same typed reference, so every consumer observes the same selected
+value. Control-region use restrictions remain unchanged. The control suite
+compares 2048 cases, including two observations of each PHI, against the branch
+oracle, exact rebuilt use lists, ASAN and stogir-built execution. The old guard
+fails the shared-value regression before the change.
+
+### Canonical single-predecessor regions
+
+Pinned ir.c:_ir_MERGE_N constructs BEGIN when its input count is one. This port's
+raw graph API and the Coil adapter also admit explicit one-input MERGE nodes.
+SCCP's bulk rewrite now canonicalizes a reachable one-input MERGE through the
+existing region compressor even when no predecessor was removed. This also
+rewrites attached one-input PHIs before use-list reconstruction and ordinary
+END/BEGIN merging. It does not rerun SCCP or add a repeated whole-graph cleanup.
+The control suite reproduces the previous blocked integer-diamond conversion
+with one and three layers of rooted single-input regions, then compares native
+before/after choices and validates retained roots. ASAN and stogir-built execution
+pass; the old implementation fails the regression's conversion assertion.
