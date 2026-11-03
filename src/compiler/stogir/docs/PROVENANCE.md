@@ -417,3 +417,12 @@ not a claimed copy of upstream's numeric enum values. Variadic data operands use
 the existing def category; there is no separate arg code. The reference bitmask
 preserves def/ref/var/src/reg/grd/ret/lbl exactly, and rejects invalid codes before
 shifting. All validation and optional-reference behavior remain enabled.
+
+### Observable value/control roots during memory rewriting
+
+The independent positive-root API can observe a LOAD's value and the effects in
+its control closure. When forwarding or promotion rewrites such a LOAD into a
+typed COPY/BITCAST, its value reference remains and its resolved prior control
+closure is added as a root. Removed private storage/control-only roots retain
+their existing remapping. This preserves unrelated external effects through
+subsequent SCCP without adding artificial operands or changing graph semantics.
