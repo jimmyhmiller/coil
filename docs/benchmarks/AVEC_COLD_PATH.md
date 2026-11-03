@@ -1,17 +1,19 @@
-# Shared AVec bounds diagnostic and observed control roots
+# Shared AVec bounds diagnostic and observed roots
+
+Delivered compiler source **df2a4c21** is installed globally, committed and pushed. FAST passes **49/49 in 214.8 s**, including the constant-loop regression. Full compiler objects match across LLVM and stogir hosts. Performance remains outside the goal: **3.30x generation advantage, 3.51x native self-rebuild slowdown**. Current timings and identities are in OBSERVED_AVEC_COMPILER_CHECKPOINT.md; historical probes and corrections below explain the delivered contract.
 
 `avec--check [T]` previously instantiated the full type-independent formatted panic path per element type (152 graph cells in the compact-node workload). The stdlib now shares one index/count diagnostic helper with the correct `never` return type. Bounds conditions and diagnostic text are unchanged; no inline annotations are added.
 
-The inliner imports standalone component 7f8adba. Callees supply all observed control roots separately from their unique RETURN. The closure check uses all observations; cloned controls are mapped and added to caller roots. UNREACHABLE terminals with zero reserved/previous-terminal metadata are supported. Stack/frame operations remain excluded. The module provider passes its already-owned complete observed set.
+The inliner imports standalone components 7f8adba and b3a4e6c. Callees supply all explicit observed roots separately from their unique RETURN; this includes value observations and non-returning control. The closure check uses the complete supplied set and cloning remaps those observations. UNREACHABLE terminals with zero reserved/previous-terminal metadata are supported. Stack/frame operations remain excluded. The compiler provider retains its full optimization anchor list locally and supplies its control-observation view when cloning, as detailed below.
 
 Standalone native before/after tests pass ASAN, including cold helper calls followed by UNREACHABLE, child-process trap checks with a watchdog, hot answers, Never/zero budgets and fallback when the provider omits the non-returning root. Restoring RETURN-only closure fails the new assertion.
 
-The existing backend fixture adds valid, negative, end and empty-vector accesses. Candidate source c6eed721 builds. LLVM, TPDE and stogir pass the backend fixture, including exact bounds diagnostics for negative, end and empty-vector accesses and preservation of the infinite arm. FAST and installation are pending; this checkpoint is not installed globally or pushed.
+The existing backend fixture covers valid, negative, end and empty-vector accesses, recursion, non-returning control and constant-loop specialization. The historical c6eed721 probe passed its initial fixture but failed the broader suite and was never delivered; the corrected source and validations are recorded below.
 
 A preliminary void-return helper probe is retained in `avec-cold-path/void-return-preliminary.json` for diagnostic history. It is superseded by the correctly typed non-returning helper and is not a delivered performance result.
 
 
-## Matched AVec diagnostic
+## Historical c6eed721 AVec diagnostic
 
 One excluded warmup plus five alternating measured process runs, the same opaque runner object and checksum 859763163008. Both new backend objects use the same refactored stdlib:
 
