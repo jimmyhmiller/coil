@@ -12,7 +12,7 @@ and module transport lets the engines consume the same native lowering while
 remaining distinct code generators. LLVM retains its existing lowering path.
 
 The library is a separately declared package, vendored under
-`src/compiler/stogir` at revision `799bba6`. Its [README](../../src/compiler/stogir/README.md),
+`src/compiler/stogir` at revision `4ff76d2`. Its [README](../../src/compiler/stogir/README.md),
 [LICENSE](../../src/compiler/stogir/LICENSE), [NOTICE](../../src/compiler/stogir/NOTICE)
 and provenance preserve credit to coil-stogir and Dmitry Stogov's IR. No per-file
 license headers are added by the integration.
@@ -38,7 +38,8 @@ also pass all three engines. Mach-O serialization and the existing JIT loader
 selftest pass. The CLI objects section runs these checks on macOS arm64.
 
 An initial full corpus run passes 6 of 9 programs. Remaining failures include
-pinned-register shim calls, narrow bit operations/i128, and deep tail recursion.
+pinned-register shim calls and deep tail recursion. The narrow-bit/i128 gap
+from that run is repaired in 0dcc4101; scalar FP math CIR remains unsupported.
 The adapter currently demotes tail calls to ordinary calls and returns, so deep
 recursion exhausts the stack. This must be fixed before general backend use.
 Unsupported operations diagnose rather than fall back to another selector.
@@ -197,3 +198,15 @@ The [delivery report](../validation/stogir-sccp-pipeline-installed.json) records
 these checks. The [latest timing attempt](../benchmarks/STOGIR_SCCP_MODES.md) is
 provisional due competing compiler processes and does not meet the performance
 goal. Older prerequisite-only statements above describe historical checkpoints.
+
+## Full compiler bootstrap checkpoint
+
+Adapter 0dcc4101 legalizes i128 into two scalar graph values, including calls,
+PHIs and memory, and preserves narrow bit-operation widths. The full compiler
+now compiles and independently self-rebuilds byte-identical target objects on
+both stogir and LLVM paths. This is functional support, not LLVM performance
+parity: normal linked builds take 39.799s with stogir versus 11.319s LLVM O3;
+the stogir-built compiler runs substantially slower on compiler workloads.
+See [full measurements](../benchmarks/STOGIR_COMPILER.md) for phases, sample
+ranges, load qualifications, binary disassembly and validation. Historical
+checkpoint statements above describe their original revisions.

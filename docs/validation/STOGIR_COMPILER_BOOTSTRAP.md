@@ -29,3 +29,12 @@ This is an uncommitted-development capability probe with ordinary parallel nativ
 generation, not the controlled serial IR-to-object benchmark or a linked compiler.
 The next gates are linking, executable behavior, self-rebuild correctness, and a
 same-source comparison against LLVM O3. The installed compiler remains f9f0b602.
+
+## Delivered feature validation
+
+Source 0dcc4101 now passes full self-rebuild object equality for both stogir and
+LLVM targets. Cross-backend wide C ABI tests pass in both directions. FAST 49/49
+and official global installation/off-checkout checks pass. The LLVM-built driver
+with updated stogir support is installed globally. The final comparison is in
+[STOGIR_COMPILER.md](../benchmarks/STOGIR_COMPILER.md): full compiler performance
+is substantially worse than LLVM and must not be inferred from the stencil.
