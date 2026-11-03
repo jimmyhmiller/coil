@@ -499,3 +499,12 @@ iterative-fold suite exercises two pointer widths, rooted/shared observations,
 use-list reconstruction, explicit rewrite/guard counts, raw FP/NaN payloads and
 signed/high-bit inputs against the scalar conversion oracle. Native execution is
 checked on the implemented 64-bit target; 32-bit cases verify graph/type policy.
+
+### Scalar opcode property flags
+
+Opcode classification uses a static byte table projected from this port's
+pinned shape metadata, following upstream's scalar opcode-flag architecture.
+The bit layout is local to this port, not upstream's numeric flag layout.
+The string shape API remains available. Placement and SCCP query scalar flags
+instead of constructing shape slices. All 131 entries and invalid opcodes are
+checked against the preexisting independent string oracle.
