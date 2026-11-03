@@ -33,3 +33,12 @@ The c6eed721 kernel/backend fixtures passed, but stogir compilation of the compl
 The corrected inliner accepts all valid positive observed roots, including values retained by SCCP. A PARAM mapped to a literal actual argument gets a positive COPY root; duplicate observations reuse that mapping. The existing conservative budget includes the original PARAM cell. The new ASAN regression checks linked answers, duplicate root identity, one-cell growth, Never/zero-budget fallback and a three-cell budget. Restoring strict-control validation fails this regression. Rebuilt candidate and broader backend checks are required before delivery.
 
 Corrected source **f860d6b6** builds and passes the complete module-execution suite compiled by stogir O3, including cold child traps and duplicate literal observations. All three backend fixtures and exact bounds diagnostics pass again. Both regenerated AVec objects are byte-identical to the c6eed721 objects, so the retained runtime samples apply to the corrected checkpoint; SHA-256 identities are in `avec-cold-path/fixed-observed-kernel-identity.json`. FAST is being rerun from the start.
+
+
+## Constant-loop template observation regression
+
+A full-source diagnostic on f860d6b6 failed at `wasm-table-section`; no full compiler timing/object was produced. A small ULEB writer called with constant 1 reproduces it, while direct byte writes and variable ULEB inputs compile. Loop-only 256d0dd7 and nested-call f3a88fae compile the same reduction. The existing backend fixture now includes `encoded-constant`; the pre-fix candidate fails there with `observable SCCP data root is unresolved`.
+
+CIR block-end observations are control observations. Optimization can retain additional pure COPY identities when CALLs are expanded. Those anchors must stay in a definition's own optimization roots, but copying them into a caller can unconditionally pin a value from a branch that specialization makes unreachable. The provider now owns a separate control-observation view for cloning. Returned values remain connected through RETURN; effects and non-returning control remain explicit, and library closure validation still rejects missing control regions. This does not discard the standalone API's explicit value observations or change the template's own full root set.
+
+The corrected provider needs candidate, fixture, broad-suite, full-source and FAST revalidation before delivery. Open Coil issue: `stogir-inline-template-value-observations` in the `coil-bugs` pad.
