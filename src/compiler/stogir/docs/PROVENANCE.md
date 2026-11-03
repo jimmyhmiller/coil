@@ -322,3 +322,17 @@ control successor. A local worklist revisits exposed BEGIN boundaries; an
 explicit remapping table preserves caller-observed roots across removals. It
 runs before boolean-diamond conversion and scalar iterative cleanup. Other
 upstream CFG/control transformations remain incomplete.
+
+### Preserved AArch64 general registers
+
+`a64.callee-saved` and the expanded GPR class follow pinned
+`ir_aarch64.dasc` used-preserved-register prologue/epilogue policy. This first
+step saves full x19–x28 values in a distinct private frame area. Darwin x18,
+scratch x16/x17, FP/LR and preserved SIMD lanes retain their separate policies.
+SIMD v8–v15 remain excluded; no complete ABI/allocator parity is claimed.
+
+Call-boundary split preservation and argument moves are lowered as one typed
+parallel-copy group over their shared pre-call state. This is a Coil extension
+to its existing subposition transfer implementation, not a late change to graph
+semantics. Non-call odd-position transfers without dedicated operand/definition
+phase support still fail explicitly.
