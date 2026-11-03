@@ -1,4 +1,62 @@
-# Indexed fixed constraints during pressure queries
+# Allocation pressure query indexes
+
+## Current fixed-event index development
+
+The solver now builds a sorted per-register table of immutable fixed-use events
+once after its initial reservations. Binary searches inspect only event
+positions inside the current interval's ranges. A persistent split forest maps
+each event to its exact current child; every free-allocation split, spill-prefix
+split and eviction split updates that forest. Event-owner queries cache their
+last leaf, and follow descendants when it splits again. No constraint is inferred
+from range coverage: the generic API permits fixed uses outside live ranges.
+
+This changes pressure discovery only. Free-until, next-use, fixed-at, class masks,
+spill geometry, decisions and all allocator checks remain in force. Assigned-range
+intersections still use the previous scan, so this is not a complete active/inactive
+allocator port and does not claim linear whole-solver complexity. Construction,
+sorting, ownership updates and queries stay inside IR-to-machine-code generation.
+
+The old full scan and previous fixed-part index remain available as compatibility
+entry points and differential oracles. The solver requires all initial fixed uses
+to be present at construction; subsequent mutations only partition those uses.
+Adding new constraints during allocation would require updating this event index.
+
+Focused ASAN validation covers 64 seeded event/split configurations across1/4/16/64
+registers, holes, negative-parent physical reservations, repeated prefix/child
+splits and constraints outside their owners' ranges. All three pressure vectors
+are compared with the full scan. A targeted sequence invokes each actual tracked
+solver mutation, including eviction's nested spill split. Existing256 previous-index
+configurations remain. Split allocation, scalar/call/floating/checked/switch pressure,
+dynamic stack scopes and captured stencil checks pass. This component is still
+isolated; no full compiler performance or installed delivery claim is made here.
+
+## Assigned values and immutable physical reservations
+
+Canonical initially assigned negative-parent reservations have one range and one
+fixed use at its start, matching their register. Successful spill paths cannot
+mutate a negative-parent part. Other shapes stay in the general live collection.
+A register/start index with a maximum-end segment tree finds overlaps without
+scanning every future call or scanning behind a long incoming reservation.
+
+Free-until and next-use are separate queries: a reservation can overlap the
+current point while its only use is already past; later reservations can still
+supply next-use. Exact self exclusion remains part-based. Assigned values expire
+only at their final range end or after losing their register. Future holes and
+preassigned values remain represented; split/evicted ranges are read afresh.
+New assignments are deduplicated in that collection. Queries must advance
+monotonically, with equal-position post-eviction queries supported. Fixed events
+remain independent and are never expired using their owner's live ranges.
+
+64 additional seeded monotonic query configurations cover1/4/16/64 registers,
+long and nested reservations, holes, preassigned owners, noncanonical negative
+parts and fixed uses outside ranges. All three vectors match the full scan,
+including queries on reservations themselves and repeated same-position queries.
+A mutation trace checks eviction, same-position re-query, reassignment, expiration
+and surviving out-of-range fixed uses. Existing event/split and pressure oracles
+remain. ASAN native pressure, realignment and stencil checks pass. Compiler
+integration and full-source performance validation follow separately.
+
+## Historical fixed-part index and validation
 
 Diagnostic sampling of repeated public O3 compilation identified allocation
 pressure scans and constraint-use iteration as prominent leaf costs. The solver

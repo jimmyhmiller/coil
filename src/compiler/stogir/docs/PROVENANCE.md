@@ -336,3 +336,25 @@ parallel-copy group over their shared pre-call state. This is a Coil extension
 to its existing subposition transfer implementation, not a late change to graph
 semantics. Non-call odd-position transfers without dedicated operand/definition
 phase support still fail explicitly.
+
+### Fixed-use event indexing
+
+`fixed-uses` is independent Coil analysis storage that accelerates the existing
+linear-scan pressure policy guided by pinned `ir_ra.c`. Its sorted per-register
+events, persistent split ownership forest and lazy path compression are Coil
+implementations, not a translation of upstream's active/inactive linked lists.
+The semantic graph, interval constraints, allocation decisions, verification and
+subposition transfers are unchanged. Every split path updates ownership; fixed
+uses outside live ranges remain represented. The full-scan query is retained as
+an independent oracle. Assigned-interval scanning still needs separate work.
+
+### Assigned-value and physical-reservation pressure discovery
+
+`reserved-ranges` uses an independent Coil maximum-end segment tree for immutable
+canonical physical reservations. `allocation.AssignedIndex` keeps the remaining
+assigned values, expires only their final ranges, retains holes, and re-reads
+split/evicted ranges. These structures implement the existing pressure policy
+under the monotonic linear-scan frontier guided by pinned `ir_ra.c`; they are not
+a translation of upstream's active/inactive linked lists. Noncanonical inputs
+retain general intersection/next-use handling. All three pressure vectors and
+verification remain unchanged.
