@@ -1,0 +1,234 @@
+;;; Memory-chain forwarding follows ir.c:ir_find_aliasing_load_i. See NOTICE.
+;;; Contained-offset extraction is an independent little-endian extension.
+(module stogir.load-forward)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.types" :as ty)
+(import "stogir.uses" :as uses)
+(import "stogir.mem2ssa" :as mem)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defstruct Address [(base i32) (offset i64)])
+
+;;; A bounded decomposition only proves facts for constant displacements. Unknown
+;;; expressions retain their exact reference as base; no pointer provenance or
+;;; integer expression equivalence is inferred. Full-width pointer/integer BITCAST
+;;; preserves address bits and may be peeled; no distinct-base nonalias fact is used. Bounds prevent offset overflow.
+(defn word? [(type u8)] (-> bool)
+  (or (= type 5) (= type 6) (= type 11)))
+
+(defn address [(graph g/Graph) (reference i32)] (-> Address)
+  (let [(mut base) reference
+        (mut offset) 0
+        (mut steps) 0
+        (mut more) true]
+    (while (and more (< steps 16))
+      (set! more false)
+      (match (g/lookup graph base)
+        (Some [node]
+              (if (and (= (n/opcode node) 36) (word? (n/type-id node)))
+                  (match (g/lookup graph (.op1 node))
+                    (Some [input]
+                          (when (word? (n/type-id input))
+                            (set! base (.op1 node))
+                            (set! more true)))
+                    (None [] 0))
+                  (when (and (= (n/opcode node) 26) (word? (n/type-id node)))
+                    (let [(mut parent) (.op1 node)
+                          (mut constant) (.op2 node)]
+                      (when (< parent 0)
+                        (set! parent (.op2 node))
+                        (set! constant (.op1 node)))
+                      (match (g/lookup graph constant)
+                        (Some [value]
+                              (when (and (< constant 0)
+                                         (ty/integer? (cast i32
+                                                            (n/type-id value)))
+                                         (= (ty/size (cast i32
+                                                           (n/type-id value))
+                                                     8)
+                                            8))
+                                (let [delta (cast i64 (n/constant-bits value))]
+                                  (when (and (>= delta -1073741824)
+                                             (<= delta 1073741824))
+                                    (set! offset (+ offset delta))
+                                    (set! base parent)
+                                    (set! more true)))))
+                        (None [] 0))))))
+        (None [] 0))
+      (set! steps (+ steps 1)))
+    (Address :base base :offset offset)))
+
+(defn scalar? [(type u8) (pointer-bytes i32)] (-> bool)
+  (and (> type 0)
+       (ty/valid-scalar? (cast i32 type))
+       (> (ty/size (cast i32 type) pointer-bytes) 0)))
+
+;;; Exact width views preserve bits. Partial integer views exclude BOOL and
+;;; pointers. Never reinterpret floating point numerically or truncate provenance.
+(defn convertible? [(source u8)
+                    (target u8)
+                    (offset i64)
+                    (pointer-bytes i32)] (-> bool)
+  (let [wide (ty/size (cast i32 source) pointer-bytes)
+        narrow (ty/size (cast i32 target) pointer-bytes)]
+    (and (scalar? source pointer-bytes)
+         (scalar? target pointer-bytes)
+         (>= offset 0)
+         (or (= source target) (and (!= source 1) (!= target 1)))
+         (<= (+ offset (cast i64 narrow)) (cast i64 wide))
+         (or (and (= offset 0) (= wide narrow))
+             (and (ty/integer? (cast i32 source))
+                  (ty/integer? (cast i32 target))
+                  (!= source 1)
+                  (!= target 1)
+                  (!= source 6)
+                  (!= target 6))))))
+
+(defstruct Found [(value i32) (offset i64)])
+
+;;; At most32 control predecessors per query. All unrecognized effects, block
+;;; boundaries, calls, volatile/atomic accesses and register writes are barriers.
+;;; This is conservative relative to upstream's pure-call and RSTORE handling.
+(defn find [(graph g/Graph) (load i32) (pointer-bytes i32)] (-> Found)
+  (let [node (get (.instructions graph) (cast i64 load))
+        target (n/type-id node)
+        target-size (cast i64 (ty/size (cast i32 target) pointer-bytes))
+        target-address (address graph (.op2 node))
+        (mut cursor) (.op1 node)
+        (mut steps) 0
+        (mut found) (Found :value 0 :offset 0)]
+    (while (and (> cursor 0) (< steps 32) (= (.value found) 0))
+      (let [prior (get (.instructions graph) (cast i64 cursor))
+            opcode (cast i32 (n/opcode prior))]
+        (if (or (= opcode 91) (= opcode 93))
+            (let [source (if (= opcode 91) cursor (.op3 prior))
+                  value
+                    (match (g/lookup graph source)
+                      (Some [v] v)
+                      (None [] (n/make 0 0 0 0 0 0)))
+                  source-type (n/type-id value)
+                  source-size
+                    (cast i64 (ty/size (cast i32 source-type) pointer-bytes))
+                  source-address (address graph (.op2 prior))
+                  same-base (= (.base target-address) (.base source-address))
+                  delta (- (.offset target-address) (.offset source-address))
+                  overlap
+                    (or (not same-base)
+                        (and (< delta source-size)
+                             (> (+ delta target-size) 0)))]
+              (if (and same-base
+                       (convertible? source-type target delta pointer-bytes)
+                       (!= (n/opcode value) 89))
+                  (set! found (Found :value source :offset delta))
+                  (when (and (= opcode 93) overlap) (set! cursor 0)))
+              (when (> cursor 0) (set! cursor (.op1 prior))))
+            (set! cursor 0)))
+      (set! steps (+ steps 1)))
+    found))
+
+(defn append! [(graph (mut g/Graph))
+               (opcode u8)
+               (type u8)
+               (left i32)
+               (right i32)] (-> i32)
+  (match (if (= right 0)
+             (g/append-inputs! (mut graph) opcode type [left])
+             (g/append-inputs! (mut graph) opcode type [left right]))
+    (Some [r] r)
+    (None [] (panic "load forwarding reference exhaustion"))))
+
+;;; Explicit endian argument guards the independent contained-offset extension.
+;;; Same-address partial forwarding also requires little endian. Big-endian
+;;; callers retain memory until their extraction convention is implemented.
+(defn run! [(graph (mut g/Graph))
+            (roots (mut (ArrayList i32)))
+            (pointer-bytes i32)
+            (little-endian bool)
+            (a (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (if (not little-endian)
+      (Ok 0)
+      (let [size (len (.instructions graph))
+            (mut data) (mem/zeros size a)
+            (mut control) (mem/zeros size a)
+            (mut changes) (: 0 i32)
+            (mut r) 1]
+        (while (< r size)
+          (let [node (get (.instructions graph) r)
+                count (get (.arities graph) r)]
+            (when (and (= (n/opcode node) 91)
+                       (scalar? (n/type-id node) pointer-bytes))
+              (let [found (find graph (cast i32 r) pointer-bytes)]
+                (when (!= (.value found) 0)
+                  (let [(mut value) (mem/resolve data (.value found))
+                        source
+                          (match (g/lookup graph value)
+                            (Some [v] v)
+                            (None [] (panic "forwarded value missing")))
+                        source-type (n/type-id source)
+                        target (n/type-id node)]
+                    (when (> (.offset found) 0)
+                      (let [shift
+                              (match (g/intern-constant! (mut graph)
+                                                         source-type
+                                                         source-type
+                                                         0
+                                                         (cast u64
+                                                               (* (.offset found)
+                                                                  8)))
+                                (Some [v] v)
+                                (None []
+                                      (panic "forward shift constant failed")))]
+                        (set! value
+                              (append! (mut graph) 50 source-type value shift))))
+                    (when (!= source-type target)
+                      (set! value
+                            (append! (mut graph)
+                                     (if (= (ty/size (cast i32 source-type)
+                                                     pointer-bytes)
+                                            (ty/size (cast i32 target)
+                                                     pointer-bytes))
+                                         36
+                                         35)
+                                     target
+                                     value
+                                     0)))
+                    (set! (mut data) r value)
+                    (set! (mut control) r (.op1 node))
+                    (set! changes (+ changes 1))))))
+            (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+        (set! r 1)
+        (while (< r (len (.instructions graph)))
+          (let [node (get (.instructions graph) r)
+                count (get (.arities graph) r)]
+            (for [i 1 (+ (cast i64 count) 1)]
+              (let [kind
+                      (op/operand-kind (cast i32 (n/opcode node)) (cast i32 i))]
+                (when (uses/edge-kind? kind)
+                  (match (g/operand graph (cast i32 r) (cast i32 i))
+                    (Some [old]
+                          (let [new
+                                  (mem/resolve (if (= kind "src") control data)
+                                               old)]
+                            (when (!= old new)
+                              (g/set-operand! (mut graph)
+                                              (cast i32 r)
+                                              (cast i32 i)
+                                              new))))
+                    (None [] 0)))))
+            (when (and (< r size) (!= (get data r) 0))
+              (g/rewrite-inputs! (mut graph)
+                                 (cast i32 r)
+                                 68
+                                 (n/type-id node)
+                                 [(mem/resolve data (get data r)) (: 0 i32)]))
+            (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+        ; Forwarded LOAD roots retain their original reference as a typed COPY.
+        ; Only their outgoing control edges bypass the effect.
+        (free! (mut data))
+        (free! (mut control))
+        (Ok changes))))

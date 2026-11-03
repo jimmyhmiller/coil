@@ -358,3 +358,20 @@ under the monotonic linear-scan frontier guided by pinned `ir_ra.c`; they are no
 a translation of upstream's active/inactive linked lists. Noncanonical inputs
 retain general intersection/next-use handling. All three pressure vectors and
 verification remain unchanged.
+
+### Control-chain scalar memory forwarding
+
+`load-forward` follows pinned `ir.c:ir_find_aliasing_load_i` for control-chain
+load/store forwarding, same-width bit views and integer truncation. The Coil
+version conservatively stops at all calls, register writes, unknown effects and
+block starts rather than implementing upstream's pure-call and register-set
+exceptions. Query and address walks are bounded independently of graph size.
+
+Contained extraction at a nonzero constant byte offset is an independent Coil
+extension, enabled only by an explicit little-endian target argument. Logical
+shift and truncation preserve integer bits; BOOL/pointer partial views are
+excluded. Full-width integer/pointer bitcasts and constant address displacements
+are decomposed without inferring disjointness for different bases. Unknown or
+partially overlapping stores remain barriers. This is construction-equivalent
+memory folding before promotion/SCCP and all matching/liveness, not an emitter
+peephole or a relaxation of mem2SSA's exact-field eligibility rules.
