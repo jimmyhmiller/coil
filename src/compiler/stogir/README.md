@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`81cf8d6`, on 2026-11-03. The independent library remains maintained in that
+`b3a2fcb`, on 2026-11-03. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 

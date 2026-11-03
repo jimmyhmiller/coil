@@ -375,3 +375,14 @@ are decomposed without inferring disjointness for different bases. Unknown or
 partially overlapping stores remain barriers. This is construction-equivalent
 memory folding before promotion/SCCP and all matching/liveness, not an emitter
 peephole or a relaxation of mem2SSA's exact-field eligibility rules.
+
+### Signed high-field view folding
+
+The incremental fold kernel independently implements the integer identity
+`SEXT(TRUNC(SHR(word, wordBits-fieldBits))) = view(SAR(word, wordBits-fieldBits))`.
+It reuses only a single-use, unrooted intermediate cell and updates exact use
+edges and the affected-node work queue. Same-width BITCAST retains the final
+signed/unsigned type. Shared/rooted fields and neighboring shift distances are
+unchanged. This is a Coil rule related to pinned ir_fold.h's conversion/shift
+families, not a claimed translation of an identical upstream pattern. Scalar
+SEXT nodes seed iterative folding analogously to existing TRUNC conversions.
