@@ -6,6 +6,21 @@ The inliner imports standalone component 7f8adba. Callees supply all observed co
 
 Standalone native before/after tests pass ASAN, including cold helper calls followed by UNREACHABLE, child-process trap checks with a watchdog, hot answers, Never/zero budgets and fallback when the provider omits the non-returning root. Restoring RETURN-only closure fails the new assertion.
 
-The existing backend fixture adds valid, negative, end and empty-vector accesses. Candidate build, backend checks, measurement and FAST are pending. This checkpoint is not installed globally or pushed.
+The existing backend fixture adds valid, negative, end and empty-vector accesses. Candidate source c6eed721 builds. LLVM, TPDE and stogir pass the backend fixture, including exact bounds diagnostics for negative, end and empty-vector accesses and preservation of the infinite arm. FAST and installation are pending; this checkpoint is not installed globally or pushed.
 
 A preliminary void-return helper probe is retained in `avec-cold-path/void-return-preliminary.json` for diagnostic history. It is superseded by the correctly typed non-returning helper and is not a delivered performance result.
+
+
+## Matched AVec diagnostic
+
+One excluded warmup plus five alternating measured process runs, the same opaque runner object and checksum 859763163008. Both new backend objects use the same refactored stdlib:
+
+| Kernel | Median runtime |
+|---|---:|
+| Previous nested-call stogir f3a88fae | 0.10619862494058907 s |
+| Observed-control and shared-never-helper stogir c6eed721 | 0.08115674997679889 s |
+| LLVM O3 c6eed721 | 0.05074412492103875 s |
+
+This is **23.58% less stogir runtime**, leaving a **1.60x** gap to LLVM. The checker shrinks from 152 to 43 graph cells and is inlined with its non-returning branch intact. Saved general registers are gone from the hot kernel; the frame retains FP/LR for the cold call. New object size is 14,492 bytes versus 14,372 previously. Single small kernel generation diagnostics are 0.012286 s stogir and 0.038820 s LLVM; these are not full compiler acceptance timings.
+
+Raw samples and identities: `avec-cold-path/never-return-results.json`. The earlier LLVM kernel used a different stdlib; compare the current matched objects when judging backend runtime.
