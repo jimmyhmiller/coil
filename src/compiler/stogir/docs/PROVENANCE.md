@@ -557,3 +557,16 @@ raw conversion cases fail before the change. ASAN, stogir-built fold execution,
 and the affected pipeline/control/rewrite JIT suites pass. Raw-cloning-only cases
 are excluded from the pinned upstream oracle stream, whose constructor contract
 differs; existing oracle fixtures remain present.
+
+### AArch64 literal boolean selections
+
+An independent target selection pattern lowers typed integer COND(c,1,0) or
+COND(c,0,1) directly to CSET using the existing truth flag emitter. Literal
+choices need no register materialization, and CSET already produces canonical
+0/1 at every integer width. Other selections, named addresses, relocations and
+floating/vector result handling retain the ordinary selection path. This is a
+local pattern extension, not claimed as identical upstream COND emission.
+
+The native selection matrix includes both literal orders across integer/pointer
+condition and result widths. Additional f32/f64 conditions check signed zeros,
+finite values, infinities and NaN against a bit-level truth oracle. ASAN passes.
