@@ -313,3 +313,12 @@ It preserves this implementation's observable control roots with an END/BEGIN
 boundary and maintains exact use lists. Nonempty arms, multiple Phis, overflow
 and RLOAD-dependent conditions remain excluded. Inverted wide integer results
 retain COND; this does not claim the full upstream IF-conversion/folding surface.
+
+### END/BEGIN normalization
+
+`control-merge` follows pinned `ir_sccp.c:ir_merge_blocks` and its iterative
+BEGIN eligibility checks: no computed label, one use per boundary and a direct
+control successor. A local worklist revisits exposed BEGIN boundaries; an
+explicit remapping table preserves caller-observed roots across removals. It
+runs before boolean-diamond conversion and scalar iterative cleanup. Other
+upstream CFG/control transformations remain incomplete.
