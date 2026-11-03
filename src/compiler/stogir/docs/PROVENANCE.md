@@ -609,3 +609,27 @@ with byte-identical images. Undefined uninitialized capture cases are checked
 structurally and are not executed. ASAN and stogir-built execution pass. The
 previous implementation fails the expansion-count regression. Compiler module
 integration and template promotion are separate subsequent work.
+
+### Dead normal loads and pre-promotion pruning
+
+The shared stogir.dead-code worklist follows pinned ir_sccp.c's dead-load
+control bypass and recursive removal of unused foldable data. A normal LOAD is
+removed only when its sole use is a control successor; that successor is wired
+to the prior control and exact operand uses are updated. Observable data roots,
+used load values, volatile accesses and atomics remain. Dependencies are queued,
+so dead pointer expressions can expose more dead loads without another scan.
+The same removal kernel participates in iterative SCCP cleanup.
+
+Our memory pass also prunes dead reads before field classification, reusing the
+uses it already built. This explicit local ordering bridge is needed for raw
+undef aggregate construction: unused initial reads must not block promotion of
+an otherwise-private object. There is no repeated SCCP analysis or new graph
+copy in the pruning routine. The iterative pure-DCE path uses the shared kernel.
+
+Native regression cases compare execution before/after, fresh versus maintained
+use lists, idempotence, used/rooted values, rooted storage, volatile and atomic
+reads, dead address/load chains, and constructor-style promotion. The old
+pipeline retains ALLOCA and fails the regression. ASAN and stogir-built tests
+pass; affected mem2ssa/iteration/control/module/atomic/rewrite/seed suites pass
+ASAN. The overlap guard fixture now roots its overlapping value: an unobserved
+read is legitimately dead and should not masquerade as an incompatible view.
