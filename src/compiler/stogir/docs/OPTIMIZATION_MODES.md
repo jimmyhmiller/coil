@@ -9,13 +9,13 @@ their existing behavior.
 | --- | --- |
 | 0 | Explicit unsupported diagnostic. Upstream's distinct CFG/de-SSA/fast-allocation path is not implemented. |
 | 1 | Existing preparation, scheduling, matching, liveness, allocation and emission path, without SCCP. This is the options default. |
-| 2 | Rooted SCCP analysis, owned rewrite and incremental scalar cleanup, followed by the same native pipeline. |
+| 2 | Nonescaping aggregate splitting/block-local promotion, then rooted SCCP analysis, owned rewrite and incremental scalar cleanup, followed by the same native pipeline. |
 | 3 | Level 2 plus automatic guarded integer loop vector prefixes, followed by the same native pipeline. |
 
 The gate at levels above one follows pinned dstogov/ir
 `92171d0a4a36b0acf707f2dea7998de615dd4acd`, `ir.h:ir_jit_compile`.
 This does not establish full upstream mode parity: missing fold rules, promotion,
-control/load cleanup, optional mem2ssa, coalescing and allocation-policy gaps
+control/load cleanup, cross-block mem2ssa, coalescing and allocation-policy gaps
 remain. Optimized entry requires START at reference one. Invalid levels outside
 zero through three are rejected.
 

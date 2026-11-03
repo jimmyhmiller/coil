@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`4ff76d2`, on 2026-11-02. The independent library remains maintained in that
+`e9df256`, on 2026-11-02. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 
@@ -35,3 +35,8 @@ code. See [metadata validation](docs/OPCODE_METADATA.md).
 
 Finalized split-child locations use per-value indexing for CFG and contiguous
 transfer reconciliation. See [location indexing](docs/LOCATION_INDEX.md).
+
+Nonescaping aggregate fields are promoted within control blocks before SCCP.
+Cross-block Phi promotion remains open. Assignment verification retains all
+checks through a sparse class index and live-range sweep; see
+[verification](docs/ALLOCATION_VERIFICATION.md).

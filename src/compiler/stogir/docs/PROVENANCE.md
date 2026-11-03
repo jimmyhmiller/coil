@@ -288,3 +288,10 @@ numeric table approach. See OPCODE_METADATA.md for representation and oracle.
 
 Finalized per-value location indexing follows upstream virtual-value interval
 ownership and split-child linkage. See LOCATION_INDEX.md for representation.
+
+Local aggregate promotion adapts pinned `ir_mem2ssa.c` eligibility and SRA rules:
+constant ALLOCA extents, nonescaping address uses, exact disjoint typed fields.
+The current implementation forwards within control blocks and deletes storage
+only when every load has a replacement. It does not yet port cross-block Phi
+construction. Graph references stay stable; dual control/value results are
+remapped separately. See tests/jit-mem2ssa.coil and its linked AOT consumer.
