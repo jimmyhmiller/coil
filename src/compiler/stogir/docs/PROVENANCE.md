@@ -540,3 +540,20 @@ The control suite reproduces the previous blocked integer-diamond conversion
 with one and three layers of rooted single-input regions, then compares native
 before/after choices and validates retained roots. ASAN and stogir-built execution
 pass; the old implementation fails the regression's conversion assertion.
+
+### Literal folds exposed by raw graph cloning
+
+Upstream SCCP's benefit gate assumes construction already folded initial literal
+expressions. Our reference-stable inliner patches raw cloned nodes, which can
+newly have only literal operands without a positive lattice replacement. SCCP
+now evaluates that all-literal case through its existing evaluator. Mixed-input
+benefit/discovery rules, DIV/MOD guard exclusion and COPY metadata policy remain.
+This is an explicit bridge for this port's raw graph contract, not a claim that
+upstream's gate is identical. No repeated SCCP pass is added.
+
+The fold suite checks raw versus COPY-discovered conversions against the scalar
+conversion evaluator, and raw arithmetic against explicit expected values. Seven
+raw conversion cases fail before the change. ASAN, stogir-built fold execution,
+and the affected pipeline/control/rewrite JIT suites pass. Raw-cloning-only cases
+are excluded from the pinned upstream oracle stream, whose constructor contract
+differs; existing oracle fixtures remain present.
