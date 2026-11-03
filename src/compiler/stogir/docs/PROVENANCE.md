@@ -465,3 +465,18 @@ module supplies explicit relocation bindings for new imports. Private STR
 constants remain unsupported, preserving their identity and ownership. Linked
 execution checks global loads, returned function-pointer identity and execution,
 prototype-byte remapping, and unchanged private-string fallback.
+
+### Feasible inputs of retained overdefined PHIs
+
+The pinned SCCP representation/worklist and monotone bottom state are retained.
+Our reference-stable graph pipeline additionally closes backward discovery over
+all feasible inputs of a retained PHI, even after its meet becomes overdefined.
+When region feasibility changes, already-bottom PHIs discover newly feasible top
+inputs without putting bottom nodes on the analysis worklist. This closes a gap
+exposed by module expansion and forward pure-data references; it is not claimed
+as an identical port of upstream's early-terminating PHI meet loop.
+
+The existing JIT rewrite suite includes a three-way switch whose first two PHI
+inputs differ and whose last value is a forward BITCAST, with both immediate and
+delayed final predecessors. The old code left that live value top and rewrite
+failed. Both graph rewrites now verify and execute identically before/after.
