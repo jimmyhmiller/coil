@@ -653,6 +653,7 @@ stogir-built checks pass, with the existing 2640 stack/free variants, frame,
 mem2ssa, iterative folds, module execution and 112 atomic graphs passing ASAN.
 
 
+## Conditional PHI branch splitting
 
 The IF(PHI) and IF(CMP(PHI, literal)) transformations follow the control-shape approach in pinned upstream `ir_sccp.c`, `ir_try_split_if` (line 3168) and `ir_try_split_if_cmp` (line 3348), at commit 92171d0a4a36b0acf707f2dea7998de615dd4acd. This independent Coil implementation reuses compact graph references, updates def-use lists during each mutation, and queues only newly exposed predecessor merges. Optimization remains before matching and liveness, shared by JIT and AOT.
 
