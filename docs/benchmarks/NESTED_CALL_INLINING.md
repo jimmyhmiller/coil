@@ -6,4 +6,19 @@ The compiler provider uses linear Kahn elimination of actual direct CALL edges a
 
 After expansion, the module worklist records newly introduced import dependencies and revisits newly cloned calls. The existing 512-cell total growth budget remains in force: positive growth consumes budget, while zero-growth expansion cannot add a CALL and removes one. All structural analyses still run after graph optimization, and provider work stays in backend timing.
 
-The existing stogir-register-results CLI fixture now covers wrapper chains retaining a Never call, calls inside a loop, and a recursive function that remains callable. Candidate build and backend checks are pending; this component is not globally installed or pushed yet.
+The existing stogir-register-results CLI fixture now covers wrapper chains retaining a Never call, calls inside a loop, self recursion, mutual recursion and a caller of a recursive function that remain callable. The candidate builds and the fixture passes under LLVM, TPDE and stogir, including preservation of its observable infinite arm. FAST and installation are pending; this component is not globally installed or pushed yet.
+
+
+## Matched AVec diagnostic
+
+One excluded warmup and five alternating process samples use the identical opaque LLVM-built runner and checksum 859763163008:
+
+| Kernel | Median runtime |
+|---|---:|
+| Loop-only stogir 256d0dd7 | 0.11802000005263835 s |
+| Nested-call stogir f3a88fae | 0.10638170898891985 s |
+| LLVM O3 | 0.04391591600142419 s |
+
+Nested-call support reduces runtime by **9.86%**, leaving a **2.42x** LLVM gap. New object size is 14,372 bytes versus 13,648 for loop-only. The new single kernel generation diagnostic is 0.009556 s. These measurements do not establish the full compiler goal. Raw samples and runner identity are in `nested-call-inlining/avec-results.json`.
+
+The backend fixture also confirms the conservative policy for self recursion, mutual recursion and callers of recursive definitions through explicit template-policy traces. All three backends return 42 and preserve the infinite arm.
