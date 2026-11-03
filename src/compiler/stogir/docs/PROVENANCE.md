@@ -397,3 +397,23 @@ emission finishes. The full-scan public interfaces remain compatibility wrappers
 and a differential oracle, including negative-parent lookup behavior. This is
 independent Coil plumbing for the existing location policy guided by ir_ra.c and
 ir_aarch64.dasc; no new allocation or emission decisions are introduced.
+
+### Indexed opcode arity facts
+
+Fixed input counts and physical operand-slot counts are stored in signed-byte
+lookup tables, matching upstream's ir_op_infos organization. Existing meanings,
+variadic sentinels and invalid-opcode results are unchanged. The opcode test
+independently derives both counts from the frozen pinned shape strings,
+including extra metadata operands, and checks invalid integer boundaries.
+
+### Numeric operand categories inside graph passes
+
+Graph construction/verification, control and vector checks, use lists, liveness,
+placement/scheduling, SCCP rewrites, promotion/forwarding and matching now consume
+the existing packed operand codes directly. Public operand-name and string
+predicate APIs remain compatibility interfaces and the independent oracle.
+The compact numeric encoding is Coil storage for the pinned ir.h categories,
+not a claimed copy of upstream's numeric enum values. Variadic data operands use
+the existing def category; there is no separate arg code. The reference bitmask
+preserves def/ref/var/src/reg/grd/ret/lbl exactly, and rejects invalid codes before
+shifting. All validation and optional-reference behavior remain enabled.
