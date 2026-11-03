@@ -11,7 +11,7 @@ and [LICENSE](../LICENSE).
 | Upstream optimized stage | Coil implementation and status |
 | --- | --- |
 | Construction folding/CSE, def-use lists | Compact graph, builder/fold modules and uses. Implemented coverage does not imply all upstream folds. |
-| Optional mem2ssa, then reset CFG | Typed nonescaping ALLOCA partitions and block-local forwarding before SCCP. Cross-block Phi promotion remains open. Analyses are rebuilt afterward. |
+| Optional mem2ssa, then reset CFG | Typed nonescaping ALLOCA partitions and demand-driven SSA across joins/loops before SCCP. Uninitialized paths retain storage. Analyses are rebuilt afterward. |
 | SCCP at optimization levels above one | Rooted analysis, owned rewriting and incremental scalar fold/CSE/DCE run through explicit image/object options at levels 2/3. Fold/restart coverage, promotion and CFG/control/load cleanup remain incomplete. See `OPTIMIZATION_MODES.md`. |
 | CFG, dominators, loops, GCM, scheduling | `pipeline.prepare` orchestrates CFG, dominance, loop depth, placement and scheduling. Full upstream algorithm parity remains unverified. |
 | Target matching | `a64.compile.generate` builds a persistent `a64.match.Plan` before register analysis. Fusion and reuse coverage remain incomplete. |

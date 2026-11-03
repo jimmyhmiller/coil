@@ -295,3 +295,12 @@ The current implementation forwards within control blocks and deletes storage
 only when every load has a replacement. It does not yet port cross-block Phi
 construction. Graph references stay stable; dual control/value results are
 remapped separately. See tests/jit-mem2ssa.coil and its linked AOT consumer.
+
+Cross-block field promotion preserves pinned ir_mem2ssa.c's typed Phi and
+control/value renaming semantics. The SSA discovery algorithm is a Coil
+implementation using demand-driven incoming/outgoing definitions and explicit
+work frames, rather than the pinned implementation's dominance-frontier
+placement and renaming walks. It uses only the compact graph. Uninitialized
+paths reject promotion for the complete allocation; loop-local allocation
+boundaries reset incoming values. This is not a claim of full mem2ssa parity
+(VAR promotion and broader aggregate layouts remain open).
