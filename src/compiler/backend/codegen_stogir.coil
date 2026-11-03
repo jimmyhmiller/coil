@@ -5,6 +5,8 @@
 (import "coil.alloc" :use *)
 (import "coil.scratch" :as scratch)
 (import "coil.arraylist" :use [ArrayList])
+(import "coil.hashmap" :use [HashMap])
+(import "coil.str" :use [keyops-borrowed])
 (import "coil.result" :use *)
 (import "coil.cc" :as cc)
 
@@ -28,6 +30,11 @@
 (import "stogir.image" :as image)
 (import "stogir.a64.compile" :as native)
 (import "stogir.options" :as native-options)
+(import "stogir.call-inline" :as inlining)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.strings" :as strings)
+(import "stogir.bitqueue" :as queue)
 
 (defn fail [(name (slice u8)) (message (slice u8))] (-> never)
   (eprintln "stogir: {}: {}" name message)
@@ -1538,49 +1545,347 @@
                   0))
     (asm/sym-def! ta symbol asm/SEC-TEXT text-base (len (.text source)))))
 
+(defstruct Definition
+  [(symbol u32)
+   (graph graph/Graph)
+   (entry i32)
+   (roots (ArrayList i32))
+   (name (slice u8))
+   (source (ptr cir/Func))
+   (import-names (ArrayList (slice u8)))
+   (import-ids (ArrayList u32))])
+
+;;; Prepared once in source submission order, then immutable during emission.
+;;; The module allocator owns every definition until all jobs have finished.
+(defstruct Module
+  [(a (dyn Allocator))
+   (trace bool)
+   (definitions (ArrayList Definition))
+   (by-symbol (ArrayList i64))
+   (bindings (HashMap (slice u8) u32))])
+
+(defn module-create [(a (dyn Allocator)) (trace bool)] (-> Module)
+  (Module
+    :a a
+    :trace trace
+    :definitions (ArrayList::new [Definition] a)
+    :by-symbol (ArrayList::new [i64] a)
+    :bindings (HashMap::new [(slice u8) u32] a (keyops-borrowed))))
+
+(defn adapt! [(s (ptr Adapter))
+              (f (ptr cir/Func))
+              (ta (ptr asm/Asm))
+              (text-data (ptr (ArrayList MTextData)))
+              (a (dyn Allocator))] (-> void)
+  (set! (.a s) a)
+  (set! (.f s) f)
+  (set! (.ta s) ta)
+  (set! (.text-data s) text-data)
+  (set! (.g s) (graph/create a))
+  (set! (.values s) (ArrayList::new [i32] a))
+  (set! (.high-values s) (ArrayList::new [i32] a))
+  (set! (.regions s) (ArrayList::new [i32] a))
+  (set! (.order s) (ArrayList::new [i64] a))
+  (set! (.from s) (ArrayList::new [i64] a))
+  (set! (.to s) (ArrayList::new [i64] a))
+  (set! (.ends s) (ArrayList::new [i32] a))
+  (set! (.branches s) (ArrayList::new [i32] a))
+  (set! (.exits s) (ArrayList::new [i32] a))
+  (set! (.import-names s) (ArrayList::new [(slice u8)] a))
+  (set! (.import-ids s) (ArrayList::new [u32] a))
+  (set! (.start s) (emit! s 104 0 [(: 0 i32)]))
+  (set! (.control s) (.start s))
+  (translate! s)
+  ; Every reachable CIR terminator is observable control. A path that only
+  ; loops forever need not flow backward from a RETURN root.
+  (for ending (.ends s) (push! (mut (.exits s)) ending))
+  (for branch (.branches s)
+    (when (> branch 0) (push! (mut (.exits s)) branch))))
+
+(defn own-definition! [(definition (ptr Definition))
+                       (source graph/Graph)
+                       (roots (slice i32))
+                       (names (slice (slice u8)))
+                       (ids (slice u32))
+                       (a (dyn Allocator))] (-> void)
+  (set! (.graph definition) (graph/duplicate source a))
+  (set! (.roots definition) (ArrayList::new [i32] a))
+  (for root roots (push! (mut (.roots definition)) root))
+  (set! (.import-names definition) (ArrayList::new [(slice u8)] a))
+  (set! (.import-ids definition) (ArrayList::new [u32] a))
+  (for name names (push! (mut (.import-names definition)) (sconcat a name "")))
+  (for id ids (push! (mut (.import-ids definition)) id)))
+
+;;; Analyses and adapter temporaries die with this scratch arena; only bounded
+;;; definitions and their explicit symbol bindings enter the module allocator.
+(defn module-prepare! [(module (ptr Module))
+                       (f (ptr cir/Func))
+                       (ta (ptr asm/Asm))
+                       (symbol u32)
+                       (never bool)] (-> void)
+  (when (and (not never) (<= (len (.insts f)) 64))
+    (let [work (p/alloc-stack scratch/ScratchArena)]
+      (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
+      (let [a (allocator work)
+            keep (.a module)
+            (mut state) (zeroed Adapter)
+            s (cast (ptr Adapter) (mut state))]
+        (adapt! s f ta (p/cast (ptr (ArrayList MTextData)) 0) a)
+        (match (sccp/optimize-memory (.g s) 8 (slice (.exits s)) true a)
+          (Err [message] (fail (.name f) message))
+          (Ok [optimized]
+              (let [(mut optimized) optimized
+                    (mut roots) (ArrayList::new [i32] a)
+                    (mut r) 1]
+                ; Keep every control root during optimization. The library then
+                ; proves all control live from the template's single return.
+                (while (< r (len (.instructions (.graph optimized))))
+                  (let [n (get (.instructions (.graph optimized)) r)
+                        count (get (.arities (.graph optimized)) r)]
+                    (when (= (node/opcode n) 120)
+                      (push! (mut roots) (cast i32 r)))
+                    (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+                (when (.trace module)
+                  (eprintln "stogir template {}: {} cells, {} returns"
+                            (.name f)
+                            (len (.instructions (.graph optimized)))
+                            (len roots)))
+                (when (and (= (len roots) 1)
+                           (<= (len (.instructions (.graph optimized))) 65))
+                  (let [(mut owned) (zeroed Definition)
+                        definition (cast (ptr Definition) (mut owned))]
+                    (set! (.symbol definition) symbol)
+                    (set! (.source definition) f)
+                    (set! (.entry definition) (.start s))
+                    (set! (.name definition)
+                          (sconcat keep
+                                   "_coil_stogir_import_"
+                                   (i64->str keep (cast i64 symbol))))
+                    (own-definition! definition
+                                     (.graph optimized)
+                                     (slice roots)
+                                     (slice (.import-names s))
+                                     (slice (.import-ids s))
+                                     keep)
+                    (for [i 0 (len (.import-ids definition))]
+                      (let [name (get (.import-names definition) i)
+                            id (get (.import-ids definition) i)]
+                        (match (get (.bindings module) name)
+                          (Some [prior]
+                                (when (!= prior id)
+                                  (fail (.name f)
+                                        "conflicting module symbol binding")))
+                          (None [] (set! (mut (.bindings module)) name id)))))
+                    (while (<= (len (.by-symbol module)) (cast i64 symbol))
+                      (push! (mut (.by-symbol module)) 0))
+                    (push! (mut (.definitions module)) owned)
+                    (set! (mut (.by-symbol module))
+                          (cast i64 symbol)
+                          (len (.definitions module)))))
+                (rewrite/release! (mut optimized)))))
+        (graph/release! (mut (.g s))))
+      (close! work))))
+
+(defn definition-index [(s (ptr Adapter))
+                        (module (ptr Module))
+                        (name (slice u8))] (-> i64)
+  (let [(mut found) (: -1 i64)]
+    (for [i 0 (len (.import-ids s))]
+      (when (= name (get (.import-names s) i))
+        (let [id (cast i64 (get (.import-ids s) i))]
+          (when (< id (len (.by-symbol module)))
+            (set! found (- (get (.by-symbol module) id) 1))))))
+    found))
+
+(defn bind-cloned-imports! [(s (ptr Adapter)) (module (ptr Module))] (-> void)
+  (for [i 0 (len (.constants (.g s)))]
+    (when (> (get (.constant-spans (.g s)) i) 0)
+      (let [value (get (.constants (.g s)) i)]
+        (when (or (= (node/opcode value) 74) (= (node/opcode value) 75))
+          (match (strings/lookup (.strings (.g s))
+                                 (cast i32 (node/constant-bits value)))
+            (None [] (fail (.name (.f s)) "cloned symbol name missing"))
+            (Some [name]
+                  (let [(mut found) false]
+                    (for prior (.import-names s)
+                      (when (= prior name) (set! found true)))
+                    (unless found
+                      (match (get (.bindings module) name)
+                        (None []
+                              (fail (.name (.f s))
+                                    "cloned symbol has no module binding"))
+                        (Some [id]
+                              (push! (mut (.import-ids s)) id)
+                              ; Own bytes independently of any mutable graph string pool.
+                              (push! (mut (.import-names s))
+                                     (sconcat (.a s) name "")))))))))))))
+
+(defn expand-module! [(s (ptr Adapter)) (module (ptr Module)) (budget i32)]
+  (-> i32)
+  (if (= (p/cast i64 module) 0)
+      0
+      (let [a (.a s)
+            (mut sites) (ArrayList::new [inlining/Site] a)
+            (mut changes) (: 0 i32)
+            (mut r) 1]
+        ; Only instruction starts are nodes; variadic payload cells are skipped.
+        (while (< r (len (.instructions (.g s))))
+          (let [call (get (.instructions (.g s)) r)
+                count (get (.arities (.g s)) r)]
+            (when (= (node/opcode call) 79)
+              (match (graph/lookup (.g s) (.op2 call))
+                (None [] 0)
+                (Some [function]
+                      (when (= (node/opcode function) 74)
+                        (match (strings/lookup (.strings (.g s))
+                                               (cast i32
+                                                     (node/constant-bits function)))
+                          (None [] 0)
+                          (Some [name]
+                                (let [index (definition-index s module name)]
+                                  (when (>= index 0)
+                                    (let [definition
+                                            (get (.definitions module) index)]
+                                      (push! (mut sites)
+                                             (inlining/Site
+                                               :reference (cast i32 r)
+                                               :target
+                                                 (inlining/Callee
+                                                   :name (.name definition)
+                                                   :graph (.graph definition)
+                                                   :entry (.entry definition)
+                                                   :roots
+                                                     (slice (.roots definition))
+                                                   :never false))))))))))))
+            (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+        (when (> (len sites) 0)
+          (match (inlining/optimize-sites (.g s)
+                                          (slice (.exits s))
+                                          (slice sites)
+                                          8
+                                          budget
+                                          a)
+            (Err [message] (fail (.name (.f s)) message))
+            (Ok [expanded]
+                (let [(mut expanded) expanded]
+                  (set! changes (.changes expanded))
+                  (when (.trace module)
+                    (eprintln "stogir expand {}: {} sites, {} changes"
+                              (.name (.f s))
+                              (len sites)
+                              changes))
+                  (if (= changes 0)
+                      (rewrite/release! (mut expanded))
+                      (do
+                        (graph/release! (mut (.g s)))
+                        (free! (mut (.exits s)))
+                        (set! (.g s) (.graph expanded))
+                        (set! (.exits s) (.roots expanded))
+                        (bind-cloned-imports! s module)
+                        (queue/release! (mut (.iteration expanded)))))))))
+        (free! (mut sites))
+        changes)))
+
+;;; Preparation reaches a fixed point over original call dependencies. Eligible
+;;; definitions contain no CALL, so each successful expansion strictly removes
+;;; calls and cannot create recursion or an unbounded worklist. Every definition
+;;; has a total 512-cell growth budget. Emission sees the frozen result only.
+(defn module-finish! [(module (ptr Module))] (-> void)
+  (let [a (.a module)
+        count (len (.definitions module))
+        (mut heads) (ArrayList::new [i64] a)
+        (mut next) (ArrayList::new [i64] a)
+        (mut callers) (ArrayList::new [i64] a)
+        (mut budgets) (ArrayList::new [i32] a)
+        (mut work) (queue/create count a)
+        temporary (p/alloc-stack scratch/ScratchArena)]
+    (for [i 0 count]
+      (push! (mut heads) -1)
+      (push! (mut budgets) 512)
+      (queue/add! (mut work) i))
+    (for [i 0 count]
+      (let [definition (get (.definitions module) i)]
+        (for symbol (.import-ids definition)
+          (let [id (cast i64 symbol)]
+            (when (< id (len (.by-symbol module)))
+              (let [callee (- (get (.by-symbol module) id) 1)]
+                (when (>= callee 0)
+                  (push! (mut callers) i)
+                  (push! (mut next) (get heads callee))
+                  (set! (mut heads) callee (- (len callers) 1)))))))))
+    (let [(mut index) (queue/pop! (mut work))]
+      (while (>= index 0)
+        (scratch/ScratchArena::init-with-capacity temporary
+                                                  (malloc-allocator)
+                                                  65536)
+        (let [definition (elem (mut (.definitions module)) index)
+              before (len (.instructions (.graph definition)))
+              (mut state) (zeroed Adapter)
+              s (cast (ptr Adapter) (mut state))]
+          (set! (.a s) (allocator temporary))
+          (set! (.f s) (.source definition))
+          (set! (.g s) (.graph definition))
+          (set! (.start s) (.entry definition))
+          (set! (.exits s) (.roots definition))
+          (set! (.import-names s) (.import-names definition))
+          (set! (.import-ids s) (.import-ids definition))
+          (when (> (expand-module! s module (get budgets index)) 0)
+            (own-definition! definition
+                             (.g s)
+                             (slice (.exits s))
+                             (slice (.import-names s))
+                             (slice (.import-ids s))
+                             a)
+            (set! (mut budgets)
+                  index
+                  (- (get budgets index)
+                     (cast i32 (- (len (.instructions (.g s))) before))))
+            (let [(mut edge) (get heads index)]
+              (while (>= edge 0)
+                (queue/add! (mut work) (get callers edge))
+                (set! edge (get next edge))))))
+        (close! temporary)
+        (set! index (queue/pop! (mut work)))))
+    (queue/release! (mut work))
+    (free! (mut budgets))
+    (free! (mut callers))
+    (free! (mut next))
+    (free! (mut heads))))
+
+(defn compile-with-module! [(f (ptr cir/Func))
+                            (ta (ptr asm/Asm))
+                            (symbol u32)
+                            (text-data (ptr (ArrayList MTextData)))
+                            (optimization i32)
+                            (module (ptr Module))] (-> void)
+  (let [work (p/alloc-stack scratch/ScratchArena)
+        codegen-start (tr/codegen-start)]
+    (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
+    (let [a (allocator work)
+          (mut state) (zeroed Adapter)
+          s (cast (ptr Adapter) (mut state))]
+      (adapt! s f ta text-data a)
+      (expand-module! s module 512)
+      (match (native/image-with-options (.g s)
+                                        (.start s)
+                                        (slice (.exits s))
+                                        "_coil_stogir_body"
+                                        (native-options/Options
+                                          :level optimization)
+                                        a)
+        (Err [message] (fail (.name f) message))
+        (Ok [result] (merge! s result symbol))))
+    (close! work)
+    (tr/codegen-end "stogir" "ir-codegen" codegen-start)))
+
 (defn compile! [(f (ptr cir/Func))
                 (ta (ptr asm/Asm))
                 (symbol u32)
                 (text-data (ptr (ArrayList MTextData)))
                 (optimization i32)] (-> void)
-  (let [work (p/alloc-stack scratch/ScratchArena)]
-    (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
-    (let [a (allocator work)
-          (mut state) (zeroed Adapter)
-          s (cast (ptr Adapter) (mut state))]
-      (set! (.a s) a)
-      (set! (.f s) f)
-      (set! (.ta s) ta)
-      (set! (.text-data s) text-data)
-      (set! (.g s) (graph/create a))
-      (set! (.values s) (ArrayList::new [i32] a))
-      (set! (.high-values s) (ArrayList::new [i32] a))
-      (set! (.regions s) (ArrayList::new [i32] a))
-      (set! (.order s) (ArrayList::new [i64] a))
-      (set! (.from s) (ArrayList::new [i64] a))
-      (set! (.to s) (ArrayList::new [i64] a))
-      (set! (.ends s) (ArrayList::new [i32] a))
-      (set! (.branches s) (ArrayList::new [i32] a))
-      (set! (.exits s) (ArrayList::new [i32] a))
-      (set! (.import-names s) (ArrayList::new [(slice u8)] a))
-      (set! (.import-ids s) (ArrayList::new [u32] a))
-      (set! (.start s) (emit! s 104 0 [(: 0 i32)]))
-      (set! (.control s) (.start s))
-      (translate! s)
-      ; Every reachable CIR terminator is observable control. A path that only
-      ; loops forever need not flow backward from a RETURN root.
-      (for ending (.ends s) (push! (mut (.exits s)) ending))
-      (for branch (.branches s)
-        (when (> branch 0) (push! (mut (.exits s)) branch)))
-      (let [codegen-start (tr/codegen-start)]
-        (match (native/image-with-options (.g s)
-                                          (.start s)
-                                          (slice (.exits s))
-                                          "_coil_stogir_body"
-                                          (native-options/Options
-                                            :level optimization)
-                                          a)
-          (Err [message] (fail (.name f) message))
-          (Ok [result] (merge! s result symbol)))
-        (tr/codegen-end "stogir" "ir-codegen" codegen-start)))
-    (close! work)))
+  (compile-with-module! f
+                        ta
+                        symbol
+                        text-data
+                        optimization
+                        (p/cast (ptr Module) 0)))

@@ -66,3 +66,28 @@ matching/liveness, rebuild invalidated analysis, prove memory dependence safety
 (or guard it at runtime), preserve scalar fallback and tails, and pass both JIT
 and linked AOT execution tests. Analysis-only fixtures do not establish a safe
 transformation or a performance improvement.
+
+### Independent bounded graph-call expansion
+
+`stogir.call-inline` is an extension beyond the pinned upstream pipeline. A module
+provider may call `optimize-sites` before SCCP and structural analysis, supplying
+borrowed immutable `Callee` graphs and an ordered set of distinct original CALL
+references. One transaction owns a single caller copy; the total growth budget
+covers cloned instruction cells and argument casts. `optimize` is the single-site
+convenience API. Both return the ordinary owned `sccp-rewrite.Rewritten`, released
+with `sccp-rewrite.release!`; inputs and all callee storage stay immutable.
+
+Eligible definitions have one scalar/void return and closed acyclic control,
+ordinary scalar or grouped scalar parameters, numeric/named constants, supported
+pure operations and normal loads/stores. Flags, result and ABI grouping match;
+same-width signed/unsigned integer arguments get explicit BITCAST nodes. Private
+strings, frame operations, nested calls, loops, variadic and aggregate results
+remain calls. Never policy is explicit. The module provider must retain symbol
+identity, own all imported names and charge its preparation to backend time.
+
+The pass preserves control/value observations of CALL roots, clones forward
+references before patching them, and retains predecessor/PHI order. CFG, placement,
+matching and liveness are rebuilt afterward; it never substitutes emitter bytes
+or modifies source inlining annotations. Linked execution coverage lives in the
+existing `tests/module-execution.coil` program, including policy/budget fallbacks,
+ABI groups, branches/PHIs, dependent calls, memory effects and typed imports.
