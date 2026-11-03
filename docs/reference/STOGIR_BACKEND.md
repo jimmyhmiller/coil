@@ -211,7 +211,7 @@ See [full measurements](../benchmarks/STOGIR_COMPILER.md) for phases, sample
 ranges, load qualifications, binary disassembly and validation. Historical
 checkpoint statements above describe their original revisions.
 
-## Cross-block field promotion and scalar Always policy
+## Cross-block field promotion and closed Always expressions
 
 The library now constructs typed SSA values across joins and loops for supported
 nonescaping ALLOCA fields. It preserves CFG predecessor positions, resets
@@ -219,15 +219,20 @@ loop-local allocation lifetimes, and retains the complete allocation when any
 path is uninitialized. The discovery algorithm uses explicit demand-driven work
 frames; it is documented separately from upstream's dominance-frontier walk.
 
-Shared native CIR lowering also accepts closed conditional scalar expressions
-marked Always. It validates every nested expression, rejects lexical/control
+Shared native CIR lowering accepts closed expression sequences and conditional
+scalar or aggregate results marked Always. It validates every nested expression, rejects lexical/control
 escapes, caches immutable-body eligibility, tracks active callees to break
 recursive cycles, and bounds the callee to 64 AST nodes, cumulative expansion
 to 16,384 nodes per function and nesting to 16. Default/Hint/Never policy is
 unchanged. This extends existing language-annotation lowering; it is not general
-module-level IR inlining. Aggregate signatures still use normal calls.
+module-level IR inlining. Coil's reference-model struct parameters retain their
+pointer aliases. Actual aggregate TV arguments are captured as private values
+when evaluated, before later arguments; explicit mutable copies remain distinct.
+Sequences contain no lexical bindings, cleanup/control escapes or static identity
+changes. Unsupported bodies retain ordinary calls.
 
-Timing mode includes eligibility and outermost inlined-body lowering spans in
+Timing mode includes eligibility, aggregate value capture and outermost
+inlined-body lowering spans in
 the native codegen sum, aggregated once per source function. Nested spans are
 not counted twice. Those optimizer costs are no longer hidden in IR creation;
 older reports did not charge them and retain their original timing definition.

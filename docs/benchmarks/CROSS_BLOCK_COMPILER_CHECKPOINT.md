@@ -24,3 +24,5 @@ The new slice-helper fixture isolates that next gap with one shared LLVM-built c
 Validation: FAST 49/49; official global installation; off-checkout checks of all 136 SDK modules; LLVM/TPDE/stogir native regression execution; ASAN promotion tests including a 2048-block chain. Source commits: Coil `4b01753f`, `94d1b580`, `35109703`. Cross-block SSA uses an explicit frame stack and preserves predecessor operand positions. It is a documented demand-driven implementation, not a claim of upstream algorithm parity.
 
 Next work: port upstream's empty boolean-diamond simplification in the standalone optimizer, validate typed folds and control/use-list invariants, then measure small cases before another full build. Work is isolated in `.worktrees/boolean-if-conversion`; it is not installed in this checkpoint.
+
+Later measurement audit: standard-library state sidecar availability was not explicitly matched across hosts in this historical checkpoint. Do not use its wall-time host ratio as a controlled acceptance result. See AGGREGATE_ALWAYS_COMPILER_CHECKPOINT.md for an explicit cache-disabled comparison.
