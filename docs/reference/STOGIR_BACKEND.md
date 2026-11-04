@@ -273,7 +273,7 @@ The complete standalone memory promotion/forwarding suite passes under ASAN/debu
 
 ### Typed constructor words and small aggregate merges
 
-The shared native lowering can construct bounded fresh sum values with scalar
+For stogir O2/O3, the shared native lowering can construct bounded fresh sum values with scalar
 integer/pointer fields as complete little-endian words. It packs each declared
 field's storage bytes, masks sign extension, and handles word boundaries. Only
 representation padding and inactive variant bytes receive zero; every active
@@ -286,6 +286,8 @@ Small aggregate if/match results snapshot each live branch into one static
 private destination, rather than merging branch-object addresses. CIR's static
 allocas dominate reachable bodies; the adapter keeps them in the entry prefix.
 Scalar/reference-valued and large aggregate merges retain their existing paths.
+TPDE and nonoptimizing stogir levels retain their existing producer forms; these
+value forms are selected for the backend's memory-promotion capability.
 Frame-escape policy remains conservative. These are Coil value-lowering choices,
 independent of upstream stogir's compact graph and exact-field SSA pass.
 
