@@ -40,6 +40,39 @@ D = args.output.resolve()
 D.mkdir(parents=True, exist_ok=True)
 E = {k: v for k, v in os.environ.items() if not k.startswith('COIL_')}
 E.update(COIL_LIBRARY_STATE='0', COIL_TPDE_SERIAL='1', COIL_CODEGEN_TIMINGS='1')
+# Host evidence is outside every measured interval. Process names exclude
+# command arguments; samples describe load, not an automatic acceptance rule.
+host = {'logical_cpus': os.cpu_count(), 'snapshots': [], 'round_loads': []}
+
+def host_snapshot(phase):
+    record = {'phase': phase, 'unix_time_s': time.time(),
+              'load_average': list(os.getloadavg())}
+    process = subprocess.run(['ps', '-Ao', 'pid=,ppid=,pcpu=,comm='],
+                             capture_output=True, text=True)
+    record['ps_exit'] = process.returncode
+    if process.returncode:
+        record['ps_error'] = process.stderr.strip()
+    else:
+        rows = []
+        for line in process.stdout.splitlines():
+            fields = line.split(None, 3)
+            if len(fields) != 4:
+                continue
+            pid, parent, cpu, name = fields
+            if int(pid) == os.getpid() or int(parent) == os.getpid():
+                continue
+            rows.append({'pid': int(pid), 'parent_pid': int(parent),
+                         'cpu_percent': float(cpu), 'name': name})
+        record['top_processes'] = sorted(rows, key=lambda row: row['cpu_percent'],
+                                         reverse=True)[:12]
+    host['snapshots'].append(record)
+
+def round_load(phase, turn):
+    host['round_loads'].append({'phase': phase, 'turn': turn,
+                               'unix_time_s': time.time(),
+                               'load_average': list(os.getloadavg())})
+
+host_snapshot('before-warmup')
 cases = [('current-stogir', C, 'stogir'), ('llvm', C, 'llvm'), ('tpde', C, 'tpde')]
 if args.before:
     cases.insert(0, ('before-stogir', args.before.resolve(), 'stogir'))
@@ -73,7 +106,9 @@ for n, c, b in cases:
     rows.append({'name': n, 'codegen_diagnostic_s': sum((int(x[3]) for x in rec)) / 1000000000.0, 'object_bytes': (D / (n + '.o')).stat().st_size, 'wall_samples_s': [], 'cpu_samples_s': [], 'codegen_samples_s': [], 'object_sha256': hashlib.sha256((D / (n + '.o')).read_bytes()).hexdigest()})
 # Initial compilation/link/check above warms each backend. Measure repeated
 # generation separately and require identical object bytes before timing runs.
+host_snapshot('generation-start')
 for turn in range(args.compile_samples):
+    round_load('generation', turn)
     for row in rows if turn % 2 == 0 else list(reversed(rows)):
         name = row['name']
         _, compiler, backend = next(case for case in cases if case[0] == name)
@@ -88,7 +123,9 @@ for turn in range(args.compile_samples):
 for row in rows:
     row['codegen_warmup_s'] = row['codegen_diagnostic_s']
     row['codegen_diagnostic_s'] = statistics.median(row['codegen_samples_s'])
+host_snapshot('generation-end-runtime-start')
 for turn in range(args.samples + 1):
+    round_load('runtime', turn)
     for row in rows if turn % 2 == 0 else list(reversed(rows)):
         r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
         t = time.monotonic()
@@ -98,11 +135,12 @@ for turn in range(args.samples + 1):
         if turn:
             row['wall_samples_s'].append(dt)
             row['cpu_samples_s'].append(r1.ru_utime + r1.ru_stime - r0.ru_utime - r0.ru_stime)
+host_snapshot('runtime-end')
 for row in rows:
     row['wall_median_s'] = statistics.median(row['wall_samples_s'])
     row['cpu_median_s'] = statistics.median(row['cpu_samples_s'])
 assert fixture.read_bytes() == fixture_bytes
 assert runner.read_bytes() == runner_bytes
-report = {'runner_source_sha256': hashlib.sha256(runner_bytes).hexdigest(), 'compilers': {n: str(c) for n, c, _ in cases}, 'samples': args.samples, 'compile_samples': args.compile_samples, 'workload': args.workload, 'work': ({'walks': 312500, 'walk_bytes': 64} if args.workload == 'iterator' else {'primitive_nodes': 2048, 'repetitions': 128, 'invalid_cases': 4 if args.workload == 'verify-transaction' else 3} if args.workload in ('verify', 'verify-transaction') else {'headers': 256, 'repetitions': 250000, 'tags_per_call_sum': 32640} if args.workload == 'tag-extract' else {'blocks': 64, 'reference_stride': 16, 'repetitions': 1024, 'depth_sum_per_call': 124}), 'mode': 'never' if args.never else 'legacy' if args.legacy else 'default', 'checksum': ('independent indexed reference and full-run accumulated hash' if args.workload == 'iterator' else 'graph-size sum and rejected layout/reference/type/Phi graphs' if args.workload == 'verify-transaction' else 'graph-size sum and three rejected invalid graphs' if args.workload == 'verify' else 'independent division/remainder reference for every prefix and accumulated tag sum' if args.workload == 'tag-extract' else 'known depth sum for outer and nested multi-latch loops; both algorithms checked before timing'), 'runner_sha256': hashlib.sha256((D / 'runner.o').read_bytes()).hexdigest(), 'fixture_sha256': hashlib.sha256(fixture.read_bytes()).hexdigest(), 'rows': rows, 'qualification': 'One identical LLVM-built opaque runner; exact result checked by runner exit. Rotating samples after excluded warmup; caches disabled, serial codegen. Generation and runtime use separate rotating repetitions with excluded warmups; not compiler bootstrap acceptance.'}
+report = {'host': host, 'runner_source_sha256': hashlib.sha256(runner_bytes).hexdigest(), 'compilers': {n: str(c) for n, c, _ in cases}, 'samples': args.samples, 'compile_samples': args.compile_samples, 'workload': args.workload, 'work': ({'walks': 312500, 'walk_bytes': 64} if args.workload == 'iterator' else {'primitive_nodes': 2048, 'repetitions': 128, 'invalid_cases': 4 if args.workload == 'verify-transaction' else 3} if args.workload in ('verify', 'verify-transaction') else {'headers': 256, 'repetitions': 250000, 'tags_per_call_sum': 32640} if args.workload == 'tag-extract' else {'blocks': 64, 'reference_stride': 16, 'repetitions': 1024, 'depth_sum_per_call': 124}), 'mode': 'never' if args.never else 'legacy' if args.legacy else 'default', 'checksum': ('independent indexed reference and full-run accumulated hash' if args.workload == 'iterator' else 'graph-size sum and rejected layout/reference/type/Phi graphs' if args.workload == 'verify-transaction' else 'graph-size sum and three rejected invalid graphs' if args.workload == 'verify' else 'independent division/remainder reference for every prefix and accumulated tag sum' if args.workload == 'tag-extract' else 'known depth sum for outer and nested multi-latch loops; both algorithms checked before timing'), 'runner_sha256': hashlib.sha256((D / 'runner.o').read_bytes()).hexdigest(), 'fixture_sha256': hashlib.sha256(fixture.read_bytes()).hexdigest(), 'rows': rows, 'qualification': 'One identical LLVM-built opaque runner; exact result checked by runner exit. Rotating samples after excluded warmup; caches disabled, serial codegen. Generation and runtime use separate rotating repetitions with excluded warmups; not compiler bootstrap acceptance.'}
 (D / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
 print(json.dumps(rows), flush=True)
