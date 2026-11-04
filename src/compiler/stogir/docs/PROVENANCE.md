@@ -1118,3 +1118,15 @@ truncations, count normalization and field boundaries. Cases cover dying, rooted
 shared and multiply absorbed producers, plus rooted consumers; unfused plans
 retain their original input. Encoder boundary cases and the full incremental
 fold/CSE/JIT and memory-address matching suites also pass with ASAN/debug checks.
+
+### Numeric private-allocation offsets
+
+Private-field classification requires a numeric constant, not merely an integer
+or address type, for ADD displacements and fixed allocation extents. Named
+FUNC/SYM/STR payloads are string-table IDs and cannot prove byte offsets or sizes.
+Known numeric address constants retain their ordinary behavior. An added native
+case in the existing memory-promotion suite resolves a named displacement to
+eight while its ID is one: distinct initialized byte positions must not collapse
+into one SSA field. The old optimizer returned 97 instead of 41; the guarded
+classifier retains memory and preserves the correct result. Full ASAN/debug
+memory-promotion/forwarding and observation suites pass.

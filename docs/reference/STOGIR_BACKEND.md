@@ -262,3 +262,11 @@ retires only fully absorbed, unrooted producers. BOOL and crossing fields retain
 ordinary lowering. This generic fusion is an independent extension beyond the
 pinned upstream truncation matcher. Encoder and native matrix checks, incremental
 fold/CSE/JIT and memory address matching pass under ASAN/debug checks.
+
+Standalone `b72f92c` fixes private-field classification of symbolic offsets.
+Named FUNC/SYM/STR payloads are string-table IDs and no longer establish byte
+displacements or fixed extents. Known numeric address constants retain normal
+behavior. A native in-bounds reduction initialized bytes 1 and 8, then resolved
+a symbolic offset to 8 while its ID was 1: the old optimizer incorrectly returned
+97 for byte 1 instead of 41. The classifier now retains memory and returns 41.
+The complete standalone memory promotion/forwarding suite passes under ASAN/debug.
