@@ -1036,3 +1036,15 @@ No graph validation or divide control guard is removed. All exponent/width cases
 are checked against an independent i128 oracle, including exhaustive8-bit inputs,
 negative dividends, signed-minimum-divisor fallback, still-live dividends and
 forced physical aliases involving both reserved registers.
+
+
+### Checked instruction-cell borrows
+
+`graph.borrow-node` follows upstream's short-lived instruction-cell reads while
+retaining the port's separate arrays and exact signed-reference membership rules.
+It returns null for an absent reference and preserves the public value-returning
+lookup API. Borrowed pointers are valid only while the graph is unchanged; callers
+must retain signed references across mutation, growth or release. Vector and
+floating read-only classifiers consume borrows locally, avoiding OptionNode
+aggregate-result transport. This is independent Coil storage/ABI adaptation, not
+a relaxation of validation or a persistent interior-pointer cache.
