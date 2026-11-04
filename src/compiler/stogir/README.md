@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`1aa851f`, on 2026-11-04. The independent library remains maintained in that
+`40bc9d5`, on 2026-11-04. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 
@@ -40,3 +40,8 @@ Nonescaping aggregate fields are promoted across control joins and loops before
 SCCP. Uninitialized paths conservatively retain storage. Assignment verification retains all
 checks through a sparse class index and live-range sweep; see
 [verification](docs/ALLOCATION_VERIFICATION.md).
+
+Native tail-call matching follows pinned upstream late CALL/RETURN selection,
+after module inlining. JIT and AOT share ABI/frame eligibility proofs; copied
+or stack arguments and escaped frame addresses retain CALL/RETURN.
+See [architecture](docs/ARCHITECTURE.md) for validation and implementation scope.
