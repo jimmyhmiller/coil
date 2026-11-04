@@ -1339,3 +1339,14 @@ This is a local traversal optimization, not a new upstream pass. Repeated small
 sparse-input stogir runtime gains7.99%/7.43%; dense overhead ranges -0.63% to
 +1.69%. Integration performance remains to be measured. See
 [pressure register domain](PRESSURE_REGISTER_DOMAIN.md).
+
+### Exact use-list lifetime through preparation
+
+Standaloneca13d63 shares one exact use index across immutable early placement,
+late placement and local schedule consumers, following pinned ir_ctx.use_lists
+lifetime. Existing owning entry points remain; borrowed entry points require
+matching verified graph/version and preserve every prior prerequisite. No facts
+cross graph edits; pipeline owns/releases the index on success and errors.
+ASAN/debug placement, branch/error oracles, native loops/switch/module and linked
+AOT pass. Small preparation CPU repeats12.30%/12.38% stogir improvement; no full
+compiler gain inferred. See [use-index sharing](IMMUTABLE_USE_INDEX.md).
