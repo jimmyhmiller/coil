@@ -1191,14 +1191,16 @@ Pinned `ir_fold.h` DIV/MOD constant rules supply unsigned power-of-two
 SHR/AND restarts and the signed ZEXT case. Construction and incremental rewriting share a single proof that
 requires an exact numeric constant and a positive power of two in the
 operation's width. A signed value must be a genuine widening ZEXT of an
-integer source. Signed top-bit divisors, ordinary signed values, SEXT,
+integer source. Coil container adaptation additionally permits one same-width
+integer BITCAST around that ZEXT; the original operand reference is retained.
+Float/address views and SEXT never supply this signed nonnegative proof. Signed top-bit divisors, ordinary signed values, SEXT,
 zero/non-power divisors, named constants and unrelated types retain the
 ordinary operation. This does not introduce general predicate-range analysis.
 The existing expression restart detaches the now-unneeded DIV/MOD guard,
 updates exact uses and queues the expression and its users. References and
 observed/shared input and guard nodes remain intact.
 
-The existing incremental native test suite adds 560 width/conversion/divisor
+The existing incremental native test suite adds 896 width/conversion/divisor
 cases over both pointer widths, rebuilt-versus-incremental edge checks,
 structural validation and native before/after boundary answers. Dispatch is
 also checked through the complete incremental optimizer with observed roots.
