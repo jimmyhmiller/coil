@@ -27,3 +27,14 @@ kernel instructions. No full-bootstrap gain is inferred. Last full measurement
 was contended;5× generation/within10% runtime goal remains unmet.
 
 [Raw data](results/analysis-storage/integrated.json), [driver](results/analysis-storage/measure.py).
+
+## Integrated repeat
+
+Same fixed drivers, workload, context and sampling protocol as above. Verifier
+104.1720 → 97.4310 ms generation (6.47% reduction), CPU35.5640 → 35.5855 ms,
+103419-byte identical objects. LLVM O3 generation361.3815 ms, CPU10.1965 ms;
+TPDE1.5170 ms, CPU69.4910 ms. Selector generation0.3640 → 0.3440 ms,
+CPU5.9970 → 5.9745 ms; LLVM14.5180/6.1265 ms, TPDE0.0520/17.8170 ms.
+This repeats the small integrated generation gain, with no runtime change.
+[Repeat raw data](results/analysis-storage/integrated-repeat.json),
+[driver](results/analysis-storage/measure-repeat.py).
