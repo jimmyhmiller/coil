@@ -926,3 +926,20 @@ expression with widened arithmetic, not the rotate implementation. It checks
 dynamic counts, commuted OR/ADD, MUL-by-two, rejection cases and shared/rooted
 producers. Exact maintained use multisets match rebuilt lists; the existing
 iterative suite and these cases pass under ASAN.
+
+## Exact bounded graph-clone cost
+
+The independent call-expansion extension now budgets actual reserved instruction
+cells instead of stable-reference source length. NOPs, mapped START/PARAM cells
+and the consumed RETURN are not cloned. Preflight counts full variadic instruction
+extents, parameter casts, unique positive observation anchors for literal PARAMs,
+and both stack-scope cells. Existing signature, privacy, control-closure, stack,
+Never and zero-budget checks remain. A post-application invariant rejects any
+reservation exceeding the preflight budget instead of silently overspending.
+
+The native/ASAN module suite checks exact one-ADD multi-site totals, duplicate
+literal observations at one cell, an observed signedness cast at one cell, and
+source immutability. The scoped native loop checks exact measured reservation
+boundaries and one-cell-under rejection, including a source padded with1024 NOPs;
+its virtual-result read guard remains independently exercised with a large budget.
+No growth budget was raised and no benchmark-specific exception was introduced.
