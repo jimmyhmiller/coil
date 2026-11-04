@@ -1171,3 +1171,16 @@ integer typing, unary validation and native SCCP control suites pass. An added
 2420-case scalar/pointer/result-type matrix checks acceptance, counts and exact
 error priority. Fixed-emitter runtime comparisons preserve old and intermediate
 object hashes; performance acceptance and integrated generation remain separate.
+
+### Compact operand word reads
+
+Pinned `ir.h:ir_insn_op` reads a signed operand word directly from instruction
+storage. `graph.operand` now uses checked ArrayList.at for the addressed Node
+cell, then immediately reads its selected i32 word. Positive instruction
+membership and 1-based arity bounds are retained; continuation payload cells
+are storage, not instruction references. No borrow survives graph mutation.
+Node16 and every slot, high-bit signed payloads, zero/max arities, growth and
+invalid references/indices have ASAN/debug tests in the existing graph suite.
+Repeated fixed-emitter runtime measurements are in
+[operand-word-read](benchmarks/operand-word-read/README.md); they do not establish
+a full compiler gain.
