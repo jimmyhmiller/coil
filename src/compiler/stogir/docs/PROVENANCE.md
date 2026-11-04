@@ -1130,3 +1130,21 @@ eight while its ID is one: distinct initialized byte positions must not collapse
 into one SSA field. The old optimizer returned 97 instead of 41; the guarded
 classifier retains memory and preserves the correct result. Full ASAN/debug
 memory-promotion/forwarding and observation suites pass.
+
+### Dominating predicates in late IF cleanup
+
+Pinned `ir.c:ir_check_dominating_predicates_i` and
+`ir_sccp.c:ir_iter_optimize_condition` supply the exact-identity straight-control
+proof now used by `conditional.dominating-truth` and `iter-control.fold-if!`.
+A preceding matching IF projection or GUARD/GUARD_NOT establishes truth. START,
+MERGE and LOOP_BEGIN stop the walk. The upstream reference limit is preserved,
+including later-numbered predicates introduced by rewrites; a finite step bound
+also prevents an invalid control cycle from hanging this read-only query.
+Shared dynamic conditions use the existing constant-IF rewriting, queue and
+reachability machinery. No predicate value is globally replaced by a path fact.
+
+ASAN/debug native tests cover both branch projections, intervening counted
+memory effects, predicate/control observations, reference ordering, and a native
+post-merge counterexample. Guard truth and join/loop barriers have direct proof
+queries; this does not claim new native guard emission. The existing SCCP
+control suite also passes. Coil integration and performance remain pending.

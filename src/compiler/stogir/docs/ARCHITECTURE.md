@@ -181,3 +181,12 @@ and RETURN before liveness and constraints; the semantic graph stays unchanged.
 Caller-clobber reservations use the resulting live ranges, so a selected CALL
 with no virtual result does not leave x0/v0 unreserved. Native eligibility uses
 the same declared ABI and frame lifetime proof as explicit tail calls.
+
+### Exact dominating predicate proof
+
+Late IF cleanup now follows pinned `ir_check_dominating_predicates_i`: scan the
+straight control chain for the exact shared predicate, retaining projection and
+guard truth and stopping at joins/loop entries. This is a local path fact, never
+a global value substitution or general range analysis. Existing IF cleanup owns
+all edge/root/reachability changes. Native effect, observation, merge and
+reference-order checks pass under ASAN/debug; compiler performance is pending.
