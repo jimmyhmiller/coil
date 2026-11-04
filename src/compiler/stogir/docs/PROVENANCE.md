@@ -363,9 +363,11 @@ verification remain unchanged.
 
 `load-forward` follows pinned `ir.c:ir_find_aliasing_load_i` for control-chain
 load/store forwarding, same-width bit views and integer truncation. The Coil
-version conservatively stops at all calls, register writes, unknown effects and
-block starts rather than implementing upstream's pure-call and register-set
-exceptions. Query and address walks are bounded independently of graph size.
+version follows the unique predecessor through IF/SWITCH, their projections,
+END and plain BEGIN. MERGE, LOOP_BEGIN and annotated BEGIN remain barriers.
+It conservatively stops at all calls, register writes and unknown effects rather
+than implementing upstream's pure-call and register-set exceptions. Query and
+address walks are bounded independently of graph size.
 
 Contained extraction at a nonzero constant byte offset is an independent Coil
 extension, enabled only by an explicit little-endian target argument. Logical
