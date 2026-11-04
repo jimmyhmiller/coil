@@ -21,6 +21,7 @@ parser.add_argument('--never', action='store_true')
 parser.add_argument('--legacy', action='store_true')
 parser.add_argument('--workload', choices=['iterator', 'verify', 'loops', 'verify-transaction', 'tag-extract'], default='iterator')
 parser.add_argument('--before', type=Path, help='previous compiler candidate')
+parser.add_argument('--baseline', type=Path, help='additional earlier stogir candidate')
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--objdump', default='llvm-objdump')
 parser.add_argument('--samples', type=int, default=6)
@@ -42,6 +43,8 @@ E.update(COIL_LIBRARY_STATE='0', COIL_TPDE_SERIAL='1', COIL_CODEGEN_TIMINGS='1')
 cases = [('current-stogir', C, 'stogir'), ('llvm', C, 'llvm'), ('tpde', C, 'tpde')]
 if args.before:
     cases.insert(0, ('before-stogir', args.before.resolve(), 'stogir'))
+if args.baseline:
+    cases.insert(0, ('baseline-stogir', args.baseline.resolve(), 'stogir'))
 
 def run(args):
     p = subprocess.run([str(x) for x in args], cwd=S, env=E, capture_output=True, text=True)
