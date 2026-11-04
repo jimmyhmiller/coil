@@ -34,3 +34,15 @@ inputs. Source digests frozen. No concurrent heavy build/test/install job.
 Stogir CPU decreases9.4%. Current stogir remains4.50×LLVM runtime on this
 reduction. This is not compiler-bootstrap acceptance. Actual integrated generation
 impact remains to be measured. Exact [samples/hashes](results/node-borrow/runtime.json).
+
+
+## Integrated generation comparison
+
+Candidate2ac4ffbd versus saved45f4e200, same current library/fixture and opaque
+LLVM runner. Six rotating generation and eight CPU samples after warmup. Objects
+are byte-identical (SHA256
+`97bd39f4c288671e042876dba5b1070f6f9055a14de9bb6dbf8ae028c4d9a26c`).
+Generation112.9315→113.4460ms and runtime41.3880→41.3490ms show no meaningful
+integrated generation change. Current LLVM O3 generation340.3455ms/CPU9.2155ms;
+TPDE1.3645ms/73.9215ms. This is distinct from the9.4%runtime algorithm gain
+above. Exact [integrated samples](results/node-borrow/integrated-verifier.json).
