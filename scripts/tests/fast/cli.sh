@@ -1286,6 +1286,8 @@ EOF
         "$COIL" run "$ROOT/tests/cli/native-backends.coil" --backend "$backend" -O3 --no-debug
       expect_rc 42 "native graph-call results, loops and observations ($backend)" \
         "$COIL" run "$ROOT/tests/cli/stogir-register-results.coil" --backend "$backend" -O3 --no-debug
+      expect_rc 0 "bounded aggregate and wide-helper capture loops ($backend)" \
+        "$COIL" run "$ROOT/tests/cli/stogir-capture-loop.coil" --backend "$backend" -O3 --no-debug
       if "$COIL" emit-obj "$T/lib.coil" --backend "$backend" --no-debug -o "$T/native-$backend.o" > "$T/native-$backend.log" 2>&1 \
          && cc "$T/driver.c" "$T/native-$backend.o" -o "$T/native-$backend" 2>> "$T/native-$backend.log"; then
         expect_rc 0 "native exported aggregate C ABI ($backend)" "$T/native-$backend"
