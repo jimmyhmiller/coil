@@ -81,3 +81,25 @@ comparison isolates the resulting code change without claiming bootstrap parity.
 Entry promotion improves paired stogir runtime CPU by 15.1%; it remains 2.88×
 LLVM O3. This does not meet the runtime target. Exact repetitions, wall times,
 source hashes and objects: [entry-promotion-kernel.json](results/iterator-results-control/entry-promotion-kernel.json).
+
+The full scoped-promotion compiler check passes: the generated compiler's
+version/check/run smokes pass, and both hosts emit byte-identical LLVM and stogir
+objects. Mac load reached about80, so wall measurements are load-affected
+diagnostics, not acceptance. On the stogir rebuild, generated host process CPU
+was74.545313s versus30.334616s for the LLVM-built host (2.46×); the runtime goal
+is still unmet. Through LLVM it was56.750920s versus43.687750s. Exact raw values
+and hashes: [entry-promotion-compiler.json](results/iterator-results-control/entry-promotion-compiler.json).
+
+## Pinned rotate reconstruction, standalone5e2bb1d
+
+Complementary shifts now restart as ROL/ROR using the existing graph/use-list
+worklist machinery. OR accepts dynamic complementary counts and masked zero;
+ADD requires constant nonoverlapping contributions. MUL-by-two rotate-by-one is
+also covered. The ASAN native oracle checks77,760 original/optimized answers,
+plus exact maintained use-list multisets and existing iterative tests.
+
+Paired iterator runtime CPU improves32.0510→31.3615ms (2.2%). Generation medians
+are1.3705→1.3845ms. LLVM O3 runtime11.4720ms and TPDE59.1970ms; stogir remains
+2.73×LLVM. Assembly replaces LSL/LSR/ORR with a constant-count ROR sequence;
+the existing emitter still materializes a count register. This small gain is
+not bootstrap acceptance. Exact samples: [rotate-kernel.json](results/iterator-results-control/rotate-kernel.json).

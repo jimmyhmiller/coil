@@ -907,3 +907,22 @@ inner objects, copied/observed snapshots and explicit frees, plus the public O2/
 pipeline. These and the existing memory/forwarding suites pass under ASAN. This
 is a conservative subset of upstream promotion; arbitrary scoped object lifetime
 analysis and redundant empty-scope elimination remain unimplemented.
+
+## Complementary-shift rotate restarts
+
+Pinned `ir_fold.h` OR/ADD(SHL,SHR), commuted operands, dynamic complementary
+OR counts, and MUL-by-two/SHR rotate-by-one rules now feed the existing iterative
+restart path. The matcher reads only original immutable graph structure; SCCP
+queues matching Bottom expressions for later iterative cleanup. Rewrites update
+the existing graph, use lists and affected worklist through rewrite-expression!.
+Address/Boolean and mismatched-width/source families remain conservative.
+
+OR permits masked zero counts. ADD is accepted only for constant counts strictly
+inside the width, proving disjoint contributions; dynamic ADD and endpoint sums
+retain their original expression. No conclusion about upstream correctness is
+made without an execution reproduction. The native oracle evaluates the original
+expression with widened arithmetic, not the rotate implementation. It checks
+77,760 results across eight signed/unsigned widths, boundary/out-of-range and
+dynamic counts, commuted OR/ADD, MUL-by-two, rejection cases and shared/rooted
+producers. Exact maintained use multisets match rebuilt lists; the existing
+iterative suite and these cases pass under ASAN.
