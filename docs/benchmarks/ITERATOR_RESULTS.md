@@ -58,3 +58,26 @@ either acceptance target and is not a performance delivery.
 | stogir-host | llvm | 35.403238 | 62.259477 | 58.713059 |
 
 Exact values, object sizes and SHA-256 hashes: [compiler.json](results/iterator-results-control/compiler.json).
+
+## Scoped entry promotion, standalone b7eca18
+
+Original constant entry-prefix objects can now be promoted across opaque stack
+scopes; inner objects and saved-pointer observations/copies/frees stay conservative.
+Native and ASAN tests cover those boundaries and public O2/O3 emission.
+
+Four rotating generation and six runtime samples with the identical caller give
+the following CPU medians. The before compiler is the saved control-observation
+candidate, predating the template budget-accounting repair; its iterator object
+is byte-identical to the earlier cached prototype (f47e451e...), so this kernel
+comparison isolates the resulting code change without claiming bootstrap parity.
+
+| Backend | Generation ms | Runtime CPU ms |
+|---|---:|---:|
+| before-stogir | 1.3220 | 37.6090 |
+| current-stogir | 1.3955 | 31.9145 |
+| llvm | 17.8165 | 11.0695 |
+| tpde | 0.0765 | 59.4230 |
+
+Entry promotion improves paired stogir runtime CPU by 15.1%; it remains 2.88×
+LLVM O3. This does not meet the runtime target. Exact repetitions, wall times,
+source hashes and objects: [entry-promotion-kernel.json](results/iterator-results-control/entry-promotion-kernel.json).
