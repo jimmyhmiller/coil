@@ -68,3 +68,23 @@ Generation advantage2.13× is below5×. Generated compiler CPU on stogir emissio
 is2.87×LLVM host, outside the10%runtime target. Borrowing alone does not establish
 a generation win. The LLVM library dominates LLVM-target backend spans and is
 not evidence of native-code quality parity. Exact [full report](results/node-borrow/compiler.json).
+
+
+## Separate backend profile
+
+After the timed run, an excluded LLVM-host emit profile starts8seconds after
+launch and samples5seconds at1ms intervals; the compile completes successfully.
+In this interval the worker is largely in module call expansion. Main-thread
+`__ulock_wait`3870samples are a worker join, not optimizer CPU. Worker leafs:
+operation verification617, structural verification513, use-list building346,
+floating classification144, Phi verification131. Call eligibility and allocation
+pressure each have25leaf samples, so neither is the main target in this interval.
+
+Call expansion has1350inclusive samples,867inside callee `rewrite.validate`.
+The source validates each Site's full immutable target graph independently,
+including duplicates. Next investigate transaction-local deduplication of exact
+validation read views, preserving all per-site root/capture/eligibility checks.
+No such cache is implemented here. [Profile excerpt](results/node-borrow/codegen-profile-excerpt.txt)
+includes the full artifact hash; local raw profile and reproduction controller
+are `build/compiler-node-borrow-profile/sample.txt` and
+`/tmp/stogir-node-borrow-codegen-profile.py`.
