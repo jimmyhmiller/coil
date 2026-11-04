@@ -1229,3 +1229,22 @@ accessor; every input reference retains checked membership. This scoped reuse
 does not introduce a new unchecked graph API. The same raw-storage predicate
 matrix passes. Repeated fixed-emitter CPU measurements and their limits are in
 [classification reads](benchmarks/classification-reads/README.md).
+
+### Switch control in module call expansion
+
+The independent bounded module inliner now admits the existing upstream-shaped
+SWITCH, CASE_VAL, CASE_RANGE and CASE_DEFAULT nodes after complete typed-dispatch
+preflight. Its existing two-phase graph clone remaps case/control references and
+numeric constants, retains Phi predecessor/value insertion order, and preserves
+all observed terminal roots. No switch is lowered or rescheduled during inlining.
+A provider that omits a non-returning default still retains CALL. Budget and
+Never rules are unchanged; this is not a new upstream inlining pass.
+
+The existing module execution suite adds 32 dense/range, signed/unsigned-width
+and returning/trapped-default graphs, with zero-budget fallback, malformed-case
+rejection, native before/after answers and observable stores. Dense cloned
+callers must retain jump-table data. Child processes check actual trap defaults.
+ASAN/debug module and switch-validator suites pass; the existing linked module
+driver checks the serialized inlined Mach-O image. The module test's libc signal
+declaration was corrected to pointer types to agree with the debug runtime.
+See [switch inlining](INLINE_SWITCH_CONTROL.md) for reproducible validation.
