@@ -122,3 +122,24 @@ as prominent backend leaves. A next candidate is sharing structural validation
 between integer and Phi checks on the same immutable graph, preserving every
 check and all public API diagnostics. No verification optimization is included
 in this checkpoint.
+
+## Delivery checkpoint
+
+FAST passes49/49 (330.1s wall; time warning under external load, cli/objects peak
+1.61GB against the1.5GB reporting line). The rotate-enabled backend emits the full
+compiler; the linked generated compiler passes version/check/compile-run smokes.
+The earlier scoped-promotion same-source run proves host object identity for both
+targets; that full identity comparison has not been repeated after the rotate port.
+
+The LLVM-built candidate with the updated backend is installed globally with its
+matching426 compiler/stdlib files and149 stogir modules. JIT and lint units are
+warmed. Candidate and installed toolchain stamps match; build provenance reports
+`d7412eb27f94, dirty`, whose compiled source content includes the rotate changes
+committed in cdf6f1bd (later benchmark/report commits do not change that content).
+Installed off-checkout register-result and million-iteration capture/wide-helper
+checks pass on LLVM, TPDE and stogir.
+
+This is correctness/optimizer progress, not performance acceptance. The5×
+generation and≤1.10×runtime goal remains active. Checked verification now isolates
+an actual compiler-code gap; accurate clone-cost accounting and prepared-template
+profitability/phase reuse require further evidence before implementation.
