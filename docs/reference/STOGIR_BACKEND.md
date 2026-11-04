@@ -270,3 +270,25 @@ behavior. A native in-bounds reduction initialized bytes 1 and 8, then resolved
 a symbolic offset to 8 while its ID was 1: the old optimizer incorrectly returned
 97 for byte 1 instead of 41. The classifier now retains memory and returns 41.
 The complete standalone memory promotion/forwarding suite passes under ASAN/debug.
+
+### Typed constructor words and small aggregate merges
+
+The shared native lowering can construct bounded fresh sum values with scalar
+integer/pointer fields as complete little-endian words. It packs each declared
+field's storage bytes, masks sign extension, and handles word boundaries. Only
+representation padding and inactive variant bytes receive zero; every active
+field still comes from its checked constructor argument, evaluated in order.
+This constructs an entire fresh value, never widens a store into an existing
+object. Unsupported aggregate/floating/vector fields retain typed construction.
+The existing native inline-copy bound also bounds constructor packing.
+
+Small aggregate if/match results snapshot each live branch into one static
+private destination, rather than merging branch-object addresses. CIR's static
+allocas dominate reachable bodies; the adapter keeps them in the entry prefix.
+Scalar/reference-valued and large aggregate merges retain their existing paths.
+Frame-escape policy remains conservative. These are Coil value-lowering choices,
+independent of upstream stogir's compact graph and exact-field SSA pass.
+
+The sums corpus adds signed/unsigned mixed-width field and argument-snapshot
+checks. Existing large, aggregate and floating payload cases cover fallback.
+Performance and full native validation are pending for this checkpoint.

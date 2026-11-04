@@ -2476,12 +2476,14 @@
 
 ; ---- control flow ----
 
-;; A merge variable for branch results: scalars by value, places by address.
-(defstruct Merge [(var u32) (kind i64) (ty Type) (has bool)])
+;; Scalars merge in SSA. Small aggregate values snapshot into one private
+;; destination; larger aggregates retain their address merge.
+(defstruct Merge [(var u32) (storage u32) (kind i64) (ty Type) (has bool)])
 
 (defn merge-new [] (-> Merge)
   (Merge
     :var (none32)
+    :storage (none32)
     :kind 2
     :ty (TVoid)
     :has false))
@@ -2493,14 +2495,19 @@
       (set! (.kind m) (if (= (.kind tv) 3) 0 (.kind tv)))
       (set! (.ty m) (.ty tv))
       (let [(mut t) (.ty tv)]
-        (set! (.var m)
-              (cir/new-var! (.f tl)
-                            (if (= (.kind m) 1) cir/T-I64 (tl-cty (mut t)))))))
+        (if (and (= (.kind m) 1) (<= (tsize tl (mut t)) isel/INLINE-COPY-MAX))
+            (set! (.storage m) (new-slot tl (mut t)))
+            (set! (.var m)
+                  (cir/new-var! (.f tl)
+                                (if (= (.kind m) 1) cir/T-I64 (tl-cty (mut t))))))))
     (open! tl)
     (if (= (.kind m) 1)
         (do
           (set! (.frame-escapes (.f tl)) true)
-          (cir/def-var! (.f tl) (.var m) (place tl tv)))
+          (if (!= (.storage m) (none32))
+              (let [(mut t) (.ty m)]
+                (memcpy tl (.storage m) (place tl tv) (tsize tl (mut t))))
+              (cir/def-var! (.f tl) (.var m) (place tl tv))))
         (cir/def-var! (.f tl)
                       (.var m)
                       (coerce-scalar tl (scalar tl tv) (.ty tv) (.ty m)))))
@@ -2511,7 +2518,10 @@
       (tv-s (iconst tl 0) (i64t))
       (TV
         :kind (.kind m)
-        :v (cir/use-var! (.f tl) (.var m))
+        :v
+          (if (!= (.storage m) (none32))
+              (.storage m)
+              (cir/use-var! (.f tl) (.var m)))
         :ty (.ty m))))
 
 (defn tl-if [(tl (ptr Tl))
@@ -2651,6 +2661,77 @@
 
 ; ---- sums ----
 
+;;; Only bounded fresh sum construction is packed. Every active field must
+;;; have an integer/pointer container; other layouts keep typed construction.
+;;; This never changes the access width of a store into an existing object.
+(defn packed-sum? [(tl (ptr Tl)) (fields (ptr (ArrayList Field))) (size i64)]
+  (-> bool)
+  (let [(mut eligible) (and (> size 0) (<= size isel/INLINE-COPY-MAX))]
+    (for field (load fields)
+      (let [(mut t) (.ty field)
+            bytes (tsize tl (mut t))]
+        (unless (and (= (tl-cty (mut t)) cir/T-I64) (> bytes 0) (<= bytes 8))
+          (set! eligible false))))
+    eligible))
+
+;;; Serialize all bytes of one declared field into its fresh value's words.
+;;; Masks prevent sign extension from overwriting neighboring fields; splitting
+;;; at word boundaries also handles layouts without word-aligned fields.
+(defn pack-sum-field! [(tl (ptr Tl))
+                       (words (mut (ArrayList u32)))
+                       (offset i64)
+                       (bytes i64)
+                       (value u32)] (-> void)
+  (let [(mut consumed) 0
+        zero (iconst tl 0)]
+    (while (< consumed bytes)
+      (let [at (+ offset consumed)
+            index (/ at 8)
+            lane (% at 8)
+            count
+              (if (< (- bytes consumed) (- 8 lane))
+                  (- bytes consumed)
+                  (- 8 lane))
+            raw
+              (if (= consumed 0)
+                  value
+                  (op2 tl
+                       cir/OP-LSHR
+                       cir/T-I64
+                       value
+                       (iconst tl (* consumed 8))
+                       0
+                       0))
+            masked
+              (if (= count 8)
+                  raw
+                  (op2 tl
+                       cir/OP-AND
+                       cir/T-I64
+                       raw
+                       (iconst tl
+                               (cast i64
+                                     (- (<< (: 1 u64) (cast u64 (* count 8))) 1)))
+                       0
+                       0))
+            shifted
+              (if (= lane 0)
+                  masked
+                  (op2 tl
+                       cir/OP-SHL
+                       cir/T-I64
+                       masked
+                       (iconst tl (* lane 8))
+                       0
+                       0))
+            prior (get words index)]
+        (set! (mut words)
+              index
+              (if (= prior zero)
+                  shifted
+                  (op2 tl cir/OP-OR cir/T-I64 prior shifted 0 0)))
+        (set! consumed (+ consumed count))))))
+
 (defn tl-construct [(tl (ptr Tl))
                     (sum (slice u8))
                     (variant (slice u8))
@@ -2663,11 +2744,33 @@
           s (new-slot tl (mut sumty))
           vs (load (field (sum-at (field g layouts) su) variants))
           vfields (load (field (al-at [Variant] vs vidx) fields))]
-      (store-n tl s 0 (iconst tl vidx) 4)
-      (for i (range 0 (len (load args)))
-        (let [tv (tl-expr tl (elem args i))
-              off (g-natural-off g vfields i)]
-          (store-tv tl s (+ 8 off) tv)))
+      (let [size (tsize tl (mut sumty))]
+        (if (packed-sum? tl vfields size)
+            (let [(mut words) (ArrayList::new [u32] (.a tl))]
+              ; Zero only representation padding/inactive variant bytes. Active
+              ; fields are always supplied by the checked constructor arguments.
+              (for [i 0 (/ (+ size 7) 8)] (push! (mut words) (iconst tl 0)))
+              (pack-sum-field! tl (mut words) 0 4 (iconst tl vidx))
+              (for i (range 0 (len (load args)))
+                (let [tv (tl-expr tl (elem args i))
+                      off (g-natural-off g vfields i)
+                      (mut t) (.ty (al-at [Field] vfields i))]
+                  (pack-sum-field! tl
+                                   (mut words)
+                                   (+ 8 off)
+                                   (tsize tl (mut t))
+                                   (scalar tl tv))))
+              (for [i 0 (len words)]
+                (let [offset (* i 8)
+                      count (if (< (- size offset) 8) (- size offset) 8)]
+                  (store-bytes tl s offset (get words i) count)))
+              (free! (mut words)))
+            (do
+              (store-n tl s 0 (iconst tl vidx) 4)
+              (for i (range 0 (len (load args)))
+                (let [tv (tl-expr tl (elem args i))
+                      off (g-natural-off g vfields i)]
+                  (store-tv tl s (+ 8 off) tv))))))
       (tv-p s (TStruct sum)))))
 
 (defn tl-match [(tl (ptr Tl)) (scrut (ptr Expr)) (arms (ptr (ArrayList Arm)))]
