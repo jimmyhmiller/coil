@@ -3,9 +3,13 @@
 ;;; the semantic representation. See NOTICE and docs/PROVENANCE.md.
 (module stogir.call-inline)
 
-(export Callee Site SiteProof inspect-verified-site optimize optimize-sites optimize-sites-if-changed Registry RegisteredSite registry-create registry-release! register! prioritize-registered-sites optimize-registered-if-changed)
+(export Callee Site SiteProof inspect-verified-site optimize optimize-sites optimize-sites-if-changed Registry RegisteredSite registry-create registry-release! register! prioritize-registered-sites optimize-registered-prioritized-if-changed optimize-registered-if-changed)
 
 (import "stogir.graph" :as g)
+(import "stogir.cfg" :as cfg)
+(import "stogir.adjacency" :as adj)
+(import "stogir.dominators" :as dom)
+(import "stogir.loops" :as loops)
 (import "stogir.node" :as n)
 (import "stogir.opcode" :as op)
 (import "stogir.types" :as types)
@@ -1069,11 +1073,13 @@
 ;;; Explicit optional policy; the ordered optimization APIs retain their input
 ;;; order. Cost is cached per owned immutable registry snapshot, not rescanned
 ;;; per comparison/site. Original ordinals make ties deterministic and stable.
-(defstruct RankedSite [(site RegisteredSite) (cost i64) (ordinal i64)])
+(defstruct RankedSite [(cost i64) (ordinal i64) (depth i32)])
 
 (defn rank-before? [(left RankedSite) (right RankedSite)] (-> bool)
-  (or (< (.cost left) (.cost right))
-      (and (= (.cost left) (.cost right)) (< (.ordinal left) (.ordinal right)))))
+  (or (> (.depth left) (.depth right))
+      (and (= (.depth left) (.depth right))
+           (or (< (.cost left) (.cost right))
+               (and (= (.cost left) (.cost right)) (< (.ordinal left) (.ordinal right)))))))
 
 (defn rank-sift! [(values (mut (ArrayList RankedSite))) (start i64) (limit i64)] (-> void)
   (let [(mut root) start (mut active) true]
@@ -1104,9 +1110,8 @@
             (if (or (<= handle 0) (> handle (len (.callees state))))
                 (set! error "invalid inline registry handle")
                 (push! (mut ranked)
-                       (RankedSite :site site
-                                   :cost (.base-cells (get (.callees state) (- handle 1)))
-                                   :ordinal i)))))
+                       (RankedSite :cost (.base-cells (get (.callees state) (- handle 1)))
+                                   :ordinal i :depth 0)))))
         (if (!= error "")
             (do (free! (mut ranked)) (free! (mut result)) (Err error))
             (do
@@ -1122,30 +1127,32 @@
                     (set! (mut ranked) limit value))
                   (rank-sift! (mut ranked) 0 limit)))
               (reserve! (mut result) (len ranked))
-              (for value ranked (push! (mut result) (.site value)))
+              (for value ranked (push! (mut result) (get sites (.ordinal value))))
               (free! (mut ranked))
               (Ok result))))))
 
 ;;; Handles are one-based and local to this registry. Resolution supplies only
 ;;; borrowed immutable definitions, whose successful validation belongs to the
 ;;; registry's owned snapshot for its entire lifetime.
-(defn optimize-registered-if-changed [(registry Registry)
+(defn optimize-registered-core [(registry Registry)
                                       (source g/Graph)
                                       (roots (slice i32))
                                       (sites (slice RegisteredSite))
-                                      (budget i32)
+                                      (budget i32) (entry i32)
                                       (a (dyn Allocator))]
   (-> (Result (Option rewrite/Rewritten) (slice u8)))
   (if (= (p/cast u64 (.state registry)) 0)
       (Err "inline registry is released")
       (let [state (p/cast (ptr RegistryState) (.state registry))
             (mut resolved) (ArrayList::new [Site] a)
+            (mut costs) (ArrayList::new [i64] a)
             (mut error) ""]
         (for site sites
           (let [handle (.callee site)]
             (if (or (<= handle 0) (> handle (len (.callees state))))
                 (set! error "invalid registered inline callee")
                 (let [target (get (.callees state) (- handle 1))]
+                  (when (> entry 0) (push! (mut costs) (.base-cells target)))
                   (push! (mut resolved)
                          (Site
                            :reference (.reference site)
@@ -1165,10 +1172,25 @@
                                          (slice resolved)
                                          (.pointer-bytes state)
                                          budget
-                                         true
+                                         true (slice costs) entry
                                          a))]
-          (free! (mut resolved))
+          (free! (mut resolved)) (free! (mut costs))
           result))))
+
+(defn optimize-registered-if-changed [(registry Registry) (source g/Graph)
+                                      (roots (slice i32)) (sites (slice RegisteredSite))
+                                      (budget i32) (a (dyn Allocator))]
+  (-> (Result (Option rewrite/Rewritten) (slice u8)))
+  (optimize-registered-core registry source roots sites budget 0 a))
+
+;;; Optional natural-loop-first policy under estimated budget pressure. The
+;;; ordered API remains unchanged. Source validation precedes every analysis.
+(defn optimize-registered-prioritized-if-changed [(registry Registry) (source g/Graph)
+                (entry i32) (roots (slice i32)) (sites (slice RegisteredSite))
+                (budget i32) (a (dyn Allocator))]
+  (-> (Result (Option rewrite/Rewritten) (slice u8)))
+  (if (<= entry 0) (Err "invalid priority entry")
+      (optimize-registered-core registry source roots sites budget entry a)))
 
 ;;; All storage consulted by rewrite.validate: instructions/arities, constants/
 ;;; spans, binary string bytes/entries, and function prototype metadata. Interner
@@ -1216,15 +1238,55 @@
 ;;; START/RETURN and NOP cells do not consume caller instruction space. Casts,
 ;;; literal-PARAM observation anchors and scoped stack boundaries do. Definitions
 ;;; are borrowed and immutable throughout; all structural analyses are rebuilt.
+(defn prioritized-order [(source g/Graph) (entry i32) (sites (slice Site))
+                         (costs (slice i64)) (budget i32) (a (dyn Allocator))]
+  (-> (Result (ArrayList i64) (slice u8)))
+  (let [(mut order) (ArrayList::new [i64] a) (mut total) 0]
+    (for [i 0 (len sites)]
+      (unless (.never (.target (get sites i))) (set! total (+ total (get costs i)))))
+    (if (or (<= (len sites) 1) (<= budget 0) (<= total (cast i64 budget)))
+        (Ok order)
+        (match (cfg/build source a)
+          (Err [message] (Err message))
+          (Ok [owned]
+              (let [(mut blocks) owned
+                    (mut pred) (adj/build blocks true a)
+                    (mut succ) (adj/build blocks false a)
+                    (mut rpo) (adj/reverse-postorder blocks succ entry a)
+                    (mut idom) (dom/build blocks pred rpo a)
+                    (mut depth) (loops/depths blocks pred idom a)
+                    (mut ranked) (ArrayList::new [RankedSite] a)]
+                (reserve! (mut ranked) (len sites))
+                (for [i 0 (len sites)]
+                  (let [reference (.reference (get sites i))
+                        block (get (.membership blocks) (cast i64 reference))]
+                    (push! (mut ranked) (RankedSite :cost (get costs i) :ordinal i
+                      :depth (if (> block 0) (get depth (cast i64 block)) 0)))))
+                (let [(mut start) (/ (len ranked) 2)]
+                  (while (> start 0)
+                    (set! start (- start 1)) (rank-sift! (mut ranked) start (len ranked))))
+                (let [(mut limit) (len ranked)]
+                  (while (> limit 1)
+                    (set! limit (- limit 1))
+                    (let [value (get ranked 0)]
+                      (set! (mut ranked) 0 (get ranked limit))
+                      (set! (mut ranked) limit value))
+                    (rank-sift! (mut ranked) 0 limit)))
+                (for value ranked (push! (mut order) (.ordinal value)))
+                (free! (mut ranked)) (free! (mut depth)) (free! (mut idom)) (free! (mut rpo))
+                (adj/release! (mut pred)) (adj/release! (mut succ)) (cfg/release! (mut blocks))
+                (Ok order)))))))
+
 (defn optimize-sites-core [(source g/Graph)
                                  (roots (slice i32))
                                  (sites (slice Site))
                                  (pointer-bytes i32)
                                  (budget i32)
-                                 (registered bool)
+                                 (registered bool) (costs (slice i64)) (entry i32)
                                  (a (dyn Allocator))]
   (-> (Result (Option rewrite/Rewritten) (slice u8)))
   (let [(mut error) ""
+        (mut order) (ArrayList::new [i64] a)
         (mut seen) (zeros (len (.instructions source)) a)
         (mut validated) (ArrayList::new [u64] a)
         (mut view) [(: 0 u64) 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
@@ -1283,8 +1345,17 @@
     (free! (mut seen))
     (free! (mut validated))
     (free! (mut validation-heads))
+    (when (and (= error "") (> entry 0))
+      (if (!= (len costs) (len sites)) (set! error "invalid priority cost count")
+          (match (g/lookup source entry)
+            (None [] (set! error "invalid priority entry"))
+            (Some [node]
+                  (if (!= (n/opcode node) 104) (set! error "invalid priority entry")
+                      (match (prioritized-order source entry sites costs budget a)
+                        (Err [message] (set! error message))
+                        (Ok [ranked] (set! order ranked))))))))
     (if (!= error "")
-        (Err error)
+        (do (free! (mut order)) (Err error))
         (let [(mut graph) source
               (mut owned) false
               (mut observed) (ArrayList::new [i32] a)
@@ -1293,8 +1364,9 @@
               (mut remaining) budget
               (mut capture-edges) (: (None) (Option uses/Uses))]
           (for root roots (push! (mut observed) root))
-          (for site sites
-            (let [target (.target site)
+          (for [i 0 (len sites)]
+            (let [site (get sites (if (= (len order) 0) i (get order i)))
+                  target (.target site)
                   reference (.reference site)]
               (when (and (= error "")
                          (eligible? graph reference target remaining a))
@@ -1338,6 +1410,7 @@
                                   (set! error
                                         "inline cloning exceeded preflight budget")
                                   (set! remaining (- remaining added))))))))))))
+          (free! (mut order))
           (match capture-edges
             (None [] 0)
             (Some [edges]
@@ -1370,7 +1443,7 @@
                                  (sites (slice Site)) (pointer-bytes i32)
                                  (budget i32) (a (dyn Allocator))]
   (-> (Result (Option rewrite/Rewritten) (slice u8)))
-  (optimize-sites-core source roots sites pointer-bytes budget false a))
+  (optimize-sites-core source roots sites pointer-bytes budget false [] 0 a))
 
 ;;; Compatibility API always returns an independent owned graph, including
 ;;; no-change cases. Borrowing callers can use the conditional transaction above.

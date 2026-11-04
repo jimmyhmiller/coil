@@ -1310,3 +1310,11 @@ caller-specific and total growth checks remain unchanged. Existing ordered APIs
 keep their behavior. ASAN/debug ordering/ownership/error/native dependency/store
 and exact-budget tests pass, as does linked module AOT. No compiler performance
 claim yet; see [site priority](INLINE_SITE_PRIORITY.md).
+
+Loop-aware optional module policy reuses the existing CFG/dominator/natural-loop
+analyses after ordinary input validation, only under estimated clone pressure.
+Higher natural-loop depth precedes base cost and stable ordinal; no budget or
+legality gate changes. A native exact-one-cell case contrasts ordered cold-call
+selection with loop-call selection at equal results. Existing registry/capture/
+ABI/mutation/order and AOT checks pass. The naive cost-only compiler policy was
+not accepted after a use-builder regression; revised performance remains pending.

@@ -29,3 +29,26 @@ Linked Mach-O module/switch AOT consumer also passes.
 No compiler integration or speedup is established yet. Next opt in from the Coil
 adapter and measure reduced workloads with the same512-cell limit. Cost-first is
 a heuristic, not an assertion of optimal profitability or upstream inliner parity.
+
+The first Coil cost-only experiment improved verifier runtime but regressed the
+shared-use reduction around20%: it left graph.operand called inside the loop.
+It is not an accepted compiler policy. A split-use probe also accidentally used
+the SDK namespace because the driver ran from Coil's project; those identical
+objects do not establish any split-walk comparison.
+
+`optimize-registered-prioritized-if-changed` now offers a caller-aware policy.
+It validates source/sites through the normal transaction before consulting CFG
+facts. If non-Never base clone estimates fit the budget, or the budget is zero,
+it retains input order and builds no loop analysis. Under estimated pressure it
+uses the existing CFG/adjacency/dominator/natural-loop implementations, ranking
+higher loop depth first, then smaller base cost, then original ordinal. Unknown
+irreducible-loop frequency is not fabricated. Exact eligibility and charged
+casts/scope/anchors/total growth remain unchanged. Existing APIs remain ordered.
+
+A native loop test proves the policy spends a one-cell budget on the loop call,
+while the ordered API spends it on the earlier cold call. Both compiled images
+produce the same answers across opaque inputs, with exact one-cell growth.
+Zero budget, invalid entry and released handles are checked. All existing
+registered transactions also run the new single-site API and compare against
+ordinary checked expansion. Full ASAN/debug module and linked AOT suites pass.
+No accepted compiler performance claim for the revised policy yet.
