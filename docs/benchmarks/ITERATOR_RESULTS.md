@@ -39,3 +39,22 @@ emitting the whole compiler. Diagnostic tracing identified a rooted COPY whose
 source CALL had unreachable control. The fix emits the wrapper successfully;
 the existing register-result and capture-loop runtime checks pass. Full compiler
 and delivery gates remain in progress; no new bootstrap ratio is claimed here.
+
+## Full compiler diagnostic, source 8e60aeec
+
+Same compiler source, serial code generation, caches disabled. Each row is one
+diagnostic sample; external activity was possible. Both generated compiler hosts
+produce byte-identical stogir and LLVM objects. Generation is **2.05×** faster
+than LLVM O3; generated compiler CPU through stogir is **3.12×** slower than the
+LLVM-built host. Broad expansion regresses the bootstrap. This does not meet
+either acceptance target and is not a performance delivery.
+
+| Host | Target | Generation s | Whole emit s | Process CPU s |
+|---|---|---:|---:|---:|
+| llvm-host-before | stogir | 11.076210 | 21.425309 | 19.450522 |
+| llvm-host | stogir | 17.680901 | 26.739329 | 26.022482 |
+| llvm-host | llvm | 36.237838 | 43.846811 | 43.215804 |
+| stogir-host | stogir | 61.340795 | 87.955598 | 81.196321 |
+| stogir-host | llvm | 35.403238 | 62.259477 | 58.713059 |
+
+Exact values, object sizes and SHA-256 hashes: [compiler.json](results/iterator-results-control/compiler.json).
