@@ -111,3 +111,15 @@ dynamic predecessors, protected identities, and branch-local loads. The load
 cases pass null on the other path, checking that no access is speculated. The
 existing iterative suite passes ASAN/debug checks across 10,560 graphs and
 253,440 native answers, with independent exact-use-list comparisons.
+
+
+### Immediate integer rotates
+
+Persistent scalar selection follows pinned AArch64 `IR_SHIFT_CONST` for
+32/64-bit ROL/ROR. Counts are normalized by the language width; ROL uses the
+opposite right-rotate count. The tile has no count operand, so liveness and
+allocation do not materialize a constant register. Emission uses the checked
+EXTR/ROR-immediate encoder. Narrow and dynamic rotates retain their existing
+width-specific paths. Encoder words match llvm-mc; the existing native shift
+suite covers signed/unsigned widths, zero/wrapped/large counts and bit patterns,
+and division/variable-rotate regressions pass ASAN/debug checks.
