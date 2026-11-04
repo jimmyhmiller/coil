@@ -1148,3 +1148,26 @@ memory effects, predicate/control observations, reference ordering, and a native
 post-merge counterexample. Guard truth and join/loop barriers have direct proof
 queries; this does not claim new native guard emission. The existing SCCP
 control suite also passes. Coil integration and performance remain pending.
+
+### Checked structure-verifier cell reads
+
+The structure verifier consumes an existing checked `graph.borrow-node` only
+while inspecting an immutable operand. It reads the opcode immediately and
+reuses that same membership result within the operand's validation iteration.
+This follows the existing upstream-style borrowed-cell contract, preserves
+optional zero links and diagnostic ordering, and does not weaken membership or
+retain a pointer across graph changes. Guard/type/dominance validators remain
+separate and unchanged. ASAN verifier and graph suites pass; added cases cover
+positive/negative references, absence, extrema, continuation cells, local storage,
+void RETURN and competing malformed operands. Runtime-only measurement uses a
+fixed emitter and a checksum-verified retained before object; integrated compiler
+generation and delivery are not yet established.
+
+The integer verifier's left/right operand checks likewise consume checked cell
+borrows immediately and retain only type bytes. The validator's sequence of
+operand/result/right-type checks and diagnostic precedence is unchanged,
+including ADD/SUB pointer offsets and both target widths. ASAN verify, graph,
+integer typing, unary validation and native SCCP control suites pass. An added
+2420-case scalar/pointer/result-type matrix checks acceptance, counts and exact
+error priority. Fixed-emitter runtime comparisons preserve old and intermediate
+object hashes; performance acceptance and integrated generation remain separate.
