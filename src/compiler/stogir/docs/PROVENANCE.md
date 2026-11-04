@@ -1019,3 +1019,20 @@ validation. SCCP analysis and rewrite preserve their prior check and diagnostic
 order, including whether constants precede operations; no proof is cached across
 mutation or exposed as a caller-supplied flag. This is independent Coil pipeline
 orchestration over the existing validation rules, not upstream pass parity.
+
+
+### Power-of-two scalar division target rules
+
+Persistent unsigned/signed DIV and MOD rules follow pinned
+`ir_aarch64.dasc` DIV_PWR2/SDIV_PWR2/MOD_PWR2/SMOD_PWR2 selection. Zero and
+non-power denominators, and signed negative top-bit constants, keep general
+division/remainder. Unsigned division uses LSR and remainder uses an AND mask.
+Signed operations use a sign-derived low-bit bias, ADD and ASR or mask/SUB,
+preserving truncation toward zero. This independent emission form permits
+result/input register reuse while using the existing reserved x16/x17 contract;
+it differs from upstream's compare/select quotient and negate/select remainder
+sequences. Narrow input normalization and final canonicalization are unchanged.
+No graph validation or divide control guard is removed. All exponent/width cases
+are checked against an independent i128 oracle, including exhaustive8-bit inputs,
+negative dividends, signed-minimum-divisor fallback, still-live dividends and
+forced physical aliases involving both reserved registers.
