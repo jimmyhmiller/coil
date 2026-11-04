@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare checked conditional iterator returns using an identical opaque caller.
+"""Compare checked compiler kernels using an identical opaque caller.
 
 Compilers must be candidates in their checkout's build/bin directory, so the
 source identity check can verify that all kernels see the same standard library.
@@ -18,12 +18,15 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--compiler', type=Path, required=True)
 parser.add_argument('--library', type=Path, required=True, help='coil-stogir checkout')
 parser.add_argument('--never', action='store_true')
+parser.add_argument('--workload', choices=['iterator', 'verify'], default='iterator')
 parser.add_argument('--before', type=Path, help='previous compiler candidate')
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--objdump', default='llvm-objdump')
 parser.add_argument('--samples', type=int, default=6)
 parser.add_argument('--compile-samples', type=int, default=4)
 args = parser.parse_args()
+if args.workload == 'verify' and args.never:
+    parser.error('--never applies only to the iterator workload')
 if args.samples < 2 or args.compile_samples < 2:
     parser.error('--samples and --compile-samples must be at least 2')
 C = args.compiler.resolve()
@@ -41,8 +44,9 @@ def run(args):
     p = subprocess.run([str(x) for x in args], cwd=S, env=E, capture_output=True, text=True)
     assert p.returncode == 0, (args, p.returncode, p.stdout[-1000:], p.stderr[-2000:])
     return p
-fixture = S / 'benchmarks/compiler-gaps/iterator-return.coil'
-runner = S / 'benchmarks/compiler-gaps/iterator-return-runner.coil'
+prefix = 'iterator-return' if args.workload == 'iterator' else 'verify-graph'
+fixture = S / ('benchmarks/compiler-gaps/' + prefix + '.coil')
+runner = S / ('benchmarks/compiler-gaps/' + prefix + '-runner.coil')
 fixture_bytes = fixture.read_bytes()
 runner_bytes = runner.read_bytes()
 for _, c, _ in cases:
@@ -93,6 +97,6 @@ for row in rows:
     row['cpu_median_s'] = statistics.median(row['cpu_samples_s'])
 assert fixture.read_bytes() == fixture_bytes
 assert runner.read_bytes() == runner_bytes
-report = {'runner_source_sha256': hashlib.sha256(runner_bytes).hexdigest(), 'compilers': {n: str(c) for n, c, _ in cases}, 'samples': args.samples, 'compile_samples': args.compile_samples, 'walks': 312500, 'walk_bytes': 64, 'mode': 'never' if args.never else 'default', 'checksum': 'validated by independent indexed reference and full-run accumulated hash', 'runner_sha256': hashlib.sha256((D / 'runner.o').read_bytes()).hexdigest(), 'fixture_sha256': hashlib.sha256(fixture.read_bytes()).hexdigest(), 'rows': rows, 'qualification': 'One identical LLVM-built opaque runner; exact checksum checked by runner exit. Rotating samples after excluded warmup; caches disabled, serial codegen. Generation and runtime use separate rotating repetitions with excluded warmups; not compiler bootstrap acceptance.'}
+report = {'runner_source_sha256': hashlib.sha256(runner_bytes).hexdigest(), 'compilers': {n: str(c) for n, c, _ in cases}, 'samples': args.samples, 'compile_samples': args.compile_samples, 'workload': args.workload, 'work': ({'walks': 312500, 'walk_bytes': 64} if args.workload == 'iterator' else {'primitive_nodes': 2048, 'repetitions': 128, 'invalid_cases': 3}), 'mode': 'never' if args.never else 'default', 'checksum': ('independent indexed reference and full-run accumulated hash' if args.workload == 'iterator' else 'graph-size sum and three rejected invalid graphs'), 'runner_sha256': hashlib.sha256((D / 'runner.o').read_bytes()).hexdigest(), 'fixture_sha256': hashlib.sha256(fixture.read_bytes()).hexdigest(), 'rows': rows, 'qualification': 'One identical LLVM-built opaque runner; exact result checked by runner exit. Rotating samples after excluded warmup; caches disabled, serial codegen. Generation and runtime use separate rotating repetitions with excluded warmups; not compiler bootstrap acceptance.'}
 (D / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
 print(json.dumps(rows), flush=True)

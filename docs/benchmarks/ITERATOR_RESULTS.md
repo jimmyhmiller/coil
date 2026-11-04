@@ -103,3 +103,22 @@ are1.3705→1.3845ms. LLVM O3 runtime11.4720ms and TPDE59.1970ms; stogir remains
 2.73×LLVM. Assembly replaces LSL/LSR/ORR with a constant-count ROR sequence;
 the existing emitter still materializes a count register. This small gain is
 not bootstrap acceptance. Exact samples: [rotate-kernel.json](results/iterator-results-control/rotate-kernel.json).
+
+## Profile reduction: actual graph verifier
+
+`--workload verify` runs the real integer-operation validator over2048 mixed
+scalar operations,128 times, through one identical LLVM caller. The caller uses
+graph storage primitives and checks layout, dangling-reference and type errors
+before timing. Its independently accumulated graph-size result must match.
+
+Exploratory CPU medians: stogir64.8205ms, LLVM15.4065ms, TPDE104.9240ms. This
+exposes a4.21×generated-code gap in actual compiler work. Generation medians are
+139.3775ms/346.9720ms/1.4790ms respectively. FAST and external activity overlapped;
+these are diagnostic baselines, not acceptance results. Exact raw data:
+[verify-baseline.json](results/iterator-results-control/verify-baseline.json).
+
+The five-second native compile profile also shows verification/operand access
+as prominent backend leaves. A next candidate is sharing structural validation
+between integer and Phi checks on the same immutable graph, preserving every
+check and all public API diagnostics. No verification optimization is included
+in this checkpoint.
