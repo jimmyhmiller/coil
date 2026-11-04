@@ -1,6 +1,6 @@
 # Private ABI capture lifetime checkpoint
 
-Compiler executable source 85f6a274; standalone b5dcc4e, including immediate comparison selection cfb432c. Current changes are committed in worktrees; delivery gates and installation/push are pending. Current installed executable remains 67f02f1e. The 5× generation/within 10% generated-compiler runtime goal remains unmet.
+Compiler executable source 85f6a274; standalone b5dcc4e, including immediate comparison selection cfb432c. The executable is installed globally from source 85f6a274. The full delivery checks below pass. The 5× generation/within 10% generated-compiler runtime goal remains unmet.
 
 ## Reduced correctness defect
 
@@ -31,4 +31,6 @@ Immediate comparisons separately remove constant materializations but do not imp
 
 ## Delivery
 
-Full FAST, off-checkout installation checks, and delivery are pending. The bug remains open in coil-bugs/stogir-long-branch-harness-crash until the corrected toolchain is delivered.
+FAST passed 49/49 in 231.8 seconds, including the new capture regression on LLVM/TPDE/stogir. The existing cli/objects memory-budget warning remains at 1.61 GB against its 1.5 GB warning line. The compiler and matching SDK are installed globally; JIT/lint units are warmed. All 149 standalone modules and all 426 compiler/stdlib files match, as do the toolchain stamp and AVec source.
+
+Off-checkout LLVM/TPDE/stogir native/bounds fixtures pass. The installed Pair/Quad/wide capture loops, 10,920-graph immediate comparison matrix, formerly crashing long-branch harness, module/inliner, allocation, edge, memory, vector, SCCP and iterative suites pass. See [installed-checks.json](capture-lifetime/installed-checks.json). These establish correctness/delivery, not the performance objective.
