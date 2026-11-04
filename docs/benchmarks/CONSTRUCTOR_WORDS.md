@@ -47,7 +47,11 @@ stogir O1/O2/O3. New checks cover mixed signed/unsigned fields, scalar argument
 snapshots, opaque/scalar neighbors sharing a word, and pointer preservation;
 existing floating, aggregate and large payloads cover fallback. TPDE and stogir
 O1 iterator objects remain byte-identical to baseline. O0 remains unsupported.
-Full optimized corpus and FAST are the next delivery gate.
+FAST passed all 49 steps in 229.9 seconds for delivered checkpoint c7bdd0ba.
+The extended O3 sweep exposed an SCCP retained-load address bug, fixed in
+standalone 0608fba and Coil c7bdd0ba; types_traits now passes. Existing missing
+tail-call lowering, pinned shim adaptation, and floating intrinsics still keep
+three other corpus programs from passing. Full O3 corpus support is not claimed.
 
 Raw [compiler](results/constructor-words/compiler.json),
 [iterator](results/constructor-words/iterator.json),

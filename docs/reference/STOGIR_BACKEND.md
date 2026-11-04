@@ -295,3 +295,20 @@ independent of upstream stogir's compact graph and exact-field SSA pass.
 The sums corpus adds signed/unsigned mixed-width fields, argument snapshots,
 pointer preservation, and opaque/scalar fields sharing a word. Existing large, aggregate and floating payload cases cover fallback.
 Performance and full native validation are pending for this checkpoint.
+
+
+## Program observations and private IF splitting
+
+The adapter observes RETURN/UNREACHABLE terminals and every reachable CIR edge
+whose destination does not increase the total block order. Every directed cycle
+has such an edge, so backward closure retains both terminating paths and paths
+that loop forever. Intermediate acyclic branches are not external observations.
+This does not weaken explicit roots supplied to the standalone library.
+
+The iterative optimizer ports pinned upstream `ir_try_split_if` and
+`ir_try_split_if_cmp`. Private two-input merge/Phi/tests can route literal
+predecessors directly and test the other value in its original predecessor.
+Branch-local loads stay behind their original control. Protected identities
+decline the rewrite. Same-truth cases use the ordinary control reachability
+rebuild. Tests extend the FFI corpus with an exported self-cycle and an exported
+returning function with two nonreturning cycle paths.
