@@ -653,106 +653,6 @@ stogir-built checks pass, with the existing 2640 stack/free variants, frame,
 mem2ssa, iterative folds, module execution and 112 atomic graphs passing ASAN.
 
 
-### Closed returning loops in bounded call expansion
-
-The independent graph inliner now accepts LOOP_BEGIN/LOOP_END and loop-carried
-PHIs in a closed single-return region. This extends the earlier acyclic-only
-component; it is not attributed to an upstream module inliner. The existing
-two-phase clone reserves all definitions before patching forward and cyclic
-edges. The closure check requires every control node to be reachable backwards
-from the return. Separate non-returning regions remain ineligible. Nested calls,
-frame operations, terminal side exits and variadic calls remain excluded.
-
-`tests/module-execution.coil` compares linked native execution before and after
-expansion of a loop with two PHIs, including zero and multiple trips, positive
-and negative inputs, and Never/zero-budget fallback. A separate infinite control
-region is explicitly rejected. ASAN passes; restoring the old inliner fails the
-new expansion-count assertion. No source inline annotation or backend-specific
-emission shortcut is introduced.
-
-
-### Nested ordinary direct calls in bounded graph expansion
-
-The next independent component accepts ordinary CALL nodes whose callee is a
-named FUNC constant carrying its typed prototype. The existing constant mapper
-re-interns both function names and prototype bytes in the destination graph;
-CALL control/data edges and ABI grouping remain unchanged. Indirect PROTO nodes,
-variadic calls and aggregate-result call adapters remain excluded. Never policy
-and the transaction's actual graph-growth budget are unchanged.
-
-The extended module-execution suite passes ASAN for a direct nested call and a
-call inside a two-PHI loop, comparing linked execution before/after and checking
-immutable inputs. Indirect and variadic cases execute correctly without graph
-expansion; Never/zero-budget cases remain calls. Restoring the loop-only inliner
-fails the new expansion-count assertion. Compiler adoption requires separate
-worklist dependency, termination and recursive-template policy validation.
-
-
-### Complete observed controls in call expansion
-
-`Callee` now supplies `observed` controls separately from its unique RETURN root.
-The independent bounded inliner validates these roots, uses all of them for
-control closure, clones them through the normal two-phase mapping, and appends
-their mapped references to caller observations. This preserves side exits and
-infinite control regions rather than inferring observability from RETURN alone.
-UNREACHABLE terminals are accepted with zero reserved operand and no linked
-previous-terminal metadata. Frame/stack operations remain excluded, and the
-private register-result proof remains restricted to its existing linear region.
-
-The extended module-execution suite passes ASAN. Hot inputs compare linked
-native before/after answers; cold inputs execute a helper CALL then UNREACHABLE
-in child processes and must trap. A child watchdog bounds failures. Never and
-zero-budget fallbacks preserve execution, and omitting the non-returning root
-retains the original call. Restoring RETURN-only closure fails the new assertion.
-This is an explicit independent inliner extension; normal graph verification,
-CFG, placement, matching and liveness remain the post-optimization pipeline.
-
-
-Observed roots can also be values after SCCP or CALL expansion. The initial
-control-only observation validation failed while compiling the module-execution
-suite with stogir (`generate-matched`: invalid inline observed control), so that
-candidate was not delivered. The corrected contract accepts every valid positive
-observation. A rooted PARAM mapped to a literal actual argument gets one positive
-COPY observation, cached for duplicate roots; its original PARAM cell bounds the
-additional growth. ASAN compares native before/after answers and checks duplicate
-root identity, one-cell growth, Never/zero budget and a three-cell budget. The
-strict-control version fails this regression before execution.
-
-
-### AArch64 logical immediates
-
-The pinned upstream `ir_aarch64.dasc` uses `aarch64_may_encode_logical_imm`
-and logical-immediate binary rules. Our persistent selector now covers ordinary
-32/64-bit OR, AND and XOR literals on either side. Zero, all-ones and masks that
-cannot be encoded retain the register rule; narrow scalar and vector paths are
-unchanged. Selection stores canonical N:immr:imms fields before liveness and
-physical emission consumes those fields without redoing mask search.
-
-The independent encoder discovers the smallest repeated element by halving,
-then uses popcount/ctz to locate and verify its circular run of ones. It does not
-copy DynASM's immediate encoder. Field/width/register validation rejects reserved
-encodings, and the emitter checks the full tile payload before narrowing it.
-Matching uses allocated scalar registers; ABI-specific SP/ZR forms remain the
-responsibility of their existing encoders. Graph references, pass order, CFG,
-placement, uses and the shared JIT/AOT emitter stay unchanged.
-
-Host-independent encoder and selection checks cover known words, normalized
-32-bit inputs, reserved fields and both literal sides. The existing native
-`jit-bitwise` suite enumerates all 6,636 mathematical masks independently by
-bit position and executes AND/ORR/EOR words against five inputs (99,540 hardware
-answers), plus signed/unsigned graph compilation and non-encodable fallback.
-
-The final tests retain host-independent encoder/selector checks and put hardware execution in the existing Darwin `jit-bitwise` suite. All four suites pass ASAN and when built by stogir O3. Logical matching avoids the pre-existing shift/multiply literal lookup, so the selected mask is analyzed only once.
-
-
-Narrow scalar logical operations use the same 32-bit immediate tiles while
-retaining `narrow!`'s existing input and result normalization. This includes
-byte/halfword signedness and booleans; vector paths remain unchanged. The raw
-constant already has the verified scalar type's width, so it is interpreted as
-that value in the 32-bit instruction. Word-level zero/all-ones and unencodable
-patterns keep their register fallback. Extended host-independent selection and
-native graph tests cover all scalar widths, both literal sides, narrow signed
-returns and boolean inputs. ASAN and stogir O3 tests pass.
 ## Conditional PHI branch splitting
 
 The IF(PHI) and IF(CMP(PHI, literal)) transformations follow the control-shape approach in pinned upstream `ir_sccp.c`, `ir_try_split_if` (line 3168) and `ir_try_split_if_cmp` (line 3348), at commit 92171d0a4a36b0acf707f2dea7998de615dd4acd. This independent Coil implementation reuses compact graph references, updates def-use lists during each mutation, and queues only newly exposed predecessor merges. Optimization remains before matching and liveness, shared by JIT and AOT.
@@ -776,8 +676,6 @@ The existing `optimize-sites` and single-site convenience API preserve their alw
 ## Local integer mask and extension comparison proofs
 
 This independent fold extension uses the existing SCCP CONST decision and worklist. It does not claim an upstream range-analysis pass. Typed literal AND masks (either operand side), TRUNC(AND), ZEXT and nonnegative SEXT of those shapes yield allowed-bit masks in constant local work. Unsupported conversion chains, BOOL and pointer types remain unchanged. Signed relational folding requires a nonnegative bound; unsigned comparisons cover the full scalar bit pattern. EQ/NE use impossible-bit exclusion or an exact singleton, never the invalid endpoint-equality shortcut. Other relations require equal results at both interval endpoints.
-
-Structural bounds inspect only the immutable input graph, including the comparison's original left operand. They do not consult transient lattice constants or copy identities on grandchildren: changes to those facts need not requeue a comparison once an intervening producer is Bottom. Ordinary direct-input SCCP constant folding remains lattice-aware. A focused transient-mask regression rejects temporary bounds, and a cumulative saved-register layout test exercises the real loop-carried mask failure. Both regressions fail against the prior implementation; the corrected compiler also passes the previously failing module-execution suite and the native mask/control matrices.
 
 Raw-cloned structural comparisons must be evaluated before SCCP commits Bottom, even without a direct lattice replacement. A narrow opcode/producer-shape trigger supplies that opportunity, retaining the existing monotone lattice and deduplicated worklist. No extra graph analysis, pass, bounds-check bypass or workload-specific opcode limit is added. Numeric width masks use u64 with an explicit 64-bit case.
 
