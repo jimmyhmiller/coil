@@ -56,3 +56,25 @@ Exact samples and hashes: [iterator](results/branch-forward/iterator.json).
 
 Current development is committed, not installed globally and not pushed. The
 previous c379f059 toolchain remains global; no bootstrap result is claimed here.
+
+
+## Full compiler diagnostic
+
+One serial same-source diagnostic (not repeated acceptance), caches disabled,
+source5984439a. The stogir compiler is linked from the exact measured object.
+Version/check/run smoke checks pass, and both hosts emit byte-identical objects
+for both backends.
+
+| Compiler host | Target | IR-to-object s | Whole emit CPU s | Object bytes |
+|---|---|---:|---:|---:|
+| LLVM before86036f0c | stogir |16.014382|23.198343|14670088|
+| LLVM5984439a | stogir |16.290539|23.501541|14643124|
+| LLVM5984439a | LLVM O3 |31.831348|38.628595|8404616|
+| stogir5984439a | stogir |50.841913|70.490443|14643124|
+| stogir5984439a | LLVM O3 |32.160289|51.311849|8404616|
+
+Current generation is1.95×LLVM speed, below5×. Generated compiler runtime on
+stogir emission is3.00×LLVM-host process CPU, outside the10% target. These small
+kernel wins did not establish a full-compiler generation improvement. The LLVM
+library dominates the LLVM-target backend span and must not be mistaken for
+native-code quality parity. Raw data: [full compiler](results/branch-forward/compiler.json).
