@@ -38,3 +38,16 @@ stogir remains4.79×LLVM runtime. This is an algorithm improvement, not target
 parity or bootstrap acceptance. Actual integrated generation impact is pending.
 Raw [runtime samples and hashes](results/classification/runtime.json) and
 [isolated profile](results/classification/isolated-verifier-profile.txt).
+
+
+## Integrated compiler generation
+
+Candidate45f4e200 versus saved55422438, identical current library/fixture source,
+six rotating generation repetitions and eight CPU repetitions after warmup.
+Median generation114.4505→110.2640ms improves3.7%. Before/after target objects
+are byte-identical (SHA256
+`9c642742d7387c94d6f7178ede6e272c26fa599ee88c62e958edb00ac27d73e6`).
+Runtime44.5905→44.5455ms is noise for identical code. Current LLVM O3 generation
+333.1545ms and CPU9.0125ms; TPDE generation1.3730ms and CPU73.2960ms.
+Exact [integrated samples](results/classification/integrated-verifier.json).
+No new full-bootstrap result is established by this reduction.
