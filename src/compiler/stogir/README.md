@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`f34be99`, on 2026-11-04. The independent library remains maintained in that
+`88a45b7`, on 2026-11-04. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 
@@ -52,3 +52,7 @@ extension using existing scalar IR. See [packed switch lookup](docs/SWITCH_VALUE
 
 Def-use construction initializes known integer storage extents in bulk; exact
 edge categories and mutation semantics stay intact. See [initialization](docs/USES_INITIALIZATION.md).
+
+The compiler can explicitly prioritize smaller registered templates under its
+existing clone budget. Ordered library APIs remain unchanged; see
+[site priority](docs/INLINE_SITE_PRIORITY.md).

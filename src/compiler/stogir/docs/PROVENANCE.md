@@ -1292,3 +1292,21 @@ order, offsets and mutation contracts remain unchanged. ASAN/debug uses, mutable
 uses, native switch matrix and verifier pass. The independently checked opaque
 reduction improves stogir CPU15.1%/14.6%, with LLVM also improving12.8%/13.4%;
 this is not a full bootstrap claim. See [evidence](USES_INITIALIZATION.md).
+
+### Per-node use-list operand metadata
+
+Following pinned ir.c:ir_build_def_use_lists flags placement, read one metadata
+word per node instead of repeating the opcode lookup for every operand. Preserve
+our full five-field reference classification rather than truncate to upstream
+input-prefix counts. The public decoder keeps its boundary behavior; the frozen
+string oracle, ASAN/debug uses/mutation/switch/verifier and all-backend native
+checksum pass. Fixed-emitter native reduction improves stogir5.16%/5.00%, while LLVM is1.2%/2.0% slower and TPDE9.9%/9.7% faster. No compiler bootstrap claim; see [scope](USES_METADATA.md).
+
+### Optional inline site ranking
+
+Independent module policy: stable smallest-base-template-first ordering over
+owned registry snapshots. Cached base clone extents are a ranking estimate only;
+caller-specific and total growth checks remain unchanged. Existing ordered APIs
+keep their behavior. ASAN/debug ordering/ownership/error/native dependency/store
+and exact-budget tests pass, as does linked module AOT. No compiler performance
+claim yet; see [site priority](INLINE_SITE_PRIORITY.md).
