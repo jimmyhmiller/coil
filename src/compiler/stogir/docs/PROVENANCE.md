@@ -1059,7 +1059,10 @@ string bytes/entries pointers, lengths and capacities; and function-prototype
 metadata. Target pointer width is fixed for that invocation. Interner caches and
 allocator identities are not read by these validators; debug collection checks
 do inspect capacities. A hash bucket is never proof: all nineteen scalar key
-words are compared, including for aliases sharing instruction storage. One fixed
+words are compared, including for aliases sharing instruction storage. Raw
+descriptor reads avoid triggering an unrelated collection assertion before the
+original validator reaches its first error. These reads do not inspect payloads
+or establish a proof. One fixed
 key buffer is reused; successful keys and collision links use packed scalar
 storage. The cache is released before expansion or any return; no proof crosses
 mutation or calls. Caller validation and every per-site root, observation, CALL,
