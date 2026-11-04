@@ -46,3 +46,25 @@ Generation112.9315→113.4460ms and runtime41.3880→41.3490ms show no meaningfu
 integrated generation change. Current LLVM O3 generation340.3455ms/CPU9.2155ms;
 TPDE1.3645ms/73.9215ms. This is distinct from the9.4%runtime algorithm gain
 above. Exact [integrated samples](results/node-borrow/integrated-verifier.json).
+
+
+## Full compiler same-source diagnostic
+
+Current source2ac4ffbd, caches disabled, serial. One sample per host/target,
+not repeated acceptance. Exact emitted stogir object links to a compiler which
+passes version/check/run smoke. Both hosts emit byte-identical objects for both
+backends; saved45f4e200 and current2ac4ffbd also emit identical stogir objects
+from the same current source.
+
+| Host | Target | Generation s | Whole emit CPU s |
+|---|---|---:|---:|
+| LLVM before45f4e200 | stogir |14.343333|21.505410|
+| LLVM2ac4ffbd | stogir |14.688434|21.820397|
+| LLVM2ac4ffbd | LLVM O3 |31.356165|38.095533|
+| stogir2ac4ffbd | stogir |42.998141|62.532137|
+| stogir2ac4ffbd | LLVM O3 |32.150433|51.226315|
+
+Generation advantage2.13× is below5×. Generated compiler CPU on stogir emission
+is2.87×LLVM host, outside the10%runtime target. Borrowing alone does not establish
+a generation win. The LLVM library dominates LLVM-target backend spans and is
+not evidence of native-code quality parity. Exact [full report](results/node-borrow/compiler.json).
