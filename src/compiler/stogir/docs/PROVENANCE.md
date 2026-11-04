@@ -888,3 +888,22 @@ Graph-call expansion remains an independent extension beyond the pinned upstream
 Register-result privacy still requires exact private caller storage, no virtual-result reads or escapes, and complete byte coverage. Coverage must be established on the unconditional return tail; control flow before that tail may remain explicit. Every read of the virtual destination is rejected, including reads on an earlier branch. Partial payload/padding writes are not assumed initialized, and no default zero values are invented. A common ABI lowering that copies an entire local aggregate into the virtual result on the return tail can satisfy this proof even when its constructor has branches and local storage.
 
 The new native/ASAN regression compares linked and expanded execution inside a million-iteration caller loop, exercises both callee branches, resolves the caller by symbol, and checks acceptance exactly at the two-extra-cell budget boundary. Disabling only the inserted restore exhausts the stack; restoring it passes. A virtual-result read on an earlier branch remains ineligible. Existing recursive/module, call-result alias/escape/write-coverage, Never and budget suites pass. Coil retains templates within the same explicit total expansion budget and may borrow its finalized immutable graph during its own emission; native optimization and analysis stages are still run.
+
+## Entry storage promotion across opaque stack scopes
+
+Upstream `ir_mem2ssa.c` classifies individual ALLOCAs inside CFG blocks and does
+not globally disable promotion for BLOCK_BEGIN/BLOCK_END. Coil now permits its
+existing field/SSA promotion for original constant entry-prefix objects when
+saved stack pointers remain opaque. Their only data consumers must be direct
+BLOCK_END restores, and the saved pointers may not be observable roots. AFREE,
+non-direct restore sources, copied/arithmetic/escaped/observed saved pointers,
+and all objects allocated outside the original entry prefix retain conservative
+storage. The entry-prefix proof is shared with call-result capture validation
+through stogir.stack; no new semantic graph representation is introduced.
+
+The existing nonescape, initialization, exact field geometry and pointer identity
+checks still apply. Native before/after checks cover the permitted outer object,
+inner objects, copied/observed snapshots and explicit frees, plus the public O2/O3
+pipeline. These and the existing memory/forwarding suites pass under ASAN. This
+is a conservative subset of upstream promotion; arbitrary scoped object lifetime
+analysis and redundant empty-scope elimination remain unimplemented.
