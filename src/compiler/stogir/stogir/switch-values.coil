@@ -1,0 +1,280 @@
+;;; Independent bounded scalar switch-result folding over the compact IR.
+;;; Preserve the default control path; lookup uses existing integer operations.
+(module stogir.switch-values)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.types" :as types)
+(import "stogir.symbols" :as symbols)
+(import "stogir.switch" :as switch)
+(import "stogir.uses" :as uses)
+(import "stogir.bitset" :as bits)
+(import "stogir.bitqueue" :as q)
+(import "stogir.iter-control" :as control)
+(import "stogir.conditional" :as conditional)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defstruct Plan
+  [(branch i32) (merge i32) (phi i32) (fallback i32)
+   (default-end i32) (default-value i32)
+   (selector i32) (selector-type i32) (result-type i32)
+   (first u64) (base u64) (packed u64) (width i32)
+   (cases (ArrayList i32)) (ends (ArrayList i32)) (values (ArrayList u64))])
+
+(defn create [(a (dyn Allocator))] (-> Plan)
+  (Plan :branch 0 :merge 0 :phi 0 :fallback 0 :default-end 0 :default-value 0
+        :selector 0 :selector-type 0 :result-type 0 :first 0 :base 0 :packed 0 :width 0
+        :cases (ArrayList::new [i32] a) :ends (ArrayList::new [i32] a)
+        :values (ArrayList::new [u64] a)))
+
+(defn release! [(plan (mut Plan))] (-> void)
+  (free! (mut (.cases plan))) (free! (mut (.ends plan))) (free! (mut (.values plan))))
+
+(defn input [(graph g/Graph) (reference i32) (position i32)] (-> i32)
+  (match (g/operand graph reference position) (Some [r] r) (None [] 0)))
+
+(defn count [(edges uses/Uses) (reference i32)] (-> i64)
+  (.count (get (.ranges edges) (cast i64 reference))))
+
+(defn sole-user [(edges uses/Uses) (reference i32)] (-> uses/Use)
+  (let [range (get (.ranges edges) (cast i64 reference))]
+    (if (= (.count range) 1) (get (.edges edges) (.offset range))
+        (uses/Use :user 0 :operand 0))))
+
+(defn mask [(ty i32) (pointer-bytes i32)] (-> u64)
+  (cast u64 (- (<< (: 1 u128) (cast u128 (* 8 (types/scalar-size ty pointer-bytes)))) 1)))
+
+;;; Only a linear default path is needed. Keep all of its existing effects.
+(defn default-path? [(graph g/Graph) (reference i32) (fallback i32)] (-> bool)
+  (let [(mut r) reference (mut steps) 0]
+    (while (and (> r 0) (!= r fallback) (< steps (len (.instructions graph))))
+      (let [node (get (.instructions graph) (cast i64 r))
+            opcode (cast i32 (n/opcode node))]
+        (set! r (if (and (op/control? opcode)
+                         (not (op/block-start? opcode))
+                         (not (op/block-end? opcode))
+                         (= (op/operand-code opcode 1) op/OPERAND-SRC))
+                    (.op1 node) 0)))
+      (set! steps (+ steps 1)))
+    (= r fallback)))
+
+;;; Called only with structurally verified graph and exact current use lists.
+;;; Populate owned scratch arrays; no graph mutation occurs during proof.
+(defn prove! [(plan (mut Plan)) (graph g/Graph) (edges uses/Uses)
+              (protected bits/Bits) (phi i32) (pointer-bytes i32)
+              (a (dyn Allocator))] (-> bool)
+  (clear! (mut (.cases plan))) (clear! (mut (.ends plan))) (clear! (mut (.values plan)))
+  (set! (.default-end plan) 0) (set! (.default-value plan) 0)
+  (set! (.base plan) 0) (set! (.packed plan) 0) (set! (.width plan) 0)
+  (let [value (get (.instructions graph) (cast i64 phi))
+        ty (cast i32 (n/type-id value))
+        merge (.op1 value)
+        (mut good) (and (= (n/opcode value) 67) (types/integer? ty) (!= ty 6)
+                        (> merge 0))
+        (mut branch) (: 0 i32)]
+    (when good
+      (let [node (get (.instructions graph) (cast i64 merge))
+            arity (get (.arities graph) (cast i64 merge))]
+        (set! good (and (= (n/opcode node) 112) (>= arity 2) (<= arity 65)))
+        (when good
+          (for [i 1 (+ (cast i64 arity) 1)]
+            (let [end (input graph merge (cast i32 i))
+                  term (get (.instructions graph) (cast i64 end))]
+              (when (and (= (n/opcode term) 114) (> (.op1 term) 0))
+                (let [arm (get (.instructions graph) (cast i64 (.op1 term)))]
+                  (when (= (n/opcode arm) 109) (set! branch (.op1 arm)))))))
+          (let [range (get (.ranges edges) (cast i64 merge))]
+            (for [i (.offset range) (+ (.offset range) (.count range))]
+              (let [edge (get (.edges edges) i)
+                    user (get (.instructions graph) (cast i64 (.user edge)))
+                    opcode (cast i32 (n/opcode user))]
+                (unless (or (and (= (.user edge) phi) (= (.operand edge) 1))
+                            (and (op/control? opcode)
+                                 (= (op/operand-code opcode (.operand edge)) op/OPERAND-SRC)))
+                  (set! good false))))))))
+    (when (or (= branch 0) (bits/contains? protected (cast i64 branch))) (set! good false))
+    (when good
+      (match (switch/collect graph branch edges a)
+        (Err [_] (set! good false))
+        (Ok [owned]
+            (let [(mut dispatch) owned
+                  length (len (.cases dispatch))
+                  first (if (> length 0) (.low (get (.cases dispatch) 0)) (: 0 u64))
+                  arity (get (.arities graph) (cast i64 merge))
+                  result-mask (mask ty pointer-bytes)
+                  sign (if (types/signed? ty)
+                           (<< (: 1 u64) (cast u64 (- (* 8 (types/scalar-size ty pointer-bytes)) 1))) 0)
+                  (mut minimum) (: 0 u64)]
+              (set! good (and (>= length 2) (<= length 64)
+                             (or (= (cast i64 arity) length) (= (cast i64 arity) (+ length 1)))
+                             (<= (+ (cast u128 first) (cast u128 (- length 1)))
+                                 (cast u128 (mask (.ty dispatch) pointer-bytes)))
+                             (conditional/movable-condition? graph (.selector dispatch))))
+              (for [i 0 length]
+                (when good
+                  (let [item (get (.cases dispatch) i)
+                        arm (.target item)
+                        edge (sole-user edges arm)
+                        end (.user edge)]
+                    (set! good (and (= (.low item) (.high item))
+                                    (= (cast u128 (.low item)) (+ (cast u128 first) (cast u128 i)))
+                                    (> end 0) (= (.operand edge) 1)
+                                    (not (bits/contains? protected (cast i64 arm)))
+                                    (not (bits/contains? protected (cast i64 end)))))
+                    (when good
+                      (let [term (get (.instructions graph) (cast i64 end))
+                            use (sole-user edges end)
+                            constant (input graph phi (+ (.operand use) 1))]
+                        (set! good (and (= (n/opcode term) 114)
+                                        (= (.user use) merge) (> (.operand use) 0)
+                                        (< constant 0)))
+                        (when good
+                          (match (g/lookup graph constant)
+                            (None [] (set! good false))
+                            (Some [literal]
+                                  (set! good (and (symbols/numeric? literal) (= (cast i32 (n/type-id literal)) ty)))
+                                  (when good
+                                    (let [raw (& (n/constant-bits literal) result-mask)
+                                          ordered (^ raw sign)]
+                                      (when (or (= i 0) (< ordered minimum)) (set! minimum ordered))
+                                      (push! (mut (.values plan)) raw)
+                                      (push! (mut (.cases plan)) arm)
+                                      (push! (mut (.ends plan)) end)))))))))))
+              (when good
+                (for [i 1 (+ (cast i64 arity) 1)]
+                  (let [end (input graph merge (cast i32 i)) (mut known) false]
+                    (for item (.ends plan) (when (= item end) (set! known true)))
+                    (unless known
+                      (set! good (and good (= (.default-end plan) 0)
+                                      (= (n/opcode (get (.instructions graph) (cast i64 end))) 114)
+                                      (default-path? graph (input graph end 1) (.fallback dispatch))))
+                      (set! (.default-end plan) end)
+                      (set! (.default-value plan) (input graph phi (cast i32 (+ i 1)))))))
+                (set! (.base plan) (^ minimum sign))
+                (let [(mut maximum) (: 0 u64)
+                      modulus (<< (: 1 u128) (cast u128 (* 8 (types/scalar-size ty pointer-bytes))))]
+                  (for raw (.values plan)
+                    (let [delta (cast u64 (& (- (+ (cast u128 raw) modulus) (cast u128 (.base plan)))
+                                             (cast u128 result-mask)))]
+                      (when (> delta maximum) (set! maximum delta))))
+                  (while (> maximum 0)
+                    (set! (.width plan) (+ (.width plan) 1))
+                    (set! maximum (>> maximum 1)))
+                  (when (> (* length (cast i64 (.width plan))) 64) (set! good false))
+                  (when (and good (> (.width plan) 0))
+                    (for [i 0 length]
+                      (let [delta (cast u64 (& (- (+ (cast u128 (get (.values plan) i)) modulus)
+                                                  (cast u128 (.base plan))) (cast u128 result-mask)))]
+                        (set! (.packed plan) (| (.packed plan) (<< delta (cast u64 (* i (cast i64 (.width plan))))))))))))
+              (when good
+                (set! (.branch plan) branch) (set! (.merge plan) merge) (set! (.phi plan) phi)
+                (set! (.fallback plan) (.fallback dispatch))
+                (set! (.selector plan) (.selector dispatch))
+                (set! (.selector-type plan) (.ty dispatch)) (set! (.result-type plan) ty)
+                (set! (.first plan) first))
+              (free! (mut (.cases dispatch)))))))
+    good))
+
+;;; New definitions join the same exact use lists and affected-node queue.
+(defn append! [(graph (mut g/Graph)) (edges (mut uses/Uses)) (queue (mut q/Queue))
+               (opcode u8) (ty u8) (inputs (slice i32))] (-> i32)
+  (let [reference (match (g/append-inputs! (mut graph) opcode ty inputs)
+                    (None [] (panic "switch lookup instruction space exhausted"))
+                    (Some [r] r))]
+    (while (< (len (.ranges edges)) (len (.instructions graph)))
+      (push! (mut (.ranges edges)) (uses/Range :offset 0 :count 0)))
+    (for [i 0 (len inputs)]
+      (let [value (get inputs i)]
+        (when (and (> value 0) (uses/edge-code? (op/operand-code (cast i32 opcode) (cast i32 (+ i 1)))))
+          (uses/add! (mut edges) value (uses/Use :user reference :operand (cast i32 (+ i 1)))))))
+    (q/add! (mut queue) (cast i64 reference))
+    reference))
+
+(defn literal! [(graph (mut g/Graph)) (ty i32) (value u64)] (-> i32)
+  (match (g/intern-scalar! (mut graph) (cast u8 ty) value)
+    (None [] (panic "switch lookup constant space exhausted")) (Some [r] r)))
+
+(defn apply! [(graph (mut g/Graph)) (edges (mut uses/Uses)) (queue (mut q/Queue))
+              (plan Plan) (pointer-bytes i32)] (-> void)
+  (let [selector (.selector plan)
+        ty (.selector-type plan)
+        size (types/scalar-size ty pointer-bytes)
+        unsigned (case size 1 (: 2 i32) 2 3 4 4 5)
+        bits (* size 8)
+        sign (if (types/signed? ty) (<< (: 1 u64) (cast u64 (- bits 1))) 0)
+        raw (if (= ty unsigned) selector (append! (mut graph) (mut edges) (mut queue) 36 (cast u8 unsigned) [selector]))
+        ordered (if (= sign 0) raw (append! (mut graph) (mut edges) (mut queue) 48 (cast u8 unsigned)
+                                             [raw (literal! (mut graph) unsigned sign)]))
+        index (if (= (.first plan) 0) ordered (append! (mut graph) (mut edges) (mut queue) 27 (cast u8 unsigned)
+                                                     [ordered (literal! (mut graph) unsigned (.first plan))]))
+        limit (literal! (mut graph) unsigned (cast u64 (- (len (.cases plan)) 1)))
+        ; ULE keeps wrapped/out-of-range indices on the original default path.
+        condition (append! (mut graph) (mut edges) (mut queue) 22 1 [index limit])
+        previous (.op1 (get (.instructions graph) (cast i64 (.branch plan))))
+        result-type (.result-type plan)
+        (mut result) (literal! (mut graph) result-type (.base plan))]
+    (when (> (.width plan) 0)
+      (let [wide (if (= unsigned 5) index (append! (mut graph) (mut edges) (mut queue) 34 5 [index]))
+            shift (append! (mut graph) (mut edges) (mut queue) 28 5
+                            [wide (literal! (mut graph) 5 (cast u64 (.width plan)))])
+            shifted (append! (mut graph) (mut edges) (mut queue) 50 5
+                              [(literal! (mut graph) 5 (.packed plan)) shift])
+            masked (append! (mut graph) (mut edges) (mut queue) 47 5
+                             [shifted (literal! (mut graph) 5
+                                       (cast u64 (- (<< (: 1 u128) (cast u128 (.width plan))) 1)))])
+            value (if (= result-type 5) masked
+                      (append! (mut graph) (mut edges) (mut queue)
+                               (if (= (types/scalar-size result-type pointer-bytes) 8) 36 35)
+                               (cast u8 result-type) [masked]))]
+        (set! result (if (= (.base plan) 0) value
+                         (append! (mut graph) (mut edges) (mut queue) 26 (cast u8 result-type)
+                                  [value result])))))
+    (let [yes (get (.cases plan) 0)
+          end (append! (mut graph) (mut edges) (mut queue) 114 0 [yes])]
+      (control/rewrite! (mut graph) (mut edges) (mut queue) (.branch plan) 116 0 0 [previous condition])
+      (control/rewrite! (mut graph) (mut edges) (mut queue) yes 107 0 0 [(.branch plan) (: 0 i32)])
+      (control/rewrite! (mut graph) (mut edges) (mut queue) (.fallback plan) 108 0 0 [(.branch plan) (: 0 i32)])
+      (if (> (.default-end plan) 0)
+          (do (control/rewrite! (mut graph) (mut edges) (mut queue) (.merge plan) 112 0 0 [end (.default-end plan)])
+              (control/rewrite! (mut graph) (mut edges) (mut queue) (.phi plan) 67 (cast u8 result-type) 0
+                                 [(.merge plan) result (.default-value plan)]))
+          (do (control/rewrite! (mut graph) (mut edges) (mut queue) (.phi plan) 68 (cast u8 result-type) 0 [result (: 0 i32)])
+              (control/rewrite! (mut graph) (mut edges) (mut queue) (.merge plan) 106 0 0 [end (: 0 i32)])))
+      (for old (.ends plan) (control/rewrite! (mut graph) (mut edges) (mut queue) old 0 0 0 []))
+      (for old (.cases plan)
+        (unless (= old yes) (control/rewrite! (mut graph) (mut edges) (mut queue) old 0 0 0 []))))))
+
+;;; One bounded proof per original Phi; new expressions are drained normally.
+(defn at-merge! [(plan (mut Plan)) (graph (mut g/Graph))
+                  (edges (mut uses/Uses)) (queue (mut q/Queue))
+                  (protected bits/Bits) (merge i32) (pointer-bytes i32)
+                  (a (dyn Allocator))] (-> bool)
+  (let [range (get (.ranges edges) (cast i64 merge))
+        (mut phi) (: 0 i32) (mut multiple) false]
+    (for [i 0 (.count range)]
+      (let [edge (get (.edges edges) (+ (.offset range) i))]
+        (when (and (= (.operand edge) 1)
+                   (= (n/opcode (get (.instructions graph) (cast i64 (.user edge)))) 67))
+          (if (= phi 0) (set! phi (.user edge)) (set! multiple true)))))
+    (if (and (> phi 0) (not multiple)
+             (prove! (mut plan) graph edges protected phi pointer-bytes a))
+        (do (apply! (mut graph) (mut edges) (mut queue) plan pointer-bytes) true)
+        false)))
+
+(defn rewrite! [(graph (mut g/Graph)) (roots (ArrayList i32))
+                (edges (mut uses/Uses)) (queue (mut q/Queue))
+                (pointer-bytes i32) (a (dyn Allocator))] (-> i32)
+  (let [(mut plan) (create a) (mut protected) (bits/create (len (.instructions graph)) a)
+        limit (len (.instructions graph)) (mut changes) 0 (mut r) 1]
+    (for root roots (bits/add! (mut protected) (cast i64 root)))
+    (while (< r limit)
+      (let [node (get (.instructions graph) r) arity (get (.arities graph) r)]
+        (when (and (= (n/opcode node) 67)
+                   (prove! (mut plan) graph edges protected (cast i32 r) pointer-bytes a))
+          (apply! (mut graph) (mut edges) (mut queue) plan pointer-bytes)
+          (set! changes (+ changes 1)))
+        (set! r (+ r (/ (+ (cast i64 arity) 4) 4)))))
+    (release! (mut plan)) (bits/release! (mut protected))
+    (cast i32 changes)))
