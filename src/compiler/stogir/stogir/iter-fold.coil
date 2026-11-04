@@ -1,9 +1,10 @@
 ;;; Incremental fold/CSE/DCE kernel adapted from pinned ir_sccp.c:ir_iter_fold,
 ;;; ir_iter_replace_insn and ir_iter_find_cse. Control cleanup and promotion are
-;;; separate pending parts of ir_iter_opt; this module does not claim full parity.
+;;; supported incrementally; broader predicate/loop/type promotion remains pending.
 (module stogir.iter-fold)
 (import "stogir.graph" :as g)
 (import "stogir.iter-constant-cse" :as literal-cse)
+(import "stogir.iter-memory" :as memory)
 (import "stogir.dead-code" :as dead)
 (import "stogir.iter-control" :as control)
 (import "stogir.control-merge" :as boundaries)
@@ -656,14 +657,17 @@
     changed))
 
 ;;; Caller owns graph/lists/queue. Only seeded nodes and users/inputs affected by
-;;; changes are visited. Bottom facts expose current graph values to the shared
-;;; fold rules; no second SCCP analysis or persistent alternative IR is built.
+;;; changes are visited. Current graph values feed the shared fold rules;
+;;; no second SCCP analysis or persistent alternative IR is built.
 (defstruct Progress [(changes i32) (control bool)])
 
 (defn run-core-indexed! [(graph (mut g/Graph))
                          (lists (mut uses/Uses))
                          (queue (mut q/Queue))
-                         (protected bits/Bits)
+                         (roots (mut (ArrayList i32)))
+                         (pending-loads (mut (ArrayList i32)))
+                         (protected (mut bits/Bits))
+                         (rooted bool)
                          (constants (mut literal-cse/Index))
                          (pointer-bytes i32)
                          (fold-control bool)
@@ -739,6 +743,37 @@
                           (mut dead-context)
                           (cast i32 next))
         (set! changes (+ changes 1)))
+      (when (= (n/opcode (get (.instructions graph) next)) 91)
+        (if fold-control
+            (push! (mut pending-loads) (cast i32 next))
+            (let [type (n/type-id (get (.instructions graph) next))
+                  forwarded
+                    (memory/prepare! (mut graph)
+                                     (mut lists)
+                                     (mut queue)
+                                     (mut roots)
+                                     (mut protected)
+                                     rooted
+                                     (cast i32 next)
+                                     pointer-bytes)
+                  source (.source forwarded)
+                  opcode (.opcode forwarded)]
+              (when (!= source 0)
+                (if (= opcode 0)
+                    (replace! (mut graph)
+                              (mut lists)
+                              (mut queue)
+                              protected
+                              (cast i32 next)
+                              source)
+                    (rewrite-unary! (mut graph)
+                                    (mut lists)
+                                    (mut queue)
+                                    (cast i32 next)
+                                    opcode
+                                    type
+                                    source))
+                (set! changes (+ changes 1))))))
       (let [reference (cast i32 next)
             node (get (.instructions graph) next)
             opcode (cast i32 (n/opcode node))]
@@ -794,20 +829,29 @@
                  (a (dyn Allocator))]
   (-> (Result Progress (slice u8)))
   (let [(mut constants) (literal-cse/create a)
+        (mut roots) (ArrayList::new [i32] a)
+        (mut pending-loads) (ArrayList::new [i32] a)
+        (mut protection) protected
         result
           (run-core-indexed! (mut graph)
                              (mut lists)
                              (mut queue)
-                             protected
+                             (mut roots)
+                             (mut pending-loads)
+                             (mut protection)
+                             false
                              (mut constants)
                              pointer-bytes
                              fold-control
                              a)]
     (literal-cse/release! (mut constants))
+    (free! (mut pending-loads))
+    (free! (mut roots))
     result))
 
-;;; Scalar-only compatibility entry. This does not expose transient control
-;;; graphs to callers that supply protection bits without a mutable root list.
+;;; Rootless compatibility entry: no transient IF changes or protected-load
+;;; replacement without a mutable observation list. Ordinary dead/aliased loads
+;;; can still be bypassed without changing basic-block structure.
 (defn run! [(graph (mut g/Graph))
             (lists (mut uses/Uses))
             (queue (mut q/Queue))
@@ -834,50 +878,68 @@
                            (queue (mut q/Queue))
                            (protected (mut bits/Bits))
                            (constants (mut literal-cse/Index))
+                           (pending-loads (mut (ArrayList i32)))
                            (pointer-bytes i32)
                            (a (dyn Allocator))]
   (-> (Result i32 (slice u8)))
   (match (run-core-indexed! (mut graph)
                             (mut lists)
                             (mut queue)
-                            protected
+                            (mut roots)
+                            (mut pending-loads)
+                            (mut protected)
+                            true
                             (mut constants)
                             pointer-bytes
                             true
                             a)
     (Err [message] (Err message))
     (Ok [progress]
-        (if (not (.control progress))
-            (Ok (.changes progress))
+        (let [(mut changes) (.changes progress)
+              (mut error) ""]
+          (when (.control progress)
             (match (control/prune! (mut graph)
                                    (mut roots)
                                    (mut lists)
                                    (mut queue)
                                    (mut protected)
                                    a)
-              (Err [message] (Err message))
+              (Err [message] (set! error message))
               (Ok [pruned]
-                  (let [merged
-                          (boundaries/merge! (mut graph)
-                                             (mut roots)
-                                             (mut lists)
-                                             (mut queue)
-                                             a)]
-                    ; Boundary removal remaps control observations.
-                    (bits/clear! (mut protected))
-                    (for root roots (bits/add! (mut protected) (cast i64 root)))
-                    (match (run-core-indexed! (mut graph)
+                  (set! changes (+ changes pruned))
+                  (set! changes
+                        (+ changes
+                           (boundaries/merge! (mut graph)
+                                              (mut roots)
                                               (mut lists)
                                               (mut queue)
-                                              protected
-                                              (mut constants)
-                                              pointer-bytes
-                                              false
-                                              a)
-                      (Err [message] (Err message))
-                      (Ok [after]
-                          (Ok (+ (+ (.changes progress) pruned)
-                                 (+ merged (.changes after)))))))))))))
+                                              a)))
+                  (bits/clear! (mut protected))
+                  (for root roots (bits/add! (mut protected) (cast i64 root))))))
+          (when (= error "")
+            ; Delay memory replacement until unreachable data observations have
+            ; been checked. Seed only loads encountered by the first drain.
+            (for reference pending-loads
+              (when (and (g/contains? graph reference)
+                         (= (n/opcode (get (.instructions graph)
+                                           (cast i64 reference)))
+                            91))
+                (q/add! (mut queue) (cast i64 reference))))
+            (clear! (mut pending-loads))
+            (match (run-core-indexed! (mut graph)
+                                      (mut lists)
+                                      (mut queue)
+                                      (mut roots)
+                                      (mut pending-loads)
+                                      (mut protected)
+                                      true
+                                      (mut constants)
+                                      pointer-bytes
+                                      false
+                                      a)
+              (Err [message] (set! error message))
+              (Ok [after] (set! changes (+ changes (.changes after))))))
+          (if (= error "") (Ok changes) (Err error))))))
 
 (defn run-rooted! [(graph (mut g/Graph))
                    (roots (mut (ArrayList i32)))
@@ -887,6 +949,7 @@
                    (pointer-bytes i32)
                    (a (dyn Allocator))] (-> (Result i32 (slice u8)))
   (let [(mut constants) (literal-cse/create a)
+        (mut pending-loads) (ArrayList::new [i32] a)
         result
           (run-rooted-indexed! (mut graph)
                                (mut roots)
@@ -894,9 +957,11 @@
                                (mut queue)
                                (mut protected)
                                (mut constants)
+                               (mut pending-loads)
                                pointer-bytes
                                a)]
     (literal-cse/release! (mut constants))
+    (free! (mut pending-loads))
     result))
 
 ;;; Transactional public entry: validate first, transform an owned graph, validate
