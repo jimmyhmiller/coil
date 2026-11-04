@@ -236,3 +236,14 @@ inlined-body lowering spans in
 the native codegen sum, aggregated once per source function. Nested spans are
 not counted twice. Those optimizer costs are no longer hidden in IR creation;
 older reports did not charge them and retain their original timing definition.
+
+### Immutable callee validation reuse
+
+The vendored standalone library includes `coil-stogir` commit `6842e2d`.
+Module preparation registers deep immutable callee snapshots once per definition
+version. Replacing a source definition clears its handle; old snapshots remain
+immutable until module emission completes. Before emission, every final version
+is registered and the provider freezes. Emission cannot insert into the registry.
+All snapshots are released after the module jobs finish. Caller validation and
+per-site eligibility, observations, capture, result and budget checks remain.
+This is an independent module orchestration extension, not an upstream pass.

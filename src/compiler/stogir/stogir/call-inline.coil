@@ -3,7 +3,7 @@
 ;;; the semantic representation. See NOTICE and docs/PROVENANCE.md.
 (module stogir.call-inline)
 
-(export Callee Site SiteProof inspect-verified-site optimize optimize-sites optimize-sites-if-changed)
+(export Callee Site SiteProof inspect-verified-site optimize optimize-sites optimize-sites-if-changed Registry RegisteredSite registry-create registry-release! register! optimize-registered-if-changed)
 
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
@@ -22,7 +22,7 @@
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.hashmap" :use [HashMap])
 (import "coil.primitive" :as p)
-(import "coil.alloc" :use [Allocator])
+(import "coil.alloc" :as alloc :use [Allocator])
 (import "coil.result" :use [Result Ok Err Option Some None])
 
 ;;; Borrowed immutable function definition; the provider owns its name/graph/roots
@@ -922,6 +922,172 @@
 
 (defstruct Site [(reference i32) (target Callee)])
 
+;;; An owning module-lifetime registry. Its state is deliberately opaque: no
+;;; mutable graph view or caller-asserted validation flag crosses this API.
+;;; Do not copy ownership, release while optimizing, or mutate concurrently.
+(defstruct Registry [(state (ptr u8))])
+
+(defstruct RegisteredSite [(reference i32) (callee i64)])
+
+(defstruct FrozenCallee
+  [(name (ArrayList u8))
+   (graph g/Graph)
+   (entry i32)
+   (roots (ArrayList i32))
+   (observed (ArrayList i32))
+   (never bool)])
+
+(defstruct RegistryState
+  [(a (dyn Allocator)) (pointer-bytes i32) (callees (ArrayList FrozenCallee))])
+
+(defn registry-create [(pointer-bytes i32) (a (dyn Allocator))] (-> Registry)
+  (Registry
+    :state
+      (p/cast (ptr u8)
+              (alloc/box! a
+                          RegistryState
+                          (RegistryState
+                            :a a
+                            :pointer-bytes pointer-bytes
+                            :callees (ArrayList::new [FrozenCallee] a))))))
+
+(defn registry-release! [(registry (mut Registry))] (-> void)
+  (when (!= (p/cast u64 (.state registry)) 0)
+    (let [state (p/cast (ptr RegistryState) (.state registry))
+          a (.a state)]
+      (for [i 0 (len (.callees state))]
+        (let [(mut callee) (get (.callees state) i)]
+          (g/release! (mut (.graph callee)))
+          (free! (mut (.name callee)))
+          (free! (mut (.roots callee)))
+          (free! (mut (.observed callee)))))
+      (free! (mut (.callees state)))
+      (alloc/destroy a state)
+      (set! (.state registry) (p/cast (ptr u8) 0)))))
+
+;;; Snapshot only semantic storage. Construction hash tables are neither read by
+;;; validation nor needed by immutable callees; copying them would introduce an
+;;; unrelated dependency on mutable interner state. Every descriptor copied here
+;;; must be well formed, even if its payload is unused by this particular graph.
+(defn cloneable? [T] [(values (ArrayList T))] (-> bool)
+  (and (>= (.len values) 0)
+       (>= (.cap values) (.len values))
+       (or (= (.len values) 0) (!= (p/cast u64 (.data values)) 0))))
+
+(defn register! [(registry (mut Registry)) (target Callee)]
+  (-> (Result i64 (slice u8)))
+  (if (= (p/cast u64 (.state registry)) 0)
+      (Err "inline registry is released")
+      (let [state (p/cast (ptr RegistryState) (.state registry))
+            source (.graph target)
+            a (.a state)
+            (mut error) ""]
+        (match (rewrite/validate source (.pointer-bytes state) a)
+          (Err [message] (set! error message))
+          (Ok [_] 0))
+        (when (and (= error "")
+                   (not (and (cloneable? (.instructions source))
+                             (cloneable? (.arities source))
+                             (cloneable? (.constants source))
+                             (cloneable? (.constant-spans source))
+                             (cloneable? (.bytes (.strings source)))
+                             (cloneable? (.entries (.strings source))))))
+          (set! error "invalid inline snapshot storage"))
+        (for root (.roots target)
+          (when (or (<= root 0) (not (g/contains? source root)))
+            (set! error "invalid inline callee root")))
+        (for root (.observed target)
+          (when (or (<= root 0) (not (g/contains? source root)))
+            (set! error "invalid inline observed root")))
+        (for root (.roots target)
+          (let [(mut found) false]
+            (for observed (.observed target)
+              (when (= root observed) (set! found true)))
+            (unless found (set! error "inline return is not observed"))))
+        (if (!= error "")
+            (Err error)
+            (let [(mut graph) (g/create a)
+                  (mut name) (ArrayList::new [u8] a)
+                  (mut roots) (ArrayList::new [i32] a)
+                  (mut observed) (ArrayList::new [i32] a)]
+              (clear! (mut (.instructions graph)))
+              (clear! (mut (.arities graph)))
+              (extend! (mut (.instructions graph))
+                       (.data (.instructions source))
+                       (.len (.instructions source)))
+              (extend! (mut (.arities graph))
+                       (.data (.arities source))
+                       (.len (.arities source)))
+              (extend! (mut (.constants graph))
+                       (.data (.constants source))
+                       (.len (.constants source)))
+              (extend! (mut (.constant-spans graph))
+                       (.data (.constant-spans source))
+                       (.len (.constant-spans source)))
+              (extend! (mut (.bytes (.strings graph)))
+                       (.data (.bytes (.strings source)))
+                       (.len (.bytes (.strings source))))
+              (extend! (mut (.entries (.strings graph)))
+                       (.data (.entries (.strings source)))
+                       (.len (.entries (.strings source))))
+              (set! (.function-prototype graph) (.function-prototype source))
+              (for byte (.name target) (push! (mut name) byte))
+              (for root (.roots target) (push! (mut roots) root))
+              (for root (.observed target) (push! (mut observed) root))
+              (push! (mut (.callees state))
+                     (FrozenCallee
+                       :name name
+                       :graph graph
+                       :entry (.entry target)
+                       :roots roots
+                       :observed observed
+                       :never (.never target)))
+              (Ok (len (.callees state))))))))
+
+;;; Handles are one-based and local to this registry. Resolution supplies only
+;;; borrowed immutable definitions, whose successful validation belongs to the
+;;; registry's owned snapshot for its entire lifetime.
+(defn optimize-registered-if-changed [(registry Registry)
+                                      (source g/Graph)
+                                      (roots (slice i32))
+                                      (sites (slice RegisteredSite))
+                                      (budget i32)
+                                      (a (dyn Allocator))]
+  (-> (Result (Option rewrite/Rewritten) (slice u8)))
+  (if (= (p/cast u64 (.state registry)) 0)
+      (Err "inline registry is released")
+      (let [state (p/cast (ptr RegistryState) (.state registry))
+            (mut resolved) (ArrayList::new [Site] a)
+            (mut error) ""]
+        (for site sites
+          (let [handle (.callee site)]
+            (if (or (<= handle 0) (> handle (len (.callees state))))
+                (set! error "invalid registered inline callee")
+                (let [target (get (.callees state) (- handle 1))]
+                  (push! (mut resolved)
+                         (Site
+                           :reference (.reference site)
+                           :target
+                             (Callee
+                               :name (slice (.name target))
+                               :graph (.graph target)
+                               :entry (.entry target)
+                               :roots (slice (.roots target))
+                               :observed (slice (.observed target))
+                               :never (.never target))))))))
+        (let [result
+                (if (!= error "")
+                    (Err error)
+                    (optimize-sites-core source
+                                         roots
+                                         (slice resolved)
+                                         (.pointer-bytes state)
+                                         budget
+                                         true
+                                         a))]
+          (free! (mut resolved))
+          result))))
+
 ;;; All storage consulted by rewrite.validate: instructions/arities, constants/
 ;;; spans, binary string bytes/entries, and function prototype metadata. Interner
 ;;; hash tables are not read by these validators. Capacities participate because
@@ -968,11 +1134,12 @@
 ;;; START/RETURN and NOP cells do not consume caller instruction space. Casts,
 ;;; literal-PARAM observation anchors and scoped stack boundaries do. Definitions
 ;;; are borrowed and immutable throughout; all structural analyses are rebuilt.
-(defn optimize-sites-if-changed [(source g/Graph)
+(defn optimize-sites-core [(source g/Graph)
                                  (roots (slice i32))
                                  (sites (slice Site))
                                  (pointer-bytes i32)
                                  (budget i32)
+                                 (registered bool)
                                  (a (dyn Allocator))]
   (-> (Result (Option rewrite/Rewritten) (slice u8)))
   (let [(mut error) ""
@@ -991,7 +1158,7 @@
     (for site sites
       (let [target (.target site)
             reference (.reference site)]
-        (when (= error "")
+        (when (and (= error "") (not registered))
           (validation-view! (mut view) (.graph target))
           (let [key (get view 0)
                 head
@@ -1116,6 +1283,12 @@
                                 :roots observed
                                 :changes changes
                                 :iteration queue))))))))))
+
+(defn optimize-sites-if-changed [(source g/Graph) (roots (slice i32))
+                                 (sites (slice Site)) (pointer-bytes i32)
+                                 (budget i32) (a (dyn Allocator))]
+  (-> (Result (Option rewrite/Rewritten) (slice u8)))
+  (optimize-sites-core source roots sites pointer-bytes budget false a))
 
 ;;; Compatibility API always returns an independent owned graph, including
 ;;; no-change cases. Borrowing callers can use the conditional transaction above.

@@ -1069,3 +1069,18 @@ mutation or calls. Caller validation and every per-site root, observation, CALL,
 capture, result, closed-control and budget check remain. This independent Coil
 orchestration optimization does not establish upstream pass parity or disable
 validation.
+
+### Owned immutable callee registry
+
+The optional module-lifetime registry is an independent orchestration extension,
+not an upstream optimization pass. Registration performs complete validation and
+owns snapshots of all semantic graph arrays, binary string storage, names,
+roots and observations. Construction interner caches are not copied or trusted.
+Snapshot descriptors must be cloneable even when a graph does not use their
+payload. The registry exposes checked local indices, never a writable graph or
+an unchecked validation flag. Original inputs can be mutated or released after
+registration. Registered expansion shares the private expansion implementation
+with the legacy API; caller validation and all per-site and output checks stay
+in place. The pointer width belongs to the registry. Its owner must prevent
+mutation or release during optimization and release the registry exactly once;
+release through the original owning value is idempotent.
