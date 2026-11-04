@@ -1260,10 +1260,10 @@ is at most64. A normalized unsigned ULE guard preserves all default effects
 and traps. Ordinary shifts, masks and wrapped scalar addition decode the result;
 no new opcode, literal-memory alias assumption or target assembly rewrite is used.
 
-One original-Phi scan at the SCCP finish boundary handles unchanged initial
+The existing merge walk at the SCCP finish boundary handles unchanged initial
 candidates; exact use updates queue new expressions for normal cleanup. Inputs
 remain owned by the existing rewrite transaction. The native test matrix covers
-104 graphs over signed/unsigned selectors, result widths/bools, high/signed bases,
+112 native fixtures over signed/unsigned selectors, result widths/bools, high/signed bases,
 zero-width and64-bit packing, holes/ranges/effects/protected controls/additional
 Phis and65-entry fallback. Original, direct and SCCP-native answers agree;
 rebuilt use edges and typed validation agree. Child traps verify the default
@@ -1273,12 +1273,12 @@ See [packed switch values](SWITCH_VALUE_LOOKUP.md) for commands and limitations.
 
 The domain suite further checks CHAR/address/bool selector normalization,
 address-result fallback, both floating-result fallback types, and a32-bit
-pointer selector near UINT32_MAX. There are111 native differential fixtures,
+pointer selector near UINT32_MAX. There are112 native differential fixtures,
 two FP no-change graphs and one32-bit pointer graph validation; all pass under
 ASAN/debug. The linked AOT driver also passes after this expansion.
 
 Lookup recognition shares the existing boolean-diamond merge walk and protected
 root set; a reusable plan avoids per-merge scratch allocation. Conditional motion
 exclusions are shared through conditional.coil. There is no extra SCCP graph scan.
-A112th native fixture covers all-equal lookup followed immediately by ordinary
+The pure-default fixture covers all-equal lookup followed immediately by ordinary
 diamond folding with a pure default; new END bookkeeping grows before that fold.

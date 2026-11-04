@@ -3,7 +3,7 @@
 This independent optimization recognizes validated contiguous singleton switch
 cases whose empty arms join one constant-valued integer Phi. It rejects case/end
 observations, shared case/control users, other Phi users, effectful arms, holes,
-ranges and results too wide for one64-bit packed word. Address and floating
+ranges and results too wide for one 64-bit packed word. Address and floating
 results keep the original switch. The default region, including stores and
 non-returning traps, stays on the false guard path.
 
@@ -15,8 +15,8 @@ literal storage convention, instruction opcode or machine-code patch.
 
 The existing merge walk after bulk SCCP/control cleanup visits candidates, so
 unchanged initial candidates do not depend on affected-worklist seeding. It reuses
-the walk’s protected roots and one scratch plan, without another graph scan. The existing
-exact use mutation and queue process new expressions. Stable Phi/merge references
+the walk’s protected roots and one scratch plan, without another graph scan.
+Exact use mutation and queue process new expressions. Stable Phi/merge references
 and default control observations are retained. The public SCCP transaction
 validates input/output and owns any changed graph.
 
@@ -26,14 +26,14 @@ coil run tests/aot-switch-tables-link.coil --link-flag /tmp/coil-stogir-tables-u
 ```
 
 The first test creates all linked objects. It compares original/direct/SCCP
-machine code over112 native fixtures and checks exact rebuilt use multisets, typed
+machine code over 112 native fixtures and checks exact rebuilt use multisets, typed
 validation and actual SCCP dispatch removal. Trap children check the default
 store before exiting. Verifier, module execution and native SCCP-control
 ASAN/debug suites pass too. No compiler integration or speedup is established
 by these correctness checks; broader fallback checks and measurements follow.
 
-The expanded domain checks pass112 native fixtures, two floating-result
-no-change checks and a32-bit pointer-selector graph validation. Boolean selector
+The expanded domain checks pass 112 native fixtures, two floating-result
+no-change checks and a 32-bit pointer-selector graph validation. Boolean selector
 inputs use their actual canonical conversion semantics; CHAR/address selectors
 are checked at width boundaries. Address/FP results retain the original graph.
 
