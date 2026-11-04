@@ -1094,3 +1094,27 @@ use-list/worklist machinery. Shared or rooted AND values remain valid; BOOL
 canonicalization and other masks are left to their ordinary rules. Native
 conversion tests cover signed and unsigned destinations, 32/64-bit pointer
 models, rooted observations and masks adjacent to each exact boundary.
+
+### Persistent shifted-field extraction
+
+AArch64 rule 48 selects integer `TRUNC(SHR/SAR(x, constant))` as unsigned
+bitfield extraction when the complete requested field lies inside the original
+32/64-bit word. Shift counts retain the IR's width normalization. BOOL
+canonicalization, dynamic counts, crossing fields and other widths stay on their
+ordinary paths. This generic fusion is an independent extension; pinned upstream
+uses the same bitfield instruction family for narrow shifts but does not provide
+this generic truncation matcher.
+
+Selection records the direct machine source before liveness, interval building
+and constraints; emission consumes that persistent tile. Absorbed producer edges
+are counted before retiring a shift. Rooted/shared shifts remain available, and
+multiple absorbed consumers can retire a producer only after its last edge is
+gone. The semantic graph is unchanged. Compatibility machine-use constructors
+retain their existing signatures and behavior.
+
+Native matrix coverage adds 3,120 graphs and 249,600 answers across logical and
+arithmetic shifts, signed/unsigned 32/64-bit inputs, signed/unsigned and Boolean
+truncations, count normalization and field boundaries. Cases cover dying, rooted,
+shared and multiply absorbed producers, plus rooted consumers; unfused plans
+retain their original input. Encoder boundary cases and the full incremental
+fold/CSE/JIT and memory-address matching suites also pass with ASAN/debug checks.

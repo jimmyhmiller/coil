@@ -254,3 +254,11 @@ updates preserve other observations and shared producers. The standalone full
 incremental fold/CSE/JIT suite passes with ASAN/debug checks. A compact header
 reduction removes an extra 32-bit normalization and an AND; compiler workload
 performance still requires measurement.
+
+Standalone `3ed815e` adds persistent AArch64 shifted-field extraction. Integer
+TRUNC(SHR/SAR) becomes UBFX only when the complete field lies inside a 32/64-bit
+word. Matching redirects machine uses and constraints before liveness and
+retires only fully absorbed, unrooted producers. BOOL and crossing fields retain
+ordinary lowering. This generic fusion is an independent extension beyond the
+pinned upstream truncation matcher. Encoder and native matrix checks, incremental
+fold/CSE/JIT and memory address matching pass under ASAN/debug checks.
