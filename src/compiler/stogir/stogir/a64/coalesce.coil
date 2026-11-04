@@ -1,0 +1,216 @@
+;;; Contained COPY/same-bank BITCAST reuse follows ir_ra.c:ir_coalesce and
+;;; ir_vregs_inside. Only allocation identity changes; see NOTICE/provenance.
+(module stogir.a64.coalesce)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.interval" :as interval)
+(import "stogir.constraints" :as c)
+(import "stogir.interval-queue" :as queue)
+(import "coil.hashmap" :use [HashMap])
+(import "stogir.allocation" :as allocation)
+(import "stogir.locations" :as locations)
+(import "stogir.a64.registers" :as registers)
+(import "stogir.schedule" :as schedule)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Some None])
+
+(defn reusable? [(graph g/Graph) (reference i32)] (-> bool)
+  (let [node (get (.instructions graph) (cast i64 reference))
+        opcode (n/opcode node)
+        ty (cast i32 (n/type-id node))]
+    (and (or (= opcode 68) (= opcode 36))
+         (> (.op1 node) 0)
+         (types/valid-scalar? ty)
+         (> (types/size ty 8) 0)
+         ; BOOL-producing conversions canonicalize nonzero bytes, so they
+         ; cannot share a still-live source even at the same storage width.
+         (or (= opcode 68) (!= ty 1))
+         (<= (types/size ty 8) 8)
+         (match (g/lookup graph (.op1 node))
+           (None [] false)
+           (Some [source]
+                 (let [input (cast i32 (n/type-id source))]
+                   (and (types/valid-scalar? input)
+                        (= (types/size input 8) (types/size ty 8))
+                        (= (registers/class-mask input)
+                           (registers/class-mask ty)))))))))
+
+;;; Sorted, disjoint half-open ranges, including lifetime holes. A bounding
+;;; span cannot establish containment. Empty values are never candidates.
+(defn inside? [(parent (ArrayList interval/Range))
+               (child (ArrayList interval/Range))] (-> bool)
+  (let [(mut p) 0
+        (mut result) (> (len child) 0)]
+    (for range child
+      (while (and (< p (len parent))
+                  (<= (.end (get parent p)) (.start range)))
+        (set! p (+ p 1)))
+      (if (>= p (len parent))
+          (set! result false)
+          (let [outer (get parent p)]
+            (when (or (> (.start outer) (.start range))
+                      (< (.end outer) (.end range)))
+              (set! result false)))))
+    result))
+
+;;; Full position and graph reference identity; no schedule-size truncation.
+(defn fixed-key [(parent i32) (position i64)] (-> u128)
+  (| (<< (cast u128 (cast u64 position)) 32) (cast u128 (cast u32 parent))))
+
+;;; Each member retains its sorted uses until every union is decided. Merge
+;;; once per completed vreg group with a k-way heap, O(U log K), instead of
+;;; repeatedly copying a growing source list for K contained copies.
+(defn merge-group! [(parts (mut (ArrayList allocation/Part)))
+                    (parent i32)
+                    (head i32)
+                    (links (ArrayList i32))
+                    (cursors (mut (ArrayList i64)))
+                    (a (dyn Allocator))] (-> void)
+  (let [(mut pending) (ArrayList::new [queue/Item] a)
+        (mut merged) (ArrayList::new [c/Use] a)
+        (mut member) head]
+    (while (>= member 0)
+      (let [part (at parts (cast i64 member))]
+        (when (> (len (.uses part)) 0)
+          (queue/insert! (mut pending)
+                         (queue/Item
+                           :position (.position (get (.uses part) 0))
+                           :interval member))))
+      (set! member (get links (cast i64 member))))
+    (while (> (len pending) 0)
+      (match (queue/take! (mut pending))
+        (None [] 0)
+        (Some [item]
+              (let [index (cast i64 (.interval item))
+                    part (at parts index)
+                    cursor (get cursors index)
+                    use (get (.uses part) cursor)
+                    last (- (len merged) 1)]
+                (if (and (>= last 0)
+                         (= (.position (get merged last)) (.position use)))
+                    (when (> (.kind use) (.kind (get merged last)))
+                      (set! (mut merged) last use))
+                    (push! (mut merged) use))
+                (set! (mut cursors) index (+ cursor 1))
+                (when (< (+ cursor 1) (len (.uses part)))
+                  (queue/insert! (mut pending)
+                                 (queue/Item
+                                   :position
+                                     (.position (get (.uses part) (+ cursor 1)))
+                                   :interval (.interval item))))))))
+    (set! member head)
+    (while (>= member 0)
+      (let [part (elem (mut parts) (cast i64 member))]
+        (if (= member parent)
+            (free! (mut (.uses part)))
+            (do (clear! (mut (.uses part))) (clear! (mut (.ranges part))))))
+      (set! member (get links (cast i64 member))))
+    (set! (.uses (elem (mut parts) (cast i64 parent))) merged)
+    (free! (mut pending))))
+
+(defn canonical [(parents (ArrayList i32)) (reference i32)] (-> i32)
+  (let [(mut result) reference]
+    (while (!= (get parents (cast i64 result)) result)
+      (set! result (get parents (cast i64 result))))
+    result))
+
+;;; Parts are unsplit and unassigned, before physical reservations. A child
+;;; joins its source group only when its full lifetime is already covered and
+;;; coincident fixed constraints agree. In a valid forward data schedule each
+;;; encountered COPY definition is a singleton; do not merge an existing group
+;;; as a child. Original ranges/uses remain intact until all decisions finish.
+;;; The empty result means no aliases and no change to indexed lookup.
+(defn run! [(parts (mut (ArrayList allocation/Part)))
+            (graph g/Graph)
+            (scheduled schedule/Schedule)
+            (a (dyn Allocator))] (-> (ArrayList i32))
+  (let [(mut parents) (ArrayList::new [i32] a)
+        (mut indices) (ArrayList::new [i32] a)
+        (mut heads) (ArrayList::new [i32] a)
+        (mut links) (ArrayList::new [i32] a)
+        (mut cursors) (ArrayList::new [i64] a)
+        (mut fixed) (HashMap::new-scalar [u128 i32] a)
+        (mut eligible) false
+        (mut changes) 0]
+    (for reference (.nodes scheduled)
+      (when (reusable? graph reference) (set! eligible true)))
+    (when eligible
+      (for [r 0 (len (.instructions graph))]
+        (push! (mut parents) (cast i32 r))
+        (push! (mut indices) -1))
+      (for [i 0 (len parts)]
+        (push! (mut heads) (cast i32 i))
+        (push! (mut links) -1)
+        (push! (mut cursors) 0)
+        (let [part (at parts i)]
+          (when (> (.parent part) 0)
+            (set! (mut indices) (cast i64 (.parent part)) (cast i32 i))
+            (for use (.uses part)
+              (when (= (.kind use) 2)
+                (set! (mut fixed)
+                      (fixed-key (.parent part) (.position use))
+                      (.register use)))))))
+      (for reference (.nodes scheduled)
+        (when (reusable? graph reference)
+          (let [source
+                  (canonical parents
+                             (.op1 (get (.instructions graph)
+                                        (cast i64 reference))))
+                parent (get indices (cast i64 source))
+                child (get indices (cast i64 reference))]
+            (when (and (!= source reference)
+                       (>= parent 0)
+                       (>= child 0)
+                       (= (get heads (cast i64 child)) child))
+              (let [p (at parts (cast i64 parent))
+                    v (at parts (cast i64 child))
+                    (mut compatible)
+                      (and (= (.allowed p) (.allowed v))
+                           (inside? (.ranges p) (.ranges v)))]
+                (when compatible
+                  (for use (.uses v)
+                    (when (= (.kind use) 2)
+                      (match (get fixed (fixed-key source (.position use)))
+                        (None [] 0)
+                        (Some [reg]
+                              (when (!= reg (.register use))
+                                (set! compatible false)))))))
+                (when compatible
+                  (for use (.uses v)
+                    (when (= (.kind use) 2)
+                      (set! (mut fixed)
+                            (fixed-key source (.position use))
+                            (.register use))))
+                  (set! (mut links)
+                        (cast i64 child)
+                        (get heads (cast i64 parent)))
+                  (set! (mut heads) (cast i64 parent) child)
+                  (set! (mut heads) (cast i64 child) -1)
+                  (set! (mut parents) (cast i64 reference) source)
+                  (set! changes (+ changes 1))))))))
+      (for [i 0 (len parts)]
+        (let [head (get heads i)]
+          (when (and (>= head 0) (!= head (cast i32 i)))
+            (merge-group! (mut parts) (cast i32 i) head links (mut cursors) a))))
+      (for [r 1 (len parents)]
+        (set! (mut parents) r (canonical parents (cast i32 r)))))
+    (free! (mut fixed))
+    (free! (mut indices))
+    (free! (mut heads))
+    (free! (mut links))
+    (free! (mut cursors))
+    (when (= changes 0)
+      (free! (mut parents))
+      (set! parents (ArrayList::new [i32] a)))
+    parents))
+
+;;; The immutable lookup index is the graph-ref to allocated-vreg map. Alias
+;;; buckets borrow the canonical bucket's split children; no duplicate part or
+;;; transfer is created. Generic non-coalesced indices keep their usual shape.
+(defn index! [(index (mut locations/Index)) (parents (ArrayList i32))] (-> void)
+  (for [r 1 (len parents)]
+    (let [parent (get parents r)]
+      (when (!= parent (cast i32 r))
+        (set! (mut (.parents index)) r (get (.parents index) (cast i64 parent)))))))
