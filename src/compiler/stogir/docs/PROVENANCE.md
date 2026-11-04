@@ -1184,3 +1184,23 @@ invalid references/indices have ASAN/debug tests in the existing graph suite.
 Repeated fixed-emitter runtime measurements are in
 [operand-word-read](benchmarks/operand-word-read/README.md); they do not establish
 a full compiler gain.
+
+### Power-of-two division after zero extension
+
+Pinned `ir_fold.h` DIV/MOD constant rules supply unsigned power-of-two
+SHR/AND restarts and the signed ZEXT case. The incremental implementation
+requires an exact numeric constant and a positive power of two in the
+operation's width. A signed value must be a genuine widening ZEXT of an
+integer source. Signed top-bit divisors, ordinary signed values, SEXT,
+zero/non-power divisors, named constants and unrelated types retain the
+ordinary operation. This does not introduce general predicate-range analysis.
+The existing expression restart detaches the now-unneeded DIV/MOD guard,
+updates exact uses and queues the expression and its users. References and
+observed/shared input and guard nodes remain intact.
+
+The existing incremental native test suite adds 560 width/conversion/divisor
+cases over both pointer widths, rebuilt-versus-incremental edge checks,
+structural validation and native before/after boundary answers. Dispatch is
+also checked through the complete incremental optimizer with observed roots.
+ASAN/debug incremental native and division-fold suites pass. Performance and
+compiler integration are measured separately.
