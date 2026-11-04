@@ -977,3 +977,32 @@ answers across eight integer widths/signedness variants and ADDR, including zero
 divisors, signed min/-1, extreme bit patterns and positive/negative divisors.
 Additional tests cover a floating divide, exact one-cell budgets, Never/zero
 budget, and a guarded division that remains a call. Existing module cases pass.
+
+## Read-only site proof diagnostics
+
+`inspect-verified-site` reports common eligibility, caller-capture privacy and
+complete virtual-result proof separately for inputs satisfying the existing
+verified-site contract. It does not mutate either graph or replace any guard.
+The compiler invokes it only under its statistics trace. The module suite checks
+that these diagnostics agree with actual expansion across existing ABI, alias,
+Never, budget, guard, observation and result cases under ASAN.
+
+## Bounded natural-loop analysis work
+
+Natural-loop membership still unions all dominance backedges before counting a
+header, and irreducible-cycle policy is unchanged. Private visited marks now use
+unique positive CFG-header references as epochs, avoiding a graph-sized clear
+per candidate header. Depths increment when a member is first marked, avoiding a
+second full-block scan. Immediate-dominator forests receive owned Euler intervals
+for constant-time ancestry queries during this phase; the original public tree
+walk remains available. Construction uses an explicit heap work stack, and
+unreachable entries have zero intervals. Output arrays reserve known capacity.
+
+The ASAN oracle compares5120 generated CFGs (all three-vertex directed graphs,
+sparse references, sampled four-vertex graphs and duplicate edges) against the
+previous full-clear/tree-walk implementation and checks every start-pair ancestry.
+Existing325 block-order cases, fixed nested-loop expectations, a4096-level tree,
+disjoint roots/unreachable entries, and native scalar/switch-loop suites pass.
+The checked phase benchmark retains the prior algorithm as a reference; both
+modes use identical kernel objects and one opaque LLVM caller. It independently
+checks a nested multi-latch graph's known depth sum before1024 repetitions.

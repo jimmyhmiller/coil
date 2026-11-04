@@ -18,15 +18,18 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--compiler', type=Path, required=True)
 parser.add_argument('--library', type=Path, required=True, help='coil-stogir checkout')
 parser.add_argument('--never', action='store_true')
-parser.add_argument('--workload', choices=['iterator', 'verify'], default='iterator')
+parser.add_argument('--legacy', action='store_true')
+parser.add_argument('--workload', choices=['iterator', 'verify', 'loops'], default='iterator')
 parser.add_argument('--before', type=Path, help='previous compiler candidate')
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--objdump', default='llvm-objdump')
 parser.add_argument('--samples', type=int, default=6)
 parser.add_argument('--compile-samples', type=int, default=4)
 args = parser.parse_args()
-if args.workload == 'verify' and args.never:
+if args.workload != 'iterator' and args.never:
     parser.error('--never applies only to the iterator workload')
+if args.workload != 'loops' and args.legacy:
+    parser.error('--legacy applies only to the loops workload')
 if args.samples < 2 or args.compile_samples < 2:
     parser.error('--samples and --compile-samples must be at least 2')
 C = args.compiler.resolve()
@@ -44,7 +47,7 @@ def run(args):
     p = subprocess.run([str(x) for x in args], cwd=S, env=E, capture_output=True, text=True)
     assert p.returncode == 0, (args, p.returncode, p.stdout[-1000:], p.stderr[-2000:])
     return p
-prefix = 'iterator-return' if args.workload == 'iterator' else 'verify-graph'
+prefix = {'iterator': 'iterator-return', 'verify': 'verify-graph', 'loops': 'loop-depths'}[args.workload]
 fixture = S / ('benchmarks/compiler-gaps/' + prefix + '.coil')
 runner = S / ('benchmarks/compiler-gaps/' + prefix + '-runner.coil')
 fixture_bytes = fixture.read_bytes()
@@ -61,7 +64,7 @@ for n, c, b in cases:
     rec = [l.split('\t') for l in p.stderr.splitlines() if l.startswith('coil-codegen\t')]
     assert rec
     run(['cc', D / 'runner.o', D / (n + '.o'), '-o', D / n])
-    run([D / n, *(['--never'] if args.never else [])])
+    run([D / n, *(['--never'] if args.never else ['--legacy'] if args.legacy else [])])
     asm = run([args.objdump, '-d', '--no-show-raw-insn', D / (n + '.o')]).stdout
     (D / (n + '.asm')).write_text(asm)
     rows.append({'name': n, 'codegen_diagnostic_s': sum((int(x[3]) for x in rec)) / 1000000000.0, 'object_bytes': (D / (n + '.o')).stat().st_size, 'wall_samples_s': [], 'cpu_samples_s': [], 'codegen_samples_s': [], 'object_sha256': hashlib.sha256((D / (n + '.o')).read_bytes()).hexdigest()})
@@ -86,7 +89,7 @@ for turn in range(args.samples + 1):
     for row in rows if turn % 2 == 0 else list(reversed(rows)):
         r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
         t = time.monotonic()
-        run([D / row['name'], *(['--never'] if args.never else [])])
+        run([D / row['name'], *(['--never'] if args.never else ['--legacy'] if args.legacy else [])])
         dt = time.monotonic() - t
         r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
         if turn:
@@ -97,6 +100,6 @@ for row in rows:
     row['cpu_median_s'] = statistics.median(row['cpu_samples_s'])
 assert fixture.read_bytes() == fixture_bytes
 assert runner.read_bytes() == runner_bytes
-report = {'runner_source_sha256': hashlib.sha256(runner_bytes).hexdigest(), 'compilers': {n: str(c) for n, c, _ in cases}, 'samples': args.samples, 'compile_samples': args.compile_samples, 'workload': args.workload, 'work': ({'walks': 312500, 'walk_bytes': 64} if args.workload == 'iterator' else {'primitive_nodes': 2048, 'repetitions': 128, 'invalid_cases': 3}), 'mode': 'never' if args.never else 'default', 'checksum': ('independent indexed reference and full-run accumulated hash' if args.workload == 'iterator' else 'graph-size sum and three rejected invalid graphs'), 'runner_sha256': hashlib.sha256((D / 'runner.o').read_bytes()).hexdigest(), 'fixture_sha256': hashlib.sha256(fixture.read_bytes()).hexdigest(), 'rows': rows, 'qualification': 'One identical LLVM-built opaque runner; exact result checked by runner exit. Rotating samples after excluded warmup; caches disabled, serial codegen. Generation and runtime use separate rotating repetitions with excluded warmups; not compiler bootstrap acceptance.'}
+report = {'runner_source_sha256': hashlib.sha256(runner_bytes).hexdigest(), 'compilers': {n: str(c) for n, c, _ in cases}, 'samples': args.samples, 'compile_samples': args.compile_samples, 'workload': args.workload, 'work': ({'walks': 312500, 'walk_bytes': 64} if args.workload == 'iterator' else {'primitive_nodes': 2048, 'repetitions': 128, 'invalid_cases': 3} if args.workload == 'verify' else {'blocks': 64, 'reference_stride': 16, 'repetitions': 1024, 'depth_sum_per_call': 124}), 'mode': 'never' if args.never else 'legacy' if args.legacy else 'default', 'checksum': ('independent indexed reference and full-run accumulated hash' if args.workload == 'iterator' else 'graph-size sum and three rejected invalid graphs' if args.workload == 'verify' else 'known depth sum for outer and nested multi-latch loops; both algorithms checked before timing'), 'runner_sha256': hashlib.sha256((D / 'runner.o').read_bytes()).hexdigest(), 'fixture_sha256': hashlib.sha256(fixture.read_bytes()).hexdigest(), 'rows': rows, 'qualification': 'One identical LLVM-built opaque runner; exact result checked by runner exit. Rotating samples after excluded warmup; caches disabled, serial codegen. Generation and runtime use separate rotating repetitions with excluded warmups; not compiler bootstrap acceptance.'}
 (D / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
 print(json.dumps(rows), flush=True)
