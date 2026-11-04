@@ -1282,3 +1282,13 @@ root set; a reusable plan avoids per-merge scratch allocation. Conditional motio
 exclusions are shared through conditional.coil. There is no extra SCCP graph scan.
 The pure-default fixture covers all-equal lookup followed immediately by ordinary
 diamond folding with a pure default; new END bookkeeping grows before that fold.
+
+### Def-use bulk initialization
+
+Known range/cursor/edge extents use ArrayList.extend-zeroed! instead of repeated
+zero push loops, following pinned ir.c:ir_build_def_use_lists bulk allocation.
+All records contain only integer fields; exact reference classification, edge
+order, offsets and mutation contracts remain unchanged. ASAN/debug uses, mutable
+uses, native switch matrix and verifier pass. The independently checked opaque
+reduction improves stogir CPU15.1%/14.6%, with LLVM also improving12.8%/13.4%;
+this is not a full bootstrap claim. See [evidence](USES_INITIALIZATION.md).
