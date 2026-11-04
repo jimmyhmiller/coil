@@ -1188,7 +1188,7 @@ a full compiler gain.
 ### Power-of-two division after zero extension
 
 Pinned `ir_fold.h` DIV/MOD constant rules supply unsigned power-of-two
-SHR/AND restarts and the signed ZEXT case. The incremental implementation
+SHR/AND restarts and the signed ZEXT case. Construction and incremental rewriting share a single proof that
 requires an exact numeric constant and a positive power of two in the
 operation's width. A signed value must be a genuine widening ZEXT of an
 integer source. Signed top-bit divisors, ordinary signed values, SEXT,
@@ -1202,5 +1202,7 @@ The existing incremental native test suite adds 560 width/conversion/divisor
 cases over both pointer widths, rebuilt-versus-incremental edge checks,
 structural validation and native before/after boundary answers. Dispatch is
 also checked through the complete incremental optimizer with observed roots.
-ASAN/debug incremental native and division-fold suites pass. Performance and
-compiler integration are measured separately.
+The same matrix checks construction folding, since unchanged initial nodes do
+not enter the affected-node queue. ASAN/debug incremental native and
+division-fold suites pass. Performance and compiler integration are measured
+separately.
