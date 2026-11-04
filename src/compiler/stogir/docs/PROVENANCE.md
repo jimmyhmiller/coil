@@ -1328,3 +1328,14 @@ ASAN/debug CFG/dom/loops/live/schedule/native module and AOT checks pass. The
 independently checked opaque preparation reduction improves stogir4.33%/5.31%,
 LLVM6.55%/5.29%, TPDE3.89%/4.17%; no full bootstrap claim. See
 [analysis storage](ANALYSIS_STORAGE.md).
+
+### Empty register buckets in pressure queries
+
+Standalone0db3867 adds conservative event-domain queries to fixed-use and physical
+reservation indexes. Empty buckets bypass interval range traversal; nonempty
+buckets retain all existing ownership, intersection and deactivation handling.
+Pinned upstream linear-scan policy and emitted-code decisions are unchanged.
+This is a local traversal optimization, not a new upstream pass. Repeated small
+sparse-input stogir runtime gains7.99%/7.43%; dense overhead ranges -0.63% to
++1.69%. Integration performance remains to be measured. See
+[pressure register domain](PRESSURE_REGISTER_DOMAIN.md).
