@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`7f5c17c`, on 2026-11-04. The independent library remains maintained in that
+`b346ad2`, on 2026-11-04. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 
@@ -56,3 +56,6 @@ edge categories and mutation semantics stay intact. See [initialization](docs/US
 The compiler can explicitly prioritize smaller registered templates under its
 existing clone budget. Ordered library APIs remain unchanged; see
 [site priority](docs/INLINE_SITE_PRIORITY.md).
+
+Known-size plain analysis buffers use bulk zero initialization. See
+[storage initialization](docs/ANALYSIS_STORAGE.md).

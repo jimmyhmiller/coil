@@ -1318,3 +1318,13 @@ legality gate changes. A native exact-one-cell case contrasts ordered cold-call
 selection with loop-call selection at equal results. Existing registry/capture/
 ABI/mutation/order and AOT checks pass. The naive cost-only compiler policy was
 not accepted after a use-builder regression; revised performance remains pending.
+
+### Known-size analysis storage initialization
+
+Use existing bulk zero extension for plain integer/bool and integer-only Range
+analysis buffers, matching their prior zero values and upstream-sized allocation
+approach. Leave -1 sentinels and owning/nested records unchanged. Focused
+ASAN/debug CFG/dom/loops/live/schedule/native module and AOT checks pass. The
+independently checked opaque preparation reduction improves stogir4.33%/5.31%,
+LLVM6.55%/5.29%, TPDE3.89%/4.17%; no full bootstrap claim. See
+[analysis storage](ANALYSIS_STORAGE.md).
