@@ -75,3 +75,17 @@ integer validation and119 reserved-ranges.first. The next reduction should test
 hot selector/aggregate call costs and actual inlining eligibility; those stack
 names alone do not prove an inlining or ABI defect. Preserve the call/alias,
 root and aggregate lifetime contracts when identifying the code-quality gap.
+
+
+The follow-up [selector reduction](results/classification-reads/selector-audit/probe.coil)
+confirms an eligibility restriction: sx-tag has140 compact cells but only33 base
+clone cells, one RETURN, acyclic policy and512 remaining budget. Its graph has
+CASE_VAL109, CASE_DEFAULT111 and SWITCH117. These are absent from the inliner
+control whitelist; the caller trace reports common=false. This is not evidence
+of an aggregate copy or a need to increase the budget. The stogir wrapper emits
+an empty frame setup/restore and a direct tail branch to sx-tag; LLVM emits a
+five-instruction scalar tag table lookup. Trace and assembly excerpts are saved
+beside the reduction. Next work must support switch control cloning with exact
+case constants, edges, Phi predecessor order and observed non-returning defaults,
+through the existing validation/root machinery. No switch-inlining implementation
+or performance gain is claimed yet.
