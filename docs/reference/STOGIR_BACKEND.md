@@ -247,3 +247,10 @@ is registered and the provider freezes. Emission cannot insert into the registry
 All snapshots are released after the module jobs finish. Caller validation and
 per-site eligibility, observations, capture, result and budget checks remain.
 This is an independent module orchestration extension, not an upstream pass.
+
+Standalone `06b7d4f` restores the pinned upstream `ir_fold.h` `TRUNC(AND)`
+restart for exact 8/16/32-bit destination masks. Ordinary use-list/worklist
+updates preserve other observations and shared producers. The standalone full
+incremental fold/CSE/JIT suite passes with ASAN/debug checks. A compact header
+reduction removes an extra 32-bit normalization and an AND; compiler workload
+performance still requires measurement.

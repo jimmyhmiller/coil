@@ -1084,3 +1084,13 @@ with the legacy API; caller validation and all per-site and output checks stay
 in place. The pointer width belongs to the registry. Its owner must prevent
 mutation or release during optimization and release the registry exactly once;
 release through the original owning value is idempotent.
+
+### Truncation of exact width masks
+
+The iterative conversion restart now includes pinned `ir_fold.h`'s
+`TRUNC(AND)` rule: an integer truncation to 8, 16 or 32 bits discards an exact
+mask of that destination width. The consumer is rewritten through the ordinary
+use-list/worklist machinery. Shared or rooted AND values remain valid; BOOL
+canonicalization and other masks are left to their ordinary rules. Native
+conversion tests cover signed and unsigned destinations, 32/64-bit pointer
+models, rooted observations and masks adjacent to each exact boundary.
