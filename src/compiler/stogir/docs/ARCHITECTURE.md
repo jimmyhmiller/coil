@@ -123,3 +123,17 @@ EXTR/ROR-immediate encoder. Narrow and dynamic rotates retain their existing
 width-specific paths. Encoder words match llvm-mc; the existing native shift
 suite covers signed/unsigned widths, zero/wrapped/large counts and bit patterns,
 and division/variable-rotate regressions pass ASAN/debug checks.
+
+
+### Mask after zero extension
+
+The incremental fold kernel implements pinned `ir_fold.h`
+`AND(ZEXT, full-source-mask)`: source widths 8/16/32 and exactly the
+corresponding all-one low mask. Operand order is accepted in either direction
+without mutating predecessor/value associations. The ordinary replacement
+mechanism preserves externally observed identities via typed COPY and updates
+exact uses/worklists; shared extensions remain available. Named relocation
+payloads never become masks. The existing ASAN/debug native fold suite adds
+960 graph cases / 26,880 original and rewritten answers covering signed/unsigned
+source and destination types, exact and adjacent masks, four observation modes,
+both operand orders, and both supported pointer widths.
