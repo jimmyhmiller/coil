@@ -50,4 +50,6 @@ python3 scripts/benchmarks/stogir-avec.py --compiler build/bin/coil-candidate \
 
 Optional `--before /path/to/previous/build/bin/coil-candidate` adds the previous backend; the driver verifies identical AVec source, uses one opaque LLVM caller, checks every run's result, rotates order, excludes warmup, and saves raw CPU/wall samples and disassembly.
 
-The full FAST delivery gate is in progress. Changes are committed, not yet installed globally, and not yet pushed. The objective remains unmet.
+FAST passed 49/49 in 279.0 seconds. Its existing cli/objects memory-budget warning remains at 1.60 GB against the 1.5 GB warning line. The toolchain is installed globally from executable source 67f02f1e, with its matching SDK and warmed JIT/lint units. All 149 standalone modules and all 426 installed compiler/stdlib files match the candidate sources; the toolchain stamp and AVec source match exactly.
+
+Off-checkout LLVM/TPDE/stogir O3 builds return the expected 42 and produce all three exact bounds diagnostics. Installed stogir address matching, allocation, edge reconciliation, calls, vectors, late-memory, module, bitwise, SCCP and iterative suites pass. See [installed-checks.json](word-address/installed-checks.json). These are correctness/delivery checks, not performance acceptance. The 5×/within-10% objective remains unmet.
