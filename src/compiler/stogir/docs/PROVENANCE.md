@@ -1208,3 +1208,24 @@ The same matrix checks construction folding, since unchanged initial nodes do
 not enter the affected-node queue. ASAN/debug incremental native and
 division-fold suites pass. Performance and compiler integration are measured
 separately.
+
+### Immutable verifier classification reads
+
+Vector and scalar floating classification in the operation verifier share
+the cursor's already-checked immutable instruction and first-input type read.
+The predicates stay independent, including a floating first input and vector
+second input. All validators and diagnostic ordering remain unchanged. Input
+references still use checked immediate borrows, never retained across mutation.
+This is a Coil implementation improvement, not a new upstream optimization pass.
+The existing verifier suite compares both flags against the original independent
+classifiers over 1,451,220 raw-storage cases spanning opcode/type/count shapes,
+positive/negative/absent/continuation references and mixed malformed operands.
+ASAN/debug verifier and exact diagnostic/count checks pass. Fixed-emitter
+source-algorithm timing evidence is recorded separately from compiler generation.
+
+Classification also consumes the first three operand fields already present in
+the validated cursor value. Continuation payload reads keep the checked graph
+accessor; every input reference retains checked membership. This scoped reuse
+does not introduce a new unchecked graph API. The same raw-storage predicate
+matrix passes. Repeated fixed-emitter CPU measurements and their limits are in
+[classification reads](benchmarks/classification-reads/README.md).
