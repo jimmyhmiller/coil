@@ -273,14 +273,15 @@ The complete standalone memory promotion/forwarding suite passes under ASAN/debu
 
 ### Typed constructor words and small aggregate merges
 
-For stogir O2/O3, the shared native lowering can construct bounded fresh sum values with scalar
-integer/pointer fields as complete little-endian words. It packs each declared
-field's storage bytes, masks sign extension, and handles word boundaries. Only
-representation padding and inactive variant bytes receive zero; every active
-field still comes from its checked constructor argument, evaluated in order.
-This constructs an entire fresh value, never widens a store into an existing
-object. Unsupported aggregate/floating/vector fields retain typed construction.
-The existing native inline-copy bound also bounds constructor packing.
+For stogir O2/O3, the shared native lowering constructs known words of bounded
+fresh sum values from their declared scalar integer/pointer fields. It masks
+sign extension to field storage bytes. Words touched by opaque active fields
+(aggregate, floating, vector, or crossing-word layouts) retain their original
+typed construction, including those fields' representation bytes. Known outer
+padding and inactive variant bytes receive zero; every active field still comes
+from its checked constructor argument, evaluated in order. This constructs a
+fresh value, never widens a store into an existing object. The existing native
+inline-copy bound also bounds constructor packing.
 
 Small aggregate if/match results snapshot each live branch into one static
 private destination, rather than merging branch-object addresses. CIR's static
@@ -291,6 +292,6 @@ value forms are selected for the backend's memory-promotion capability.
 Frame-escape policy remains conservative. These are Coil value-lowering choices,
 independent of upstream stogir's compact graph and exact-field SSA pass.
 
-The sums corpus adds signed/unsigned mixed-width field and argument-snapshot
-checks. Existing large, aggregate and floating payload cases cover fallback.
+The sums corpus adds signed/unsigned mixed-width fields, argument snapshots,
+pointer preservation, and opaque/scalar fields sharing a word. Existing large, aggregate and floating payload cases cover fallback.
 Performance and full native validation are pending for this checkpoint.
