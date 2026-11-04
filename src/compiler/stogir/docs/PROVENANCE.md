@@ -1008,3 +1008,14 @@ disjoint roots/unreachable entries, and native scalar/switch-loop suites pass.
 The checked phase benchmark retains the prior algorithm as a reference; both
 modes use identical kernel objects and one opaque LLVM caller. It independently
 checks a nested multi-latch graph's known depth sum before1024 repetitions.
+
+
+### Shared structural verification transactions
+
+The operation/Phi and operation/constant/Phi transaction entry points share one
+immediate structural scan over an immutable graph. Private scan helpers are not
+exported. Public independent validators still perform their own structural
+validation. SCCP analysis and rewrite preserve their prior check and diagnostic
+order, including whether constants precede operations; no proof is cached across
+mutation or exposed as a caller-supplied flag. This is independent Coil pipeline
+orchestration over the existing validation rules, not upstream pass parity.
