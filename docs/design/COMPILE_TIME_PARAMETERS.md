@@ -68,7 +68,7 @@ case and the checker's use-based kind guessing are replaced by one uniform featu
   `(impl [T] Len (Buffer T 4))` beats `(impl [T (const N i64)] Len (Buffer T N))`.
 - In expression position a value parameter evaluates to its value, with its declared
   type. Local bindings shadow it, as with module `const`. A use inside `(comptime ...)`
-  in a generic body is an error: the value is not known until specialization.
+  in a generic body runs once per instance, when the value is known.
 - Metaprograms see constants rendered as `4`, `true` or `:meters`, through one
   type-to-Code renderer.
 
@@ -139,8 +139,9 @@ Each stage builds with the current seed, passes the gates and is committed on it
 - Bootstrap: new arms and fields are appended, and old ones are removed only after
   reseeding.
 - The retained snapshot is regenerated at every stage that changes the AST.
-- Comptime runs before specialization, so value parameters are unavailable to
-  `comptime` in step 1. Step 2 has to address this.
+- A `comptime` computing a type in a type position has no value when the type is
+  needed, since a value parameter's `comptime` runs at specialization. Step 2 has to
+  address this.
 
 ## As implemented
 
@@ -155,9 +156,9 @@ Each stage builds with the current seed, passes the gates and is committed on it
 - `VectorWidth` became `Extent` (`FixedExtent` / `ParamExtent`) and is shared by
   `TArray`, `TVec` and `EMakeSlice`, rather than lengths becoming type references.
   Mono's `resolve-extent` specializes all three; backends read `extent-value`.
-- A value parameter in an expression is `EConstParam [name ty]`. Use inside
-  `comptime` is rejected by the checker (a `comptime_depth` counter on `Cx`), not by
-  the comptime evaluator.
+- A value parameter in an expression is `EConstParam [name ty]`. `comptime` reads one
+  through a generic definition it hoists with the same parameters
+  (`docs/reference/COMPTIME.md`).
 - The migrations are part of the lint syntax preflight, not a `coil.lint.*` checker:
   neither old spelling loads, and checkers run only on programs that expand.
   `coil.compiler.generic_migration` works on read syntax. `prelint-run` applies it

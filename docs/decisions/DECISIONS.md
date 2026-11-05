@@ -412,3 +412,14 @@ What changed for a program: `comptime` runs before whole-program transforms and 
 expected type, as any macro does. It runs on the machine building the program, as it
 always did, and that is now documented rather than discovered.
 
+`comptime` then learned what is around it (2026-11-05), still as a macro. The rule is the
+one Zig draws: a value is usable if it exists while the program compiles. Running `E` in
+the checker as Zig does would have brought back the value tracking and the separate
+evaluation that were deleted, so the two cases each happen where the value appears. A
+`let` a constant could hold is known at macro time, so `comptime` copies it into what it
+hoists (`code-call-scope`, `code-known-value`). A generic parameter is known at
+specialization, so `E` is hoisted as a generic with the same parameters, and specialization
+runs the instance through the one engine (`code-specialized-value`). A local with no
+value is an error at the read, not a read of a top-level name of its spelling, which is
+what the first version silently did (`code-without-locals`).
+

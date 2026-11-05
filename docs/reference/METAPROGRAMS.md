@@ -100,7 +100,7 @@ using it pays that layout at each level; it is still correct. `code-copy` and
   `code-list?`, `code-sym?`, `code-int?`, `code-keyword?`, `code-str`, `code-eq`.
 - **Build Code:** quote `` ` ``, unquote `~` (a value becomes the syntax that rebuilds
   it, a struct, sum or array included; `primitive/code-lift` keeps a scalar's type too),
-  splice `~@`, `primitive/code-hoist` (add a definition to the module being expanded), `code-symbol` (make a
+  splice `~@`, `primitive/code-hoist` (add a definition to the module being expanded), `primitive/code-call-scope` (what is bound around the macro call), `code-symbol` (make a
   name from a symbol/string base plus suffix parts — a keyword part is its name
   without the colon, an int part becomes its decimal
   digits, and a **generic instantiation** base `(Gen A B)`, the same shape
