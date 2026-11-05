@@ -1423,3 +1423,15 @@ Complete assignments, generic allocation APIs, odd spill stores and explicit
 call transitions retain their existing semantics. This is a target-position
 adaptation, not a claim to port upstream's loop-aware optimal split placement.
 The emitter's unsupported-boundary guard is retained.
+
+Coalesced range adjacency does not imply SSA value continuity. Native split
+transfer construction excludes a transition at the birth of a newly defined
+non-COPY/BITCAST value in that same allocation group. The definition supplies
+its result; carrying the prior dead value can create a false call-preservation
+copy into an ABI argument/result register. Original matching definitions and the
+finalized location owner establish this condition. COPY/BITCAST aliases retain
+their existing transfer lowering. Duplicate-destination validation is unchanged.
+The 425-cell captured fixture comes from Coil's `meta/metahost.coil:mh-quoted`,
+adapted by compiler 5bc1bad6; [Coil](https://github.com/jimmyhmiller/coil) supplies
+the source program. A separate small executable graph reproduces the failure
+without importing the compiler and checks both branch outcomes independently.

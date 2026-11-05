@@ -12,3 +12,7 @@ Native free-range splits use legal input boundaries and explicit call definition
 transitions. This does not establish loop-aware optimal split parity.
 Native debug/ASAN range, constraint, branch, loop, GP/SIMD pressure, call, binary
 and stencil checks pass in the standalone library. Compiler timing is pending.
+
+Split transfers stop at a new SSA definition in the same allocation group;
+COPY/BITCAST aliases retain existing lowering. This fixes the captured
+metahost.mh-quoted bootstrap failure without weakening parallel-copy validation.
