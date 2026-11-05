@@ -13,7 +13,9 @@ b27ffeb4 vendors standalone ebe4833; source remains frozen after candidate build
 
 Relative to rematerialization alone: generation improves1.33%, runtime1.51%.
 Relative to the earlier backend: runtime improves3.30%, generation worsens0.93%.
-Current small-workload generation advantage versus LLVM is3.9248×, runtime
+The runtime sample ranges overlap and include outliers (rematerialization23.302–43.947ms,
+candidate22.841–28.059ms); this small median difference is not a robust acceptance
+claim. Current small-workload generation advantage versus LLVM is3.9248×, runtime
 slowdown2.74445×. These numbers do not establish either whole-bootstrap target.
 
 All rows compile the exact same current verifier/library source, with the same
@@ -35,6 +37,13 @@ Candidate build and quick gate PASS35.7s. Extended existing post-inline emission
 regression retains an opaque C aggregate-return call, checks exact results across
 a later writing call and integer edge cases; symbols/traced byte identity/units
 also pass. Library validation is centralized in vendored
-`docs/validation/result-projections`. Full FAST is pending at this checkpoint.
+`docs/validation/result-projections`. Full FAST49/49 PASS272.3s, with cli/objects3.70GB memory-threshold warning.
 
-Not globally installed. Implementation committed; compiler branch not yet pushed.
+Not globally installed. Implementation and evidence committed. Compiler branch push follows the full FAST gate.
+
+Follow-up standalone test commit6927a3c strengthens the pressure proof with36
+control-pinned input loads and explicit interval coverage assertions;120 JIT
+and40 AOT answers pass. Library implementation is unchanged from ebe4833.
+The fixture, driver and transcripts are archived here outside the frozen SDK.
+All158 vendored Coil modules match the standalone implementation byte-for-byte.
+Candidate SDK stamp reverified after gates.
