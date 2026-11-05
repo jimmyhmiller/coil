@@ -1596,6 +1596,11 @@
    (import-names (ArrayList (slice u8)))
    (import-ids (ArrayList u32))])
 
+;;; A non-template caller owns its final graph in a stable arena until emitted.
+;;; Registry snapshots remain frozen; these bodies are never registered callees.
+(defstruct EmissionBody
+  [(definition Definition) (arena (ptr scratch/ScratchArena))])
+
 ;;; Prepared once in source submission order, then immutable during emission.
 ;;; The module allocator owns every definition until all jobs have finished.
 (defstruct Module
@@ -1604,6 +1609,8 @@
    (frozen bool)
    (callees inlining/Registry)
    (definitions (ArrayList Definition))
+   (bodies (ArrayList EmissionBody))
+   (body-by-symbol (ArrayList i64))
    (by-symbol (ArrayList i64))
    (bindings (HashMap (slice u8) u32))])
 
@@ -1614,6 +1621,8 @@
     :frozen false
     :callees (inlining/registry-create 8 a)
     :definitions (ArrayList::new [Definition] a)
+    :bodies (ArrayList::new [EmissionBody] a)
+    :body-by-symbol (ArrayList::new [i64] a)
     :by-symbol (ArrayList::new [i64] a)
     :bindings (HashMap::new [(slice u8) u32] a (keyops-borrowed))))
 
@@ -1865,7 +1874,9 @@
 ;;; The module arena still owns its source definitions and bindings. Registry
 ;;; snapshots have no readers after all emission jobs have completed.
 (defn module-release-callees! [(module (ptr Module))] (-> void)
-  (inlining/registry-release! (mut (.callees module))))
+  (inlining/registry-release! (mut (.callees module)))
+  (for [i 0 (len (.bodies module))]
+    (release-emission-body! module (.symbol (.definition (at (.bodies module) i))))))
 
 (defn expand-module! [(s (ptr Adapter)) (module (ptr Module)) (budget i32)]
   (-> i32)
@@ -2183,17 +2194,70 @@
               index -1))
         -1)))
 
+(defn emission-definition [(module (ptr Module)) (f (ptr cir/Func)) (symbol u32)]
+  (-> (ptr Definition))
+  (let [index (prepared-index module f symbol) id (cast i64 symbol)]
+    (if (>= index 0)
+        (elem (mut (.definitions module)) index)
+        (if (and (< id (len (.body-by-symbol module)))
+                 (> (get (.body-by-symbol module) id) 0))
+            (let [body (elem (mut (.bodies module)) (- (get (.body-by-symbol module) id) 1))]
+              (if (= (p/cast u64 (.source (.definition body))) (p/cast u64 f))
+                  (cast (ptr Definition) (mut (.definition body)))
+                  (p/cast (ptr Definition) 0)))
+            (p/cast (ptr Definition) 0)))))
+
+;;; Serial planning moves the old raw-caller preparation before reachability.
+;;; The heap-stable arena avoids copying a whole graph into another allocator.
+;;; Its contents live until this body's emission; no graph borrows cross growth
+;;; of the bodies array. Callee eligibility and the checked clone cap are unchanged.
+(defn prepare-emission-body! [(module (ptr Module)) (f (ptr cir/Func))
+                              (ta (ptr asm/Asm)) (symbol u32) (level i32)] (-> void)
+  (when (= (p/cast i64 (emission-definition module f symbol)) 0)
+    (unless (.frozen module) (fail (.name f) "emission preparation before registry freeze"))
+    (let [work (box! (.a module) scratch/ScratchArena (zeroed scratch/ScratchArena))]
+      (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
+      (let [a (allocator work) (mut state) (zeroed Adapter)
+            s (cast (ptr Adapter) (mut state))]
+        (adapt! s f ta (p/cast (ptr (ArrayList MTextData)) 0) a)
+        (when (> level 1) (prepare-inline-caller! s))
+        (expand-module! s module (inline-budget))
+        (let [definition (Definition :inlineable false :callee-handle 0 :symbol symbol
+                            :graph (.g s) :entry (.start s)
+                            :roots (ArrayList::new [i32] a)
+                            :observed (.exits s)
+                            :inline-controls (ArrayList::new [i32] a)
+                            :name (.name f) :source f
+                            :import-names (.import-names s) :import-ids (.import-ids s))]
+          (push! (mut (.bodies module)) (EmissionBody :definition definition :arena work)))
+        (while (<= (len (.body-by-symbol module)) (cast i64 symbol))
+          (push! (mut (.body-by-symbol module)) 0))
+        (set! (mut (.body-by-symbol module)) (cast i64 symbol) (len (.bodies module)))))))
+
+(defn release-emission-body! [(module (ptr Module)) (symbol u32)] (-> void)
+  (let [id (cast i64 symbol)]
+    (when (and (< id (len (.body-by-symbol module))) (> (get (.body-by-symbol module) id) 0))
+      (let [body (elem (mut (.bodies module)) (- (get (.body-by-symbol module) id) 1))
+            work (.arena body)]
+        (when (!= (p/cast i64 work) 0)
+          (let [started (tr/codegen-start)]
+            (close! work)
+            (set! (.arena body) (p/cast (ptr scratch/ScratchArena) 0))
+            (tr/codegen-end "stogir" "ir-codegen" started))))))))
+
 ;;; Only references in instruction operands are edges. Dead constants retained
 ;;; in an interning pool are not function roots. Conservatively scanning every
 ;;; surviving instruction also retains references in not-yet-pruned CFG arms.
 (defn reference-symbols! [(module (ptr Module)) (f (ptr cir/Func)) (symbol u32)
                           (references (mut (ArrayList u32)))] (-> bool)
-  (let [index (prepared-index module f symbol)]
-    (if (< index 0)
+  (let [definition (emission-definition module f symbol)]
+    (if (= (p/cast i64 definition) 0)
         false
-        (let [definition (at (.definitions module) index)
-              source (.graph definition)
+        (let [source (.graph definition)
+              (mut bindings) (HashMap::new [(slice u8) u32] (.a module) (keyops-borrowed))
               (mut r) 1]
+          (for [i 0 (len (.import-names definition))]
+            (set! (mut bindings) (get (.import-names definition) i) (get (.import-ids definition) i)))
           (while (< r (len (.instructions source)))
             (let [cell (get (.instructions source) r)
                   count (get (.arities source) r)
@@ -2212,11 +2276,12 @@
                                 (match (strings/lookup (.strings source) (cast i32 (node/constant-bits constant)))
                                   (None [] (fail (.name f) "emission graph symbol name missing"))
                                   (Some [name]
-                                    (match (get (.bindings module) name)
+                                    (match (get bindings name)
                                       (None [] (fail (.name f) "emission graph symbol binding missing"))
                                       (Some [target] (push! (mut references) target)))))))))))))
                 (set! i (+ i 1)))
               (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+          (free! (mut bindings))
           true))))
 
 ;;; Raw large callers have not passed the template preparation epoch. Promote
@@ -2250,22 +2315,16 @@
         ; Finalized templates are immutable and already own their graph, roots
         ; and import bindings. Borrow them through image generation; the native
         ; options API still rebuilds optimization, CFG, matching and allocation.
-        (when (and (!= (p/cast i64 module) 0)
-                   (< (cast i64 symbol) (len (.by-symbol module))))
-          (let [index (- (get (.by-symbol module) (cast i64 symbol)) 1)]
-            (when (>= index 0)
-              (let [definition (get (.definitions module) index)]
-                (when (= (p/cast u64 (.source definition)) (p/cast u64 f))
-                  (set! (.a s) a)
-                  (set! (.f s) f)
-                  (set! (.ta s) ta)
-                  (set! (.text-data s) text-data)
-                  (set! (.g s) (.graph definition))
-                  (set! (.start s) (.entry definition))
-                  (set! (.exits s) (.observed definition))
-                  (set! (.import-names s) (.import-names definition))
-                  (set! (.import-ids s) (.import-ids definition))
-                  (set! prepared true))))))
+        (when (!= (p/cast i64 module) 0)
+          (let [definition (emission-definition module f symbol)]
+            (when (!= (p/cast i64 definition) 0)
+              (set! (.a s) a) (set! (.f s) f) (set! (.ta s) ta)
+              (set! (.text-data s) text-data)
+              (set! (.g s) (.graph definition)) (set! (.start s) (.entry definition))
+              (set! (.exits s) (.observed definition))
+              (set! (.import-names s) (.import-names definition))
+              (set! (.import-ids s) (.import-ids definition))
+              (set! prepared true))))
         (unless prepared
           (adapt! s f ta text-data a)
           (when (and (!= (p/cast i64 module) 0) (> optimization 1))
