@@ -1435,3 +1435,14 @@ The 425-cell captured fixture comes from Coil's `meta/metahost.coil:mh-quoted`,
 adapted by compiler 5bc1bad6; [Coil](https://github.com/jimmyhmiller/coil) supplies
 the source program. A separate small executable graph reproduces the failure
 without importing the compiler and checks both branch outcomes independently.
+
+## Guarded backward integer-width propagation
+
+`iter-fold.coil` adapts pinned `ir_sccp.c:ir_may_promote_trunc` and
+`ir_promote_i2i`: preflight single-use arithmetic, retarget conversions, then
+apply before CFG and native matching. The Coil implementation uses an explicit
+stack and a flat rewrite plan rather than recursive mutation, preserves
+protected observations, and updates exact operand-position use edges.
+MIN/MAX/ABS are excluded pending range/order proofs because the pinned native
+reproductions in `INTEGER_TYPE_PROMOTION_AUDIT.md` show wrong-code cases.
+BOOL and pointer conversion boundaries are excluded.

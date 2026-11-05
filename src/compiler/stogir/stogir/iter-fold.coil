@@ -1,6 +1,7 @@
 ;;; Incremental fold/CSE/DCE kernel adapted from pinned ir_sccp.c:ir_iter_fold,
 ;;; ir_iter_replace_insn and ir_iter_find_cse. Control cleanup and promotion are
-;;; supported incrementally; broader predicate/loop/type promotion remains pending.
+;;; supported incrementally, including guarded backward modular integer widths;
+;;; broader predicate/loop and range-dependent type promotion remains pending.
 (module stogir.iter-fold)
 (import "stogir.graph" :as g)
 (import "stogir.iter-constant-cse" :as literal-cse)
@@ -10,6 +11,7 @@
 (import "stogir.control-merge" :as boundaries)
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
+(import "stogir.conversion" :as conversion)
 (import "stogir.symbols" :as symbols)
 (import "stogir.opcode" :as op)
 (import "stogir.sccp-fold" :as fold)
@@ -19,6 +21,7 @@
 (import "stogir.uses" :as uses)
 (import "stogir.bitqueue" :as q)
 (import "stogir.bitset" :as bits)
+(import "coil.slice" :use [subslice])
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [Allocator])
 (import "coil.result" :use [Result Ok Err Option Some None])
@@ -739,6 +742,188 @@
                 (None [] 0)))))))
     changed))
 
+;;; Backward integer-width propagation follows pinned ir_sccp.c's truncation
+;;; preflight/apply split. MIN/MAX/ABS require stronger range/order proofs and
+;;; remain unchanged (see INTEGER_TYPE_PROMOTION_AUDIT.md).
+(defstruct PromotionNode [(reference i32) (opcode u8) (begin i64) (count i64)])
+(defstruct PromotionFrame [(reference i32) (plan i64) (cursor i64) (slot i64)])
+(defstruct PromotionContext
+  [(states (ArrayList u8)) (mapped (ArrayList i32))
+   (touched (ArrayList i32)) (stack (ArrayList PromotionFrame))
+   (nodes (ArrayList PromotionNode)) (inputs (ArrayList i32))])
+
+(defn promotion-context [(a (dyn Allocator))] (-> PromotionContext)
+  (PromotionContext :states (ArrayList::new [u8] a)
+    :mapped (ArrayList::new [i32] a) :touched (ArrayList::new [i32] a)
+    :stack (ArrayList::new [PromotionFrame] a)
+    :nodes (ArrayList::new [PromotionNode] a) :inputs (ArrayList::new [i32] a)))
+
+(defn release-promotion! [(c (mut PromotionContext))] (-> void)
+  (free! (mut (.states c))) (free! (mut (.mapped c)))
+  (free! (mut (.touched c))) (free! (mut (.stack c)))
+  (free! (mut (.nodes c))) (free! (mut (.inputs c))))
+
+(defn promotion-value-input? [(opcode u8) (index i64)] (-> bool)
+  (and (not (and (>= opcode 33) (<= opcode 36)))
+       (or (not (or (= opcode 60) (= opcode 67))) (> index 0))))
+
+;;; -1 rejects; zero bypasses an existing extension without changing it.
+(defn promotion-op [(graph g/Graph) (lists uses/Uses) (protected bits/Bits)
+                    (reference i32) (root i32) (target u8) (pointer-bytes i32)]
+  (-> i32)
+  (let [node (get (.instructions graph) (cast i64 reference))
+        opcode (cast i32 (n/opcode node))
+        range (get (.ranges lists) (cast i64 reference))
+        width (types/scalar-size (cast i32 target) pointer-bytes)]
+    (cond (or (= reference root)
+              (= (n/type-id node) 6)
+              (bits/contains? protected (cast i64 reference))
+              (not (types/integer? (cast i32 (n/type-id node))))
+              (<= (types/scalar-size (cast i32 (n/type-id node)) pointer-bytes) width)) -1
+          (and (>= opcode 33) (<= opcode 35))
+            (let [source (get (.instructions graph) 0)
+                  input (match (g/lookup graph (.op1 node))
+                          (None [] source) (Some [value] value))
+                  from (types/scalar-size (cast i32 (n/type-id input)) pointer-bytes)]
+              (cond (or (= (.op1 node) root)
+                        (= (n/type-id input) 1) (= (n/type-id input) 6)
+                        (not (types/integer? (cast i32 (n/type-id input))))) -1
+                    (= (n/type-id input) target) 0
+                    (!= (.count range) 1) -1
+                    (= from width) 36
+                    (> from width) 35
+                    (or (= opcode 33) (= opcode 34)) opcode
+                    :else (if (types/signed? (cast i32 target)) 33 34)))
+          (= opcode 67)
+            (let [(mut external) 0]
+              (for [i (.offset range) (+ (.offset range) (.count range))]
+                (unless (= (.user (get (.edges lists) i)) reference)
+                  (set! external (+ external 1))))
+              (if (= external 1) opcode -1))
+          (!= (.count range) 1) -1
+          (or (= opcode 26) (= opcode 27) (= opcode 28)
+              (= opcode 31) (= opcode 45)
+              (= opcode 46) (= opcode 47) (= opcode 48)) opcode
+          (= opcode 49)
+            (match (g/lookup graph (.op2 node))
+              (None [] -1)
+              (Some [amount]
+                (if (and (< (.op2 node) 0) (symbols/numeric? amount)
+                         (types/integer? (cast i32 (n/type-id amount)))
+                         (< (n/constant-bits amount) (cast u64 (* width 8)))) opcode -1)))
+          (and (= opcode 60) (!= (.op1 node) (.op2 node))
+               (!= (.op1 node) (.op3 node))) opcode
+          :else -1)))
+
+;;; Marks/maps are allocated lazily once and reset only at touched references.
+;;; An explicit stack rejects foreign cycles without recursive host-stack use.
+(defn plan-promotion! [(c (mut PromotionContext)) (graph g/Graph)
+                       (lists uses/Uses) (protected bits/Bits)
+                       (root i32) (source i32) (target u8) (pointer-bytes i32)]
+  (-> i32)
+  (for reference (.touched c) (set! (mut (.states c)) (cast i64 reference) 0))
+  (clear! (mut (.touched c))) (clear! (mut (.stack c)))
+  (clear! (mut (.nodes c))) (clear! (mut (.inputs c)))
+  (when (< (len (.states c)) (len (.instructions graph)))
+    (extend-zeroed! (mut (.states c)) (- (len (.instructions graph)) (len (.states c))))
+    (extend-zeroed! (mut (.mapped c)) (- (len (.instructions graph)) (len (.mapped c)))))
+  (push! (mut (.stack c)) (PromotionFrame :reference source :plan -1 :cursor -1 :slot -1))
+  (let [(mut valid) true (mut result) (: 0 i32)]
+    (while (and valid (> (len (.stack c)) 0))
+      (let [last (- (len (.stack c)) 1)
+            frame (get (.stack c) last)
+            reference (.reference frame)
+            index (cast i64 reference)
+            (mut finished) false (mut replacement) reference]
+        (if (= (.cursor frame) -1)
+            (cond (= (get (.states c) index) 1) (set! valid false)
+                  (= (get (.states c) index) 2)
+                    (do (set! finished true) (set! replacement (get (.mapped c) index)))
+                  :else
+                    (let [opcode (promotion-op graph lists protected reference root target pointer-bytes)
+                          node (get (.instructions graph) index)]
+                      (if (< opcode 0) (set! valid false)
+                          (do
+                            (push! (mut (.touched c)) reference)
+                            (set! (mut (.states c)) index 1)
+                            (if (= opcode 0)
+                                (do (set! finished true) (set! replacement (.op1 node)))
+                                (let [begin (len (.inputs c))
+                                      count (cast i64 (get (.arities graph) index))
+                                      planned (len (.nodes c))]
+                                  (for [i 1 (+ count 1)]
+                                    (match (g/operand graph reference (cast i32 i))
+                                      (None [] (panic "promotion operand missing"))
+                                      (Some [input] (push! (mut (.inputs c)) input))))
+                                  (push! (mut (.nodes c)) (PromotionNode :reference reference
+                                    :opcode (cast u8 opcode) :begin begin :count count))
+                                  (set! (mut (.stack c)) last
+                                    (PromotionFrame :reference reference :plan planned :cursor 0 :slot (.slot frame)))))))))
+            (let [planned (get (.nodes c) (.plan frame))]
+              (if (>= (.cursor frame) (.count planned)) (set! finished true)
+                  (let [slot (+ (.begin planned) (.cursor frame))
+                        input (get (.inputs c) slot)]
+                    (set! (.cursor (elem (mut (.stack c)) last)) (+ (.cursor frame) 1))
+                    (when (promotion-value-input? (.opcode planned) (.cursor frame))
+                      (if (< input 0)
+                          (match (g/lookup graph input)
+                            (None [] (set! valid false))
+                            (Some [literal]
+                              (unless (and (symbols/numeric? literal)
+                                           (types/integer? (cast i32 (n/type-id literal))))
+                                (set! valid false))))
+                          (unless (and (= (.opcode planned) 67) (= input reference))
+                            (if (<= input 0) (set! valid false)
+                                (push! (mut (.stack c))
+                                  (PromotionFrame :reference input :plan -1 :cursor -1 :slot slot))))))))))
+        (when finished
+          (set! (mut (.states c)) index 2)
+          (set! (mut (.mapped c)) index replacement)
+          (if (< (.slot frame) 0) (set! result replacement)
+              (set! (mut (.inputs c)) (.slot frame) replacement))
+          (pop! (mut (.stack c))))))
+    (if valid result 0)))
+
+(defn narrow-arithmetic! [(graph (mut g/Graph)) (lists (mut uses/Uses))
+                          (queue (mut q/Queue)) (protected bits/Bits)
+                          (c (mut PromotionContext)) (reference i32) (pointer-bytes i32)]
+  (-> bool)
+  (let [node (get (.instructions graph) (cast i64 reference))
+        target (n/type-id node)]
+    (if (or (!= (n/opcode node) 35) (<= (.op1 node) 0)
+            (<= target 1) (= target 6) (not (types/integer? (cast i32 target))))
+        false
+        (let [replacement (plan-promotion! (mut c) graph lists protected reference
+                                           (.op1 node) target pointer-bytes)]
+          (if (= replacement 0) false
+              (do
+                (let [(mut i) (- (len (.nodes c)) 1)]
+                  (while (>= i 0)
+                    (let [planned (get (.nodes c) i)]
+                      (for [k 0 (.count planned)]
+                        (let [slot (+ (.begin planned) k) input (get (.inputs c) slot)]
+                          (when (and (< input 0) (promotion-value-input? (.opcode planned) k))
+                            (let [literal (match (g/lookup graph input)
+                                             (Some [value] value)
+                                             (None [] (panic "promotion constant missing")))
+                                  from (types/scalar-size (cast i32 (n/type-id literal)) pointer-bytes)
+                                  to (types/scalar-size (cast i32 target) pointer-bytes)
+                                  opcode (if (= from to) 36 (if (> from to) 35
+                                             (if (types/signed? (cast i32 (n/type-id literal))) 33 34)))
+                                  value (match (conversion/evaluate (cast i32 opcode) (cast i32 (n/type-id literal))
+                                                        (cast i32 target) pointer-bytes (n/constant-bits literal))
+                                          (Some [value] value)
+                                          (None [] (panic "promotion constant conversion invalid")))
+                                  mapped (match (g/intern-scalar! (mut graph) target value)
+                                           (Some [value] value)
+                                           (None [] (panic "promotion constant reference exhaustion")))]
+                              (set! (mut (.inputs c)) slot mapped)))))
+                      (rewrite-expression! (mut graph) (mut lists) (mut queue)
+                        (.reference planned) (.opcode planned) target
+                        (subslice (slice (.inputs c)) (.begin planned) (+ (.begin planned) (.count planned)))))
+                    (set! i (- i 1))))
+                (replace! (mut graph) (mut lists) (mut queue) protected reference replacement)))))))
+
 ;;; Caller owns graph/lists/queue. Only seeded nodes and users/inputs affected by
 ;;; changes are visited. Current graph values feed the shared fold rules;
 ;;; no second SCCP analysis or persistent alternative IR is built.
@@ -759,6 +944,7 @@
   (let [(mut changes) (: 0 i32)
         (mut control-changed) false
         (mut dead-context) (zeroed dead/Context)
+        (mut promotion) (promotion-context a)
         (mut error) ""
         (mut next) (q/pop! (mut queue))]
     (while (and (>= next 0) (= error ""))
@@ -825,6 +1011,9 @@
                                  protected
                                  (cast i32 next)
                                  pointer-bytes)
+        (set! changes (+ changes 1)))
+      (when (narrow-arithmetic! (mut graph) (mut lists) (mut queue) protected
+                                 (mut promotion) (cast i32 next) pointer-bytes)
         (set! changes (+ changes 1)))
       (when (extend-high! (mut graph)
                           (mut lists)
@@ -926,6 +1115,7 @@
                              (= (n/opcode (get (.instructions graph) (cast i64 user))) 116))
                     (q/add! (mut queue) (cast i64 user)))))))))
       (set! next (q/pop! (mut queue))))
+    (release-promotion! (mut promotion))
     (if (= error "")
         (Ok (Progress :changes changes :control control-changed))
         (Err error))))

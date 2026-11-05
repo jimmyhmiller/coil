@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`41f9ea1`, on 2026-11-05. The independent library remains maintained in that
+`d6300b1`, on 2026-11-05. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 
@@ -86,3 +86,9 @@ Preallocation Phi live-range coalescing is copied from coil-stogir; see
 Verifier family dispatch uses a checked per-opcode mask while retaining semantic
 validators and diagnostic order. Integer32-bit bitcasts and truncations follow pinned AArch64
 register-move selection. See [dispatch and word views](docs/VALIDATOR_DISPATCH.md).
+
+Backward modular integer-width propagation is copied from coil-stogir d6300b1.
+It follows pinned upstream iterative truncation preflight/apply architecture,
+with exact-use/protected-root checks and explicit traversal storage. MIN/MAX/ABS,
+BOOL and pointer conversion boundaries remain excluded. Standalone validation
+and native JIT/AOT evidence are recorded in that library commit.
