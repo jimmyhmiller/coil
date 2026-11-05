@@ -5,6 +5,7 @@
 #include <time.h>
 extern void gap_graph_copy(void *, const void *);
 extern int64_t gap_graph_extent(void);
+extern void gap_graph_clear(void *);
 static double cpu(void) {
     struct timespec t;
     if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t)) abort();
@@ -26,6 +27,12 @@ int main(void) {
                 return 4;
             }
         }
+    }
+    for (size_t destination = 0; destination < 64; ++destination) {
+        memset(actual, 0xa5, 4096); memset(expected, 0xa5, 4096);
+        memset(expected + destination * 8, 0, extent);
+        gap_graph_clear(actual + destination * 8);
+        if (memcmp(actual, expected, 4096)) return 7;
     }
     unsigned char *source = malloc(64 * 2048), *destination = malloc(64 * 2048);
     if (!source || !destination) return 5;
