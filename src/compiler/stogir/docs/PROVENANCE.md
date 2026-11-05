@@ -1374,3 +1374,8 @@ No performance claim before measurement; see the standalone central NOTICE/LICEN
 
 Shifted arithmetic copied from coil-stogir1e8ab84. This is an independent
 AArch64 target extension through persistent matching; see SHIFTED_ARITHMETIC.md.
+
+
+Function-return canonicalization copied from coil-stogir6aa12bf. Independent
+END/MERGE/PHI/RETURN normalization; full validation and existing inliner proofs
+remain mandatory. See RETURN_MERGE.md.
