@@ -1350,11 +1350,3 @@ cross graph edits; pipeline owns/releases the index on success and errors.
 ASAN/debug placement, branch/error oracles, native loops/switch/module and linked
 AOT pass. Small preparation CPU repeats12.30%/12.38% stogir improvement; no full
 compiler gain inferred. See [use-index sharing](IMMUTABLE_USE_INDEX.md).
-
-### Experimental equivalent callee views
-
-Standalone3aa2386 offers ordered immutable snapshots under one exact growth
-ledger. This is an independent interprocedural extension, not an upstream port.
-Provider equivalence is explicit; prototype/name/Never and existing ordinary
-legality checks remain. Buffer reduction9.27%/9.21% CPU gain is not a bootstrap
-claim. This branch probes actual verifier performance before production adoption.
