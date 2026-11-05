@@ -44,4 +44,19 @@ __attribute__((constructor)) static void check_exported_alias(void) {
     executable = directory / 'program'
     run('cc', obj, driver, '-lm', '-o', executable)
     assert run(executable) == 'post-inline emission: 0 failures\n'
-print('post-inline symbols, data-only callback, exported C alias and recursion: PASS')
+    library = directory / 'library.coil'
+    library.write_text('(module emission.unit)\n'
+                       '(defn first [(x i64)] (-> i64) (+ x 7))\n'
+                       '(defn second [(x i64)] (-> i64) (* x 3))\n')
+    unit = directory / 'unit'
+    run(COMPILER, 'build-unit', library, '--backend', 'stogir', '-O3', '-o', unit)
+    unit_symbols = run('nm', unit / 'unit.o')
+    assert '_emission.unit.first' in unit_symbols
+    assert '_emission.unit.second' in unit_symbols
+    consumer = directory / 'consumer.coil'
+    consumer.write_text('(module emission.consumer)\n'
+                        '(import "emission.unit" :as lib)\n'
+                        '(defn main [] (-> i64) '
+                        '(if (= (+ (lib/first 5) (lib/second 9)) 39) 0 1))\n')
+    run(COMPILER, 'run', consumer, '--unit', unit, '--backend', 'stogir', '-O3', '--no-debug')
+print('post-inline symbols, native roots, recursion and prebuilt-unit retention: PASS')
