@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`b01d83d`, on 2026-11-05. The independent library remains maintained in that
+`8ddda86`, on 2026-11-05. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 
@@ -82,3 +82,7 @@ and clone limits remain. Compiler performance/adoption is unproven.
 
 Preallocation Phi live-range coalescing is copied from coil-stogir; see
 [implementation and credit](docs/PHI_COALESCING.md). Performance is unproven.
+
+Verifier family dispatch uses a checked per-opcode mask while retaining semantic
+validators and diagnostic order. Integer32-bit bitcasts follow pinned AArch64
+register-move selection. See [dispatch and word views](docs/VALIDATOR_DISPATCH.md).
