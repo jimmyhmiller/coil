@@ -1311,6 +1311,8 @@ EOF
     done
     expect_rc 0 "post-inline Stogir emission preserves native symbol roots" \
       python3 "$ROOT/scripts/tests/stogir-live-emission.py" "$COIL"
+    expect_rc 0 "deferred Stogir graph ownership under ASAN" \
+      "$COIL" run "$ROOT/tests/backend/stogir-emission-lifetime.coil" --backend llvm -O1 --no-debug --debug-checks --sanitize=address
     expect_rc 0 "native Mach-O data-in-code serialization and JIT loader" \
       "$COIL" run "$ROOT/src/compiler/selftest/jit_selftest.coil" --backend llvm
   fi
