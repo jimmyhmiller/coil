@@ -1311,6 +1311,19 @@ EOF
 EOF
   expect_out 'ret i64 8' "a constant's sizeof answers for the target" \
     "$COIL" emit-ir "$T/const-target.coil" --target wasm32
+  # An import a top-level macro produces is the program's in a cross build too, where
+  # the macro ran in the host's twin of it.
+  cat > "$T/generated-import.coil" <<'EOF'
+(module generated-import)
+(import "coil.primitive" :as primitive)
+(defn gen [] (-> Code)
+  `(do (import "coil.fs" :as gen-fs)
+       (defn ~(primitive/syntax->datum `create-flag) [] (-> i64) gen-fs/O_CREAT)))
+(gen)
+(defn main [] (-> i64) (create-flag))
+EOF
+  expect_rc 0 "a cross build sees an import a top-level macro produced" \
+    "$COIL" check "$T/generated-import.coil" --target wasm32
   # Code that runs inside the compiler is compiled for the machine running it.
   # A cross build expands it separately from the program: a function a macro
   # calls answers for the host, the program's own copy for the target, and a
