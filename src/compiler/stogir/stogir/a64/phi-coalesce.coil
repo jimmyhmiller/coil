@@ -1,0 +1,211 @@
+;;; Non-overlapping Phi vregs are joined before physical allocation, following
+;;; pinned ir_ra.c:ir_coalesce/ir_vregs_coalesce. Graph definitions stay intact.
+(module stogir.a64.phi-coalesce)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.cfg" :as cfg)
+(import "stogir.schedule" :as schedule)
+(import "stogir.interval" :as interval)
+(import "stogir.constraints" :as c)
+(import "stogir.allocation" :as allocation)
+(import "stogir.interval-queue" :as queue)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.hashmap" :use [HashMap])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Some None])
+
+(defn present? [(map (HashMap i32 i32)) (key i32)] (-> bool)
+  (match (get map key) (None [] false) (Some [_] true)))
+
+(defn group? [(map (HashMap i32 bool)) (key i32)] (-> bool)
+  (match (get map key) (None [] false) (Some [_] true)))
+
+(defstruct Candidate [(from i32) (to i32) (next i32)])
+
+(defn root [(parents (ArrayList i32)) (reference i32)] (-> i32)
+  (let [(mut r) reference]
+    (when (> (len parents) 0)
+      (while (!= (get parents (cast i64 r)) r)
+        (set! r (get parents (cast i64 r)))))
+    r))
+
+(defn resolve! [(parents (mut (ArrayList i32))) (reference i32)] (-> i32)
+  (let [owner (root parents reference) (mut current) reference]
+    (when (> (len parents) 0)
+      (while (!= current owner)
+        (let [next (get parents (cast i64 current))]
+          (set! (mut parents) (cast i64 current) owner)
+          (set! current next))))
+    owner))
+
+;;; Uses can sit at a half-open range boundary. Prove fixed compatibility
+;;; independently of range disjointness, before changing either owner.
+(defn compatible? [(a (ArrayList c/Use)) (b (ArrayList c/Use))] (-> bool)
+  (let [(mut i) 0 (mut j) 0 (mut valid) true]
+    (while (and valid (< i (len a)) (< j (len b)))
+      (let [x (get a i) y (get b j)]
+        (if (< (.position x) (.position y))
+            (set! i (+ i 1))
+            (if (> (.position x) (.position y))
+                (set! j (+ j 1))
+                (do
+                  (when (and (= (.kind x) 2) (= (.kind y) 2)
+                             (!= (.register x) (.register y)))
+                    (set! valid false))
+                  (set! i (+ i 1)) (set! j (+ j 1)))))))
+    valid))
+
+;;; Linear union preserves holes and coalesces adjacency; neither input moves
+;;; until the complete replacement is owned. Inputs are sorted valid ranges.
+(defn union-ranges [(a (ArrayList interval/Range))
+                    (b (ArrayList interval/Range))
+                    (allocator (dyn Allocator))] (-> (ArrayList interval/Range))
+  (let [(mut result) (ArrayList::new [interval/Range] allocator)
+        (mut i) 0 (mut j) 0]
+    (while (or (< i (len a)) (< j (len b)))
+      (let [take-a (and (< i (len a))
+                       (or (>= j (len b))
+                           (<= (.start (get a i)) (.start (get b j)))))
+            value (if take-a (get a i) (get b j))
+            last (- (len result) 1)]
+        (if take-a (set! i (+ i 1)) (set! j (+ j 1)))
+        (if (and (>= last 0) (<= (.start value) (.end (get result last))))
+            (when (> (.end value) (.end (get result last)))
+              (set! (mut result) last
+                    (interval/Range :start (.start (get result last)) :end (.end value))))
+            (push! (mut result) value))))
+    result))
+
+;;; Called only after compatible?; coincident uses retain the stronger demand.
+(defn union-uses [(a (ArrayList c/Use)) (b (ArrayList c/Use))
+                  (allocator (dyn Allocator))] (-> (ArrayList c/Use))
+  (let [(mut result) (ArrayList::new [c/Use] allocator)
+        (mut i) 0 (mut j) 0]
+    (while (or (< i (len a)) (< j (len b)))
+      (let [take-a (and (< i (len a))
+                       (or (>= j (len b))
+                           (<= (.position (get a i)) (.position (get b j)))))
+            value (if take-a (get a i) (get b j))
+            last (- (len result) 1)]
+        (if take-a (set! i (+ i 1)) (set! j (+ j 1)))
+        (if (and (>= last 0) (= (.position value) (.position (get result last))))
+            (when (> (.kind value) (.kind (get result last)))
+              (set! (mut result) last value))
+            (push! (mut result) value))))
+    result))
+
+;;; The caller proves exact IR type equality and resolves original refs. Parts
+;;; are unsplit and unassigned. Rejected unions leave every owner unchanged.
+(defn join! [(parts (mut (ArrayList allocation/Part)))
+             (parent i32) (child i32)
+             (allocator (dyn Allocator))] (-> bool)
+  (let [p (at parts (cast i64 parent)) v (at parts (cast i64 child))]
+    (if (or (= parent child) (!= (.allowed p) (.allowed v))
+            (= (len (.ranges p)) 0) (= (len (.ranges v)) 0)
+            (>= (interval/intersection (.ranges p) (.ranges v) 0) 0)
+            (not (compatible? (.uses p) (.uses v))))
+        false
+        (let [(mut ranges) (union-ranges (.ranges p) (.ranges v) allocator)
+              (mut uses) (union-uses (.uses p) (.uses v) allocator)]
+          (free! (mut (.ranges (elem (mut parts) (cast i64 parent)))))
+          (free! (mut (.uses (elem (mut parts) (cast i64 parent)))))
+          (set! (.ranges (elem (mut parts) (cast i64 parent))) ranges)
+          (set! (.uses (elem (mut parts) (cast i64 parent))) uses)
+          (clear! (mut (.ranges (elem (mut parts) (cast i64 child)))))
+          (clear! (mut (.uses (elem (mut parts) (cast i64 child)))))
+          true))))
+
+;;; Sparse candidate lists avoid walking all Phis for each predecessor. Heap
+;;; order matches pinned comparator + reverse consumption: shallow depth first,
+;;; then descending CFG block ordinal. Phi ties keep the scheduled order.
+;;; Multi-successor predecessors retain resolver moves (no critical-edge hack).
+(defn run! [(parts (mut (ArrayList allocation/Part)))
+            (parents (mut (ArrayList i32)))
+            (graph g/Graph) (scheduled schedule/Schedule)
+            (blocks cfg/Blocks) (depths (ArrayList i32))
+            (allocator (dyn Allocator))] (-> (HashMap i32 bool))
+  (let [(mut groups) (HashMap::new-scalar [i32 bool] allocator)
+        (mut heads) (HashMap::new-scalar [i32 i32] allocator)
+        (mut successors) (HashMap::new-scalar [i32 i32] allocator)
+        (mut candidates) (ArrayList::new [Candidate] allocator)
+        (mut pending) (ArrayList::new [queue/Item] allocator)
+        (mut indices) (ArrayList::new [i32] allocator)
+        (mut cursor) (len (.nodes scheduled))]
+    (while (> cursor 0)
+      (set! cursor (- cursor 1))
+      (let [reference (get (.nodes scheduled) cursor)
+            node (get (.instructions graph) (cast i64 reference))]
+        (when (= (n/opcode node) 67)
+          (let [region (.op1 node)
+                count (get (.arities graph) (cast i64 region))
+                (mut operand) (get (.arities graph) (cast i64 reference))]
+            (when (> count 1)
+              (while (> operand 1)
+                (match (g/operand graph reference operand)
+                  (None [] 0)
+                  (Some [input]
+                    (when (> input 0)
+                      (match (g/operand graph region (- operand 1))
+                        (None [] 0)
+                        (Some [end]
+                          (let [block (get (.membership blocks) (cast i64 end))
+                                next (match (get heads block)
+                                       (None [] -1) (Some [head] head))]
+                            (set! (mut heads) block (cast i32 (len candidates)))
+                            (push! (mut candidates)
+                                   (Candidate :from input :to reference :next next))))))))
+                (set! operand (- operand 1))))))))
+    (when (> (len candidates) 0)
+      (for edge (.edges blocks)
+        (when (present? heads (.from edge))
+          (set! (mut successors) (.from edge)
+                (+ 1 (match (get successors (.from edge))
+                       (None [] 0) (Some [count] count))))))
+      (for [i 0 (len (.starts blocks))]
+        (let [block (get (.starts blocks) i)]
+          (when (and (present? heads block)
+                     (= (match (get successors block) (None [] 0) (Some [count] count)) 1))
+            (queue/insert! (mut pending)
+                           (queue/Item :position (cast i64 (get depths (cast i64 block)))
+                                       :interval (- 0 (cast i32 i)))))))
+      (for [r 0 (len (.instructions graph))] (push! (mut indices) -1))
+      (for [i 0 (len parts)]
+        (let [part (at parts i)]
+          (when (> (.parent part) 0)
+            (set! (mut indices) (cast i64 (.parent part)) (cast i32 i)))))
+      (while (> (len pending) 0)
+        (match (queue/take! (mut pending))
+          (None [] 0)
+          (Some [item]
+            (let [block (get (.starts blocks) (cast i64 (- 0 (.interval item))))
+                  (mut current) (match (get heads block) (None [] -1) (Some [head] head))]
+              (while (>= current 0)
+                (let [candidate (get candidates (cast i64 current))
+                      from (resolve! (mut parents) (.from candidate))
+                      to (resolve! (mut parents) (.to candidate))
+                      source (get indices (cast i64 from))
+                      target (get indices (cast i64 to))]
+                  (when (and (!= from to) (>= source 0) (>= target 0)
+                             (= (n/type-id (get (.instructions graph) (cast i64 from)))
+                                (n/type-id (get (.instructions graph) (cast i64 to)))))
+                    (let [source-group (group? groups from)
+                          target-group (group? groups to)
+                          keep-source (if (!= source-group target-group)
+                                          source-group
+                                          (< (.from candidate) (.to candidate)))
+                          parent (if keep-source source target)
+                          child (if keep-source target source)
+                          owner (if keep-source from to)
+                          alias (if keep-source to from)]
+                      (when (join! (mut parts) parent child allocator)
+                        (when (= (len parents) 0)
+                          (for [r 0 (len (.instructions graph))]
+                            (push! (mut parents) (cast i32 r))))
+                        (set! (mut parents) (cast i64 alias) owner)
+                        (set! (mut groups) owner true))))
+                  (set! current (.next candidate)))))))))
+    (for [r 1 (len parents)]
+      (set! (mut parents) r (resolve! (mut parents) (cast i32 r))))
+    (free! (mut heads)) (free! (mut successors)) (free! (mut candidates))
+    (free! (mut pending)) (free! (mut indices))
+    groups))

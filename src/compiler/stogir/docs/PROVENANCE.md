@@ -1361,30 +1361,65 @@ implementations, with the same existing attribution and public validation
 requirements. They do not claim full upstream pass parity.
 
 
-Numeric context specialization/cache from coil-stogir f97960a independently uses
-existing SCCP and exact inliner contracts. Optional constant-index restoration
-retains existing scalar/LONG_CONST key, header and payload conventions, preserving
-negative IDs. This is not upstream feature parity. LICENSE/NOTICE remain intact.
+### Context-bound parameter specialization
+
+parameter-specialize independently substitutes explicit numeric argument
+bindings into a private copy of the compact graph and invokes the existing
+pinned-upstream-shaped SCCP pipeline. Its context conditions are retained,
+not promoted to unconditional callee equivalence. No upstream constant, opcode
+or validation semantics are changed. See PARAMETER_SPECIALIZATION.md.
 
 
-Dynamic-actual specialization prefilter copied from coil-stogir commit 67429e5.
-The original batch and all selected derived-callee proofs remain checked.
-No performance claim before measurement; see the standalone central NOTICE/LICENSE.
+The registered context cache is an independent bounded policy over immutable
+callee snapshots and existing SCCP/inlining. Constant-index reconstruction uses
+the same scalar key and LONG_CONST header/hash/payload conventions as existing
+graph construction; negative IDs and payloads remain intact. Original validation
+and exact clone-growth contracts remain required.
 
 
-Shifted arithmetic copied from coil-stogir1e8ab84. This is an independent
-AArch64 target extension through persistent matching; see SHIFTED_ARITHMETIC.md.
+Shifted word ADD/SUB selection is an independent AArch64 target extension.
+Pinned ir_aarch64.dasc ir_emit_binop_int (around2861..2900) uses ordinary
+register ADD/SUB for this case. This extension uses the existing immutable-graph,
+persistent target-plan and pre-allocation machine-use contract; it is not a
+claim of upstream rule parity. See docs/SHIFTED_ARITHMETIC.md.
 
 
-Function-return canonicalization copied from coil-stogir6aa12bf. Independent
-END/MERGE/PHI/RETURN normalization; full validation and existing inliner proofs
-remain mandatory. See RETURN_MERGE.md.
+Return canonicalization is an independent control/value graph normalization,
+using the existing compact END/MERGE/PHI/RETURN and terminal membership shapes.
+It is not attributed as an upstream inlining rule. Full validation and the
+existing inliner eligibility proofs remain separate. See RETURN_MERGE.md.
 
 
-Constant multiply plus-one target rule copied from coil-stogirb378e52.
-Independent word target selection extension; existing MUL_PWR2 is unchanged.
-See CONSTANT_MULTIPLY.md.
+MUL by2^k+1 as a same-source shifted ADD is an independent AArch64 selection
+extension. Existing power-of-two multiplication follows pinned MUL_PWR2 and is
+unchanged. Word overflow semantics and persistent machine-use contracts remain
+unchanged. See CONSTANT_MULTIPLY.md.
 
+## Preallocation Phi coalescing
 
-Absorbed word MUL retirement copied from coil-stogir9699a5e. Original MUL
-can supply a MUL_PWR2 shift tile; pure root-protected retirement now covers it.
+`a64/phi-coalesce.coil` follows pinned `ir_ra.c:ir_coalesce`,
+`ir_vregs_overlap`, `ir_vregs_join`, and `ir_vregs_coalesce`: predecessor-block
+ordering, exact non-overlap, preference for an existing coalesced group and then
+original reference order, union of ranges/uses, and exclusion of Phi groups from
+the subsequent contained-copy reuse stage. The comparator is consumed in reverse
+upstream, hence shallow depth first and descending CFG block ordinal here. Phi
+ties use deterministic scheduled order; identical upstream use-list ordering is
+not claimed. Constants and multi-successor predecessors retain resolver moves.
+The optional overlapping two-address operand swap is not ported; our ordinary
+AArch64 arithmetic tiles are three-address operations.
+
+Sparse candidate lists, union-find path compression, dense ref-to-part lookup,
+and linear sorted-array unions adapt the upstream linked representations to
+Coil. Graph identities, roots and machine definitions remain unchanged. Exact
+IR type and allocation-class checks additionally preserve spill geometry.
+The prepared pipeline supplies its existing CFG/depth epoch; low-level allocation
+callers without those facts retain contained-copy reuse.
+
+Phi unions expose future interference at odd definition subpositions. The target
+cannot generally move a live register to another register there before an
+instruction without potentially destroying an input. Free-range allocation now
+caps partial assignments at legal even input boundaries before register choice.
+Complete assignments, generic allocation APIs, odd spill stores and explicit
+call transitions retain their existing semantics. This is a target-position
+adaptation, not a claim to port upstream's loop-aware optimal split placement.
+The emitter's unsupported-boundary guard is retained.

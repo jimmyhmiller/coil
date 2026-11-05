@@ -79,3 +79,6 @@ coil-stogir f97960a (2026-11-05): call-inline.coil, graph.coil and
 parameter-specialize.coil. See [specialization](docs/PARAMETER_SPECIALIZATION.md).
 Only the opt-in cache API changes inline selection; original semantic validation
 and clone limits remain. Compiler performance/adoption is unproven.
+
+Preallocation Phi live-range coalescing is copied from coil-stogir; see
+[implementation and credit](docs/PHI_COALESCING.md). Performance is unproven.
