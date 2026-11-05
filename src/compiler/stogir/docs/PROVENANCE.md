@@ -1462,3 +1462,12 @@ The independent `call-inline.coil` compatibility check ignores only the two
 CONST/PURE memory-effect bits when comparing prototype flags. Calling convention,
 variadic/noreturn bits, result shape and ABI group trailer remain exact. This
 prevents inferred memory promises from disabling otherwise valid inlining.
+
+## Symbolic word rematerialization
+
+The native word-constant rule preserves upstream-style signed constant refs
+and existing AArch64 constant/address emission. A same-width symbolic address
+BITCAST receives a read-only constant-source location before virtual-register
+liveness, rather than an allocated word value. This Coil matching/allocation
+representation is distinct from the earlier unadopted latest-placement policy.
+All physical ABI, Phi/literal ownership and relocation mechanisms remain shared.

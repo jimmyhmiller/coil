@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`93349ce`, on 2026-11-05. The independent library remains maintained in that
+`d47fd14`, on 2026-11-05. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 
@@ -98,3 +98,8 @@ effect proof copied from coil-stogir e5c96da. See central provenance and NOTICE.
 
 Effect promises are independent of inline ABI compatibility, copied from
 coil-stogir93349ce. Only CONST/PURE bits are excluded from flag comparison.
+
+Symbolic word constant rematerialization is copied from coil-stogir d47fd14.
+Persistent matching removes only proven address-word views from virtual-register
+liveness; read-only constant locations preserve graph references and use the
+existing literal, ABI capture, Phi and relocation paths. Frame kinds unchanged.
