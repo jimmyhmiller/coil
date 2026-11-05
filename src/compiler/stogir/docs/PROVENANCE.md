@@ -1481,3 +1481,22 @@ optimization. They retain the established upstream-shaped ordering: persistent
 target matching before liveness and split-interval register allocation, followed
 by ABI-aware native emission. Logical graph references, control edges and scalar
 types remain intact. See [validation](validation/result-projections/README.md).
+
+## Bounded address and memory-area alias analysis
+
+`address-alias` adapts pinned `ir.c:ir_decompose_addr` and `ir_check_aliasing`
+to the existing Coil load-forwarding query. It retains one symbolic index,
+normalizes numeric ADD/SUB displacements, preserves same-width word views and
+canonicalizes VADDR to VAR storage identity. Same-origin footprint separation
+uses modular pointer-width unsigned distances, avoiding signed overflow and
+recognizing32/64-bit wrap. Walk and displacement domains remain bounded.
+
+Area disjointness is deliberately qualified for Coil's stack/alias extensions:
+only nonzero fixed function-lifetime objects and declared VAR storage provide
+private extents, and their accesses must be contained with known offsets. Raw-SP
+ALLOCA/AFREE, unknown indexed areas, numeric or frame-derived pointers, two
+caller parameters and distinct symbol names remain MAY_ALIAS. This does not
+port upstream's stronger assumptions about distinct ALLOCA/SYM roots into
+Coil's observable raw-stack or exported-alias behavior. Aggregate calls still
+remain memory barriers; no source-level purity or effect fact is invented.
+Validation and limitations: [memory area alias](validation/memory-area-alias/README.md).

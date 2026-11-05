@@ -1,0 +1,154 @@
+;;; Bounded address decomposition and memory-area tests adapted from pinned
+;;; ir.c:ir_decompose_addr/ir_check_aliasing. See NOTICE and PROVENANCE.
+(module stogir.address-alias)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.symbols" :as symbols)
+(import "stogir.stack" :as stack)
+(import "stogir.locals" :as locals)
+(import "coil.result" :use [Some None Ok Err])
+
+(defstruct Address [(base i32) (index i32) (offset i64)])
+
+(defn word? [(ty u8) (pointer-bytes i32)] (-> bool)
+  (or (= ty 6)
+      (if (= pointer-bytes 8) (or (= ty 5) (= ty 11))
+          (and (= pointer-bytes 4) (or (= ty 4) (= ty 10))))))
+
+;;; Numeric displacement or sentinel outside the admitted +/-1GiB domain.
+;;; Bounded walks make every offset sum/difference fit signed64 without wrap.
+(defn displacement [(graph g/Graph) (reference i32) (pointer-bytes i32)] (-> i64)
+  (if (>= reference 0) (: 0x7FFFFFFFFFFFFFFF i64)
+      (match (g/lookup graph reference)
+        (None [] (: 0x7FFFFFFFFFFFFFFF i64))
+        (Some [node]
+              (if (and (symbols/numeric? node) (word? (n/type-id node) pointer-bytes))
+                  (let [bits (n/constant-bits node)
+                        value (if (and (= pointer-bytes 4)
+                                       (types/signed? (cast i32 (n/type-id node))))
+                                  (cast i64 (cast i32 bits)) (cast i64 bits))]
+                    (if (and (>= value -1073741824) (<= value 1073741824))
+                        value (: 0x7FFFFFFFFFFFFFFF i64)))
+                  (: 0x7FFFFFFFFFFFFFFF i64))))))
+
+(defn swap-base? [(graph g/Graph) (left i32) (right i32)] (-> bool)
+  (or (and (< left 0) (> right 0))
+      (match (g/lookup graph right)
+        (None [] false)
+        (Some [b]
+              (or (= (n/opcode b) 75) (= (n/opcode b) 81) (= (n/opcode b) 65)
+                  (and (= (n/type-id b) 6)
+                       (match (g/lookup graph left)
+                         (None [] false)
+                         (Some [a] (!= (n/type-id a) 6)))))))))
+
+;;; Verified graph required. One symbolic index is retained by SSA identity;
+;;; unknown expressions and exhausted walks remain opaque bases. A VADDR's
+;;; canonical base is its VAR storage ref, so duplicate addresses share identity.
+(defn decompose [(graph g/Graph) (reference i32) (pointer-bytes i32)] (-> Address)
+  (let [(mut base) reference (mut index) (: 0 i32) (mut offset) (: 0 i64)
+        (mut steps) 0 (mut more) true]
+    (while (and more (< steps 16))
+      (set! more false)
+      (match (g/lookup graph base)
+        (None [] 0)
+        (Some [node]
+              (when (word? (n/type-id node) pointer-bytes)
+                (cond (= (n/opcode node) 36)
+                        (match (g/lookup graph (.op1 node))
+                          (None [] 0)
+                          (Some [input]
+                                (when (word? (n/type-id input) pointer-bytes)
+                                  (set! base (.op1 node)) (set! more true))))
+                      (or (= (n/opcode node) 26) (= (n/opcode node) 27))
+                        (let [(mut left) (.op1 node) (mut right) (.op2 node)
+                              (mut delta) (displacement graph (.op2 node) pointer-bytes)]
+                          ; The common numeric-offset form needs no base ranking.
+                          (when (and (= delta (: 0x7FFFFFFFFFFFFFFF i64))
+                                     (= (n/opcode node) 26) (swap-base? graph left right))
+                            (set! left (.op2 node)) (set! right (.op1 node))
+                            (set! delta (displacement graph right pointer-bytes)))
+                          (if (!= delta (: 0x7FFFFFFFFFFFFFFF i64))
+                              (do (set! offset (+ offset (if (= (n/opcode node) 27) (- 0 delta) delta)))
+                                  (set! base left) (set! more true))
+                              (when (and (= index 0) (= (n/opcode node) 26))
+                                (set! index right) (set! base left) (set! more true))))
+                      :else 0))))
+      (set! steps (+ steps 1)))
+    ; Normalize constant additions/subtractions within the symbolic index too.
+    (set! steps 0) (set! more (> index 0))
+    (while (and more (< steps 16))
+      (set! more false)
+      (match (g/lookup graph index)
+        (None [] 0)
+        (Some [node]
+              (when (and (word? (n/type-id node) pointer-bytes)
+                         (or (= (n/opcode node) 26) (= (n/opcode node) 27)))
+                (let [delta (displacement graph (.op2 node) pointer-bytes)]
+                  (when (!= delta (: 0x7FFFFFFFFFFFFFFF i64))
+                    (set! offset (+ offset (if (= (n/opcode node) 27) (- 0 delta) delta)))
+                    (set! index (.op1 node)) (set! more true))))))
+      (set! steps (+ steps 1)))
+    (match (g/lookup graph base)
+      (Some [node] (when (= (n/opcode node) 65) (set! base (.op1 node))))
+      (None [] 0))
+    (Address :base base :index index :offset offset)))
+
+(defn same-origin? [(left Address) (right Address)] (-> bool)
+  (and (= (.base left) (.base right)) (= (.index left) (.index right))))
+
+;;; Nonzero extent only for function-lifetime private storage. Ordinary ALLOCA
+;;; can share raw-SP observations or reused addresses and is never an area proof.
+(defn private-extent [(graph g/Graph) (base i32) (pointer-bytes i32)] (-> i64)
+  (match (g/lookup graph base)
+    (None [] 0)
+    (Some [node]
+          (cond (stack/frame-object? node)
+                  (match (stack/constant-size graph (.op2 node))
+                    (Err [_] 0)
+                    (Ok [_]
+                        (match (g/lookup graph (.op2 node))
+                          (None [] 0)
+                          (Some [size] (cast i64 (n/constant-bits size))))))
+                (= (n/opcode node) 72)
+                  (match (locals/shape graph base pointer-bytes)
+                    (Err [_] 0) (Ok [shape] (.size shape)))
+                :else 0))))
+
+(defn contained? [(address Address) (width i64) (extent i64)] (-> bool)
+  (and (= (.index address) 0) (> width 0) (>= (.offset address) 0)
+       (<= width extent) (<= (.offset address) (- extent width))))
+
+(defn external-area? [(graph g/Graph) (address Address)] (-> bool)
+  (and (= (.index address) 0)
+       (match (g/lookup graph (.base address))
+         (None [] false)
+         (Some [node]
+               (and (= (n/type-id node) 6)
+                    (or (= (n/opcode node) 71) (= (n/opcode node) 75)))))))
+
+;;; Only a proof of disjointness returns true. Same-base/index footprints use
+;;; modular unsigned relative distances, including pointer-width wrap; differing
+;;; symbolic indices remain unknown.
+;;; Different private objects must both have contained accesses. PARAM/SYM may
+;;; alias each other; raw SP, numeric addresses, escaping pointer loads and
+;;; distinct symbol names supply no disjointness proof.
+(defn disjoint? [(graph g/Graph) (left Address) (right Address)
+                  (left-width i64) (right-width i64) (pointer-bytes i32)] (-> bool)
+  (if (or (<= left-width 0) (<= right-width 0)
+          (not (or (= pointer-bytes 4) (= pointer-bytes 8)))) false
+      (if (same-origin? left right)
+          (let [mask (if (= pointer-bytes 4) (: 0xFFFFFFFF u64) (: 0xFFFFFFFFFFFFFFFF u64))
+                forward (& (- (cast u64 (.offset right)) (cast u64 (.offset left))) mask)
+                backward (& (- (cast u64 (.offset left)) (cast u64 (.offset right))) mask)]
+            (and (<= (cast u64 left-width) forward)
+                 (<= (cast u64 right-width) backward)))
+          (if (= (.base left) (.base right)) false
+              (let [a (private-extent graph (.base left) pointer-bytes)
+                    b (private-extent graph (.base right) pointer-bytes)]
+                (or (and (> a 0) (contained? left left-width a)
+                         (if (> b 0) (contained? right right-width b)
+                             (external-area? graph right)))
+                    (and (> b 0) (contained? right right-width b)
+                         (external-area? graph left))))))))

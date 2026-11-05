@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`ebe4833`, on 2026-11-05. The independent library remains maintained in that
+`6989997`, on 2026-11-05. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 
@@ -106,3 +106,7 @@ existing literal, ABI capture, Phi and relocation paths. Frame kinds unchanged.
 
 Private GP register-result captures are selected before liveness, with matched
 call output groups and fixed ABI constraints. See [validation and limits](docs/validation/result-projections/README.md).
+
+Bounded address/index/displacement alias analysis enables forwarding past stores
+to proven disjoint private storage. Raw stack/unknown/indexed-area and symbol-alias
+cases remain conservative. See [validation](docs/validation/memory-area-alias/README.md).
