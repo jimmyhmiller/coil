@@ -33,6 +33,10 @@ with tempfile.TemporaryDirectory(prefix='stogir-emission-') as temporary:
     assert obj.read_bytes() == traced.read_bytes(), 'effect tracing changes object bytes'
     assert 'stogir nonwriting-body tests.cli.stogir-live-emission.readonly-leaf: true' in result.stderr
     assert 'stogir nonwriting-body tests.cli.stogir-live-emission.writing-leaf: false' in result.stderr
+    assembly = run('llvm-objdump', '-dr', obj)
+    assert any('ARM64_RELOC_BRANCH26' in line and
+               '_tests.cli.stogir-live-emission.readonly-leaf' in line
+               for line in assembly.splitlines()), 'no residual read-only call exercised'
     symbols = run('nm', obj)
     assert symbols.strip(), 'nm returned no symbol table'
     for helper in ['leaf', 'wrapper', 'make-callback']:
