@@ -1,0 +1,1 @@
+Candidate928b34ee: quick9-step gate PASS45.5s. Full FAST not run. Compiler experiment committed, not pushed, not installed. No demonstrated performance gain; whole-bootstrap goal remains unmet. Standalone implementation/evidence pushed throughdf8e2d0.
