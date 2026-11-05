@@ -1379,3 +1379,8 @@ AArch64 target extension through persistent matching; see SHIFTED_ARITHMETIC.md.
 Function-return canonicalization copied from coil-stogir6aa12bf. Independent
 END/MERGE/PHI/RETURN normalization; full validation and existing inliner proofs
 remain mandatory. See RETURN_MERGE.md.
+
+
+Constant multiply plus-one target rule copied from coil-stogirb378e52.
+Independent word target selection extension; existing MUL_PWR2 is unchanged.
+See CONSTANT_MULTIPLY.md.
