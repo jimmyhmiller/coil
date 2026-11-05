@@ -1311,6 +1311,8 @@ EOF
     done
     expect_rc 0 "post-inline Stogir emission preserves native symbol roots" \
       python3 "$ROOT/scripts/tests/stogir-live-emission.py" "$COIL"
+    expect_rc 0 "CIR aggregate ownership and debug marks under ASAN" \
+      "$COIL" run "$ROOT/tests/backend/cir-aggregate-ownership.coil" --backend llvm -O1 --no-debug --debug-checks --sanitize=address
     expect_rc 0 "Stogir aggregate snapshots and zero-fill boundaries" \
       python3 "$ROOT/scripts/tests/stogir-runtime-bulk.py" "$COIL"
     expect_rc 0 "deferred Stogir graph ownership under ASAN" \
