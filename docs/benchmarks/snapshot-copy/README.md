@@ -61,3 +61,37 @@ call path instead of inline bulk/zero lowering. The extended native regression
 fails on the initial candidate with: small zero-fill1 became a runtime call.
 Known small zero fills now retain inline lowering; corrected candidate testing
 is pending. Do not report the initial fusion as a delivered performance win.
+
+## Corrected bootstrap diagnostic7944bdfa
+
+Full FAST PASS277.7s, objects memory warning3.99GB. Quick PASS70.1s with60s
+wall-target warning. Native ownership/overlap tests pass, including the small
+zero-fill instruction-shape regression.
+
+| Same frozen compiler source | Prior e3f6bca7 backend | Corrected Stogir | LLVM O3 |
+|---|---:|---:|---:|
+| Seed IR generation s |11.913601|11.534419|37.266725|
+| Generated compiler CPU s |38.210880|35.912306|17.050776|
+| Generated compiler wall s |40.958102|37.415659|18.416748|
+| Compiler object bytes |12590876|12539624|8533712|
+
+These are single diagnostic samples with competing Next/Node/Turbo/Coil builds
+recorded in process snapshots. Do not replace the uncontended baseline or claim
+performance acceptance. Observed same-source differences: generation-3.18%,
+generated compiler CPU-6.02%, wall-8.65%. The goal still fails at3.23091x
+generation advantage and2.03161x runtime slowdown in this run. All generated
+hosts emit the exact current seed Stogir object; source/SDK fingerprints match.
+
+Whole-process1ms profiles are separate from timing. Worker samples29154 Stogir,
+13826 LLVM; main-thread join waits excluded. Inclusive families overlap:
+Stogir verification4058(13.92%), allocation API3557(12.20%), memory/SCCP
+optimization7321(25.11%). Memory optimization within final native emission is
+2642(9.06%); preparation2073, template finalization1376, emission planning1230.
+Snapshot fusion itself10samples(0.034%). This rules out the new pass's analysis
+cost as a dominant runtime explanation. It also bounds the benefit of eliminating
+final-emission memory optimization alone; it cannot close the whole gap.
+
+Raw results, matching-host profiles, validated stack parser, commands and hashes
+are under corrected/. Profile distributions are diagnostic and affected by
+inlining and sampling; they are not timings or proof that repeated passes can
+safely be removed. Public and post-mutation validation remains required.
