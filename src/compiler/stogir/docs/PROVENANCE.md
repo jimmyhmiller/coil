@@ -1471,3 +1471,13 @@ BITCAST receives a read-only constant-source location before virtual-register
 liveness, rather than an allocated word value. This Coil matching/allocation
 representation is distinct from the earlier unadopted latest-placement policy.
 All physical ABI, Phi/literal ownership and relocation mechanisms remain shared.
+
+## Private register-result projections
+
+The existing explicit aggregate-result ABI is a Coil extension. Its private
+GP capture selection (`a64/result-projections`) and lazy multiple-output machine
+definitions are Coil implementations, not a port of a pinned upstream aggregate
+optimization. They retain the established upstream-shaped ordering: persistent
+target matching before liveness and split-interval register allocation, followed
+by ABI-aware native emission. Logical graph references, control edges and scalar
+types remain intact. See [validation](validation/result-projections/README.md).

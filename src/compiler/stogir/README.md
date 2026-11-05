@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`d47fd14`, on 2026-11-05. The independent library remains maintained in that
+`ebe4833`, on 2026-11-05. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 
@@ -103,3 +103,6 @@ Symbolic word constant rematerialization is copied from coil-stogir d47fd14.
 Persistent matching removes only proven address-word views from virtual-register
 liveness; read-only constant locations preserve graph references and use the
 existing literal, ABI capture, Phi and relocation paths. Frame kinds unchanged.
+
+Private GP register-result captures are selected before liveness, with matched
+call output groups and fixed ABI constraints. See [validation and limits](docs/validation/result-projections/README.md).
