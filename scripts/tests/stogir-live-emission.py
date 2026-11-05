@@ -26,10 +26,11 @@ with tempfile.TemporaryDirectory(prefix='stogir-emission-') as temporary:
         '--backend', 'stogir', '-O3', '--no-debug', '-o', obj)
     symbols = run('nm', obj)
     assert symbols.strip(), 'nm returned no symbol table'
-    for helper in ['leaf', 'wrapper']:
+    for helper in ['leaf', 'wrapper', 'make-callback']:
         assert f'_tests.cli.stogir-live-emission.{helper}' not in symbols, helper
     for retained in ['_stogir_retained_entry',
                      '_tests.cli.stogir-live-emission.address-only',
+                     '_tests.cli.stogir-live-emission.returned-callback',
                      '_tests.cli.stogir-live-emission.recursive']:
         assert retained in symbols, retained
     driver = directory / 'alias.c'

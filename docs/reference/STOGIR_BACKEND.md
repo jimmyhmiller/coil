@@ -312,3 +312,37 @@ Branch-local loads stay behind their original control. Protected identities
 decline the rewrite. Same-truth cases use the ordinary control reachability
 rebuild. Tests extend the FFI corpus with an exported self-cycle and an exported
 returning function with two nonreturning cycle paths.
+
+## Post-inline target emission planning
+
+The Coil module layer now determines which functions still need machine code
+after bounded inlining. This is a compiler integration pass, independent of the
+pinned upstream's per-function pipeline. It leaves library graph validation,
+callee eligibility, recursion rules and the 512-cell growth ledger intact.
+
+Public symbols, export aliases, native-data function addresses and prebuilt-unit
+exports remain roots. Non-template callers remain roots too; they are prepared
+in source order against the frozen callee registry. Their finalized graphs
+supply symbol edges, including function addresses cloned into a caller. Unused
+constants retained in an interning pool do not create edges. Host-image mode
+retains every requested function for later private-name lookup.
+
+Temporary adaptation/optimization scratch is closed after copying only the
+final graph, observations and import bindings into a retained snapshot arena.
+Code generation borrows that exact snapshot; its arena is released after text
+and relocations have merged. Snapshot copying preserves graph references,
+constant/prototype IDs and owned string bytes. The ordinary native image
+optimizer and verifier still run.
+
+Pruned jobs are removed from native definition placement rather than assigned a
+fake text offset. A late relocation to a pruned function is a hard error. New
+planning, validation and release costs are included in IR-codegen timing.
+
+The CLI object gate checks inlined-helper removal, ordinary and cloned function
+addresses, native data, exported C aliases, recursion and prebuilt-unit retention.
+A direct CIR-to-native ASAN harness executes 6432 calls after releasing all
+caller arenas. An independent resolver-probe ASAN failure prevents claiming a
+clean end-to-end sanitized compiler; it is recorded in the coil-bugs Pad.
+
+Performance evidence is kept in `docs/benchmarks/live-emission`; neither this
+pass nor the latest bootstrap diagnostic meets the full performance objective.
