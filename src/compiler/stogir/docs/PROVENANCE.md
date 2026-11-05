@@ -1384,3 +1384,7 @@ remain mandatory. See RETURN_MERGE.md.
 Constant multiply plus-one target rule copied from coil-stogirb378e52.
 Independent word target selection extension; existing MUL_PWR2 is unchanged.
 See CONSTANT_MULTIPLY.md.
+
+
+Absorbed word MUL retirement copied from coil-stogir9699a5e. Original MUL
+can supply a MUL_PWR2 shift tile; pure root-protected retirement now covers it.

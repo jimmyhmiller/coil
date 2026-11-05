@@ -21,3 +21,14 @@ input patterns. The scan runner owns a real Coil ArrayList; an independently
 compiled C reference checks signed field extraction and unsigned checksum wrap.
 Its process-CPU timer covers only opaque kernel calls, with reference checking
 outside the timer. Small kernel measurements are not bootstrap acceptance.
+
+
+## Absorbed multiply retirement
+
+Persistent shifted ADD/SUB can consume an existing MUL_PWR2 tile, whose original
+IR opcode is MUL rather than SHL. The retired-expression cascade previously
+recognized shifts but not pure word MUL, leaving a dead LSL in the scan body.
+Word MUL is now included in the same reference-counted, root-protected pure
+retirement set. The graph is still unchanged. Matching tests cover MUL_PWR2
+producers under normal/commuted/reversed/rooted/shared ADD/SUB; the omission
+assertion fails before the fix, while native correctness alone would miss it.
