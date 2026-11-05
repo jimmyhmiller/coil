@@ -1,0 +1,1 @@
+Source/candidatec9186232; quick gate PASS (see quick.log). Full FAST not run. Compiler experiment committed, not pushed or installed. Standalone source/evidence pushed throughf9533fc. No measured gain or bootstrap adoption; goal remains unmet.
