@@ -1340,3 +1340,9 @@ index, machine constraints and call/edge transfers rematerialize them without
 virtual address ranges; frame-address and spill-content identities stay distinct. Inline
 cloning lowers marked callee objects to the existing call-local save/restore
 scope. No upstream/LLVM/TPDE implementation is imported. See STATIC_ENTRY_ALLOCATIONS.md.
+
+Contained-load promotion extends the pinned ir_mem2ssa.c-inspired field model
+independently: explicitly little-endian integer fields may be read at a smaller
+width from their starting offset. Full-width stores and the existing nonescape
+and initialized-path proofs are required. This is a Coil extension, not a claim
+of identical upstream representation or pass coverage.
