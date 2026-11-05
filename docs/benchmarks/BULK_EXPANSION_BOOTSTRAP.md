@@ -40,6 +40,12 @@ fef9140aaa0f202bc56686547d1adfc80fc55e644e9827cb611fa608d9844145.
 LLVM outputs are stable across repeated samples. Source/object identities,
 commands, samples and host snapshots are archived in results/bulk-128-bootstrap.
 
-At this checkpoint: source/evidence committed; FAST is being run. Not globally
-installed or pushed yet. Production remains 088de286 until validation/delivery.
-Full 5x generation and within 10% bootstrap runtime goal remains active/unmet.
+Delivery validation: FAST passed all 49 checks in 264.5 seconds. Its existing
+cli/objects memory warning was 1.60 GB versus the 1.5 GB reporting line. The
+candidate is globally installed as 979be2f998fb with matching compiler/stdlib,
+native archives, JIT unit and lint profile. All 337 installed compiler files and
+124 stdlib files match the source tree exactly. An off-checkout installed Stogir
+build of the wide projection passes the independent C checksum/preservation
+oracle. The standalone dependency branch is published at f77b1f4. This evidence
+commit is the Coil branch delivery record; remote hash verification follows push.
+The full 5x generation and within 10% bootstrap runtime goal remains active/unmet.
