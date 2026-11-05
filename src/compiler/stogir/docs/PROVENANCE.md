@@ -1353,3 +1353,9 @@ integer predicate pairs from ir.h/ir_fold.h (EQ/NE, LT/GE, LE/GT and unsigned
 variants) may supply opposite truth when both SSA operands are identical.
 Floating/vector comparisons remain exact-identity only; control barriers and
 cycle bounds are unchanged. Single-use complementary conditions may be queried.
+
+The profile-guided pipeline combination retains the pinned upstream-shaped
+count/prefix/fill use lists and immutable verified graph preparation. The
+specialized scans and shared in-call structural validation are independent Coil
+implementations, with the same existing attribution and public validation
+requirements. They do not claim full upstream pass parity.
