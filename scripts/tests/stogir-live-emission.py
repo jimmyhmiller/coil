@@ -24,11 +24,21 @@ with tempfile.TemporaryDirectory(prefix='stogir-emission-') as temporary:
     obj = directory / 'program.o'
     run(COMPILER, 'emit-obj', ROOT / 'tests/cli/stogir-live-emission.coil',
         '--backend', 'stogir', '-O3', '--no-debug', '-o', obj)
+    traced = directory / 'traced.o'
+    result = subprocess.run([str(COMPILER), 'emit-obj', str(ROOT / 'tests/cli/stogir-live-emission.coil'),
+                             '--backend', 'stogir', '-O3', '--no-debug', '-o', str(traced)],
+                            cwd=ROOT, env=dict(ENV, COIL_TPDE_STATS='1'),
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert obj.read_bytes() == traced.read_bytes(), 'effect tracing changes object bytes'
+    assert 'stogir nonwriting-body tests.cli.stogir-live-emission.readonly-leaf: true' in result.stderr
+    assert 'stogir nonwriting-body tests.cli.stogir-live-emission.writing-leaf: false' in result.stderr
     symbols = run('nm', obj)
     assert symbols.strip(), 'nm returned no symbol table'
     for helper in ['leaf', 'wrapper', 'make-callback']:
         assert f'_tests.cli.stogir-live-emission.{helper}' not in symbols, helper
-    for retained in ['_stogir_retained_entry',
+    for retained in ['_tests.cli.stogir-live-emission.readonly-leaf',
+                     '_stogir_retained_entry',
                      '_tests.cli.stogir-live-emission.address-only',
                      '_tests.cli.stogir-live-emission.returned-callback',
                      '_tests.cli.stogir-live-emission.recursive']:

@@ -1446,3 +1446,14 @@ protected observations, and updates exact operand-position use edges.
 MIN/MAX/ABS are excluded pending range/order proofs because the pinned native
 reproductions in `INTEGER_TYPE_PROMOTION_AUDIT.md` show wrong-code cases.
 BOOL and pointer conversion boundaries are excluded.
+
+## Declared nonwriting calls
+
+`load-forward.coil:call-preserves-memory?` adapts the pinned `ir.c`
+`ir_find_aliasing_load_i` CALL case: CONST_FUNC32/PURE_FUNC64 declarations
+permit walking the memory predecessor. Unknown/malformed prototypes stay
+barriers. Coil aggregate-result roles stay barriers because their calling
+sequence can write a caller result place. Calls themselves remain retained.
+`nonwriting-verified-body?` is a conservative Coil effect proof, not an upstream
+interprocedural analysis: validated scalar graphs are scanned through a safe
+opcode whitelist and existing declared call effects. Mutation invalidates it.
