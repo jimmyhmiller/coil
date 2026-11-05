@@ -35,3 +35,14 @@ harness. Both checks run in FAST cli/objects.
 
 Full bootstrap goal remains unmet until same-source measurements prove5x faster
 IR generation and generated compiler runtime within10% of LLVM O3.
+
+## Corrected candidate8e452187
+
+Quick PASS41.9s and cli/objects PASS43.1s, with the existing3.99GB objects
+memory warning. Snapshot analysis is included in generation timing. Repeated
+small-case medians: previous0.2775ms, candidate0.2445ms, LLVM25.004ms generation;
+previous16.922ms, candidate12.099ms, LLVM10.9025ms copy CPU. Runtime varies
+relative to the initial run, so the initial2.3% gap is not a stable result.
+External process observations are included in timed-copy-results.json.
+Whole-bootstrap diagnostic is pending; competing external builds mean it must
+be qualified rather than treated as performance acceptance.
