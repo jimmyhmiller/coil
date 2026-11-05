@@ -35,3 +35,24 @@ not measure its code-quality effect on that verifier. Its integrated benefit
 requires rebuilding the Coil backend. No bootstrap improvement or target
 acceptance is claimed. The full goal remains5x IR generation advantage and
 generated bootstrap compiler runtime within10% of LLVM O3.
+
+The subsequent word-TRUNC correction follows pinned `ir_emit_trunc` as well:
+TRUNC-to32 is a register view, elided when source and destination registers match.
+Such a view is no longer classified as already zero-extended for a later ZEXT;
+actual extensions keep their required normalization. The165-variant raw-register
+matrix passes with24direct BITCAST/TRUNC same/different-register encoding cases.
+Broader ABI/arithmetic/pressure validation and integrated measurements are pending.
+
+Word-TRUNC source0fc9528 passes16additional debug/ASAN programs: conversion,
+binary/unary matrices, narrow call/return/extend/varargs, stack arguments, call
+pressure, Phi joins/redefinitions, memory, conversion images and call ABI. Raw
+logs are under validation/validator-dispatch/word-trunc/. The actual native
+conversion matrix checks165semantic variants and24explicit view encodings.
+
+A separate scalar-property Always-inline source experimentb062e5e was rejected.
+Using one7944compiler and paired old/new library policies: Stogir generation
+92.308->97.4955ms, CPU32.4735->32.1885ms, object85707->86613bytes. Four rotating
+generation and16rotating CPU samples afterwarmup; this is a small contended
+machine diagnostic, not bootstrap evidence. It did not justify a policy change.
+Its patch and results are archived; the source annotations are NOT in this branch.
+The compiler's existing inline budgets and default source policies stay intact.
