@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`0d6d545`, on 2026-11-04. The independent library remains maintained in that
+`b01d83d`, on 2026-11-05. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 
@@ -68,3 +68,7 @@ local scheduling. See [use-index lifetime](docs/IMMUTABLE_USE_INDEX.md).
 
 Experimental constant bulk expansion uses a 128-byte budget before scalar memory
 promotion. This is a local policy probe; generation/runtime benefit is unproven.
+
+Explicit fixed function-lifetime objects are selected before register liveness and
+rematerialized through calls and Phi copies. Raw stack operations retain SP
+semantics. See [fixed entry objects](docs/STATIC_ENTRY_ALLOCATIONS.md).

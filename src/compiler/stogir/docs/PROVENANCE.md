@@ -1329,32 +1329,14 @@ independently checked opaque preparation reduction improves stogir4.33%/5.31%,
 LLVM6.55%/5.29%, TPDE3.89%/4.17%; no full bootstrap claim. See
 [analysis storage](ANALYSIS_STORAGE.md).
 
-### Empty register buckets in pressure queries
+## Fixed function-lifetime object declarations
 
-Standalone0db3867 adds conservative event-domain queries to fixed-use and physical
-reservation indexes. Empty buckets bypass interval range traversal; nonempty
-buckets retain all existing ownership, intersection and deactivation handling.
-Pinned upstream linear-scan policy and emitted-code decisions are unchanged.
-This is a local traversal optimization, not a new upstream pass. Repeated small
-sparse-input stogir runtime gains7.99%/7.43%; dense overhead ranges -0.63% to
-+1.69%. Integration performance remains to be measured. See
-[pressure register domain](PRESSURE_REGISTER_DOMAIN.md).
-
-### Exact use-list lifetime through preparation
-
-Standaloneca13d63 shares one exact use index across immutable early placement,
-late placement and local schedule consumers, following pinned ir_ctx.use_lists
-lifetime. Existing owning entry points remain; borrowed entry points require
-matching verified graph/version and preserve every prior prerequisite. No facts
-cross graph edits; pipeline owns/releases the index on success and errors.
-ASAN/debug placement, branch/error oracles, native loops/switch/module and linked
-AOT pass. Small preparation CPU repeats12.30%/12.38% stogir improvement; no full
-compiler gain inferred. See [use-index sharing](IMMUTABLE_USE_INDEX.md).
-
-### Constant-size bulk expansion experiment
-
-Standalone 0d6d545 probes a generic 128-byte constant bulk expansion budget in
-the existing scalar bulk lowering, before memory promotion. This is a local
-policy experiment, not a copied upstream threshold or a size-specific shortcut.
-Copy/move/zero semantics and dynamic-size paths remain. Validation and integrated
-generation/runtime measurements are pending; this snapshot is not production.
+The native fixed-entry object selection/layout references IR_STATIC_ALLOCA in
+pinned ir_aarch64.dasc. Explicit builder/frame-object! and ALLOCA auxiliary32768
+are an independent Coil semantic extension: ordinary ALLOCA still changes raw
+SP, including zero-size snapshots. Marked entry-prefix objects have positive
+constant extent and function lifetime. Native matching selects read-only frame addresses before liveness. The location
+index, machine constraints and call/edge transfers rematerialize them without
+virtual address ranges; frame-address and spill-content identities stay distinct. Inline
+cloning lowers marked callee objects to the existing call-local save/restore
+scope. No upstream/LLVM/TPDE implementation is imported. See STATIC_ENTRY_ALLOCATIONS.md.
