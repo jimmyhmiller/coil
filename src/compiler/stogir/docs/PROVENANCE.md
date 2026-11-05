@@ -1500,3 +1500,21 @@ port upstream's stronger assumptions about distinct ALLOCA/SYM roots into
 Coil's observable raw-stack or exported-alias behavior. Aggregate calls still
 remain memory barriers; no source-level purity or effect fact is invented.
 Validation and limitations: [memory area alias](validation/memory-area-alias/README.md).
+
+## Native register-result effects and capture regions
+
+`call-effects` retains pinned CONST/PURE declaration validation while separating
+native target effects from Coil's explicit caller capture writes. Global memory
+preservation remains scalar-only. A qualified register-result call can preserve a
+particular queried address only when the full GP/HFA/HVA capture region is proven
+disjoint. Indirect x8 results remain excluded. The validated native-target body
+proof admits nonescaping writes only to synthetic register-result PARAM0 storage;
+this parameter lowers to private callee frame storage, not a native caller address.
+These are Coil aggregate-ABI extensions, not an upstream aggregate optimization.
+
+The shared mem2ssa pointer classifier now has compile-time field/region policies.
+Its existing exact-field/little-endian promotion checks are unchanged. The effect
+region policy permits bounded partial/overlapping accesses without promoting
+those accesses to SSA. Escapes, unknown offsets, volatile effects and foreign
+stores remain rejected. Proofs carry no facts across graph mutation. See
+[validation](validation/register-result-effects/README.md).

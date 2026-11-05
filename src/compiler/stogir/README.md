@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`6989997`, on 2026-11-05. The independent library remains maintained in that
+`ca716c2`, on 2026-11-05. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 
@@ -110,3 +110,7 @@ call output groups and fixed ABI constraints. See [validation and limits](docs/v
 Bounded address/index/displacement alias analysis enables forwarding past stores
 to proven disjoint private storage. Raw stack/unknown/indexed-area and symbol-alias
 cases remain conservative. See [validation](docs/validation/memory-area-alias/README.md).
+
+Native readonly register-result targets are distinguished from their explicit
+caller capture writes. Forwarding requires disjoint queried/capture footprints;
+indirect x8 results remain barriers. See [validation](docs/validation/register-result-effects/README.md).
