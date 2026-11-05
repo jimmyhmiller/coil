@@ -2,6 +2,7 @@
 """Byte-exact constant aggregate snapshot and zero-fill boundaries."""
 from pathlib import Path
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -73,7 +74,15 @@ int main(void) {
 ''')
     obj = d / 'matrix.o'
     run(COMPILER, 'emit-obj', fixture, '--backend', 'stogir', '-O3', '--no-debug', '-o', obj)
-    executable = d / 'matrix'
+    assembly = run('llvm-objdump', '-dr', obj)
+    bodies = re.split(r'^[0-9a-f]+ <([^>]+)>:\s*$', assembly, flags=re.M)
+    functions = dict(zip(bodies[1::2], bodies[2::2]))
+    for size in SIZES:
+        if size <= 128:
+            body = functions[f'_zero_{size}']
+            if re.search(r'ARM64_RELOC_BRANCH26\s+_(memset|memmove)', body):
+                raise AssertionError(f'small zero-fill {size} became a runtime call')
+    executable = d / 'matrix' 
     run('cc', '-O2', '-fsanitize=address', driver, obj, '-o', executable)
     run(executable)
 print(f'{len(SIZES)} widths, {len(SIZES)*4096} overlapping snapshots and '

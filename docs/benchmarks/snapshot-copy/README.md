@@ -46,3 +46,18 @@ relative to the initial run, so the initial2.3% gap is not a stable result.
 External process observations are included in timed-copy-results.json.
 Whole-bootstrap diagnostic is pending; competing external builds mean it must
 be qualified rather than treated as performance acceptance.
+
+## Initial whole-bootstrap diagnostic8e452187
+
+Both generated hosts emitted the exact seed Stogir object. Stogir generation
+13.819041s versus LLVM36.257130s; generated compiler CPU40.341109s versus
+LLVM17.763648s, wall41.665932s versus17.969353s. Previous e3f6bca7 backend on
+this same frozen source used13.729235s generation and38.605329s generated-host
+CPU. There is no demonstrated bootstrap improvement. External competing builds
+were observed; these are single-sample diagnostics, not acceptance.
+
+Audit then found that fused zero fills below128 bytes used the dynamic memset
+call path instead of inline bulk/zero lowering. The extended native regression
+fails on the initial candidate with: small zero-fill1 became a runtime call.
+Known small zero fills now retain inline lowering; corrected candidate testing
+is pending. Do not report the initial fusion as a delivered performance win.
