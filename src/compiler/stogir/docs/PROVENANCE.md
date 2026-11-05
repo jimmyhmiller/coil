@@ -1346,3 +1346,10 @@ independently: explicitly little-endian integer fields may be read at a smaller
 width from their starting offset. Full-width stores and the existing nonescape
 and initialized-path proofs are required. This is a Coil extension, not a claim
 of identical upstream representation or pass coverage.
+
+Integer complement ancestry independently extends the pinned
+ir_check_dominating_predicates_i-style straight-control query. The existing
+integer predicate pairs from ir.h/ir_fold.h (EQ/NE, LT/GE, LE/GT and unsigned
+variants) may supply opposite truth when both SSA operands are identical.
+Floating/vector comparisons remain exact-identity only; control barriers and
+cycle bounds are unchanged. Single-use complementary conditions may be queried.
