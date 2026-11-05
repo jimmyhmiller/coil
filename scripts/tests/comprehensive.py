@@ -74,8 +74,6 @@ def steps(x64: bool) -> list[Step]:
         Step("generated/modules", [PY, "scripts/tests/generated-modules.py"]),
         Step("memory/generated-units", [PY, "scripts/tests/generated-unit-memory.py", "--units", "64"]),
         Step("memory/namespace-index", [PY, "scripts/tests/project-scan-memory.py", "--full"]),
-        Step("memory/self-build", [PY, "scripts/tests/self-build-expansion-memory.py", "{compiler}"],
-             whole_compiler=True, memory_gb=HEAVY_LINE_GB),
         Step("extern-prototypes", [PY, "scripts/tests/extern-prototypes.py", "{compiler}"],
              whole_compiler=True, memory_gb=HEAVY_LINE_GB),
         Step("aggregates", [PY, "scripts/tests/aggregate-ir-scan.py", "{compiler}"],

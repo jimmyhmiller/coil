@@ -204,7 +204,7 @@ uint64_t env_memchr(uint64_t p, uint32_t c, uint64_t n) {
     return hit ? (uint64_t)(hit - MEM) : 0;
 }
 // uname(2) for the guest: the host's struct, in the host's layout, which is
-// the one comptime.coil's native-arch-str reads for the OS it reports.
+// the one metastate.coil's native-arch-str reads for the OS it reports.
 uint32_t env_uname(uint64_t buf) {
     struct utsname u;
     if (uname(&u) != 0) return (uint32_t)-1;
