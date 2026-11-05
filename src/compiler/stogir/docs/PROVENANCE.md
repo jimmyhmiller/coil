@@ -1365,3 +1365,8 @@ Numeric context specialization/cache from coil-stogir f97960a independently uses
 existing SCCP and exact inliner contracts. Optional constant-index restoration
 retains existing scalar/LONG_CONST key, header and payload conventions, preserving
 negative IDs. This is not upstream feature parity. LICENSE/NOTICE remain intact.
+
+
+Dynamic-actual specialization prefilter copied from coil-stogir commit 67429e5.
+The original batch and all selected derived-callee proofs remain checked.
+No performance claim before measurement; see the standalone central NOTICE/LICENSE.
