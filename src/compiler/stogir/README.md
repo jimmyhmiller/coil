@@ -72,3 +72,10 @@ promotion. This is a local policy probe; generation/runtime benefit is unproven.
 Explicit fixed function-lifetime objects are selected before register liveness and
 rematerialized through calls and Phi copies. Raw stack operations retain SP
 semantics. See [fixed entry objects](docs/STATIC_ENTRY_ALLOCATIONS.md).
+
+
+Context-bound parameter specialization/cache is selectively copied from
+coil-stogir f97960a (2026-11-05): call-inline.coil, graph.coil and
+parameter-specialize.coil. See [specialization](docs/PARAMETER_SPECIALIZATION.md).
+Only the opt-in cache API changes inline selection; original semantic validation
+and clone limits remain. Compiler performance/adoption is unproven.

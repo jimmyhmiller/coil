@@ -1359,3 +1359,9 @@ count/prefix/fill use lists and immutable verified graph preparation. The
 specialized scans and shared in-call structural validation are independent Coil
 implementations, with the same existing attribution and public validation
 requirements. They do not claim full upstream pass parity.
+
+
+Numeric context specialization/cache from coil-stogir f97960a independently uses
+existing SCCP and exact inliner contracts. Optional constant-index restoration
+retains existing scalar/LONG_CONST key, header and payload conventions, preserving
+negative IDs. This is not upstream feature parity. LICENSE/NOTICE remain intact.
