@@ -1370,3 +1370,7 @@ negative IDs. This is not upstream feature parity. LICENSE/NOTICE remain intact.
 Dynamic-actual specialization prefilter copied from coil-stogir commit 67429e5.
 The original batch and all selected derived-callee proofs remain checked.
 No performance claim before measurement; see the standalone central NOTICE/LICENSE.
+
+
+Shifted arithmetic copied from coil-stogir1e8ab84. This is an independent
+AArch64 target extension through persistent matching; see SHIFTED_ARITHMETIC.md.
