@@ -1309,6 +1309,8 @@ EOF
         bad "IR timing produces identical serial object bytes ($backend)" "emit-obj failed or object bytes differ"
       fi
     done
+    expect_rc 0 "post-inline Stogir emission preserves native symbol roots" \
+      python3 "$ROOT/scripts/tests/stogir-live-emission.py" "$COIL"
     expect_rc 0 "native Mach-O data-in-code serialization and JIT loader" \
       "$COIL" run "$ROOT/src/compiler/selftest/jit_selftest.coil" --backend llvm
   fi
