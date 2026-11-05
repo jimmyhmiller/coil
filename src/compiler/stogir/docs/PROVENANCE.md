@@ -1350,3 +1350,11 @@ cross graph edits; pipeline owns/releases the index on success and errors.
 ASAN/debug placement, branch/error oracles, native loops/switch/module and linked
 AOT pass. Small preparation CPU repeats12.30%/12.38% stogir improvement; no full
 compiler gain inferred. See [use-index sharing](IMMUTABLE_USE_INDEX.md).
+
+### Constant-size bulk expansion experiment
+
+Standalone 0d6d545 probes a generic 128-byte constant bulk expansion budget in
+the existing scalar bulk lowering, before memory promotion. This is a local
+policy experiment, not a copied upstream threshold or a size-specific shortcut.
+Copy/move/zero semantics and dynamic-size paths remain. Validation and integrated
+generation/runtime measurements are pending; this snapshot is not production.
