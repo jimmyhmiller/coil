@@ -1,41 +1,40 @@
 # Metaprograms in Coil
 
-A **metaprogram** is a Coil function that runs at compile time and operates on the
-program. There is no separate metalanguage — it is Coil operating on Coil, compiled
-to native code and run, its output type-checked and compiled normally.
+Coil has two metaprogramming systems. Both are Coil functions that run at compile
+time and operate on `Code`. There is no separate metalanguage: it is Coil operating on
+Coil, compiled to native code and run, its output type-checked and compiled normally.
 
-## The four kinds
+| system | signature | sees | returns |
+|---|---|---|---|
+| **Macro** | `[Code…] -> Code` | its own call site | replacement code |
+| **Metaprogram**: checker | `Modules -> Code` | all modules, grouped | veto/report |
+| **Metaprogram**: transformer | `Program -> Program` | the whole program | a rewritten program |
 
-Distinguished only by *what they receive* and *what they return*.
+The difference is scope (one call site or the whole program) and when each runs: a
+macro before checking, and by default a metaprogram after.
 
-| kind | signature | receives | returns | status |
-|---|---|---|---|---|
-| **Macro** | `[Code…] -> Code` | its own call site | replacement code | shipped |
-| **Generator** | `() -> Code` (via `meta`) | nothing | new top-level forms | shipped |
-| **Checker** | `Modules -> Code` | all modules, grouped | veto/report | **shipped** |
-| **Transformer** | `Program -> Program` | the whole program | a rewritten program | **shipped** |
+## Applying them
 
-## Applying a metaprogram
-
-- **Macros** — *call* them: `(when c body)`. Detected by their `Code` signature.
-- **Checkers / transformers** — *register* them at top level: `(checker lint-icmp)` /
+- **Macros**: *call* them: `(when c body)`. Detected by their `Code` signature. A macro
+  called at top level returns top-level forms, a `(do …)` for several, so it is also how
+  to generate definitions: `(gen-open-flags)`. `(comptime E)` and `derive` are macros
+  ([COMPTIME.md](COMPTIME.md)).
+- **Checkers / transformers**: *register* them at top level: `(checker lint-icmp)` /
   `(transform desugar-inc)`. The compiler runs them during compilation. A **checker is
-  handed the program as a list of modules** — `((name form…) …)`, one record per module
+  handed the program as a list of modules**: `((name form…) …)`, one record per module
   (head = module name symbol, rest = its top-level forms). The checker owns the loop and
   decides which modules to look at. A **transformer** receives the same module-shaped
   input and returns a `do` bundle of module records (see “Transforms” below).
-- **Dialects** — *import* a module that contains those registrations: one
+- **Dialects**: *import* a module that contains those registrations: one
   `(import "safe_dialect")` applies its whole stack.
-- **From the CLI, optionally** — `coil run app.coil --use lint.coil` imports a
+- **From the CLI, optionally**: `coil run app.coil --use lint.coil` imports a
   metaprogram module (which self-registers its `(checker …)`) **without editing the
   source**. Repeatable; works on `run` and `build`. This is how you run a linter on
   demand: `coil run app.coil --use lint.coil`.
 
-All four share one substrate: the `Code` value, the `code-*` operations, type
-reflection, and the compiled comptime engine. The difference is **scope** (my-call-site
-vs whole-program) and **power** (produce vs reject vs rewrite). An ordered stack of
-checkers/transformers is what we mean by a **dialect** (e.g. the GC dialect, a
-Rust-like ownership dialect, a Scheme frontend).
+They share one substrate: the `Code` value, the `code-*` operations, type reflection and
+the compiled engine. An ordered stack of checkers/transformers is what we mean by a
+**dialect** (e.g. the GC dialect, a Rust-like ownership dialect, a Scheme frontend).
 
 ### Walking the whole program
 
@@ -99,7 +98,9 @@ using it pays that layout at each level; it is still correct. `code-copy` and
 
 - **Take Code apart:** `code-count`, `code-nth`, `code-rest`, `code-sym`,
   `code-list?`, `code-sym?`, `code-int?`, `code-keyword?`, `code-str`, `code-eq`.
-- **Build Code:** quote `` ` ``, unquote `~`, splice `~@`, `code-symbol` (make a
+- **Build Code:** quote `` ` ``, unquote `~` (a value becomes the syntax that rebuilds
+  it, a struct, sum or array included; `primitive/code-lift` keeps a scalar's type too),
+  splice `~@`, `primitive/code-hoist` (add a definition to the module being expanded), `code-symbol` (make a
   name from a symbol/string base plus suffix parts — a keyword part is its name
   without the colon, an int part becomes its decimal
   digits, and a **generic instantiation** base `(Gen A B)`, the same shape
@@ -123,8 +124,8 @@ using it pays that layout at each level; it is still correct. `code-copy` and
   sum sees real field types), `code-trait-*` (and value-form `field-count`,
   `struct?`, `field-name`, …).
   Kind tags: `0=int 1=float 2=bool 3=struct 4=sum 5=ptr 6=array 7=slice 8=other`.
-- **Compute:** the compiled engine runs arbitrary Coil — including generics,
-  collections, allocation and FFI.
+- **Compute:** the compiled engine runs arbitrary Coil, including generics,
+  collections, allocation and FFI. Integer division by zero is a located error.
 - **Fail / branch:** `error` (abort expansion with a message), `target-arch`,
   `target-os`.
 
@@ -165,7 +166,7 @@ load there, as Rust has no `std::fs` on a `*-none` target.)
 (defn gen-open-flags [] (-> Code)
   `(do (const ~(explicit-public-name `O_CREAT) ~(os/os-pick `64 `512 `512))
        (const ~(explicit-public-name `O_TRUNC) ~(os/os-pick `512 `1024 `1024))))
-(meta (gen-open-flags))
+(gen-open-flags)
 ```
 
 so the flags stay true compile-time literals (no runtime branch at any use) and
@@ -175,7 +176,7 @@ which is the only place the property is observable — a cross-built binary neve
 
 ### Code that runs inside the compiler
 
-Macros, `(meta …)` generators, transforms and checkers run inside the compiler,
+Macros, transforms and checkers run inside the compiler,
 on the machine building the program, so in a cross build they are compiled for
 that machine, the **host**, as Rust compiles proc macros and Racket keeps
 phases apart. The questions answer for **the code being produced at that
@@ -185,11 +186,11 @@ moment**:
 - **A function a macro calls while it runs** was compiled for the host, so its
   body's platform choices (an `os-pick` constant, a `freestanding-or`, the width
   of `usize`) are the host's. A macro that opens a file gets the host's `O_CREAT`.
-- **A macro or generator asking `target-os` itself, as it runs,** gets the
-  platform of the code it is producing: `--target` while it expands or generates
-  the program, so `gen-open-flags` above emits the target's flags.
+- **A macro asking `target-os` itself, as it runs,** gets the platform of the code
+  it is producing: `--target` while it expands the program, so `gen-open-flags`
+  above emits the target's flags.
 
-So a generator that produces per-platform definitions asks when it runs, as
+So a macro that produces per-platform definitions asks when it runs, as
 `gen-open-flags` does (its `os-pick` calls receive Code values, so they are
 ordinary calls made at run time); one that called an ordinary helper which had
 already baked in a choice would get the host's answer. When `--target` is the
@@ -198,7 +199,7 @@ host's own platform, all of this is one expansion and nothing changes. FAST's
 builder's.
 
 A cross build's program also leaves out what only the compiler's code uses, so a
-macro or generator can read and write files through `coil.fs` while the program is
+macro can read and write files through `coil.fs` while the program is
 built for bare metal, where `coil.fs` cannot load. Coil works out the phase of
 every use from the source:
 
@@ -226,12 +227,11 @@ the host and why every other module is in the program. The phases are inferred,
 so a macro that builds a name from a string (`code-symbol`) instead of writing it
 gets a resolve error in a cross build rather than the module it meant.
 
-A generator can use what another generates: one that calls `fs/write-file` needs
-the `O_CREAT` `coil.fs`'s own generator produces. The generators run as one
-program when they check as one; otherwise each that checks on its own runs first,
-the program is expanded with its output, and the rest run after. FAST's
-`cli/cross` step and COMPREHENSIVE's `freestanding` step (`build_time.coil`, run
-under QEMU) check these cases.
+A macro can use what another generates: one that calls `fs/write-file` needs the
+`O_CREAT` that `coil.fs`'s own top-level macro produces. A top-level macro runs once its
+own code checks, and the program is expanded with its output. FAST's `cli/cross` step and
+COMPREHENSIVE's `freestanding` step (`build_time.coil`, run under QEMU) check these
+cases.
 
 New API this project added (all shipped):
 
@@ -494,9 +494,8 @@ compiles it with the ordinary pipeline (cached content-addressed under
 language can do, a metaprogram can do — generics, HashMap, `malloc`, libc FFI at
 expansion time (`tests/meta/samecode_test.coil` runs the same code both ways).
 
-This covers **every** compile-time call site with one semantics: macros, `(meta …)`
-generators, checkers, transforms, and `(comptime E)` / `(const …)` folding. So a helper
-behaves the same whether it is reached from a macro, a generator, or a `const`.
+This covers **every** compile-time call site with one semantics: macros, `comptime`,
+checkers and transforms. So a helper behaves the same whichever reaches it.
 
 How the metaprogram object is produced depends on the host, invisibly: the LLVM build
 uses the LLVM backend, the LLVM-free `main_a64` compiler uses the arm64 backend's
@@ -516,10 +515,8 @@ receives its arguments as written, not the expanded `let`.
 Staging is lazy and per-qual: an engine miss stages that macro on demand, and a macro
 that cannot be staged is a hard error rather than a silent fallback.
 
-Known limits: entries are capped at 8 parameters; a comptime **result** must be
-materializable as a literal (a pointer, or an aggregate that is a generic instance,
-is a located error); and deep self-recursion at comptime is not TCO'd, so a runaway
-comptime recursion crashes rather than reporting.
+A macro whose own code needs its expansion is an error naming the function that closes
+the cycle.
 
 ## What metaprograms can and can't do
 
@@ -540,9 +537,8 @@ of the project. What remains:
    to an interceptable call over a `%store!` primitive is the open design (below); it
    is the one change that would re-bless the oracle snapshots.
 2. **Function-signature reflection** for auto-coercion at dialect boundaries.
-3. **A comptime result that is a pointer or a generic-instance aggregate**, and
-   **runaway comptime recursion**, which is unbounded and crashes rather than
-   reporting.
+3. **A value holding a pointer** has no syntax, and fails where it is unquoted.
+4. **Runaway compile-time recursion** is unbounded and crashes rather than reporting.
 
 ## Still open
 

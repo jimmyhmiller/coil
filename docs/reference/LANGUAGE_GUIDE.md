@@ -1194,13 +1194,13 @@ Owners that outlive a lexical allocator take an `AllocatorLease` instead of a
 hello 16 3
 ```
 
-`const` is evaluated at compile time and may call any function. `def` is a
-module-level binding with static storage; it can't be assigned. For a mutable
+`const` names an expression, which may not call a function; `(comptime …)` computes a
+value that takes one. `def` is a module-level binding with static storage; it can't be assigned. For a mutable
 global, `def` a `Var` made by `var-static`, then read it with `get` and write it
 with `set`.
 
-A `def`'s initializer is also computed at compile time, so a table can be built
-with calls, and a struct or array `def` is read in place: indexing it, reading a
+A table a `def` holds can be built with calls through `(comptime …)`, and a struct or
+array `def` is read in place: indexing it, reading a
 field or borrowing it as a slice addresses the static itself, never a copy.
 That static is read-only, so the optimizer folds loads from it (an MMIO
 descriptor's address becomes an immediate), and writing it through a slice or
@@ -1215,7 +1215,7 @@ needs a `const`.
 (defn twice [(x i64)] (-> i64) (* 2 x))
 
 (def PROGRAM [(Push :n 1) (Push :n 2) (Pop)])
-(def SQUARES [(twice 1) (twice 2) (twice 3)])
+(def SQUARES (comptime [(twice 1) (twice 2) (twice 3)]))
 
 (defn program [] (-> (slice Op)) PROGRAM)
 
@@ -1460,27 +1460,33 @@ namespace's definitions and docs.
 
 ## Compile time
 
-Coil runs ordinary Coil at compile time: the full language, including allocation,
-collections and FFI.
+A `const` names an expression: literals, other constants, operators, casts,
+constructors and questions about types such as `sizeof`. No code runs to make it, so
+it answers for the target.
+
+`(comptime E)` runs ordinary Coil while the program compiles, with the full language,
+including allocation, collections and FFI, and leaves the literal it comes to.
 
 ```coil
 (module example.consteval)
 (defn fib [(n i64)] (-> i64) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
 
-(const FIB-20 (fib 20))
+(const FIB-20 (comptime (fib 20)))
+(const WORD-BITS (* 8 (cast i64 (sizeof i64))))
 
 (defn main [] (-> i64)
-  (println "{} {}" FIB-20 (comptime (* 6 7)))
+  (println "{} {} {}" FIB-20 WORD-BITS (comptime (* 6 7)))
   0)
 ```
 
 ```output
-6765 42
+6765 64 42
 ```
 
-`const` and `(comptime E)` evaluate once during compilation and embed the result.
-The result must be a literal-shaped value: a scalar, string, array, or non-generic
-struct or sum. It can't be a pointer.
+The result must be a literal-shaped value: a scalar, string, array, struct or sum. It
+can't hold a pointer. `comptime` is a macro, so `E` sees top-level names, not the
+locals around it, and is compiled for the machine running the compiler: ask about the
+target with a `const`. [COMPTIME.md](COMPTIME.md) has the details.
 
 ### Macros
 
@@ -1520,7 +1526,8 @@ again
   `primitive/code-list-new` and splice it with `~@`.
 - `coil dump-hygiene FILE` prints the expanded program with scope information, and
   `--trace-macros` logs each expansion.
-- `(meta (generator))` runs a generator and splices the top-level forms it returns.
+- A macro called at top level returns top-level forms, a `(do …)` for several: it is
+  how a program generates definitions.
 
 ### Reflection
 

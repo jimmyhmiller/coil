@@ -28,7 +28,7 @@ that is not arm64, is an error rather than code for another machine.
 - `src/compiler/object/elf.coil` — ELF64 `ET_REL` writer: sections, `.rela.*`
   relocations, weak symbols, the local-before-global symbol order ELF requires.
 - `src/compiler/jit/jit_elf.coil` — maps an in-memory ELF object into this
-  process for metaprograms and comptime: far-call stubs for symbols out of
+  process for metaprograms: far-call stubs for symbols out of
   `rel32` reach, and a GOT for the relocations that name one.
 - `src/compiler/object/x64.coil` — the x86-64 instruction encoder the loader's
   stubs, `native_call.coil` and the ELF self-test use.

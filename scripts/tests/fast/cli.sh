@@ -463,8 +463,8 @@ section_check() {
   expect_rc 0 "an extern may redeclare a library symbol with another integer width" "$COIL" check "$T/extern-width.coil"
   # A constant's initializer is checked for ownership as a body is, and reported
   # against the constant (a constant's error stops the compile, so it is its own).
-  printf '(module const-move)\n(defstruct Owner [(value i64)])\n(impl Drop Owner (drop [(self (mut Owner))] (-> void) 0))\n(defn consume [(o Owner)] (-> i64) (.value o))\n(const TWICE (let [o (Owner :value 1)] (consume o) (consume o)))\n(defn main [] (-> i64) TWICE)\n' > "$T/const-move.coil"
-  expect_rc_out 1 "in 'const const-move.TWICE': use of moved value 'o'" \
+  printf '(module const-move)\n(defstruct Owner [(value i64)])\n(impl Drop Owner (drop [(self (mut Owner))] (-> void) 0))\n(defn consume [(o Owner)] (-> i64) (.value o))\n(const TWICE (comptime (let [o (Owner :value 1)] (consume o) (consume o))))\n(defn main [] (-> i64) TWICE)\n' > "$T/const-move.coil"
+  expect_rc_out 1 "use of moved value 'o'" \
     "check: a constant's initializer moves an owner once" "$COIL" check "$T/const-move.coil"
   # A generic body that copies an element out of a slice is refused at the
   # instance whose element type owns something, at the read.
@@ -498,7 +498,7 @@ section_check() {
 (defstruct S :layout (layout/Align (+ 8 8)) [(a u8)])|:layout takes a coil.layout.Layout
 (def X [1 2 3]) (def Y X) (defn use-y [] (-> i64) (get Y 1))|a def's initializer cannot read the def 'X'
 (defn mk [] (-> (slice i64)) (let [k 3] [1 2 k]))|returns a slice of an array literal that this call's frame holds
-(const target (helper)) (defn helper [] (-> i64) target) (defn stage [] (-> Code) `(do ~target)) (defn use-it [] (-> i64) (stage))|this compile-time value depends on itself
+(const target (comptime (helper))) (defn helper [] (-> i64) target) (defn stage [] (-> Code) `(do ~target)) (defn use-it [] (-> i64) (stage))|this compile-time value depends on itself
 EOF
   # Code has no runtime layout: a runtime function asking for it is compile-time
   # code, and a runtime entry that reaches it is a located error.
@@ -1300,6 +1300,17 @@ arm64-apple-ios18.0-simulator 2 20
 aarch64-unknown-linux-gnu 2 10
 riscv32-unknown-none-elf 4 40
 EOF
+  # A constant is an expression of the program, so it answers for the target: the
+  # size of a struct holding a pointer, where a pointer is 4 bytes.
+  cat > "$T/const-target.coil" <<'EOF'
+(module const-target)
+(defstruct Holder [(tag i8) (at (ptr i8))])
+(const HOLDER-SIZE (cast i64 (sizeof Holder)))
+(defn size [] (-> i64) HOLDER-SIZE)
+(defn main [] (-> i64) (size))
+EOF
+  expect_out 'ret i64 8' "a constant's sizeof answers for the target" \
+    "$COIL" emit-ir "$T/const-target.coil" --target wasm32
   # Code that runs inside the compiler is compiled for the machine running it.
   # A cross build expands it separately from the program: a function a macro
   # calls answers for the host, the program's own copy for the target, and a

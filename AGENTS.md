@@ -203,8 +203,8 @@ Use this format:
   `driver.coil`, which dispatches commands, `jit_api.coil` for `coil.jit`, `prelude.coil`
   for `coil.core`), with `pipeline.coil`, what compiling a program takes, shared by every
   command; the rest is grouped by stage: `frontend/` (parser, loader, resolve, expander, check,
-  mono), `comptime/` (compile-time evaluation, the bytecode interpreter), `meta/`
-  (compiled metaprograms), `backend/` (LLVM, arm64, x64, wasm, tpde codegen),
+  mono), `meta/` (the metaprogram engine, the code operations and the bytecode
+  interpreter), `backend/` (LLVM, arm64, x64, wasm, tpde codegen),
   `object/` (instruction encoders, Mach-O/ELF/DWARF/wasm writers), `jit/` (with `session.coil`,
   a live session, and `terminal.coil`, the terminal REPL over one), `artifact/` (units and
   artifact identity), `cli/` (one module per command
