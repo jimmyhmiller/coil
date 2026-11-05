@@ -1518,3 +1518,13 @@ region policy permits bounded partial/overlapping accesses without promoting
 those accesses to SSA. Escapes, unknown offsets, volatile effects and foreign
 stores remain rejected. Proofs carry no facts across graph mutation. See
 [validation](validation/register-result-effects/README.md).
+
+## Nested bitcast construction
+
+`conversion.bitcast-source` follows `ir_fold.h:IR_FOLD(BITCAST(BITCAST))`
+in pinned dstogov/ir 92171d0a4a36b0acf707f2dea7998de615dd4acd:
+restart on the original bit pattern and copy when its type equals the destination.
+Coil additionally validates each removed conversion and bounds traversal to reject
+malformed/cyclic chains. BOOL normalization is deliberately excluded; Coil's BOOL
+destination canonicalizes a byte and cannot be treated as an arbitrary bit view.
+No arithmetic conversion, extension or truncation is peeled by this rule.
