@@ -39,3 +39,8 @@ supported. Do not infer an unported upstream optimization merely from a name
 search. Pinned ir.c:ir_check_dominating_predicates_i is already implemented.
 
 [Raw measurements, source fixture/caller hashes and trace](results/callee-view-probe).
+
+Restoration validation: FAST49/49PASS278.4s, cli/objects1.60GB memory warning.
+The restored candidate and full SDK digest match production088de286. Official
+installation restored/warmed that same production binary, SDK/native/JIT/lint;
+the experimental610ac7dc binary is archived separately and is not installed.
