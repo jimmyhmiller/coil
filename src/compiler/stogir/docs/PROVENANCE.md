@@ -1457,3 +1457,8 @@ sequence can write a caller result place. Calls themselves remain retained.
 `nonwriting-verified-body?` is a conservative Coil effect proof, not an upstream
 interprocedural analysis: validated scalar graphs are scanned through a safe
 opcode whitelist and existing declared call effects. Mutation invalidates it.
+
+The independent `call-inline.coil` compatibility check ignores only the two
+CONST/PURE memory-effect bits when comparing prototype flags. Calling convention,
+variadic/noreturn bits, result shape and ABI group trailer remain exact. This
+prevents inferred memory promises from disabling otherwise valid inlining.

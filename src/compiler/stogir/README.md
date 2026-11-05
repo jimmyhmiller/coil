@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`e5c96da`, on 2026-11-05. The independent library remains maintained in that
+`93349ce`, on 2026-11-05. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 
@@ -95,3 +95,6 @@ and native JIT/AOT evidence are recorded in that library commit.
 
 Declared nonwriting scalar-call forwarding and conservative validated-body
 effect proof copied from coil-stogir e5c96da. See central provenance and NOTICE.
+
+Effect promises are independent of inline ABI compatibility, copied from
+coil-stogir93349ce. Only CONST/PURE bits are excluded from flag comparison.
