@@ -1303,7 +1303,7 @@ EOF
   # Code that runs inside the compiler is compiled for the machine running it.
   # A cross build expands it separately from the program: a function a macro
   # calls answers for the host, the program's own copy for the target, and a
-  # (meta …) generator asking at run time gets the program's target.
+  # top-level macro asking at run time gets the program's target.
   cat > "$T/stages.coil" <<'EOF'
 (module stages)
 (import "coil.primitive" :as primitive)
@@ -1316,7 +1316,7 @@ EOF
         via (primitive/code-str (os-name))]
     `(do (defn ~(primitive/syntax->datum `generated-direct) [] (-> (slice u8)) ~direct)
          (defn ~(primitive/syntax->datum `generated-via) [] (-> (slice u8)) ~via))))
-(meta (gen-views))
+(gen-views)
 (defn main [] (-> i64) 0)
 EOF
   local other host_os other_os stages
@@ -1383,23 +1383,23 @@ EOF
   expect_rc_out 1 'is in the program because a template in .write_note.exists-call. uses .fs/exists\?. at run time' \
     "a macro template calling coil.fs keeps it in a bare-metal program, and says so" \
     "$COIL" check "$T/phase/probe.coil" --target riscv32-unknown-none-elf
-  # A (meta …) generator reads a file on the build machine; it needs the O_CREAT
-  # and directory constants coil.fs's own generators produce, so they run first.
+  # A top-level macro reads a file on the build machine; it needs the O_CREAT
+  # and directory constants coil.fs's own top-level macros produce.
   printf 'abc' > "$T/phase/data.txt"
   cat > "$T/phase/sized.coil" <<'EOF'
 (module sized)
 (import "coil.primitive" :as primitive)
 (import "coil.fs" :as fs)
 (import "coil.meta" :use [expansion-allocator])
-(defn gen-size [(path (slice u8))] (-> Code)
-  (match (fs/read-file (expansion-allocator) path)
+(defn gen-size [(path Code)] (-> Code)
+  (match (fs/read-file (expansion-allocator) (primitive/code-str path))
     (Ok [text] `(defn ~(primitive/syntax->datum `data-size) [] (-> i64) ~(primitive/cast i64 (len text))))
     (Err [_] (primitive/error "gen-size: could not read the file"))))
 EOF
-  printf '(module sized_main)\n(import "sized" :use [gen-size])\n(meta (gen-size "%s"))\n(defn main [] (-> i64) (data-size))\n' \
+  printf '(module sized_main)\n(import "sized" :use [gen-size])\n(gen-size "%s")\n(defn main [] (-> i64) (data-size))\n' \
     "$T/phase/data.txt" > "$T/phase/sized_main.coil"
-  expect_rc 3 "a generator reads a file with coil.fs" "$COIL" run "$T/phase/sized_main.coil"
-  expect_out '\(defn\* data-size \[\] \(-> i64\) 3\)' "a bare-metal program's generator reads a file with coil.fs" \
+  expect_rc 3 "a top-level macro reads a file with coil.fs" "$COIL" run "$T/phase/sized_main.coil"
+  expect_out '\(defn\* data-size \[\] \(-> i64\) 3\)' "a bare-metal program's top-level macro reads a file with coil.fs" \
     "$COIL" expand "$T/phase/sized_main.coil" --target riscv32-unknown-none-elf
   expect_rc_out 1 "coil.core.Os does not name: freebsd" "an OS coil.core.Os does not name is an error, not the host's" \
     "$COIL" check "$T/seven.coil" --target x86_64-unknown-freebsd

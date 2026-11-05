@@ -308,7 +308,7 @@ expect 0 "" "the consumer links the unit; state, a def it shares, generic static
 # A module that re-exports another's names builds as a unit, and its consumer sees
 # the re-exported names, under the names the import gives them, and nothing more.
 # With no export list, every name the module declares is public through the unit
-# as from source: one its `meta` generates, a C function, a generic sum's
+# as from source: one its top-level macro generates, a C function, a generic sum's
 # variants, a derive generator, constants, its `main` (an ordinary function in a
 # unit, never a second process entry beside the consumer's), and functions keep
 # their parameter names.

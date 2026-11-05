@@ -119,7 +119,7 @@ expect "hygiene: a reflected type of a module not imported is not in scope" 1 \
 out=$("$COIL" check $M/hygiene_capture.coil 2>&1); rc=$?
 case "$rc|$out" in
   *'$scope'*|*'$datum'*) bad "hygiene: captures report no internal scope key" "$out" ;;
-  "1|"*"unbound variable 'total'"*"unbound variable 'state'"*"unbound variable 'hidden'"*"3 errors"*)
+  "1|"*"unbound variable 'state'"*"unbound variable 'hidden'"*"unbound variable 'total'"*"3 errors"*)
     ok "hygiene: three captures, each reported, in one run" ;;
   *) bad "hygiene: three captures, each reported, in one run" "exit $rc: $out" ;;
 esac

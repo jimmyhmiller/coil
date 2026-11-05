@@ -123,7 +123,6 @@ def main() -> None:
                 spans.setdefault(name, []).append(int(elapsed))
             wanted = ('jit.prepare', 'jit.prepare.enter', 'jit.prepare.read',
                       'jit.prepare.load', 'frontend.expand.stage3-rounds',
-                      'frontend.expand.round.capture-metas',
                       'frontend.expand.round.resolve',
                       'frontend.expand.round.parse-recover',
                       'frontend.expand.round.closure',
@@ -131,7 +130,6 @@ def main() -> None:
                       'frontend.expand.round.snapshot',
                       'frontend.expand.round.engine-setup',
                       'frontend.expand.round.run-expand',
-                      'frontend.expand.round.restore-metas',
                       'frontend.transforms-and-check', 'frontend.check.typecheck',
                       'frontend.check.resolve', 'frontend.check.transform-fixpoint',
                       'frontend.check.setup', 'frontend.check.functions',

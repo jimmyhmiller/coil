@@ -40,9 +40,8 @@ itself. What the toolchain guarantees:
   one that prints `fatal: out of memory at box!`; without a handler the program
   stops at the trap instruction. `--debug-runtime` and `--sanitize=undefined`
   checks trap the same way.
-- **Compile-time code runs on the build machine.** Macros, `(meta …)` generators
-  and transforms run while the image is built, with the build machine's OS, so
-  they can use `coil.fs` and friends; what only they use is never compiled for
+- **Compile-time code runs on the build machine.** Macros and transforms run
+  while the image is built, with the build machine's OS, so they can use `coil.fs` and friends; what only they use is never compiled for
   the target (see "Code that runs inside the compiler" in
   `docs/reference/METAPROGRAMS.md`). A module the image itself uses at run time
   that needs an OS is refused, with the use that brought it in.
