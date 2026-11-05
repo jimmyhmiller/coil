@@ -86,6 +86,30 @@ printf '(defn main [] (-> i64) (bad-fn 3))\n' > "$T/broken.coil"
 
 # ---------------------------------------------------------------------------
 section_run() {
+  # include-str is replaced as a file loads, whatever form holds it: a def, and a
+  # top-level macro's argument, whose helper reads a constant of its own module.
+  mkdir -p "$T/embed/src"
+  printf '[package]\nname = "embed"\nentry = "src/main.coil"\n' > "$T/embed/Coil.toml"
+  printf 'abc' > "$T/embed/src/embedded.txt"
+  cat > "$T/embed/src/gen.coil" <<'EOF'
+(module embed.gen)
+(import "coil.primitive" :as primitive)
+(const FACTOR 2)
+(defn factor [] (-> i64) FACTOR)
+(defn report-size [(text Code)] (-> Code)
+  (println "generator saw {} bytes, factor {}" (len (primitive/code-str text)) (factor))
+  `(do))
+EOF
+  cat > "$T/embed/src/main.coil" <<'EOF'
+(module embed.main)
+(import "embed.gen" :as gen)
+(def text (include-str "embedded.txt"))
+(gen/report-size (include-str "embedded.txt"))
+(defn main [] (-> i64) (len text))
+EOF
+  expect_rc_out 3 'generator saw 3 bytes, factor 2' "include-str in a def and in a top-level macro's argument" \
+    bash -c 'cd "$1" && "$2" run' _ "$T/embed" "$COIL"
+
   # A program is not a compiler: it gets the environment coil was given, without the
   # project configuration coil applied to itself.
   mkdir -p "$T/run-env/src"
