@@ -161,3 +161,6 @@ Exact ordered comparison choices copied from coil-stogir caa8275 (base33d6b59). 
 
 
 Cheap guard ordering copied from coil-stogir e48c294: reject non-COND nodes before matcher flags/error equality, and reject nonordered/nonidentity choices before movability work. Pure predicates reordered;1,219,680 native answer regression passes. Initial f1b39ed6 compiler result was neutral/slower; this follow-up is measured separately.
+
+
+Phi-entry spill-home correction copied from coil-stogir 32c1770 (base 4e068bc). A Phi certifies its parent's home only when its block-entry location, where Phi transfers and literals write, is that home. Fixes a miscompile of `stogir.verify.integer-operations-target-structured` in the Stogir-built compiler (a831fb94 host failed `missing integer operand`). Real-graph property replay, native/ASAN suites and exact whole-bootstrap object reproduction pass. See coil-stogir docs/validation/phi-home-entry.
