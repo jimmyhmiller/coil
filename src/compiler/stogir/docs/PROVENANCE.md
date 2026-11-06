@@ -1576,48 +1576,38 @@ volatile/atomic accesses and hard COPY barriers decline. Detailed proof, root
 protection, native semantic tests and actual allocator replay are documented in
 validation/memory-countdown. This is not an upstream loop-elimination port.
 
-Wide integer shared IF comparison fusion in a64/match.coil follows pinned
-ir_aarch64.dasc all_usages_are_fusable and IR_IF matching. The supported IF-only
-subset requires every scheduled use to be an IF condition, with explicit roots
-protected. Machine inputs are redirected before liveness. GUARD, narrow and
-floating-point coverage is unchanged; validation/shared-compare-fusion records
-native semantic, call-pressure and actual compiler-helper replay evidence.
+Structural verification now consumes instruction operand words directly only
+after complete per-node extent/count/continuation checks. This uses pinned
+ir.h's four-word cell layout, as Graph.operand does. Referenced-node membership,
+prototype/optional/local-storage checks remain unchanged; no unchecked public
+Graph API is introduced. The signed instruction-reference domain is explicitly
+checked once, matching Graph.append's existing limit. Proof/differential/error
+and performance evidence are in validation/structure-proven-operands.
 
-Verifier extent-proven operand reads copied from coil-stogir78394b7.
-This independent implementation caches operand shape and reads signed operand
-words only after complete storage/extent/domain validation; reference membership,
-local/prototype and optional-reference checks remain. Validation includes255exact
-valid/malformed diagnostics and native/ASAN runs. See validation/structure-proven-operands.
+Integer verifier current-header operand reads are an independent implementation
+improvement in verify.coil, using the existing successful structural-validation
+precondition. Referenced cells and type/width/guard checks remain checked.
+See validation/integer-operand-fields for exact diagnostic and ASAN evidence.
 
-Integer verifier current-header operand reads copied from coil-stogir756b206.
-Independent implementation improvement using the existing successful structural
-validation precondition. Referenced-cell and all semantic checks remain. Exact
-92992-case diagnostic/native/ASAN evidence: validation/integer-operand-fields.
+Identity-only iterative Phi cleanup is an independent extension in iter-fold.coil
+and sccp-rewrite.coil's existing seed walk. Pinned ir_sccp.c also skips iterative
+PHI folding; this is not its port. Exact reference identity, self-edge handling,
+root preservation and native validation: validation/iterative-phi-identity.
 
-Iterative identity-only Phi cleanup copied from coil-stogir309d37e (audit51c44fd).
-Independent extension, not upstream iterative-Phi parity: pinned ir_iter_opt also
-skips Phi folding. Existing affected-user rewrites/root COPYs and initial bulk
-seed walk are reused. See validation/iterative-phi-identity and value-diamond-audit.
+Affected-merge literal diamond reconsideration follows pinned ir_sccp.c's
+ir_iter_optimize_merge/ir_optimize_phi orchestration for the existing literal
+subset. Bulk and local paths share one collapse operation; arbitrary-value
+availability and MIN/MAX/ABS remain unimplemented. See validation/affected-merge-diamond.
 
-Affected-merge literal diamond reconsideration copied from coil-stogir19d6a1a.
-Follows pinned ir_iter_optimize_merge/ir_optimize_phi orchestration for the
-existing literal subset. One collapse operation serves bulk/local paths, with
-exact uses, rooted observations and normal control repair. Availability for
-arbitrary values and MIN/MAX/ABS remains outside scope. Validation/affected-merge-diamond.
-
-Diamond rewrite consumer notification copied from coil-stogird2ab904.
-Restores pinned ir_optimize_phi/ir_iter_add_uses restart discipline when a
-producer changes form. No new fold rules. Existing Boolean comparison folds
-now revisit affected users. See validation/diamond-user-notification.
+Diamond producer rewrites now notify existing users as pinned ir_optimize_phi
+notifies ir_iter_add_uses after conversion. This restores the affected-consumer
+restart contract without adding fold rules. See validation/diamond-user-notification.
 
 
-Verifier semantic-family gate copied from coil-stogir d108f15, validation86a7f4e. Preserves all inner checks and their order, including overlapping families. Independent verifier source optimization; pinned upstream revision unchanged.71,050 exact-result/diagnostic differential cases and ASAN pass; two local paired timings show1.7–2.0% verifier improvement. No whole-bootstrap performance claim.
+## Exact comparison choices
 
+The exact operand-identity diamond pattern follows dstogov/ir ir_sccp.c MIN/MAX handling at pinned92171d0a4a36b0acf707f2dea7998de615dd4acd. Coil retains COND in the generic graph so signed comparison semantics survive canonical unsigned CIR word types, then reuses the existing AArch64 signed/unsigned MIN/MAX CMP/CSEL recipes. No arbitrary-value availability or floating MIN/MAX transformation is implied. Validation is centralized under docs/validation/compare-choice-minmax; original license/credit remains in NOTICE.
 
-Fused free-register choice copied from coil-stogir75ed841/docs532a9cd. Exact limit array and prior lower-ID selection/hint policy retained;69,984 differential policy cases plus native/ASAN allocation suite pass. Independent source optimization, pinned upstream unchanged. Mixed-hint LLVM microbenchmark regressed; actual-emitter evaluation pending, no whole-bootstrap claim.
+## Class-only free register decisions
 
-
-Exact ordered comparison choices copied from coil-stogir caa8275 (base33d6b59). Includes correctness-only active-reservation protection and verified-reader c89a0d5; excludes both rejected register-release retry policies. Exact comparison-input identities follow pinned ir_sccp.c MIN/MAX recognition. Generic graph retains COND; AArch64 chooses existing signed/unsigned CMP/CSEL recipes from comparison opcode, preserving canonical CIR word interpretation.1,219,680 original/selected nativeanswers in native and LLVM-ASAN runs pass, including literals, addressbits, sharedcomparisons and rooteddiamonds. No new full matching scan. Central LICENSE/NOTICE unchanged. No bootstrap performance claim.
-
-
-Cheap guard ordering copied from coil-stogir e48c294: reject non-COND nodes before matcher flags/error equality, and reject nonordered/nonidentity choices before movability work. Pure predicates reordered;1,219,680 native answer regression passes. Initial f1b39ed6 compiler result was neutral/slower; this follow-up is measured separately.
+Independent implementation optimization of the existing linear-scan decision policy: visit only admissible physical registers instead of materializing a complete limit vector inside the solver. Upstream hint and longest-availability choices are preserved. The complete-limit public API is unchanged. See validation/class-register-choice.

@@ -1,0 +1,7 @@
+# Class-only free register decisions
+
+The solver visits only the intersection of the target mask, value class, and current fixed requirement, in ascending register order. It computes identical fixed-use/boundary limits for those candidates. Direct hint priority, source hints requiring whole-interval availability, strict longest-availability ties, and split policy are unchanged. The existing full-limit API still fills all availability entries, including inadmissible registers. Shared assignment/splitting machinery remains unchanged; no release-retry policy is introduced.
+
+Native Stogir O3/debug checks and LLVM O1/debug/ASAN pass 279,936 independent reference-policy cases (four value class masks). Matrix includes 0..72 availability entries, 64-bit high register, required registers, source/preferred hints, 1/2/4 boundary steps, extra legal boundaries. All previously asserted exact full limits remain checked. Existing pressure-index, mixed-spill-allocation, JIT call pressure and floating pressure pass.
+
+Fixed 71856236 compiler, common opaque b27ffeb4 LLVM caller, 300,000 decisions, eight rotating CPU samples after warmup: Stogir full 76.4525 ms, class-only 31.285 ms; LLVM full 47.182 ms, class-only 22.713 ms. Raw samples, source hashes, deterministic matching answers and compiler identities in micro-results.json. No own tests/builds overlap timing. Microbenchmark only; actual compiler and bootstrap gains remain unmeasured.
