@@ -1,0 +1,142 @@
+;;; Explicit private register-return pieces before native scheduling/allocation.
+(module stogir.a64.return-values)
+(export Return Lowered prepare release!)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.stack" :as stack)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.call-results" :as results)
+(import "stogir.mem2ssa" :as mem)
+(import "stogir.liveness" :as live)
+(import "stogir.verify" :as verify)
+(import "stogir.a64.incoming" :as incoming)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+(defstruct Return [(reference i32) (low i32) (high i32)])
+(defstruct Lowered
+  [(graph g/Graph) (roots (ArrayList i32)) (returns (ArrayList Return))
+   (spec results/Spec)])
+
+(defn release! [(value (mut Lowered))] (-> void)
+  (g/release! (mut (.graph value)))
+  (free! (mut (.roots value)))
+  (free! (mut (.returns value))))
+
+(defn record! [(value (Result i32 (slice u8))) (error (mut (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (do (set! error message) 0))))
+
+(defn append! [(graph (mut g/Graph)) (opcode u8) (ty u8) (inputs (slice i32))
+               (error (mut (slice u8)))] (-> i32)
+  (match (g/append-inputs! (mut graph) opcode ty inputs)
+    (Some [r] r) (None [] (do (set! error "return lowering reference exhaustion") 0))))
+
+;;; Source is fully native-validated. Parameter0 is the ABI's private result
+;;; place, not an externally supplied address. The owned trial is discarded
+;;; unless existing memory promotion eliminates that entire private object.
+(defn lower [(source g/Graph) (entry i32) (roots (slice i32)) (place i32)
+              (spec results/Spec) (marked (ArrayList bool)) (a (dyn Allocator))]
+  (-> (Result (Option Lowered) (slice u8)))
+  (let [(mut value) (Lowered :graph (g/duplicate source a)
+                     :roots (ArrayList::new [i32] a)
+                     :returns (ArrayList::new [Return] a) :spec spec)
+        (mut error) "" (mut r) (: 1 i64)
+        size (record! (b/scalar-constant! (mut (.graph value)) 5
+                                         (cast u64 (results/size spec)) 8) (mut error))
+        eight (record! (b/scalar-constant! (mut (.graph value)) 5 8 8) (mut error))]
+    (for root roots (push! (mut (.roots value)) root))
+    (when (= error "")
+      (unless (g/rewrite-inputs-with-aux! (mut (.graph value)) place 81 6 32768
+                                         [entry size (: 8 i32)])
+        (set! error "return place cannot become a private frame object")))
+    ; Splice its control definition into the entry prefix. PARAM data anchors
+    ; remain on START; every actual entry control successor follows the object.
+    (while (and (= error "") (< r (len (.instructions source))))
+      (let [node (get (.instructions source) r)
+            count (get (.arities source) r)]
+        (when (and (!= (cast i32 r) place) (op/control? (cast i32 (n/opcode node))))
+          (for k (range 1 (+ (cast i64 count) 1))
+            (when (= (op/operand-code (cast i32 (n/opcode node)) (cast i32 k)) op/OPERAND-SRC)
+              (match (g/operand source (cast i32 r) (cast i32 k))
+                (None [] (set! error "entry control operand missing"))
+                (Some [previous]
+                  (when (= previous entry)
+                    (unless (g/set-operand! (mut (.graph value)) (cast i32 r) (cast i32 k) place)
+                      (set! error "entry control splice failed"))))))))
+        (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+    (set! r 1)
+    (while (and (= error "") (< r (len (.instructions source))))
+      (let [node (get (.instructions (.graph value)) r)
+            count (get (.arities source) r)]
+        (when (and (= (n/opcode node) 120) (get marked r))
+          (let [(mut control) (.op1 node)
+                (mut low) (: 0 i32) (mut high) (: 0 i32)]
+            (for piece (range 0 (cast i64 (.count spec)))
+              (when (= error "")
+                (let [address (if (= piece 0) place
+                                 (append! (mut (.graph value)) 26 6 [place eight] (mut error)))
+                      read (if (= error "")
+                               (append! (mut (.graph value)) 91 (.ty spec) [control address] (mut error)) 0)]
+                  (when (= error "")
+                    (if (= piece 0) (set! low read) (set! high read))
+                    (push! (mut (.roots value)) read)
+                    (set! control read)))))
+            (when (= error "")
+              (unless (g/set-operand! (mut (.graph value)) (cast i32 r) 1 control)
+                (set! error "return control splice failed"))
+              (push! (mut (.returns value)) (Return :reference (cast i32 r) :low low :high high)))))
+        (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+    (when (and (= error "") (> (len (.returns value)) 0))
+      (record! (mem/promote-ordered! (mut (.graph value)) (mut (.roots value)) true a) (mut error)))
+    (let [(mut complete) (and (= error "") (> (len (.returns value)) 0)
+                             (= (n/opcode (get (.instructions (.graph value)) (cast i64 place))) 0))]
+      (for ret (.returns value)
+        (let [pieces [(.low ret) (.high ret)]]
+        (for piece-ref pieces
+          (when (> piece-ref 0)
+            (let [node (get (.instructions (.graph value)) (cast i64 piece-ref))]
+              (when (or (= (n/opcode node) 91) (!= (n/type-id node) (.ty spec)))
+                (set! complete false)))))))
+      (cond (!= error "") (do (release! (mut value)) (Err error))
+            (not complete) (do (release! (mut value)) (Ok (None)))
+            :else (Ok (Some value))))))
+
+;;; Transactional public entry. Unsupported banks, indirect x8 returns, escaped
+;;; storage, partial initialization or incomplete promotion retain the old ABI
+;;; buffer path. Validation failures remain errors; source/roots are never edited.
+(defn prepare [(graph g/Graph) (entry i32) (roots (slice i32)) (a (dyn Allocator))]
+  (-> (Result (Option Lowered) (slice u8)))
+  (match (calls/function-result graph)
+    (Err [message] (Err message))
+    (Ok [spec]
+      (if (not (and (= (.kind spec) 1) (or (= (.ty spec) 5) (= (.ty spec) 11))
+                    (>= (.count spec) 1) (<= (.count spec) 2)))
+          (Ok (None))
+          (match (verify/native-input graph entry roots)
+            (Err [message] (Err message))
+            (Ok [_]
+              (match (incoming/build graph entry a)
+                (Err [message] (Err message))
+                (Ok [parameters]
+                  (let [(mut parameters) parameters (mut place) (: 0 i32)
+                        (mut safe) true (mut r) (: 1 i64)
+                        (mut marked) (live/mark graph roots a)]
+                    (for parameter parameters
+                      (when (= (.kind parameter) 3) (set! place (.reference parameter))))
+                    (free! (mut parameters))
+                    ; Raw stack/opaque assembly can observe physical frame geometry.
+                    (while (< r (len (.instructions graph)))
+                      (let [node (get (.instructions graph) r)
+                            opcode (cast i32 (n/opcode node))
+                            count (get (.arities graph) r)]
+                        (when (or (= opcode 66) (and (= opcode 81) (not (stack/frame-object? node)))
+                                  (and (>= opcode 82) (<= opcode 84))
+                                  (and (>= opcode 122) (<= opcode 124)))
+                          (set! safe false))
+                        (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+                    (let [answer (if (or (<= place 0) (not safe)) (Ok (None))
+                                     (lower graph entry roots place spec marked a))]
+                      (free! (mut marked)) answer))))))))))

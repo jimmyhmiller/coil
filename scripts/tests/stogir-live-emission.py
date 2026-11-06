@@ -57,10 +57,17 @@ with tempfile.TemporaryDirectory(prefix='stogir-emission-') as temporary:
     driver = directory / 'alias.c'
     driver.write_text('''#include <stdint.h>
 #include <stdlib.h>
+struct NativePair { uint64_t first, second; };
+extern struct NativePair stogir_register_pair(uint64_t, uint64_t);
 extern int64_t stogir_retained_entry(int64_t);
 __attribute__((constructor)) static void check_exported_alias(void) {
     for (int64_t x = -100; x < 100; ++x)
         if (stogir_retained_entry(x) != x + 17) abort();
+    const uint64_t values[] = {0, 1, 17, UINT64_C(0x8000000000000000), UINT64_MAX};
+    for (unsigned i = 0; i < 5; ++i) for (unsigned j = 0; j < 5; ++j) {
+        struct NativePair result = stogir_register_pair(values[i], values[j]);
+        if (result.first != values[i] || result.second != values[j]) abort();
+    }
 }
 ''')
     executable = directory / 'program'

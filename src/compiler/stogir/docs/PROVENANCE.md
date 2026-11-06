@@ -1528,3 +1528,23 @@ Coil additionally validates each removed conversion and bounds traversal to reje
 malformed/cyclic chains. BOOL normalization is deliberately excluded; Coil's BOOL
 destination canonicalizes a byte and cannot be treated as an arbitrary bit view.
 No arithmetic conversion, extension or truncation is peeled by this rule.
+
+## Private register-return value preparation
+
+`a64/return-values.coil` is an independent native ABI lowering extension.
+The validated kind1 GP result place is callee-private, unlike x8 indirect output.
+An owned trial replaces its synthetic PARAM0 with a marked entry frame object,
+adds explicit piece reads before each live RETURN, and reuses existing ordered
+memory SSA promotion. It succeeds only when the entire object disappears and
+every return piece becomes a typed SSA value. Unsupported banks, escapes,
+uninitialized/partial fields, address observations, raw stack geometry and
+opaque assembly retain the existing path. Input graph and roots remain borrowed
+and unchanged. Raw IR RETURN shapes and public C ABI are preserved.
+
+Private GP return pieces are installed as matched RETURN inputs before liveness,
+interval construction and constraints. The semantic void RETURN/prototype stays
+unchanged. Complete groups remove the implicit result-slot allocation and use
+existing typed simultaneous transfers; recipes are materialized only after
+physical sources have been consumed. Original constant IDs are retained and all
+pending Buffer references are checked against that namespace before the owned
+lowered graph is released. Unsupported foreign references retain the old path.
