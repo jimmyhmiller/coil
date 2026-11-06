@@ -1,0 +1,417 @@
+;;; Owned private leaf bytes and signature, without mutable image aliases.
+(module stogir.a64.private-leaf)
+(export Frozen create release! call-mask append-to! Context active? no-context context-create context-release! register! register-as! freeze! context-mask validate-references bind-image! Publication no-publication confirm-publication! seal-module! module-valid? binding verify-publication)
+(import "stogir.a64.leaf-effects" :as effects)
+(import "stogir.a64.registers" :as registers)
+(import "stogir.a64.code" :as code)
+(import "stogir.image" :as image)
+(import "stogir.text-data" :as text-data)
+(import "stogir.prototype-bytes" :as prototype)
+(import "stogir.call-groups" :as groups)
+(import "stogir.call-results" :as results)
+(import "stogir.bytes" :as bytes)
+(import "stogir.graph" :as graph)
+(import "stogir.node" :as node)
+(import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
+(import "stogir.strings" :as strings)
+(import "coil.slice" :use [subslice])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.hashmap" :use [HashMap])
+(import "coil.alloc" :as alloc :use [Allocator])
+(import "coil.primitive" :as p)
+(import "coil.result" :use [Option Some None Result Ok Err])
+
+;;; Single ownership, like the inline registry. Do not copy ownership, mutate
+;;; concurrently, or retain borrowed views/handles after release.
+(defstruct Frozen [(state (ptr u8))])
+(defstruct State [(a (dyn Allocator)) (name (ArrayList u8))
+                  (prototype (ArrayList u8)) (text (ArrayList u8)) (writes u64)])
+
+(defn same? [(a (slice u8)) (b (slice u8))] (-> bool)
+  (let [(mut equal) (= (len a) (len b)) (mut i) 0]
+    (while (and equal (< i (len a)))
+      (unless (= (get a i) (get b i)) (set! equal false))
+      (set! i (+ i 1)))
+    equal))
+
+;;; AArch64 passes signed/unsigned 32- and 64-bit scalar integers with the
+;;; same register and stack representation. Narrow integers remain distinct:
+;;; Darwin requires the caller to extend them according to signedness.
+(defn abi-type [(ty u8)] (-> u8)
+  (case ty 10 (: 4 u8) 11 (: 5 u8) ty))
+
+;;; Compare validated ABI shapes, not semantic type spelling or proof flags.
+;;; Preserve calling convention, variadic boundary, aggregate result role and
+;;; every parameter group boundary/alignment. No narrow, FP or pointer coercion.
+(defn same-abi? [(a (slice u8)) (b (slice u8))] (-> bool)
+  (let [(mut equal) (and (= (& (get a 0) 31) (& (get b 0) 31))
+                          (= (get a 2) (get b 2))
+                          (= (abi-type (get a 1)) (abi-type (get b 1)))
+                          (= (groups/count a) (groups/count b)))
+        ar (results/decode a) br (results/decode b)]
+    (unless (and (= (.kind ar) (.kind br)) (= (.count ar) (.count br))
+                 (= (abi-type (.ty ar)) (abi-type (.ty br))))
+      (set! equal false))
+    (when equal
+      (for [i 3 (+ 3 (cast i64 (get a 2)))]
+        (unless (= (abi-type (get a i)) (abi-type (get b i)))
+          (set! equal false)))
+      (for [i 0 (groups/count a)]
+        (let [ag (groups/at a i) bg (groups/at b i)]
+          (unless (and (= (.first ag) (.first bg)) (= (.count ag) (.count bg))
+                       (= (.alignment ag) (.alignment bg)))
+            (set! equal false)))))
+    equal))
+
+(defn own [(name (slice u8)) (signature (slice u8)) (text (slice u8))
+            (writes u64) (a (dyn Allocator))] (-> Frozen)
+  (let [(mut owned-name) (ArrayList::new [u8] a)
+        (mut owned-signature) (ArrayList::new [u8] a)
+        (mut owned-text) (ArrayList::new [u8] a)]
+    (for byte name (push! (mut owned-name) byte))
+    (for byte signature (push! (mut owned-signature) byte))
+    (for byte text (push! (mut owned-text) byte))
+    (Frozen :state
+      (p/cast (ptr u8)
+        (alloc/box! a State (State :a a :name owned-name
+          :prototype owned-signature :text owned-text :writes writes))))))
+
+;;; The source symbol must already be a private text definition. The exact
+;;; range is supplied by emission metadata, never inferred from adjacent labels.
+;;; Relocations/data touching the body decline. Snapshot bytes are independently
+;;; decoded before ownership is established. This does not emit or bind a caller.
+(defn create [(source image/Image) (symbol i32) (size i64)
+               (signature (slice u8)) (a (dyn Allocator))] (-> (Option Frozen))
+  (if (or (< symbol 0) (>= (cast i64 symbol) (len (.symbols source)))
+          (not (image/valid-alignments? source)) (not (prototype/valid-bytes? signature))
+          (not (or (= (& (get signature 0) 15) 0) (= (& (get signature 0) 15) 9))))
+      (None)
+      (let [definition (get (.symbols source) (cast i64 symbol))
+            start (.offset definition) name-start (.name definition)
+            name-size (.length definition) (mut valid) true]
+        (when (or (.global? definition) (!= (.section definition) 1)
+                  (< start 0) (> start (len (.text source))) (!= (% start 4) 0)
+                  (<= size 0) (> size (- (len (.text source)) start))
+                  (< name-start 0) (> name-start (len (.names source)))
+                  (<= name-size 0) (> name-size (- (len (.names source)) name-start)))
+          (set! valid false))
+        (match (text-data/validate (.text-data source) (len (.text source)))
+          (Err [_] (set! valid false)) (Ok [_] 0))
+        (when valid
+          (for relocation (.relocations source)
+            (when (= (.section relocation) 1)
+              (let [width (if (= (.kind relocation) 1) 8 4)
+                    offset (.offset relocation)]
+                (if (or (< offset 0) (> offset (- (len (.text source)) width))
+                        (< (.kind relocation) 1) (> (.kind relocation) 4))
+                    (set! valid false)
+                    (when (and (< offset (+ start size)) (> (+ offset width) start))
+                      (set! valid false))))))
+          (for range (.text-data source)
+            (when (and (< (.offset range) (+ start size))
+                       (> (+ (.offset range) (.length range)) start))
+              (set! valid false))))
+        (if (not valid) (None)
+            (let [name (subslice (slice (.names source)) name-start (+ name-start name-size))
+                  text (subslice (slice (.text source)) start (+ start size))]
+              (for byte name (when (= byte 0) (set! valid false)))
+              (if (not valid) (None)
+                  (match (effects/text text)
+                    (None [] (None))
+                    (Some [writes] (Some (own name signature text writes a))))))))))
+
+(defn release! [(leaf (mut Frozen))] (-> void)
+  (when (!= (p/cast usize (.state leaf)) 0)
+    (let [s (p/cast (ptr State) (.state leaf)) a (.a s)]
+      (free! (mut (.name s))) (free! (mut (.prototype s))) (free! (mut (.text s)))
+      (alloc/destroy a s)
+      (set! (.state leaf) (p/cast (ptr u8) 0)))))
+
+;;; Only ordinary direct calls to this exact owned name/signature may use the
+;;; result. A target adapter must bind that call to append-to!'s private symbol,
+;;; or to an equivalent publication of these same owned bytes. No caller is
+;;; allowed to infer a binding from this mask. Tail/indirect/external calls keep
+;;; the full ABI mask. Semantic flags outside the low five ABI bits may differ.
+(defn call-mask [(leaf Frozen) (name (slice u8)) (signature (slice u8))]
+  (-> (Option u64))
+  (if (= (p/cast usize (.state leaf)) 0) (None)
+      (let [s (p/cast (ptr State) (.state leaf))]
+        (if (and (same? name (slice (.name s)))
+                 (prototype/valid-bytes? signature)
+                 (same-abi? signature (slice (.prototype s))))
+            (Some (& (| (.writes s) (registers/call-setup-gpr-mask))
+                     (registers/caller-gpr-mask)))
+            (None)))))
+
+;;; Publish the snapshot itself, not the possibly changed source image. A local
+;;; definition cannot be rebound by a later global definition of the same name.
+(defn append-to! [(leaf Frozen) (output (mut image/Image))]
+  (-> (Result i32 (slice u8)))
+  (if (or (= (p/cast usize (.state leaf)) 0) (not (image/valid-alignments? output)))
+      (Err "released private leaf or invalid output image")
+      (let [s (p/cast (ptr State) (.state leaf)) size (len (.text s))
+            before (len (.text output)) pad (% (- 4 (% before 4)) 4)]
+        (if (> before (- (- 0x7FFFFFFFFFFFFFFF size) pad))
+            (Err "private leaf publication exceeds text range")
+            (match (image/local-symbol! (mut output) (slice (.name s)) 1 (+ before pad))
+              (Err [message] (Err message))
+              (Ok [symbol]
+                (for [i 0 pad] (push! (mut (.text output)) (: 0 u8)))
+                (if (bytes/append-slice! (mut (.text output)) (slice (.text s)))
+                    (Ok symbol) (Err "private leaf text append failed"))))))))
+
+;;; Module-lifetime, immutable-after-freeze context. Entries own their snapshots;
+;;; callers may release the source images immediately after registration.
+(defstruct Context [(state (ptr u8))])
+(defstruct ContextState [(a (dyn Allocator)) (frozen bool)
+                        (leaves (ArrayList Frozen)) (next (ArrayList i32))
+                        (heads (HashMap u64 i32)) (targets (ArrayList i64))
+                        (scope usize) (sealed bool)])
+
+(defn active? [(context Context)] (-> bool) (!= (p/cast usize (.state context)) 0))
+
+(defn no-context [] (-> Context) (Context :state (p/cast (ptr u8) 0)))
+
+(defn context-create [(a (dyn Allocator))] (-> Context)
+  (Context :state (p/cast (ptr u8)
+    (alloc/box! a ContextState (ContextState :a a :frozen false
+      :leaves (ArrayList::new [Frozen] a) :next (ArrayList::new [i32] a)
+      :heads (HashMap::new-scalar [u64 i32] a)
+      :targets (ArrayList::new [i64] a) :scope 0 :sealed false)))))
+
+(defn find-leaf [(s (ptr ContextState)) (name (slice u8))] (-> i32)
+  (let [(mut i) (match (get (.heads s) (image/hash-name name))
+                  (None [] (: -1 i32)) (Some [i] i))
+        (mut found) (: -1 i32)]
+    (while (and (>= i 0) (< found 0))
+      (let [leaf (get (.leaves s) (cast i64 i))
+            body (p/cast (ptr State) (.state leaf))]
+        (if (same? name (slice (.name body))) (set! found i)
+            (set! i (get (.next s) (cast i64 i))))))
+    found))
+
+(defn context-release! [(context (mut Context))] (-> void)
+  (when (!= (p/cast usize (.state context)) 0)
+    (let [s (p/cast (ptr ContextState) (.state context)) a (.a s)]
+      (for [i 0 (len (.leaves s))] (release! (elem (mut (.leaves s)) i)))
+      (free! (mut (.leaves s))) (free! (mut (.next s))) (free! (mut (.heads s)))
+      (free! (mut (.targets s)))
+      (alloc/destroy a s)
+      (set! (.state context) (p/cast (ptr u8) 0)))))
+
+(defn source-name [(source image/Image) (id i32)] (-> (Option (slice u8)))
+  (if (or (< id 0) (>= (cast i64 id) (len (.symbols source)))) (None)
+      (let [symbol (get (.symbols source) (cast i64 id))
+            offset (.name symbol) size (.length symbol)]
+        (if (and (>= offset 0) (> size 0) (<= offset (len (.names source)))
+                 (<= size (- (len (.names source)) offset)))
+            (Some (subslice (slice (.names source)) offset (+ offset size))) (None)))))
+
+;;; Naming a module-owned binding separately from the temporary image's entry
+;;; label does not alter its bytes or ABI. The target adapter must publish that
+;;; exact body once at the original private symbol before sealing the context.
+(defn register-as! [(context (mut Context)) (name (slice u8)) (source image/Image)
+                     (symbol i32) (size i64) (signature (slice u8))]
+  (-> (Result bool (slice u8)))
+  (if (not (active? context)) (Err "private context is released")
+      (let [s (p/cast (ptr ContextState) (.state context))]
+        (cond
+          (.frozen s) (Err "private context is frozen")
+          (not (symbols/valid-name? name)) (Err "invalid private binding name")
+          (>= (find-leaf s name) 0) (Err "duplicate private leaf name")
+          :else
+            (match (create source symbol size signature (.a s))
+              (None [] (Ok false))
+              (Some [leaf]
+                (let [(mut leaf) leaf body (p/cast (ptr State) (.state leaf))
+                      hash (image/hash-name name)
+                      head (match (get (.heads s) hash) (None [] (: -1 i32)) (Some [i] i))
+                      index (len (.leaves s))]
+                  (if (> index 2147483647)
+                      (do (release! (mut leaf)) (Err "private leaf index space exhausted"))
+                      (do
+                        (unless (same? name (slice (.name body)))
+                          (clear! (mut (.name body)))
+                          (for byte name (push! (mut (.name body)) byte)))
+                        (push! (mut (.next s)) head)
+                        (push! (mut (.targets s)) (: -1 i64))
+                        (push! (mut (.leaves s)) leaf)
+                        (set! (mut (.heads s)) hash (cast i32 index))
+                        (Ok true))))))))))
+
+(defn register! [(context (mut Context)) (source image/Image) (symbol i32)
+                  (size i64) (signature (slice u8))] (-> (Result bool (slice u8)))
+  (if (not (active? context)) (Err "private context is released")
+      (if (.frozen (p/cast (ptr ContextState) (.state context)))
+          (Err "private context is frozen")
+          (match (source-name source symbol)
+            (None [] (Ok false))
+            (Some [name] (register-as! (mut context) name source symbol size signature))))))
+
+(defn freeze! [(context (mut Context))] (-> void)
+  (when (!= (p/cast usize (.state context)) 0)
+    (set! (.frozen (p/cast (ptr ContextState) (.state context))) true)))
+
+;;; Query only ordinary, direct, declared CALLs. Recheck the current graph's
+;;; name/signature so rewrites cannot reuse a stale per-reference mask. The native
+;;; image entry point must subsequently bind-image! before exposing the image.
+(defn context-mask [(context Context) (source graph/Graph) (reference i32)]
+  (-> (Option u64))
+  (if (= (p/cast usize (.state context)) 0) (None)
+      (let [s (p/cast (ptr ContextState) (.state context))]
+        (if (not (.frozen s)) (None)
+            (match (graph/lookup source reference)
+              (None [] (None))
+              (Some [call]
+                (if (or (!= (node/opcode call) 79) (>= (.op2 call) 0)) (None)
+                    (match (graph/lookup source (.op2 call))
+                      (None [] (None))
+                      (Some [target]
+                        (if (or (!= (node/opcode target) 74)
+                                (not (symbols/validate source target))) (None)
+                            (match (calls/validate-call source reference)
+                              (Err [_] (None))
+                              (Ok [signature]
+                                (if (<= (.id signature) 0) (None)
+                                    (match (strings/lookup (.strings source)
+                                              (cast i32 (node/constant-bits target)))
+                                      (None [] (None))
+                                      (Some [name]
+                                        (let [index (find-leaf s name)]
+                                          (if (< index 0) (None)
+                                              (match (strings/lookup (.strings source) (.id signature))
+                                                (None [] (None))
+                                                (Some [bytes]
+                                                  (call-mask (get (.leaves s) (cast i64 index)) name bytes))))))))))))))))))))
+
+;;; Internalize only the matching undefined declaration, at its existing symbol
+;;; ID, then publish the exact owned bytes. Existing caller relocation IDs remain
+;;; stable and can no longer resolve through an external/global symbol.
+(defn install! [(leaf Frozen) (output (mut image/Image)) (id i32)]
+  (-> (Result i32 (slice u8)))
+  (let [s (p/cast (ptr State) (.state leaf))
+        declaration (get (.symbols output) (cast i64 id))
+        before (len (.text output)) size (len (.text s)) pad (% (- 4 (% before 4)) 4)]
+    (if (or (!= (.section declaration) 0) (not (.global? declaration))
+            (> before (- (- 0x7FFFFFFFFFFFFFFF size) pad)))
+        (Err "private binding conflicts with an existing definition or text limit")
+        (do
+          (let [symbol (elem (mut (.symbols output)) (cast i64 id))]
+            (set! (.section symbol) 1) (set! (.offset symbol) (+ before pad))
+            (set! (.global? symbol) false))
+          (for [i 0 pad] (push! (mut (.text output)) (: 0 u8)))
+          (if (bytes/append-slice! (mut (.text output)) (slice (.text s)))
+              (Ok id) (Err "private binding text append failed"))))))
+
+;;; Validate the references actually emitted, not dead graph constants. A named
+;;; private function cannot silently bind an incompatible declaration. Unknown
+;;; names remain ordinary external references and use full ABI reservations.
+;;; Untyped address constants need only the name binding: they cannot authorize
+;;; reduced call reservations, which context-mask checks from the actual call.
+(defn validate-references [(context Context) (source graph/Graph)
+                            (references (slice code/Reference))]
+  (-> (Result i32 (slice u8)))
+  (if (not (active? context)) (Ok 0)
+      (let [s (p/cast (ptr ContextState) (.state context))
+            (mut count) (: 0 i32) (mut error) ""]
+        (if (not (.frozen s)) (Err "private context must be frozen before emission")
+            (do
+              (for pending references
+                (match (graph/lookup source (.target pending))
+                  (None [] (set! error "private reference target missing"))
+                  (Some [target]
+                    (when (= (node/opcode target) 74)
+                      (match (strings/lookup (.strings source) (cast i32 (node/constant-bits target)))
+                        (None [] (set! error "private function name missing"))
+                        (Some [name]
+                          (let [index (find-leaf s name)]
+                            (when (and (>= index 0) (> (node/auxiliary target) 0))
+                              (match (strings/lookup (.strings source) (cast i32 (node/auxiliary target)))
+                                (None [] (set! error "private function requires a declared prototype"))
+                                (Some [signature]
+                                  (match (call-mask (get (.leaves s) (cast i64 index)) name signature)
+                                    (None [] (set! error "private function ABI prototype mismatch"))
+                                    (Some [_] (set! count (+ count 1))))))))))))))
+              (if (= error "") (Ok count) (Err error)))))))
+
+(defn bind-image! [(context Context) (output (mut image/Image))]
+  (-> (Result i32 (slice u8)))
+  (if (= (p/cast usize (.state context)) 0) (Ok 0)
+      (let [s (p/cast (ptr ContextState) (.state context))
+            (mut count) (: 0 i32) (mut error) ""]
+        (if (not (.frozen s)) (Err "private context must be frozen before binding")
+            (do
+              (for [i 0 (len (.symbols output))]
+                (when (= error "")
+                  (let [symbol (get (.symbols output) i)
+                        name (subslice (slice (.names output)) (.name symbol)
+                                       (+ (.name symbol) (.length symbol)))
+                        index (find-leaf s name)]
+                    (when (>= index 0)
+                      (match (install! (get (.leaves s) (cast i64 index)) (mut output) (cast i32 i))
+                        (Err [message] (set! error message))
+                        (Ok [_] (set! count (+ count 1))))))))
+              (if (= error "") (Ok count) (Err error)))))))
+
+;;; Borrowed publication token; its owning context must remain alive. A transport
+;;; supplies actual symbol metadata and emitted bytes, never a validation flag.
+(defstruct Publication [(owner (ptr u8)) (scope usize)])
+(defn no-publication [] (-> Publication)
+  (Publication :owner (p/cast (ptr u8) 0) :scope 0))
+
+(defn confirm-publication! [(context (mut Context)) (scope usize) (name (slice u8))
+                            (symbol i64) (binding u8) (text (slice u8))]
+  (-> (Result bool (slice u8)))
+  (if (not (active? context)) (Err "private context is released")
+      (let [s (p/cast (ptr ContextState) (.state context)) index (find-leaf s name)]
+        (cond
+          (.frozen s) (Err "private context is frozen")
+          (or (= scope 0) (< symbol 0) (> symbol 4294967295) (!= binding 0))
+            (Err "private publication requires a local symbol and target scope")
+          (and (!= (.scope s) 0) (!= (.scope s) scope))
+            (Err "private publication target scope changed")
+          (< index 0) (Ok false)
+          :else
+            (let [leaf (get (.leaves s) (cast i64 index))
+                  body (p/cast (ptr State) (.state leaf))
+                  (mut used) false]
+              (for target (.targets s) (when (= target symbol) (set! used true)))
+              (cond
+                used (Err "private symbol already published")
+                (>= (get (.targets s) (cast i64 index)) 0) (Err "private body already published")
+                (not (same? text (slice (.text body)))) (Err "published private bytes differ")
+                :else (do (set! (.scope s) scope)
+                          (set! (mut (.targets s)) (cast i64 index) symbol)
+                          (Ok true))))))))
+
+(defn seal-module! [(context (mut Context)) (scope usize)] (-> (Option Publication))
+  (if (or (not (active? context)) (= scope 0)) (None)
+      (let [s (p/cast (ptr ContextState) (.state context))
+            (mut valid) (or (= (.scope s) 0) (= (.scope s) scope))]
+        (for target (.targets s) (when (< target 0) (set! valid false)))
+        (if (not valid) (None)
+            (do (set! (.scope s) scope) (set! (.frozen s) true) (set! (.sealed s) true)
+                (Some (Publication :owner (.state context) :scope scope)))))))
+
+(defn module-valid? [(context Context) (publication Publication) (scope usize)] (-> bool)
+  (and (active? context) (!= scope 0)
+       (= (p/cast usize (.state context)) (p/cast usize (.owner publication)))
+       (= scope (.scope publication))
+       (let [s (p/cast (ptr ContextState) (.state context))]
+         (and (.frozen s) (.sealed s) (= scope (.scope s))))))
+
+(defn binding [(context Context) (publication Publication) (scope usize) (name (slice u8))]
+  (-> (Option i64))
+  (if (not (module-valid? context publication scope)) (None)
+      (let [s (p/cast (ptr ContextState) (.state context)) index (find-leaf s name)]
+        (if (< index 0) (None) (Some (get (.targets s) (cast i64 index)))))))
+
+(defn verify-publication [(context Context) (publication Publication) (scope usize)
+                           (name (slice u8)) (symbol i64) (kind u8) (text (slice u8))]
+  (-> bool)
+  (if (or (!= kind 0) (not (module-valid? context publication scope))) false
+      (let [s (p/cast (ptr ContextState) (.state context)) index (find-leaf s name)]
+        (and (>= index 0) (= symbol (get (.targets s) (cast i64 index)))
+             (let [body (p/cast (ptr State) (.state (get (.leaves s) (cast i64 index))))]
+               (same? text (slice (.text body))))))))

@@ -1624,3 +1624,21 @@ Cheap guard ordering copied from coil-stogir e48c294: reject non-COND nodes befo
 
 
 Class-only free register decisions copied from coil-stogir ab061ee. Independent implementation improvement preserving the existing pinned-upstream hint and longest-availability policy; only admissible candidate registers are visited in ascending order inside the solver. Complete-limit API and assignment/splitting machinery remain unchanged. 279,936 independent oracle cases, native/ASAN allocation and pressure checks pass. Microbenchmark benefit is not a whole-bootstrap claim. See validation/class-register-choice.
+
+## Private leaf module publication
+
+Imported AArch64 leaf effects, owned private contexts, private call reservations and
+module-bound caller generation from coil-stogir commit88ec58b (including72b3bff,
+638a30a andabc1e9f). Coil publishes candidate bodies once at their original local
+assembler symbols and verifies exact bytes and identity before finalization.
+Existing centralized LICENSE/NOTICE and upstream credit remain applicable.
+Validation notes live under docs/validation; whole-bootstrap benefit is unproven.
+
+Follow-up address-taking correction: private untyped FUNC addresses preserve the
+module binding without granting reduced call effects; explicit ABI mismatches
+remain rejected. See the module-publication validation note.
+
+ABI-shape comparison preserves calling convention and aggregate/group geometry,
+while treating signed/unsigned 32- and 64-bit scalar spelling equivalently.
+The private module validation note records the actual emitter mismatch and121
+scalar signature checks.

@@ -31,6 +31,8 @@
 (import "stogir.bulk" :as bulk)
 (import "stogir.image" :as image)
 (import "stogir.a64.compile" :as native)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.link" :as native-link)
 (import "stogir.options" :as native-options)
 (import "stogir.call-inline" :as inlining)
 (import "stogir.sccp" :as sccp)
@@ -146,6 +148,9 @@
       base
       (emit! s 26 5 [base (constant! s 5 (p/cast u64 offset))])))
 
+(defn import-name [(a (dyn Allocator)) (symbol u32)] (-> (slice u8))
+  (sconcat a "_coil_stogir_import_" (i64->str a (cast i64 symbol))))
+
 (defn symbol! [(s (ptr Adapter)) (id u32)] (-> i32)
   (let [(mut found) (: -1 i64)]
     (for [i 0 (len (.import-ids s))]
@@ -154,9 +159,7 @@
       (set! found (len (.import-ids s)))
       (push! (mut (.import-ids s)) id)
       (push! (mut (.import-names s))
-             (sconcat (.a s)
-                      "_coil_stogir_import_"
-                      (i64->str (.a s) (cast i64 id)))))
+             (import-name (.a s) id)))
     (require s (symbols/function! (mut (.g s)) (get (.import-names s) found) 0))))
 
 ;;; CIR container values are normalized explicitly; memory and ABI widths remain typed.
@@ -1562,7 +1565,7 @@
             (require s (calls/function! (mut (.g s)) prototype (.a s))))))))
 
 ;;; Merge independent stogir bytes into the compiler's existing module transport.
-(defn merge! [(s (ptr Adapter)) (source image/Image) (symbol u32)] (-> void)
+(defn merge! [(s (ptr Adapter)) (source image/Image) (symbol u32) (module (ptr Module))] (-> void)
   (let [ta (.ta s)
         text-base
           (asm/sect-append! ta
@@ -1603,6 +1606,16 @@
                                                 data-base)
                                             (.offset sy))
                                          0))))
+        (when (and (= (.section sy) 0) (!= (p/cast usize module) 0)
+                   (> (.native-certified module) 0))
+          (match (private/binding (.native-context module) (.native-publication module)
+                                  (p/cast usize ta) (native-link/name source sy))
+            (None [] 0)
+            (Some [target]
+              (unless (and (= mapped (cast u32 target))
+                           (= (.binding (asm/sym-at ta mapped)) asm/BIND-LOCAL)
+                           (= (.sect (asm/sym-at ta mapped)) asm/SEC-TEXT))
+                (fail (.name (.f s)) "private native binding differs from publication")))))
         (when (= mapped (cir/none))
           (fail (.name (.f s)) "unmapped image symbol"))
         (push! (mut mapping) mapped)))
@@ -1647,6 +1660,12 @@
 (defstruct EmissionBody
   [(definition Definition) (arena (ptr scratch/ScratchArena))])
 
+;;; Candidate images are generated once before callers and published at their
+;;; original assembler symbols. They remain owned until final byte verification.
+(defstruct NativeCache
+  [(source (ptr cir/Func)) (symbol u32) (name (slice u8)) (label (slice u8))
+   (image image/Image) (certified bool)])
+
 ;;; Prepared once in source submission order, then immutable during emission.
 ;;; The module allocator owns every definition until all jobs have finished.
 (defstruct Module
@@ -1658,7 +1677,13 @@
    (bodies (ArrayList EmissionBody))
    (body-by-symbol (ArrayList i64))
    (by-symbol (ArrayList i64))
-   (bindings (HashMap (slice u8) u32))])
+   (bindings (HashMap (slice u8) u32))
+   (native-context private/Context)
+   (native-publication private/Publication)
+   (native-target (ptr asm/Asm))
+   (native-cache (ArrayList NativeCache))
+   (native-by-symbol (ArrayList i64))
+   (native-certified i64)])
 
 (defn module-create [(a (dyn Allocator)) (trace bool)] (-> Module)
   (Module
@@ -1670,7 +1695,13 @@
     :bodies (ArrayList::new [EmissionBody] a)
     :body-by-symbol (ArrayList::new [i64] a)
     :by-symbol (ArrayList::new [i64] a)
-    :bindings (HashMap::new [(slice u8) u32] a (keyops-borrowed))))
+    :bindings (HashMap::new [(slice u8) u32] a (keyops-borrowed))
+    :native-context (private/no-context)
+    :native-publication (private/no-publication)
+    :native-target (p/cast (ptr asm/Asm) 0)
+    :native-cache (ArrayList::new [NativeCache] a)
+    :native-by-symbol (ArrayList::new [i64] a)
+    :native-certified 0))
 
 (defn adapt! [(s (ptr Adapter))
               (f (ptr cir/Func))
@@ -1921,6 +1952,10 @@
 ;;; The module arena still owns its source definitions and bindings. Registry
 ;;; snapshots have no readers after all emission jobs have completed.
 (defn module-release-callees! [(module (ptr Module))] (-> void)
+  (for [i 0 (len (.native-cache module))]
+    (image/release! (mut (.image (elem (mut (.native-cache module)) i)))))
+  (free! (mut (.native-cache module))) (free! (mut (.native-by-symbol module)))
+  (private/context-release! (mut (.native-context module)))
   (inlining/registry-release! (mut (.callees module)))
   (for [i 0 (len (.bodies module))]
     (release-emission-body! module (.symbol (.definition (at (.bodies module) i))))))
@@ -2464,12 +2499,146 @@
             (for byte target (print " {}" byte)) (println "")))
         (println "stogir-snapshot end")))))
 
+;;; A conservative source filter avoids compiling callers before their private
+;;; callees. Every candidate is emitted exactly once, even if effect decoding
+;;; later declines it. Only instruction starts are inspected.
+(defn native-leaf-candidate? [(graph graph/Graph)] (-> bool)
+  (let [(mut valid) (> (.function-prototype graph) 0) (mut r) (: 1 i64)]
+    (while (and valid (< r (len (.instructions graph))))
+      (if (>= r (len (.arities graph))) (set! valid false)
+          (let [count (get (.arities graph) r)
+                opcode (node/opcode (get (.instructions graph) r))]
+            (if (or (< count 0) (= opcode 79) (= opcode 80))
+                (set! valid false)
+                (let [step (/ (+ (cast i64 count) 4) 4)]
+                  (if (or (<= step 0) (> step (- (len (.instructions graph)) r)))
+                      (set! valid false) (set! r (+ r step))))))))
+    (and valid (= r (len (.instructions graph))))))
+
+(defn native-cached? [(module (ptr Module)) (f (ptr cir/Func)) (symbol u32)] (-> bool)
+  (let [id (cast i64 symbol)]
+    (if (and (< id (len (.native-by-symbol module)))
+             (> (get (.native-by-symbol module) id) 0))
+        (let [entry (at (.native-cache module) (- (get (.native-by-symbol module) id) 1))]
+          (unless (and (= (.symbol entry) symbol)
+                       (= (p/cast usize (.source entry)) (p/cast usize f)))
+            (fail (.name f) "native cache function identity changed"))
+          true)
+        false)))
+
+(defn begin-native! [(module (ptr Module)) (ta (ptr asm/Asm))] (-> void)
+  (unless (and (.frozen module) (= (p/cast usize (.native-target module)) 0))
+    (fail "module" "native preparation requires a fresh frozen module"))
+  (set! (.native-target module) ta)
+  (set! (.native-context module) (private/context-create (.a module))))
+
+;;; Compose copies only the finished image into module ownership. All optimizer,
+;;; CFG, allocation and temporary native image storage dies with per-leaf work.
+(defn retain-native-image [(source image/Image) (a (dyn Allocator))] (-> image/Image)
+  (match (native-link/compose [source] a)
+    (Err [message] (fail "native cache" message))
+    (Ok [cloned]
+      (let [(mut cloned) cloned result (load (mut (.image cloned)))]
+        (store! (mut (.image cloned)) (image/create a))
+        (native-link/release! (mut cloned)) result))))
+
+(defn published-native-text [(ta (ptr asm/Asm)) (entry NativeCache)] (-> (slice u8))
+  (let [symbol (asm/sym-at ta (.symbol entry))
+        text (buf/as-slice (asm/sect-buf ta asm/SEC-TEXT))]
+    (unless (and (= (.binding symbol) asm/BIND-LOCAL) (= (.sect symbol) asm/SEC-TEXT)
+                 (= (.size symbol) (len (.text (.image entry))))
+                 (>= (.off symbol) 0) (<= (.off symbol) (len text))
+                 (<= (.size symbol) (- (len text) (.off symbol))))
+      (fail (.label entry) "private native publication metadata changed"))
+    (subslice text (.off symbol) (+ (.off symbol) (.size symbol)))))
+
+(defn precompile-native-leaf! [(module (ptr Module)) (f (ptr cir/Func))
+                               (ta (ptr asm/Asm)) (symbol u32)
+                               (text-data (ptr (ArrayList MTextData))) (level i32)] (-> void)
+  (let [definition (emission-definition module f symbol)]
+    (when (and (!= (p/cast usize definition) 0)
+               (= (.binding (asm/sym-at ta symbol)) asm/BIND-LOCAL)
+               (not (native-cached? module f symbol))
+               (native-leaf-candidate? (.graph definition)))
+      (let [work (p/alloc-stack scratch/ScratchArena)]
+        (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
+        (let [(mut state) (zeroed Adapter) s (p/cast (ptr Adapter) (mut state))]
+          (set! (.a s) (.a module)) (set! (.f s) f) (set! (.ta s) ta)
+          (set! (.text-data s) text-data) (set! (.g s) (.graph definition))
+          (set! (.start s) (.entry definition)) (set! (.exits s) (.observed definition))
+          (set! (.import-names s) (.import-names definition))
+          (set! (.import-ids s) (.import-ids definition))
+          (when (.trace module) (trace-graph! s))
+          (match (native/image-with-options (.graph definition) (.entry definition)
+                   (slice (.observed definition)) "_coil_stogir_body"
+                   (native-options/Options :level level) (allocator work))
+            (Err [message] (fail (.name f) message))
+            (Ok [temporary]
+              (let [(mut temporary) temporary
+                    (mut cached) (retain-native-image temporary (.a module))
+                    root (match (image/find-symbol cached "_coil_stogir_body")
+                           (None [] (fail (.name f) "cached entry missing")) (Some [root] root))
+                    name (import-name (.a module) symbol)
+                    signature (match (strings/lookup (.strings (.graph definition))
+                                       (.function-prototype (.graph definition)))
+                                (None [] (fail (.name f) "private function prototype missing"))
+                                (Some [signature] signature))]
+                ; The temporary label's privacy follows the actual target symbol,
+                ; checked above. Its logical name stays intact for ordinary merge.
+                (set! (.global? (elem (mut (.symbols cached)) (cast i64 root))) false)
+                (let [accepted (match (private/register-as! (mut (.native-context module))
+                                        name cached root (len (.text cached)) signature)
+                                 (Err [message] (fail (.name f) message)) (Ok [accepted] accepted))
+                      entry (NativeCache :source f :symbol symbol :name name
+                              :label (sconcat (.a module) (.name f) "")
+                              :image cached :certified accepted)]
+                  (merge! s cached symbol module)
+                  (when accepted
+                    (let [actual (asm/sym-at ta symbol)]
+                      (match (private/confirm-publication! (mut (.native-context module))
+                               (p/cast usize ta) name (cast i64 symbol) (.binding actual)
+                               (published-native-text ta entry))
+                        (Err [message] (fail (.name f) message))
+                        (Ok [confirmed] (unless confirmed (fail (.name f) "private body not registered")))))
+                    (set! (.native-certified module) (+ (.native-certified module) 1)))
+                  (while (<= (len (.native-by-symbol module)) (cast i64 symbol))
+                    (push! (mut (.native-by-symbol module)) 0))
+                  (push! (mut (.native-cache module)) entry)
+                  (set! (mut (.native-by-symbol module)) (cast i64 symbol) (len (.native-cache module)))
+                  (when (.trace module)
+                    (eprintln "stogir native-leaf {}: certified{} bytes{}" (.name f) accepted (len (.text cached)))
+                    (eprint "stogir native-prototype {} {}" name (.name f))
+                    (for byte signature (eprint " {}" byte)) (eprintln "")))
+                (image/release! (mut temporary))))))
+        (close! work)))))
+
+(defn seal-native! [(module (ptr Module)) (ta (ptr asm/Asm))] (-> void)
+  (set! (.native-publication module)
+    (match (private/seal-module! (mut (.native-context module)) (p/cast usize ta))
+      (None [] (fail "module" "private native publication incomplete")) (Some [p] p)))
+  (when (.trace module)
+    (eprintln "stogir native-cache: {} images, {} certified" (len (.native-cache module)) (.native-certified module))))
+
+(defn verify-native! [(module (ptr Module)) (ta (ptr asm/Asm))] (-> void)
+  (for entry (.native-cache module)
+    (when (.certified entry)
+      (unless (private/verify-publication (.native-context module) (.native-publication module)
+                 (p/cast usize ta) (.name entry) (cast i64 (.symbol entry))
+                 (.binding (asm/sym-at ta (.symbol entry))) (published-native-text ta entry))
+        (fail (.label entry) "private native publication changed before finalization")))))
+
 (defn compile-with-module! [(f (ptr cir/Func))
                             (ta (ptr asm/Asm))
                             (symbol u32)
                             (text-data (ptr (ArrayList MTextData)))
                             (optimization i32)
                             (module (ptr Module))] (-> void)
+  (when (and (!= (p/cast usize module) 0)
+             (!= (p/cast usize (.native-target module)) 0)
+             (!= (p/cast usize (.native-target module)) (p/cast usize ta)))
+    (fail (.name f) "native module target changed"))
+  (if (and (!= (p/cast usize module) 0) (native-cached? module f symbol))
+      (when (.trace module) (eprintln "stogir reuse-native {}" (.name f)))
   (let [work (p/alloc-stack scratch/ScratchArena)
         codegen-start (tr/codegen-start)]
     (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
@@ -2498,17 +2667,21 @@
             (prepare-inline-caller! s))
           (expand-module! s module (inline-budget))))
       (when (and (!= (p/cast u64 module) 0) (.trace module)) (trace-graph! s))
-      (match (native/image-with-options (.g s)
+      (match (if (and (!= (p/cast usize module) 0) (> (.native-certified module) 0))
+                 (native/image-for-private-module (.g s) (.start s) (slice (.exits s))
+                   "_coil_stogir_body" (native-options/Options :level optimization) a
+                   (.native-context module) (.native-publication module) (p/cast usize ta))
+                 (native/image-with-options (.g s)
                                         (.start s)
                                         (slice (.exits s))
                                         "_coil_stogir_body"
                                         (native-options/Options
                                           :level optimization)
-                                        a)
+                                        a))
         (Err [message] (fail (.name f) message))
-        (Ok [result] (merge! s result symbol))))
+        (Ok [result] (merge! s result symbol module))))
     (close! work)
-    (tr/codegen-end "stogir" "ir-codegen" codegen-start)))
+    (tr/codegen-end "stogir" "ir-codegen" codegen-start))))
 
 (defn compile! [(f (ptr cir/Func))
                 (ta (ptr asm/Asm))

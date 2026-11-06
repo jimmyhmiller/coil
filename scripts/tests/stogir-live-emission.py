@@ -34,6 +34,18 @@ with tempfile.TemporaryDirectory(prefix='stogir-emission-') as temporary:
     assert 'stogir nonwriting-body tests.cli.stogir-live-emission.readonly-leaf: true' in result.stderr
     assert 'stogir nonwriting-body tests.cli.stogir-live-emission.writing-leaf: false' in result.stderr
     assert 'stogir nonwriting-body tests.cli.stogir-live-emission.readonly-pair-result: true' in result.stderr
+    # The native prepass publishes once, and the ordinary job reuses each body.
+    native_lines = [line for line in result.stderr.splitlines()
+                    if line.startswith('stogir native-leaf ')]
+    assert native_lines, 'private module prepass did not run'
+    cached_names = [line.split(': certified', 1)[0].removeprefix('stogir native-leaf ')
+                    for line in native_lines]
+    assert len(cached_names) == len(set(cached_names)), 'native body compiled twice'
+    reused_names = [line.removeprefix('stogir reuse-native ')
+                    for line in result.stderr.splitlines()
+                    if line.startswith('stogir reuse-native ')]
+    assert sorted(cached_names) == sorted(reused_names), 'cache/job identity mismatch'
+    assert any(': certifiedtrue ' in line for line in native_lines), 'no certified leaf exercised'
     assembly = run('llvm-objdump', '-dr', obj)
     assert any('ARM64_RELOC_BRANCH26' in line and
                '_tests.cli.stogir-live-emission.readonly-leaf' in line
