@@ -37,3 +37,9 @@ build/compare-choice-minmax/replay.coil from desired sourceworktree.
 
 No integrated compiler or performance numbers yet. Whole5×/within10%goal remains
 unmet. Not installed/pushed. Central LICENSE/NOTICE/provenance retained.
+
+Guard-order follow-up: check opcode60 before fuse/error on the existing matcher
+walk, and ordered opcode/identity shape before expensive movability queries.
+Both are pure-predicate reorderings; native1,219,680-answer suite still passes.
+Initial integrated f1b39ed6 is neutral/slower (verifier+1.01%, emitter+0.77%);
+this is a measured hot-path overhead investigation, not an accepted speedup.

@@ -1618,3 +1618,6 @@ Fused free-register choice copied from coil-stogir75ed841/docs532a9cd. Exact lim
 
 
 Exact ordered comparison choices copied from coil-stogir caa8275 (base33d6b59). Includes correctness-only active-reservation protection and verified-reader c89a0d5; excludes both rejected register-release retry policies. Exact comparison-input identities follow pinned ir_sccp.c MIN/MAX recognition. Generic graph retains COND; AArch64 chooses existing signed/unsigned CMP/CSEL recipes from comparison opcode, preserving canonical CIR word interpretation.1,219,680 original/selected nativeanswers in native and LLVM-ASAN runs pass, including literals, addressbits, sharedcomparisons and rooteddiamonds. No new full matching scan. Central LICENSE/NOTICE unchanged. No bootstrap performance claim.
+
+
+Cheap guard ordering copied from coil-stogir e48c294: reject non-COND nodes before matcher flags/error equality, and reject nonordered/nonidentity choices before movability work. Pure predicates reordered;1,219,680 native answer regression passes. Initial f1b39ed6 compiler result was neutral/slower; this follow-up is measured separately.
