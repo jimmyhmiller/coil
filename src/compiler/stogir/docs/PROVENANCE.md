@@ -1604,3 +1604,8 @@ Follows pinned ir_iter_optimize_merge/ir_optimize_phi orchestration for the
 existing literal subset. One collapse operation serves bulk/local paths, with
 exact uses, rooted observations and normal control repair. Availability for
 arbitrary values and MIN/MAX/ABS remains outside scope. Validation/affected-merge-diamond.
+
+Diamond rewrite consumer notification copied from coil-stogird2ab904.
+Restores pinned ir_optimize_phi/ir_iter_add_uses restart discipline when a
+producer changes form. No new fold rules. Existing Boolean comparison folds
+now revisit affected users. See validation/diamond-user-notification.

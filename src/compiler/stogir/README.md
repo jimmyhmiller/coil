@@ -144,3 +144,8 @@ Independent extension, with native/ASAN validation in docs/validation/iterative-
 Affected MERGE reconsideration copied from coil-stogir19d6a1a. Phi cleanup can
 expose existing literal diamond conversions; local iteration shares the bulk
 rewrite body and normal root/control repair. See docs/validation/affected-merge-diamond.
+
+Diamond consumer wakeups copied from coil-stogird2ab904. Existing comparison
+folds must restart after a producer becomesCOND even when reference operands
+stay unchanged. See docs/validation/diamond-user-notification. Direct choice
+projectionf83436a is not included in this candidate.
