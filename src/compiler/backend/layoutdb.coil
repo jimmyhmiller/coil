@@ -10,6 +10,9 @@
 (import "coil.hashmap" :use *)
 (import "coil.io" :use *)
 (import "coil.control" :use *)
+(import "coil.try" :use *)
+(import "coil.mem" :use [f64-bits bits->f64])
+(import "coil.reader" :use [Diag])
 (import "coil.compiler.ast" :use *)
 
 ; The consumers used to have four copies of these records and of every algorithm
@@ -775,3 +778,425 @@
                     (set! si
                           (primitive/iadd (load si) 1))))))
       0)))
+
+; ---- constant expressions ---------------------------------------------------
+; A `def`'s value and a static assertion's condition are folded with no code run:
+; literals, `sizeof` and the other questions about a type, numeric casts,
+; arithmetic, comparisons and `if`. The operators they call are inlined into those
+; forms first (assert_fold). Each backend, and the bytecode interpreter, folds them
+; here with its own answers to the layout questions, so a value means the same
+; wherever it is laid out, and answers for the target the program is built for.
+
+;;; The layout questions a constant expression asks, answered for the target being
+;;; compiled for.
+(deftrait ConstLayout [Self]
+  (const-size [(self (ptr Self)) (t (ptr Type))] (-> i64))
+  (const-align [(self (ptr Self)) (t (ptr Type))] (-> i64))
+  ;; The offset of the field FNAME of the struct T, or None when T is not a
+  ;; struct with that field.
+  (const-offset [(self (ptr Self)) (t (ptr Type)) (fname (slice u8))]
+    (-> (Option i64))))
+
+(impl ConstLayout LayoutDb
+  (const-size [(self (ptr LayoutDb)) (t (ptr Type))] (-> i64)
+    (size self t))
+  (const-align [(self (ptr LayoutDb)) (t (ptr Type))] (-> i64)
+    (align self t))
+  (const-offset [(self (ptr LayoutDb)) (t (ptr Type)) (fname (slice u8))]
+    (-> (Option i64))
+    (match (load t)
+      (TStruct [name]
+               (let [si (struct-index self name)
+                     fi (if (< si 0) -1 (field-number self si fname))]
+                 (if (< fi 0) (None [i64]) (Some (field-offset self si fi)))))
+      (_ (None [i64])))))
+
+;;; A constant expression's value. An integer is the 64-bit pattern of its value
+;;; held `bits` wide, sign- or zero-extended past that as `signed` says; `bits` is
+;;; 0 for a literal, which takes the width of what it meets. A float is rounded to
+;;; `bits` wide.
+(defsum Folded
+  (FoldedInt [(v i64) (bits i64) (signed bool)])
+  (FoldedFloat [(v f64) (bits i64)]))
+
+(defn const-error [(e (ptr Expr)) (msg (slice u8))] (-> Diag)
+  (Diag :lo (.lo e) :hi (.hi e) :msg msg :source (.source e) :ctxt (.ctxt e)))
+
+;;; The width an integer is computed at: its own, or 64 for a literal.
+(defn const-width [(bits i64)] (-> i64)
+  (if (= bits 0) 64 bits))
+
+;;; X shifted right N bits, zeros shifted in.
+(defn const-lshr [(x i64) (n i64)] (-> i64)
+  (primitive/cast i64 (>> (primitive/cast u64 x) (primitive/cast u64 n))))
+
+;;; The low W bits, all ones; W is at most 64.
+(defn const-mask [(w i64)] (-> i64)
+  (if (>= w 64) -1 (- (<< 1 w) 1)))
+
+;;; V held BITS wide: its low bits, sign- or zero-extended.
+(defn const-wrap [(v i64) (bits i64) (signed bool)] (-> i64)
+  (if (or (= bits 0) (>= bits 64))
+      v
+      (let [low (& v (const-mask bits))]
+        (if (and signed (!= (& low (<< 1 (- bits 1))) 0))
+            (| low (^ (const-mask bits) -1))
+            low))))
+
+(defn const-int [(v i64) (bits i64) (signed bool)] (-> Folded)
+  (FoldedInt :v (const-wrap v bits signed) :bits bits :signed signed))
+
+(defn const-bool [(b bool)] (-> Folded)
+  (FoldedInt :v (if b 1 0) :bits 1 :signed false))
+
+;;; F rounded to a float BITS wide.
+(defn const-round [(f f64) (bits i64)] (-> f64)
+  (if (= bits 32) (cast f64 (cast f32 f)) f))
+
+;;; The integer V, signed as SIGNED says, as a float BITS wide: rounded once, from
+;;; the integer itself.
+(defn const-int->float [(v i64) (signed bool) (bits i64)] (-> f64)
+  (cond (and signed (= bits 32)) (cast f64 (cast f32 v))
+        signed (cast f64 v)
+        (= bits 32) (cast f64 (cast f32 (primitive/cast u64 v)))
+        :else (cast f64 (primitive/cast u64 v))))
+
+;;; 2 to the power N, exactly, as a float.
+(defn const-pow2 [(n i64)] (-> f64)
+  (let [(mut p) 1.0]
+    (for [_ 0 n] (set! p (* (load p) 2.0)))
+    (load p)))
+
+;;; The float F as an integer BITS wide, toward zero, when its integer part fits.
+(defn const-float->int [(e (ptr Expr)) (f f64) (bits i64) (signed bool)]
+  (-> (Result Folded Diag))
+  (let [w (const-width bits)
+        lo (if signed (- 0.0 (const-pow2 (- w 1))) 0.0)
+        hi (if signed (const-pow2 (- w 1)) (const-pow2 w))]
+    ; NaN fails both comparisons
+    (if (not (and (> f (- lo 1.0)) (< f hi)))
+        (Err (const-error e
+                          "this float does not fit the integer type it is cast to, so the cast has no value"))
+        (Ok (const-int (if (and (not signed) (>= w 64))
+                           (primitive/cast i64 (cast u64 f))
+                           (cast i64 f))
+                       bits
+                       signed)))))
+
+(defn const-cast [(e (ptr Expr)) (ty Type) (v Folded)]
+  (-> (Result Folded Diag))
+  (match ty
+    (TInt [bits signed]
+          (if (> bits 64)
+              (Err (const-error e
+                                "a constant expression is folded at most 64 bits wide; (comptime …) computes a wider value"))
+              (match v
+                (FoldedInt [x _ _] (Ok (const-int x bits signed)))
+                (FoldedFloat [f _] (const-float->int e f bits signed)))))
+    (TFloat [bits]
+            (Ok (FoldedFloat :v
+                              (match v
+                                (FoldedInt [x _ s] (const-int->float x s bits))
+                                (FoldedFloat [f _] (const-round f bits)))
+                            :bits bits)))
+    (_ (Err (const-error e "a cast to a type that is not a number is not a constant expression")))))
+
+;;; Does the W-bit operation OP (15 add, 16 sub, 17 mul) on X and Y overflow?
+(defn const-overflows [(op i64) (x i64) (y i64) (w i64) (signed bool)] (-> bool)
+  (if (< w 64)
+      ; X and Y are at most 32 bits wide, so the exact result fits 64
+      (let [exact (cond (= op 15) (+ x y) (= op 16) (- x y) :else (* x y))]
+        (!= (const-wrap exact w signed) exact))
+      (cond (= op 15)
+              (let [sum (primitive/iadd x y)]
+                (if signed
+                    (< (& (^ x sum) (^ y sum)) 0)
+                    (< (primitive/cast u64 sum) (primitive/cast u64 x))))
+            (= op 16)
+              (if signed
+                  (< (& (^ x y) (^ x (primitive/isub x y))) 0)
+                  (< (primitive/cast u64 x) (primitive/cast u64 y)))
+            (not signed)
+              (and (!= x 0) (!= (primitive/udiv (primitive/imul x y) x) y))
+            (= x 0) false
+            ; MIN * -1 overflows the division that would check it
+            (= x -1) (= y (<< 1 63))
+            :else (!= (/ (primitive/imul x y) x) y))))
+
+;;; The high 64 bits of the 128-bit product of X and Y.
+(defn const-mulhi64 [(x i64) (y i64) (signed bool)] (-> i64)
+  (let [m32 (const-mask 32)
+        x0 (& x m32)
+        x1 (const-lshr x 32)
+        y0 (& y m32)
+        y1 (const-lshr y 32)
+        p00 (primitive/imul x0 y0)
+        p01 (primitive/imul x0 y1)
+        p10 (primitive/imul x1 y0)
+        p11 (primitive/imul x1 y1)
+        mid (primitive/iadd (primitive/iadd (const-lshr p00 32) (& p01 m32))
+                            (& p10 m32))
+        hi (primitive/iadd (primitive/iadd p11 (const-lshr p01 32))
+                           (primitive/iadd (const-lshr p10 32)
+                                           (const-lshr mid 32)))]
+    (if signed
+        (primitive/isub (primitive/isub hi (if (< x 0) y 0)) (if (< y 0) x 0))
+        hi)))
+
+(defn const-int-binary [(e (ptr Expr))
+                        (op i64)
+                        (x i64)
+                        (xbits i64)
+                        (xsigned bool)
+                        (y i64)
+                        (ybits i64)
+                        (ysigned bool)] (-> (Result Folded Diag))
+  (let [bits (if (!= xbits 0) xbits ybits)
+        signed (cond (and (!= xbits 0) (!= ybits 0)) (and xsigned ysigned)
+                     (!= xbits 0) xsigned
+                     (!= ybits 0) ysigned
+                     :else true)
+        w (const-width bits)
+        ux (& x (const-mask w))
+        uy (& y (const-mask w))
+        least (const-wrap (<< 1 (- w 1)) w true)
+        divides (or (= op 3) (= op 4) (= op 5) (= op 6))]
+    (cond (and divides (= y 0))
+            (Err (const-error e "this constant expression divides by zero"))
+          (and (or (= op 3) (= op 4)) signed (= x least) (= y -1))
+            (Err (const-error e
+                              "this constant expression divides the least value of its type by -1, which overflows"))
+          (and (or (= op 10) (= op 11)) (or (< uy 0) (>= uy w)))
+            (Err (const-error e
+                              "this constant expression shifts by its type's width or more"))
+          (and (= op 14) (= w 64))
+            (Ok (const-int (const-mulhi64 x y signed) bits signed))
+          (>= op 15)
+            (Ok (const-bool (const-overflows op x y w signed)))
+          :else
+            (Ok (const-int (cond (= op 0) (primitive/iadd x y)
+                                 (= op 1) (primitive/isub x y)
+                                 (= op 2) (primitive/imul x y)
+                                 ; `/` and `%` read their signedness off the type
+                                 (= op 3) (if signed (/ x y) (primitive/udiv ux uy))
+                                 (= op 4) (if signed (% x y) (primitive/urem ux uy))
+                                 (= op 5) (primitive/udiv ux uy)
+                                 (= op 6) (primitive/urem ux uy)
+                                 (= op 7) (& x y)
+                                 (= op 8) (| x y)
+                                 (= op 9) (^ x y)
+                                 (= op 10) (<< x uy)
+                                 (= op 11) (if signed (>> x uy) (const-lshr ux uy))
+                                 (= op 12)
+                                   (let [r (% uy w)]
+                                     (if (= r 0)
+                                         ux
+                                         (| (<< ux r) (const-lshr ux (- w r)))))
+                                 (= op 13)
+                                   (let [r (% uy w)]
+                                     (if (= r 0)
+                                         ux
+                                         (| (const-lshr ux r) (<< ux (- w r)))))
+                                 ; the high half of a narrower product, which 64 bits hold
+                                 :else (>> (* x y) w))
+                           bits
+                           signed)))))
+
+(defn const-float-binary [(e (ptr Expr)) (op i64) (x f64) (y f64) (bits i64)]
+  (-> (Result Folded Diag))
+  (if (> op 3)
+      (Err (const-error e "this operation is not one on floats"))
+      (Ok (FoldedFloat :v
+                        (const-round (cond (= op 0) (+ x y)
+                                           (= op 1) (- x y)
+                                           (= op 2) (* x y)
+                                           :else (/ x y))
+                                     bits)
+                      :bits bits))))
+
+(defn const-binary [(e (ptr Expr)) (op i64) (x Folded) (y Folded)]
+  (-> (Result Folded Diag))
+  (match x
+    (FoldedInt [xv xb xs]
+              (match y
+                (FoldedInt [yv yb ys] (const-int-binary e op xv xb xs yv yb ys))
+                (FoldedFloat [_ _]
+                            (Err (const-error e "this operation mixes an integer and a float")))))
+    (FoldedFloat [xv xb]
+                (match y
+                  (FoldedFloat [yv yb] (const-float-binary e op xv yv (if (> xb yb) xb yb)))
+                  (FoldedInt [_ _ _]
+                            (Err (const-error e "this operation mixes an integer and a float")))))))
+
+(defn const-compare [(e (ptr Expr)) (op i64) (x Folded) (y Folded)]
+  (-> (Result Folded Diag))
+  (match x
+    (FoldedInt [xv xb xs]
+              (match y
+                (FoldedInt [yv yb ys]
+                          (let [unsigned (or (and (!= xb 0) (not xs)) (and (!= yb 0) (not ys)))]
+                            (Ok (const-bool (if unsigned
+                                                (let [l (primitive/cast u64 xv)
+                                                      r (primitive/cast u64 yv)]
+                                                  (cond (= op 0) (< l r)
+                                                        (= op 1) (<= l r)
+                                                        (= op 2) (> l r)
+                                                        (= op 3) (>= l r)
+                                                        (= op 4) (= l r)
+                                                        :else (!= l r)))
+                                                (cond (= op 0) (< xv yv)
+                                                      (= op 1) (<= xv yv)
+                                                      (= op 2) (> xv yv)
+                                                      (= op 3) (>= xv yv)
+                                                      (= op 4) (= xv yv)
+                                                      :else (!= xv yv)))))))
+                (FoldedFloat [_ _]
+                            (Err (const-error e "this comparison mixes an integer and a float")))))
+    (FoldedFloat [xv _]
+                (match y
+                  (FoldedFloat [yv _]
+                              (Ok (const-bool (cond (= op 0) (< xv yv)
+                                                    (= op 1) (<= xv yv)
+                                                    (= op 2) (> xv yv)
+                                                    (= op 3) (>= xv yv)
+                                                    (= op 4) (= xv yv)
+                                                    :else (!= xv yv)))))
+                  (FoldedInt [_ _ _]
+                            (Err (const-error e "this comparison mixes an integer and a float")))))))
+
+;;; OP (0 not, 1 clz, 2 ctz, 3 popcount, 4 bswap) of V, held BITS wide.
+(defn const-unary [(e (ptr Expr)) (op i64) (v i64) (bits i64) (signed bool)]
+  (-> (Result Folded Diag))
+  (let [w (const-width bits)
+        u (& v (const-mask w))]
+    (cond (= op 0) (Ok (const-int (^ v -1) bits signed))
+          (and (= op 4) (!= (% w 8) 0))
+            (Err (const-error e "a byte swap needs a whole number of bytes"))
+          :else
+            (let [(mut n) 0]
+              (cond (= op 1)
+                      (block :done
+                        (for [i 0 w]
+                          (when (!= (& (const-lshr u (- (- w 1) i)) 1) 0)
+                            (break :done 0))
+                          (set! n (+ (load n) 1))))
+                    (= op 2)
+                      (block :done
+                        (for [i 0 w]
+                          (when (!= (& (const-lshr u i) 1) 0) (break :done 0))
+                          (set! n (+ (load n) 1))))
+                    (= op 3)
+                      (for [i 0 w]
+                        (set! n (+ (load n) (& (const-lshr u i) 1))))
+                    :else
+                      (for [i 0 (/ w 8)]
+                        (set! n
+                              (| (load n)
+                                 (<< (& (const-lshr u (* i 8)) 255)
+                                     (- (- w 8) (* i 8)))))))
+              (Ok (const-int (load n) bits signed))))))
+
+;;; The value of the constant expression E, its layout questions answered by
+;;; LAYOUT.
+(defn const-eval [(layout (dyn ConstLayout)) (e (ptr Expr))]
+  (-> (Result Folded Diag))
+  (try (match (.kind e)
+         (EInt [v] (Ok (FoldedInt :v v :bits 0 :signed true)))
+         (EBool [b] (Ok (const-bool b)))
+         (EFloat [bits] (Ok (FoldedFloat :v (bits->f64 bits) :bits 64)))
+         (ESizeOf [ty]
+                  (let [(mut t) ty]
+                    (Ok (FoldedInt :v (const-size layout (mut t)) :bits 64 :signed true))))
+         (EAlignOf [ty]
+                   (let [(mut t) ty]
+                     (Ok (FoldedInt :v (const-align layout (mut t)) :bits 64 :signed true))))
+         (EOffsetOf [ty fname]
+                    (let [(mut t) ty]
+                      (match (const-offset layout (mut t) fname)
+                        (Some [off] (Ok (FoldedInt :v off :bits 64 :signed true)))
+                        (None []
+                              (Err (const-error e "offsetof names a field of a struct, and this is not one"))))))
+         (ECast [ty inner] (const-cast e ty (try! (const-eval layout inner))))
+         (EBin [op l r]
+               (const-binary e op (try! (const-eval layout l)) (try! (const-eval layout r))))
+         (ECmp [op l r]
+               (const-compare e op (try! (const-eval layout l)) (try! (const-eval layout r))))
+         (EIf [c t f]
+              (match (try! (const-eval layout c))
+                (FoldedInt [v _ _] (if (!= v 0) (const-eval layout t) (const-eval layout f)))
+                (FoldedFloat [_ _]
+                            (Err (const-error c "an if's condition is a bool, and this is a float")))))
+         (EIntUnary [op inner]
+                    (match (try! (const-eval layout inner))
+                      (FoldedInt [v bits signed] (const-unary e op v bits signed))
+                      (FoldedFloat [_ _]
+                                  (Err (const-error e "this operation is one on integers, and this is a float")))))
+         ; an argument an inlined operator reads, and its read
+         (ESpillRef [inner] (const-eval layout inner))
+         (ELoad [inner]
+                (match (.kind inner)
+                  (ESpillRef [value] (const-eval layout value))
+                  (_ (Err (const-error e "a read of memory is not a constant expression")))))
+         ; the branch a checked operation fails in
+         (EDo [_]
+              (Err (const-error e
+                                "this constant expression fails a check when it is computed: an operation in it overflows, divides by zero or shifts too far")))
+         (ECall [_ _ _]
+                (Err (const-error e "a function call is not a constant expression; (comptime …) computes one")))
+         (_ (Err (const-error e "this is not a constant expression; (comptime …) computes one"))))))
+
+;;; Is E a static value's scalar that is computed (arithmetic, a comparison, an
+;;; `if`, a question about a type, or a numeric cast of one), so that a writer lays
+;;; out its folded value (`const-eval`)? Literals are written as they are. A wide
+;;; literal, and a cast of one to an integer wider than 64 bits, is extended by the
+;;; writer itself.
+(defn const-computed? [(e (ptr Expr))] (-> bool)
+  (match (.kind e)
+    (EBin [_ _ _] true)
+    (ECmp [_ _ _] true)
+    (EIf [_ _ _] true)
+    (EIntUnary [_ inner] (not (const-wide-literal? inner)))
+    (ESizeOf [_] true)
+    (EAlignOf [_] true)
+    (EOffsetOf [_ _] true)
+    (ECast [ty inner]
+           (match ty
+             (TInt [bits _] (and (<= bits 64) (not (const-wide-literal? inner))))
+             (TFloat [_] true)
+             (_ false)))
+    (_ false)))
+
+;;; Is E a literal wider than 64 bits, as the checker leaves one?
+(defn const-wide-literal? [(e (ptr Expr))] (-> bool)
+  (match (.kind e)
+    (EWideInt [_ _ _ _ _] true)
+    (ECast [ty inner]
+           (match ty (TInt [_ _] (const-wide-literal? inner)) (_ false)))
+    (EIntUnary [op inner] (and (= op 0) (const-wide-literal? inner)))
+    (_ false)))
+
+;;; V as a float.
+(defn folded-f64 [(v Folded)] (-> f64)
+  (match v
+    (FoldedFloat [x _] x)
+    (FoldedInt [x _ s] (const-int->float x s 64))))
+
+;;; The bits a static of the scalar type T holds for V: a float type's IEEE bits,
+;;; or an integer's value, which the writer truncates to T's width.
+(defn folded-bits [(v Folded) (t (ptr Type))] (-> i64)
+  (let [f (folded-f64 v)]
+    (match (load t)
+      (TFloat [bits]
+              (if (= bits 32)
+                  (let [(mut narrow) (cast f32 f)]
+                    (cast i64 (load (cast (ptr u32) (mut narrow)))))
+                  (f64-bits f)))
+      (_ (match v (FoldedInt [x _ _] x) (FoldedFloat [x _] (f64-bits x)))))))
+
+;;; Does V extend past its width with its sign bit (an integer of a signed type)?
+(defn folded-signed? [(v Folded)] (-> bool)
+  (match v (FoldedInt [_ _ s] s) (FoldedFloat [_ _] false)))
+
+;;; Is V, a condition, true?
+(defn folded-true? [(v Folded)] (-> bool)
+  (match v (FoldedInt [x _ _] (!= x 0)) (FoldedFloat [x _] (!= x 0.0))))

@@ -28,7 +28,10 @@ A value that needs code run says so: a function call is an error, naming the cal
 and `comptime`.
 
 A `def` is storage laid out when the program links. Its value may hold what a
-constant's may, plus addresses (`fnptr-of`, a C string, `alloc-static`).
+constant's may, plus addresses (`fnptr-of`, a C string, `alloc-static`). Its
+numbers are folded for the target as the program is built, so
+`(def HEADER-BYTES (* 4 (sizeof Header)))` counts 4-byte pointers on wasm32 too.
+Arithmetic on integers wider than 64 bits is not folded; `(comptime …)` computes it.
 
 ## `comptime`
 

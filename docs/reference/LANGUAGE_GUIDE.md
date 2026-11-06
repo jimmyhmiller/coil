@@ -1205,8 +1205,9 @@ field or borrowing it as a slice addresses the static itself, never a copy.
 That static is read-only, so the optimizer folds loads from it (an MMIO
 descriptor's address becomes an immediate), and writing it through a slice or
 pointer is undefined behavior. Function pointers and C strings in a `def` are
-filled in by the linker. A `def` can't read another `def`; make the value it
-needs a `const`.
+filled in by the linker, and the numbers beside them, `(sizeof T)` and arithmetic
+on it included, are folded for the target. A `def` can't read another `def`; make
+the value it needs a `const`.
 
 ```coil
 (module example.tables)
