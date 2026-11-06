@@ -1578,3 +1578,10 @@ weight per reserved cell replaces strict loop-depth-first sorting. Existing
 ordered APIs, semantic proofs and one512cell compiler growth ledger unchanged.
 Independent heuristic, not a pinned-upstream policy. Native registered-module
 suite passes; compiler performance/adoption still requires measurement.
+
+Register-offset memory selection: coil-stogir 5e9bfd5/95e3a4d. Independent target
+extension beyond pinned upstream's constant-only ir_match_fuse_addr, in the same
+persistent pre-liveness stage. Selected base/index operands participate in live
+ranges and register constraints; shared/rooted definitions retained.128 LLVM MC
+oracle cases and1040native integer/FP/SIMD cases plus volatile pressure pass.
+Original upstream credit/license unchanged; performance requires measurement.
