@@ -136,3 +136,7 @@ provenance are in docs/validation/structure-proven-operands and docs/PROVENANCE.
 Integer verifier header operand reads copied from coil-stogir756b206.
 Successful structural validation proves current operand fields; referenced cells,
 types/widths/guards remain checked. See docs/validation/integer-operand-fields.
+
+Identity-only iterative Phi cleanup copied from coil-stogir309d37e.
+No new CFG/full scan; exact identity/self-edge rules preserve roots and barriers.
+Independent extension, with native/ASAN validation in docs/validation/iterative-phi-identity.

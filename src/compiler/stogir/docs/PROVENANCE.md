@@ -1593,3 +1593,8 @@ Integer verifier current-header operand reads copied from coil-stogir756b206.
 Independent implementation improvement using the existing successful structural
 validation precondition. Referenced-cell and all semantic checks remain. Exact
 92992-case diagnostic/native/ASAN evidence: validation/integer-operand-fields.
+
+Iterative identity-only Phi cleanup copied from coil-stogir309d37e (audit51c44fd).
+Independent extension, not upstream iterative-Phi parity: pinned ir_iter_opt also
+skips Phi folding. Existing affected-user rewrites/root COPYs and initial bulk
+seed walk are reused. See validation/iterative-phi-identity and value-diamond-audit.
