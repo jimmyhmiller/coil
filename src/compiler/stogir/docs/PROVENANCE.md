@@ -1651,3 +1651,13 @@ assigned child from its start; preserve every earlier operand-use kind.
 Native/ASAN indexed-state and exact frontend-graph evidence is centralized in
 docs/validation/frontend-provider-transfers. Original LICENSE/NOTICE credit
 remains applicable. This is not the complete loop-aware split-position port.
+
+## Loop-entry-aware active eviction
+
+Imported coil-stogir5ab34a5, adapting pinned92171d0 ir_ra.c optimal split
+selection for active-owner eviction. Existing prepared dominators/loop depths
+provide immutable metadata; every past operand use remains before the cut.
+General odd reloads and free/restart categories are unchanged.19,880 exact C
+oracle answers, native pressure and real graph ASAN replay pass. Central
+validation: docs/validation/loop-aware-active-split. Original credit remains
+in LICENSE/NOTICE; no new per-file license headers.
