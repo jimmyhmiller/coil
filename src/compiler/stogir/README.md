@@ -114,3 +114,11 @@ cases remain conservative. See [validation](docs/validation/memory-area-alias/RE
 Native readonly register-result targets are distinguished from their explicit
 caller capture writes. Forwarding requires disjoint queried/capture footprints;
 indirect x8 results remain barriers. See [validation](docs/validation/register-result-effects/README.md).
+
+Finite countdown update copied from coil-stogir231c610 (2026-11-06).
+Independent register/memory unit-countdown rules use the existing affected-node
+optimizer and control cleanup. Memory reduction preserves the initial read and
+zero-trip no-write path; effects, volatile/atomic accesses, unsupported aliases
+and protected observations decline. No destructor semantics are changed.
+See validation/finite-countdown and validation/memory-countdown in docs; this is
+not claimed as a pinned upstream loop-elimination port. Credits remain centralized.

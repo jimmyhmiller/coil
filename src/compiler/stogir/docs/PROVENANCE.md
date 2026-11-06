@@ -1555,43 +1555,23 @@ owners are resolved before hinting. The first existing preference wins for a
 shared value; no simultaneous hard x0/x1 constraints are imposed. Complete typed
 parallel return copies remain responsible for every result port and all cycles.
 
-Fixed-use constraint summary: coil-stogir3659161, constraints.coil and
-allocation.coil. Equivalent single-scan future fixed-use limits replace repeated
-per-register scans. Independent implementation optimization, no policy change;
-exact original-query oracle191232 cases, allocation and native pressure gates.
+Protected return COPY roots cannot always coalesce into an existing Phi group.
+Advisory result hints now also walk at most16same-width GP COPY/BITCAST views
+back to the producer. They stop at Phis, arithmetic, width changes and register
+bank changes; setting the Phi/group preference itself is allowed. No value or
+constraint is rewritten, and existing preferences win for shared owners.
 
-Reusable allocation-decision scratch: coil-stogir e1ee083 allocation.coil.
-Private per-run limits buffer survives free attempts and eviction retries;
-compatibility entry signatures and assignment policy are unchanged.1458exact
-independent reference comparisons, native pressure and aggregate ABI gates pass.
+Finite register-carried unit-countdown elimination is an independent extension
+in finite-countdown.coil, using the existing iterative optimizer and checked
+control/def-use rewrites. Pinned ir_sccp.c's induction-variable optimization was
+consulted, but this finite-loop rule is not claimed as its port. Scope/proof and
+source-captured replay are in validation/finite-countdown. Generic destructors
+and memory-carried counters remain unchanged.
 
-Validated private GP return follow-up: coil-stogir437d343/c804e37, native
-return-values/allocate/compile/constraints/function/preferences. Propagate
-advisory result hints through exact-width views, canonicalize introduced COPY
-observations, retain original RETURN machine ports, and materialize symbolic
-constant aliases after physical transfers. Central original-library attribution
-is unchanged. Native ABI, independent C linkage and captured compiler helper
-replay evidence is in the standalone library validation records.
-
-Optional inline-ranking experiment: coil-stogirbe66336. Bounded natural-loop
-weight per reserved cell replaces strict loop-depth-first sorting. Existing
-ordered APIs, semantic proofs and one512cell compiler growth ledger unchanged.
-Independent heuristic, not a pinned-upstream policy. Native registered-module
-suite passes; compiler performance/adoption still requires measurement.
-
-Register-offset memory selection: coil-stogir 5e9bfd5/95e3a4d. Independent target
-extension beyond pinned upstream's constant-only ir_match_fuse_addr, in the same
-persistent pre-liveness stage. Selected base/index operands participate in live
-ranges and register constraints; shared/rooted definitions retained.128 LLVM MC
-oracle cases and1040native integer/FP/SIMD cases plus volatile pressure pass.
-Original upstream credit/license unchanged; performance requires measurement.
-
-Register-offset follow-up: shifted ADD/SUB retirement subtracts selected machine
-operands, preserving scaled producers shared with memory through word-view
-chains. Independent1560case native matrix plus original failing compiler graph
-regression; no shape-specific exclusions. Compiler revalidation required.
-
-Natural-scale index follow-up reuses existing arithmetic tiles for MUL/SHL,
-commutes the scaled input and retains shifted ADD where fusion adds a shift.
-Independent cost refinement; native geometry/pressure matrix passes. Initial
-neutral measurements are preserved in docs/benchmarks/indexed-memory-initial.
+Guarded memory-carried unit-countdown elimination in memory-countdown.coil is
+an independent extension of the finite-counter proof. It reuses the pinned-
+upstream-inspired address-alias decomposition and existing incremental control/
+use-list machinery. It preserves the initial read and zero-trip no-write path;
+volatile/atomic accesses and hard COPY barriers decline. Detailed proof, root
+protection, native semantic tests and actual allocator replay are documented in
+validation/memory-countdown. This is not an upstream loop-elimination port.
