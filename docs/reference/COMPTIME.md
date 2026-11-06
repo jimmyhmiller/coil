@@ -111,7 +111,9 @@ what is meant.
   where inference would have needed the context.
 
 How it finds out what is around it is available to any macro: `primitive/code-call-scope`
-lists what is bound at the call, and `primitive/code-specialized-value` leaves a value
-for specialization to compute.
+lists what is bound at the call, and `primitive/code-specialized-value` leaves a form for
+each instance of a generic, with the instance's arguments where it reads the parameters.
+A name `E` binds again with `let`, `match` or a definition is not the parameter there; one
+a macro in `E` binds is not known until that macro expands, so give it another name.
 
 A value that needs itself is an error naming the function that closes the cycle.

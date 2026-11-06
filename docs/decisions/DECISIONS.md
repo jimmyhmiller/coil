@@ -418,8 +418,16 @@ the checker as Zig does would have brought back the value tracking and the separ
 evaluation that were deleted, so the two cases each happen where the value appears. A
 `let` a constant could hold is known at macro time, so `comptime` copies it into what it
 hoists (`code-call-scope`, `code-known-value`). A generic parameter is known at
-specialization, so `E` is hoisted as a generic with the same parameters, and specialization
-runs the instance through the one engine (`code-specialized-value`). A local with no
+specialization, so `comptime` leaves itself for each instance (`code-specialized-value`):
+specialization puts the instance's arguments where `E` reads the parameters, and the
+expander expands that `(comptime E)`, which reads no parameter any more. A local with no
 value is an error at the read, not a read of a top-level name of its spelling, which is
 what the first version silently did (`code-without-locals`).
+
+The first version of the generic case hoisted `E` as a generic of its own and had
+specialization call it through a function pointer the expander installed at startup.
+That is now an argument: specialization declares what it asks (`InstanceExpansion`) and
+every caller passes the expander's. What binds a name is one function both expansion
+walks and the substitution use (`scope-step-binds!`), where the macro tower and the
+final walk each had their own, so a name `E` binds again is not taken for the parameter.
 
