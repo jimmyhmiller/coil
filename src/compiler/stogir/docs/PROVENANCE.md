@@ -1564,3 +1564,11 @@ Reusable allocation-decision scratch: coil-stogir e1ee083 allocation.coil.
 Private per-run limits buffer survives free attempts and eviction retries;
 compatibility entry signatures and assignment policy are unchanged.1458exact
 independent reference comparisons, native pressure and aggregate ABI gates pass.
+
+Validated private GP return follow-up: coil-stogir437d343/c804e37, native
+return-values/allocate/compile/constraints/function/preferences. Propagate
+advisory result hints through exact-width views, canonicalize introduced COPY
+observations, retain original RETURN machine ports, and materialize symbolic
+constant aliases after physical transfers. Central original-library attribution
+is unchanged. Native ABI, independent C linkage and captured compiler helper
+replay evidence is in the standalone library validation records.
