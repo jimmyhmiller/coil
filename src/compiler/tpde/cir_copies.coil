@@ -1,0 +1,847 @@
+;;; Aggregate copy forwarding over CIR stack slots.
+;;;
+;;; Lowering copies an aggregate into a fresh slot on every read, snapshot,
+;;; indirect argument and call result. A copy MEMCPY(dst <- src, n) is removed by
+;;; one of three rewrites:
+;;;
+;;; - forward: a slot written only by the copy and afterwards only read reads
+;;;   src directly, when nothing that may write src runs in the slot's live range;
+;;; - move: a slot written only by the copy that is later written (or handed to a
+;;;   call as an indirect argument) takes over src's private slot, when no access
+;;;   of that private slot is reachable from the copy;
+;;; - call slot: a private slot whose contents are copied out becomes the
+;;;   destination itself (another private slot or this function's own sret),
+;;;   when no access of the destination is reachable from the slot's accesses
+;;;   without passing the copy.
+;;;
+;;; A slot is private when every use of its address (or an ADDI of it) is a
+;;; LOAD/STORE/MEMCPY/MEMZERO address, a call's sret operand, or an indirect
+;;; argument (AF-INDIRECT: the callee owns that storage for the call, never
+;;; retaining it). Only the moved slot itself may also be an ordinary pointer
+;;; argument. Escaped slots are never rewritten.
+;;;
+;;; A copy out of a PHI of addresses at the very start of its block is first
+;;; sunk to the ends of the PHI's predecessors (each ending in an unconditional
+;;; branch), where the rewrites above can then apply to each incoming slot.
+(module tpde.cir-copies)
+(import "tpde.cir" :as cir)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+
+(const K-READ 1)
+(const K-WRITE 2)
+(const K-SRET 3)
+(const K-CALL 4)
+(const K-ARG 5)
+
+(defstruct Access [(inst u32) (kind i64) (lo i64) (hi i64)])
+
+(defstruct State
+  [(f (ptr cir/Func))
+   ; value -> position in insts (NONE for values without an instruction)
+   (at (ArrayList u32))
+   ; position -> its block
+   (block-of (ArrayList u32))
+   ; uses, as CSR over values: (user, operand index)
+   (use-start (ArrayList u32))
+   (use-user (ArrayList u32))
+   (use-index (ArrayList u32))
+   ; derived addresses: value -> root slot (NONE) and offset from it
+   (root (ArrayList u32))
+   (off (ArrayList i64))
+   ; per root
+   (escaped (ArrayList bool))
+   (calls (ArrayList u32))
+   (acc-first (ArrayList u32))
+   (acc-count (ArrayList u32))
+   (accesses (ArrayList Access))
+   (derived (ArrayList u32))
+   (sret-arg (ArrayList bool))
+   ; dominators
+   (rpo (ArrayList u32))
+   (order (ArrayList u32))
+   (idom (ArrayList u32))
+   ; regions: forward and backward stamps per position and per block entry
+   (mark-f (ArrayList u32))
+   (mark-b (ArrayList u32))
+   (enter-f (ArrayList u32))
+   (enter-b (ArrayList u32))
+   (reached (ArrayList u32))
+   (stamp u32)
+   (work (ArrayList u32))
+   (starts (ArrayList u32))
+   (work-writes (ArrayList u32))
+   (touched (ArrayList bool))
+   (dead-slot (ArrayList bool))])
+
+(defn none [] (-> u32) (cir/none))
+
+(defn opcode [(f (ptr cir/Func)) (v u32)] (-> i64)
+  (cast i64 (.op (cir/val f v))))
+
+(defn state-new [(f (ptr cir/Func))] (-> State)
+  (let [a (malloc-allocator)]
+    (State
+      :f f
+      :at (ArrayList::new [u32] a)
+      :block-of (ArrayList::new [u32] a)
+      :use-start (ArrayList::new [u32] a)
+      :use-user (ArrayList::new [u32] a)
+      :use-index (ArrayList::new [u32] a)
+      :root (ArrayList::new [u32] a)
+      :off (ArrayList::new [i64] a)
+      :escaped (ArrayList::new [bool] a)
+      :calls (ArrayList::new [u32] a)
+      :acc-first (ArrayList::new [u32] a)
+      :acc-count (ArrayList::new [u32] a)
+      :accesses (ArrayList::new [Access] a)
+      :derived (ArrayList::new [u32] a)
+      :sret-arg (ArrayList::new [bool] a)
+      :rpo (ArrayList::new [u32] a)
+      :order (ArrayList::new [u32] a)
+      :idom (ArrayList::new [u32] a)
+      :mark-f (ArrayList::new [u32] a)
+      :mark-b (ArrayList::new [u32] a)
+      :enter-f (ArrayList::new [u32] a)
+      :enter-b (ArrayList::new [u32] a)
+      :reached (ArrayList::new [u32] a)
+      :stamp (: 0 u32)
+      :work (ArrayList::new [u32] a)
+      :starts (ArrayList::new [u32] a)
+      :work-writes (ArrayList::new [u32] a)
+      :touched (ArrayList::new [bool] a)
+      :dead-slot (ArrayList::new [bool] a))))
+
+(defn state-free! [(st (ptr State))] (-> void)
+  (free! (mut (.at st))) (free! (mut (.block-of st)))
+  (free! (mut (.use-start st))) (free! (mut (.use-user st))) (free! (mut (.use-index st)))
+  (free! (mut (.root st))) (free! (mut (.off st))) (free! (mut (.escaped st)))
+  (free! (mut (.calls st))) (free! (mut (.acc-first st))) (free! (mut (.acc-count st)))
+  (free! (mut (.accesses st))) (free! (mut (.derived st))) (free! (mut (.sret-arg st)))
+  (free! (mut (.rpo st))) (free! (mut (.order st))) (free! (mut (.idom st)))
+  (free! (mut (.mark-f st))) (free! (mut (.mark-b st)))
+  (free! (mut (.enter-f st))) (free! (mut (.enter-b st)))
+  (free! (mut (.reached st))) (free! (mut (.work st))) (free! (mut (.starts st)))
+  (free! (mut (.work-writes st)))
+  (free! (mut (.touched st))) (free! (mut (.dead-slot st))))
+
+(defn fill-u32! [(xs (mut (ArrayList u32))) (n i64) (v u32)] (-> void)
+  (clear! (mut xs))
+  (for _ (range 0 n) (push! (mut xs) v)))
+
+(defn fill-bool! [(xs (mut (ArrayList bool))) (n i64) (v bool)] (-> void)
+  (clear! (mut xs))
+  (for _ (range 0 n) (push! (mut xs) v)))
+
+; ---- CFG ----
+
+(defn successor-count [(f (ptr cir/Func)) (b u32)] (-> u32)
+  (let [term (.term (cir/blk f b))]
+    (if (= term (none))
+        (: 0 u32)
+        (let [x (cir/val f term)] (- (.ntotal x) (.nops x))))))
+
+(defn successor [(f (ptr cir/Func)) (b u32) (i u32)] (-> u32)
+  (let [x (cir/val f (.term (cir/blk f b)))]
+    (cir/operand f x (+ (.nops x) i))))
+
+;;; Reverse post-order from block 0 and Cooper-Harvey-Kennedy dominators.
+(defn dominators! [(st (ptr State))] (-> void)
+  (let [f (.f st)
+        nb (cir/i64-of (cir/block-count f))]
+    (fill-u32! (mut (.rpo st)) nb (none))
+    (fill-u32! (mut (.idom st)) nb (none))
+    (clear! (mut (.order st)))
+    (when (> nb 0)
+      ; iterative DFS: work holds (block, next successor) pairs
+      (let [(mut visited) (ArrayList::new [bool] (malloc-allocator))]
+        (fill-bool! (mut visited) nb false)
+        (clear! (mut (.work st)))
+        (push! (mut (.work st)) (: 0 u32))
+        (push! (mut (.work st)) (: 0 u32))
+        (set! (mut visited) 0 true)
+        (while (> (len (.work st)) 0)
+          (let [n (len (.work st))
+                b (get (.work st) (- n 2))
+                i (get (.work st) (- n 1))]
+            (if (< i (successor-count f b))
+                (let [s (successor f b i)]
+                  (set! (mut (.work st)) (- n 1) (+ i (: 1 u32)))
+                  (unless (get visited (cir/i64-of s))
+                    (set! (mut visited) (cir/i64-of s) true)
+                    (push! (mut (.work st)) s)
+                    (push! (mut (.work st)) (: 0 u32))))
+                (do
+                  (push! (mut (.order st)) b)
+                  (pop! (mut (.work st)))
+                  (pop! (mut (.work st)))))))
+        (free! (mut visited)))
+      ; order is post-order; number blocks in reverse
+      (let [count (len (.order st))]
+        (for i (range 0 count)
+          (set! (mut (.rpo st)) (cir/i64-of (get (.order st) i))
+                (cir/u32-of (- (- count 1) i)))))
+      (set! (mut (.idom st)) 0 (: 0 u32))
+      (let [(mut changed) true]
+        (while changed
+          (set! changed false)
+          (let [(mut i) (- (len (.order st)) 1)]
+            (while (>= i 0)
+              (let [b (get (.order st) i)]
+                (when (!= b (: 0 u32))
+                  (let [(mut new) (none)
+                        (mut e) (.pred-first (cir/blk f b))]
+                    (while (!= e (none))
+                      (let [edge (get (.edges f) (cir/i64-of e))
+                            p (.from edge)]
+                        (when (!= (get (.idom st) (cir/i64-of p)) (none))
+                          (set! new (if (= new (none)) p (intersect st p new))))
+                        (set! e (.next edge))))
+                    (when (and (!= new (none)) (!= (get (.idom st) (cir/i64-of b)) new))
+                      (set! (mut (.idom st)) (cir/i64-of b) new)
+                      (set! changed true)))))
+              (set! i (- i 1)))))))))
+
+(defn intersect [(st (ptr State)) (a0 u32) (b0 u32)] (-> u32)
+  (let [(mut a) a0 (mut b) b0]
+    (while (!= a b)
+      (while (> (get (.rpo st) (cir/i64-of a)) (get (.rpo st) (cir/i64-of b)))
+        (set! a (get (.idom st) (cir/i64-of a))))
+      (while (> (get (.rpo st) (cir/i64-of b)) (get (.rpo st) (cir/i64-of a)))
+        (set! b (get (.idom st) (cir/i64-of b)))))
+    a))
+
+;;; Whether position `a` executes before `b` on every path reaching `b`.
+(defn dominates? [(st (ptr State)) (a u32) (b u32)] (-> bool)
+  (let [ba (get (.block-of st) (cir/i64-of a))
+        bb (get (.block-of st) (cir/i64-of b))]
+    (cond (or (= (get (.idom st) (cir/i64-of ba)) (none))
+              (= (get (.idom st) (cir/i64-of bb)) (none))) false
+          (= ba bb) (< a b)
+          :else
+            (let [(mut x) bb (mut found) false]
+              (while (and (not found) (!= x (: 0 u32)))
+                (set! x (get (.idom st) (cir/i64-of x)))
+                (when (= x ba) (set! found true)))
+              found))))
+
+; ---- regions ----
+
+;;; Mark (in mark-f, listed in `reached`) every position reachable after one of
+;;; `starts`, without executing position `stop` (NONE: no stop).
+(defn forward! [(st (ptr State)) (stop u32)] (-> void)
+  (let [f (.f st)]
+    (set! (.stamp st) (+ (.stamp st) (: 1 u32)))
+    (clear! (mut (.reached st)))
+    (clear! (mut (.work st)))
+    (for i (range 0 (len (.starts st)))
+      (let [p (get (.starts st) i)]
+        (scan-forward! st (get (.block-of st) (cir/i64-of p)) (+ p (: 1 u32)) stop)))
+    (while (> (len (.work st)) 0)
+      (let [b (get (.work st) (- (len (.work st)) 1))]
+        (pop! (mut (.work st)))
+        (scan-forward! st b (.ibegin (cir/blk f b)) stop)))))
+
+(defn scan-forward! [(st (ptr State)) (b u32) (from u32) (stop u32)] (-> void)
+  (let [f (.f st)
+        end (.iend (cir/blk f b))
+        (mut j) from
+        (mut blocked) false]
+    (while (and (not blocked) (< j end))
+      (if (= j stop)
+          (set! blocked true)
+          (do
+            (when (!= (get (.mark-f st) (cir/i64-of j)) (.stamp st))
+              (set! (mut (.mark-f st)) (cir/i64-of j) (.stamp st))
+              (push! (mut (.reached st)) j))
+            (set! j (+ j (: 1 u32))))))
+    (unless blocked
+      (for i (range 0 (cir/i64-of (successor-count f b)))
+        (let [s (successor f b (cir/u32-of i))]
+          (when (!= (get (.enter-f st) (cir/i64-of s)) (.stamp st))
+            (set! (mut (.enter-f st)) (cir/i64-of s) (.stamp st))
+            (push! (mut (.work st)) s)))))))
+
+;;; Mark (in mark-b) every position from which one of `starts` is reachable
+;;; without executing `stop`. Uses the forward pass's stamp.
+(defn backward! [(st (ptr State)) (stop u32)] (-> void)
+  (let [f (.f st)]
+    (clear! (mut (.work st)))
+    (for i (range 0 (len (.starts st)))
+      (let [p (get (.starts st) i)]
+        (scan-backward! st (get (.block-of st) (cir/i64-of p)) p stop)))
+    (while (> (len (.work st)) 0)
+      (let [b (get (.work st) (- (len (.work st)) 1))]
+        (pop! (mut (.work st)))
+        (scan-backward! st b (.iend (cir/blk f b)) stop)))))
+
+;;; Positions below `before` in block b, latest first.
+(defn scan-backward! [(st (ptr State)) (b u32) (before u32) (stop u32)] (-> void)
+  (let [f (.f st)
+        begin (.ibegin (cir/blk f b))
+        (mut j) before
+        (mut blocked) false]
+    (while (and (not blocked) (> j begin))
+      (set! j (- j (: 1 u32)))
+      (if (= j stop)
+          (set! blocked true)
+          (set! (mut (.mark-b st)) (cir/i64-of j) (.stamp st))))
+    (unless blocked
+      (let [(mut e) (.pred-first (cir/blk f b))]
+        (while (!= e (none))
+          (let [edge (get (.edges f) (cir/i64-of e))
+                p (.from edge)]
+            (when (!= (get (.enter-b st) (cir/i64-of p)) (.stamp st))
+              (set! (mut (.enter-b st)) (cir/i64-of p) (.stamp st))
+              (push! (mut (.work st)) p))
+            (set! e (.next edge))))))))
+
+(defn forward-marked? [(st (ptr State)) (p u32)] (-> bool)
+  (= (get (.mark-f st) (cir/i64-of p)) (.stamp st)))
+
+(defn backward-marked? [(st (ptr State)) (p u32)] (-> bool)
+  (= (get (.mark-b st) (cir/i64-of p)) (.stamp st)))
+
+; ---- analysis ----
+
+(defn add-use! [(st (ptr State)) (o u32)] (-> void)
+  (set! (mut (.use-start st)) (cir/i64-of o)
+        (+ (get (.use-start st) (cir/i64-of o)) (: 1 u32))))
+
+(defn place-use! [(st (ptr State)) (fill (mut (ArrayList u32))) (o u32) (user u32) (k u32)]
+  (-> void)
+  (let [slot (get fill (cir/i64-of o))]
+    (set! (mut (.use-user st)) (cir/i64-of slot) user)
+    (set! (mut (.use-index st)) (cir/i64-of slot) k)
+    (set! (mut fill) (cir/i64-of o) (+ slot (: 1 u32)))))
+
+(defn each-user [(f (ptr cir/Func)) (i i64)] (-> u32)
+  (if (< i (len (.insts f)))
+      (get (.insts f) i)
+      (get (.phis f) (- i (len (.insts f))))))
+
+(defn analyze! [(st (ptr State))] (-> void)
+  (let [f (.f st)
+        nv (len (.values f))
+        ni (len (.insts f))
+        users (+ ni (len (.phis f)))]
+    (fill-u32! (mut (.at st)) nv (none))
+    (fill-u32! (mut (.block-of st)) ni (: 0 u32))
+    (for b (range 0 (cir/i64-of (cir/block-count f)))
+      (let [bb (cir/blk f (cir/u32-of b))]
+        (for j (range (cir/i64-of (.ibegin bb)) (cir/i64-of (.iend bb)))
+          (set! (mut (.block-of st)) j (cir/u32-of b))
+          (set! (mut (.at st)) (cir/i64-of (get (.insts f) j)) (cir/u32-of j)))))
+    ; CSR uses
+    (fill-u32! (mut (.use-start st)) (+ nv 1) (: 0 u32))
+    (for i (range 0 users)
+      (let [x (cir/val f (each-user f i))]
+        (for k (range 0 (cir/i64-of (.nops x)))
+          (add-use! st (cir/operand f x (cir/u32-of k))))))
+    (let [(mut total) (: 0 u32)]
+      (for v (range 0 nv)
+        (let [c (get (.use-start st) v)]
+          (set! (mut (.use-start st)) v total)
+          (set! total (+ total c))))
+      (set! (mut (.use-start st)) nv total)
+      (fill-u32! (mut (.use-user st)) (cir/i64-of total) (: 0 u32))
+      (fill-u32! (mut (.use-index st)) (cir/i64-of total) (: 0 u32)))
+    (let [(mut fill) (ArrayList::new [u32] (malloc-allocator))]
+      (for v (range 0 nv) (push! (mut fill) (get (.use-start st) v)))
+      (for i (range 0 users)
+        (let [user (each-user f i)
+              x (cir/val f user)]
+          (for k (range 0 (cir/i64-of (.nops x)))
+            (place-use! st (mut fill) (cir/operand f x (cir/u32-of k)) user (cir/u32-of k)))))
+      (free! (mut fill)))
+    ; roots: every alloca and every sret argument
+    (fill-u32! (mut (.root st)) nv (none))
+    (clear! (mut (.off st)))
+    (for _ (range 0 nv) (push! (mut (.off st)) 0))
+    (fill-bool! (mut (.escaped st)) nv false)
+    (fill-u32! (mut (.calls st)) nv (: 0 u32))
+    (fill-u32! (mut (.acc-first st)) nv (: 0 u32))
+    (fill-u32! (mut (.acc-count st)) nv (: 0 u32))
+    (fill-bool! (mut (.sret-arg st)) nv false)
+    (fill-bool! (mut (.touched st)) nv false)
+    (fill-bool! (mut (.dead-slot st)) nv false)
+    (clear! (mut (.accesses st)))
+    (for i (range 0 (len (.allocas f)))
+      (trace-root! st (get (.allocas f) i)))
+    (for i (range 0 (len (.args f)))
+      (when (get (.arg-sret f) i)
+        (let [a (get (.args f) i)]
+          (set! (mut (.sret-arg st)) (cir/i64-of a) true)
+          (trace-root! st a))))))
+
+;;; Every use of root r's derived addresses, as accesses or an escape.
+(defn trace-root! [(st (ptr State)) (r u32)] (-> void)
+  (let [f (.f st)
+        first (cir/u32-of (len (.accesses st)))]
+    (set! (mut (.root st)) (cir/i64-of r) r)
+    (set! (mut (.off st)) (cir/i64-of r) 0)
+    (clear! (mut (.derived st)))
+    (push! (mut (.derived st)) r)
+    (let [(mut i) 0]
+      (while (< i (len (.derived st)))
+        (let [d (get (.derived st) i)
+              o (get (.off st) (cir/i64-of d))
+              lo (get (.use-start st) (cir/i64-of d))
+              hi (get (.use-start st) (+ (cir/i64-of d) 1))]
+          (for u (range (cir/i64-of lo) (cir/i64-of hi))
+            (let [user (get (.use-user st) u)
+                  k (get (.use-index st) u)
+                  x (cir/val f user)
+                  op (cast i64 (.op x))
+                  inst (get (.at st) (cir/i64-of user))]
+              (cond (= inst (none)) (set! (mut (.escaped st)) (cir/i64-of r) true)
+                    (and (= op cir/OP-ADDI) (= k (: 0 u32)))
+                      (if (!= (get (.root st) (cir/i64-of user)) (none))
+                          (set! (mut (.escaped st)) (cir/i64-of r) true)
+                          (do
+                            (set! (mut (.root st)) (cir/i64-of user) r)
+                            (set! (mut (.off st)) (cir/i64-of user) (+ o (.imm x)))
+                            (push! (mut (.derived st)) user)))
+                    (and (= op cir/OP-LOAD) (= k (: 0 u32)))
+                      (push-access! st user K-READ (+ o (.imm x)) (& (.imm2 x) 255))
+                    (and (= op cir/OP-STORE) (= k (: 0 u32)))
+                      (push-access! st user K-WRITE (+ o (.imm x)) (& (.imm2 x) 255))
+                    (= op cir/OP-MEMCPY)
+                      (push-access! st user (if (= k (: 0 u32)) K-WRITE K-READ) o (.imm x))
+                    (and (= op cir/OP-MEMZERO) (= k (: 0 u32)))
+                      (push-access! st user K-WRITE o (.imm x))
+                    (= op cir/OP-CALL)
+                      (let [flags (get (.argflags f) (cir/i64-of (+ (.opb x) k)))]
+                        (cond (and (!= (& flags (: 0x100 u32)) (: 0 u32))
+                                   (= (.aux x) (: 0 u8))
+                                   (= (.ty x) (cast u8 cir/T-VOID)))
+                                (push-access! st user K-SRET o 0x40000000)
+                              (!= (& flags (cast u32 cir/AF-INDIRECT)) (: 0 u32))
+                                (push-access! st user K-ARG o 0x40000000)
+                              :else (do
+                              (set! (mut (.calls st)) (cir/i64-of r)
+                                    (+ (get (.calls st) (cir/i64-of r)) (: 1 u32)))
+                              (push-access! st user K-CALL o 0x40000000))))
+                    :else (set! (mut (.escaped st)) (cir/i64-of r) true)))))
+        (set! i (+ i 1))))
+    (set! (mut (.acc-first st)) (cir/i64-of r) first)
+    (set! (mut (.acc-count st)) (cir/i64-of r)
+          (- (cir/u32-of (len (.accesses st))) first))))
+
+(defn push-access! [(st (ptr State)) (inst u32) (kind i64) (lo i64) (size i64)] (-> void)
+  (push! (mut (.accesses st)) (Access :inst inst :kind kind :lo lo :hi (+ lo size))))
+
+(defn access [(st (ptr State)) (r u32) (i u32)] (-> Access)
+  (get (.accesses st) (cir/i64-of (+ (get (.acc-first st) (cir/i64-of r)) i))))
+
+(defn private? [(st (ptr State)) (r u32)] (-> bool)
+  (and (!= r (none))
+       (not (get (.escaped st) (cir/i64-of r)))
+       (= (get (.calls st) (cir/i64-of r)) (: 0 u32))
+       (not (get (.touched st) (cir/i64-of r)))))
+
+(defn alloca? [(st (ptr State)) (r u32)] (-> bool)
+  (= (opcode (.f st) r) cir/OP-ALLOCA))
+
+(defn position [(st (ptr State)) (v u32)] (-> u32)
+  (get (.at st) (cir/i64-of v)))
+
+;;; An instruction that may write memory other than a private slot's.
+(defn foreign-write? [(st (ptr State)) (p u32)] (-> bool)
+  (let [f (.f st)
+        v (get (.insts f) (cir/i64-of p))
+        x (cir/val f v)
+        op (cast i64 (.op x))]
+    (cond (or (= op cir/OP-STORE) (= op cir/OP-MEMCPY) (= op cir/OP-MEMZERO))
+            (let [r (get (.root st) (cir/i64-of (cir/operand f x (: 0 u32))))]
+              (not (and (!= r (none)) (alloca? st r)
+                        (not (get (.escaped st) (cir/i64-of r)))
+                        (= (get (.calls st) (cir/i64-of r)) (: 0 u32)))))
+          (or (= op cir/OP-MEMCPYV) (= op cir/OP-MEMMOVEV) (= op cir/OP-MEMSETV)
+              (= op cir/OP-CALL) (= op cir/OP-TAILCALL) (= op cir/OP-SHIMCALL)
+              (= op cir/OP-MACHINE) (= op cir/OP-ATOMIC-RMW) (= op cir/OP-CMPXCHG)
+              (= op cir/OP-ATOMIC-STORE) (= op cir/OP-FENCE))
+            true
+          :else false)))
+
+;;; Every derived ADDI of root r, and every access, is dominated by position p.
+(defn uses-dominated? [(st (ptr State)) (r u32) (p u32) (except u32)] (-> bool)
+  (let [(mut good) true]
+    (for i (range 0 (cir/i64-of (get (.acc-count st) (cir/i64-of r))))
+      (let [a (access st r (cir/u32-of i))]
+        (when (and (!= (.inst a) except)
+                   (not (dominates? st p (position st (.inst a)))))
+          (set! good false))))
+    (when good (set! good (derived-dominated? st r p)))
+    good))
+
+(defn derived-dominated? [(st (ptr State)) (r u32) (p u32)] (-> bool)
+  (let [f (.f st) (mut good) true
+        lo (get (.use-start st) (cir/i64-of r))
+        hi (get (.use-start st) (+ (cir/i64-of r) 1))]
+    (for u (range (cir/i64-of lo) (cir/i64-of hi))
+      (let [user (get (.use-user st) u)]
+        (when (and (= (opcode f user) cir/OP-ADDI)
+                   (not (dominates? st p (position st user))))
+          (set! good false))))
+    good))
+
+; ---- the three rewrites ----
+
+;;; Forward or move: the copy's destination slot becomes its source.
+(defn try-into-source! [(st (ptr State)) (c u32)] (-> bool)
+  (let [f (.f st)
+        x (cir/val f c)
+        n (.imm x)
+        pc (position st c)
+        dst (cir/operand f x (: 0 u32))
+        src (cir/operand f x (: 1 u32))
+        d (get (.root st) (cir/i64-of dst))
+        s (get (.root st) (cir/i64-of src))
+        soff (get (.off st) (cir/i64-of src))]
+    (if (not (and (!= d (none)) (alloca? st d) (= dst d)
+                  (not (get (.escaped st) (cir/i64-of d)))
+                  (not (get (.touched st) (cir/i64-of d)))
+                  (= (.imm (cir/val f d)) n)
+                  (!= s d)))
+        false
+        (let [(mut good) true (mut written) false]
+          ; the copy is the slot's only initialization and precedes every use
+          (for i (range 0 (cir/i64-of (get (.acc-count st) (cir/i64-of d))))
+            (let [a (access st d (cir/u32-of i))]
+              (if (= (.inst a) c)
+                  (unless (= (.kind a) K-WRITE) (set! good false))
+                  (do
+                    (unless (= (.kind a) K-READ) (set! written true))
+                    (unless (dominates? st pc (position st (.inst a))) (set! good false))))))
+          (when (and good (not (cir-value? f src)))
+            (set! good (derived-dominated? st d pc)))
+          (when (and good (!= s (none)) (get (.touched st) (cir/i64-of s)))
+            (set! good false))
+          (when good
+            (if written
+                (set! good (move-safe? st c d s soff n))
+                (set! good (forward-safe? st c d s src soff n))))
+          (when good (replace-root! st d src c s))
+          good))))
+
+;;; Constant-free values usable anywhere: allocas and arguments.
+(defn cir-value? [(f (ptr cir/Func)) (v u32)] (-> bool)
+  (let [op (cast i64 (.op (cir/val f v)))]
+    (or (= op cir/OP-ALLOCA) (= op cir/OP-ARG))))
+
+(defn move-safe? [(st (ptr State)) (c u32) (d u32) (s u32) (soff i64) (n i64)] (-> bool)
+  (let [f (.f st)]
+    (if (not (and (!= s (none)) (alloca? st s) (private? st s)
+                  (<= (+ soff n) (.imm (cir/val f s)))
+                  (>= (.imm2 (cir/val f s)) (.imm2 (cir/val f d)))
+                  (= (% soff (.imm2 (cir/val f d))) 0)))
+        false
+        (do
+          ; no access of the source slot is reachable from the copy
+          (clear! (mut (.starts st)))
+          (push! (mut (.starts st)) (position st c))
+          (forward! st (none))
+          (let [(mut good) true]
+            (for i (range 0 (cir/i64-of (get (.acc-count st) (cir/i64-of s))))
+              (let [a (access st s (cir/u32-of i))]
+                (when (and (!= (.inst a) c) (forward-marked? st (position st (.inst a))))
+                  (set! good false))))
+            good)))))
+
+(defn forward-safe? [(st (ptr State)) (c u32) (d u32) (s u32) (src u32) (soff i64) (n i64)]
+  (-> bool)
+  (let [f (.f st)
+        pc (position st c)
+        enumerable (and (!= s (none)) (not (get (.escaped st) (cir/i64-of s)))
+                        (= (get (.calls st) (cir/i64-of s)) (: 0 u32)))]
+    ; the destination's live range: after the copy, before a later read
+    (clear! (mut (.starts st)))
+    (push! (mut (.starts st)) pc)
+    (forward! st pc)
+    (clear! (mut (.starts st)))
+    (for i (range 0 (cir/i64-of (get (.acc-count st) (cir/i64-of d))))
+      (let [a (access st d (cir/u32-of i))]
+        (unless (= (.inst a) c) (push! (mut (.starts st)) (position st (.inst a))))))
+    (backward! st pc)
+    (let [(mut good) true]
+      (if enumerable
+          (for i (range 0 (cir/i64-of (get (.acc-count st) (cir/i64-of s))))
+            (let [a (access st s (cir/u32-of i))
+                  p (position st (.inst a))]
+              (when (and (!= (.inst a) c) (!= (.kind a) K-READ)
+                         (< (.lo a) (+ soff n)) (> (.hi a) soff)
+                         (or (and (forward-marked? st p) (backward-marked? st p))
+                             (reads-root? st (.inst a) d)))
+                (set! good false))))
+          (for i (range 0 (len (.reached st)))
+            (let [p (get (.reached st) i)]
+              (when (and (backward-marked? st p) (foreign-write? st p))
+                (set! good false)))))
+      ; each read of the slot by a copy must not overlap its new source
+      (for i (range 0 (cir/i64-of (get (.acc-count st) (cir/i64-of d))))
+        (let [a (access st d (cir/u32-of i))]
+          (when (and good (!= (.inst a) c) (= (opcode f (.inst a)) cir/OP-MEMCPY))
+            (let [y (cir/val f (.inst a))
+                  target (cir/operand f y (: 0 u32))
+                  t (get (.root st) (cir/i64-of target))]
+              (unless (or (and (!= t (none)) (alloca? st t) (!= t s)
+                               (not (get (.escaped st) (cir/i64-of t)))
+                               (= (get (.calls st) (cir/i64-of t)) (: 0 u32)))
+                          (and (!= t (none)) (= t s) enumerable
+                               (let [to (get (.off st) (cir/i64-of target))
+                                     from (+ soff (.lo a))]
+                                 (or (<= (+ to (.imm y)) from)
+                                     (<= (+ from (.imm y)) to)))))
+                (set! good false))))))
+      good)))
+
+;;; Whether instruction v also accesses root r (through any operand).
+(defn reads-root? [(st (ptr State)) (v u32) (r u32)] (-> bool)
+  (let [(mut found) false]
+    (for i (range 0 (cir/i64-of (get (.acc-count st) (cir/i64-of r))))
+      (when (= (.inst (access st r (cir/u32-of i))) v) (set! found true)))
+    found))
+
+;;; Call slot: the copy's private source slot becomes the destination.
+(defn try-into-destination! [(st (ptr State)) (c u32)] (-> bool)
+  (let [f (.f st)
+        x (cir/val f c)
+        n (.imm x)
+        pc (position st c)
+        dst (cir/operand f x (: 0 u32))
+        src (cir/operand f x (: 1 u32))
+        s (get (.root st) (cir/i64-of src))
+        d (get (.root st) (cir/i64-of dst))
+        doff (get (.off st) (cir/i64-of dst))]
+    (if (not (and (!= s (none)) (alloca? st s) (= src s) (private? st s)
+                  (= (.imm (cir/val f s)) n)
+                  (> (get (.acc-count st) (cir/i64-of s)) (: 1 u32))
+                  (!= d (none)) (!= d s) (private? st d)
+                  (or (and (alloca? st d)
+                           (<= (+ doff n) (.imm (cir/val f d)))
+                           (>= (.imm2 (cir/val f d)) (.imm2 (cir/val f s)))
+                           (= (% doff (.imm2 (cir/val f s))) 0))
+                      (get (.sret-arg st) (cir/i64-of d)))))
+        false
+        (let [(mut good) true]
+          ; the destination address is available at every source access
+          (unless (cir-value? f dst)
+            (set! good (uses-dominated? st s (position st dst) (none))))
+          ; the source slot is dead after the copy
+          (when good
+            (clear! (mut (.starts st)))
+            (push! (mut (.starts st)) pc)
+            (forward! st (none))
+            (for i (range 0 (cir/i64-of (get (.acc-count st) (cir/i64-of s))))
+              (let [a (access st s (cir/u32-of i))]
+                (when (and (!= (.inst a) c) (forward-marked? st (position st (.inst a))))
+                  (set! good false)))))
+          ; nothing reads or writes the destination while it holds the source
+          (when good
+            (clear! (mut (.starts st)))
+            (for i (range 0 (cir/i64-of (get (.acc-count st) (cir/i64-of s))))
+              (let [a (access st s (cir/u32-of i))]
+                (unless (= (.inst a) c)
+                  (push! (mut (.starts st)) (position st (.inst a)))
+                  (when (reads-root? st (.inst a) d) (set! good false)))))
+            (forward! st pc)
+            ; a read sees the source instead; a write while the source is
+            ; still live (the copy itself still reads it) clobbers it. A write
+            ; after the source dies is harmless.
+            (clear! (mut (.work-writes st)))
+            (for i (range 0 (cir/i64-of (get (.acc-count st) (cir/i64-of d))))
+              (let [a (access st d (cir/u32-of i))]
+                (when (and (!= (.inst a) c) (forward-marked? st (position st (.inst a))))
+                  (if (or (= (.kind a) K-WRITE) (= (.kind a) K-SRET))
+                      (push! (mut (.work-writes st)) (position st (.inst a)))
+                      (set! good false)))))
+            (for i (range 0 (len (.work-writes st)))
+              (when good
+                (clear! (mut (.starts st)))
+                (push! (mut (.starts st)) (get (.work-writes st) i))
+                (forward! st (none))
+                (for j (range 0 (cir/i64-of (get (.acc-count st) (cir/i64-of s))))
+                  (let [a (access st s (cir/u32-of j))]
+                    (when (forward-marked? st (position st (.inst a)))
+                      (set! good false)))))))
+          (when good (replace-root! st s dst c d))
+          good))))
+
+;;; Every operand naming slot `old` names `new` instead; the copy is dead.
+(defn replace-root! [(st (ptr State)) (old u32) (new u32) (c u32) (other u32)] (-> void)
+  (let [f (.f st)
+        lo (get (.use-start st) (cir/i64-of old))
+        hi (get (.use-start st) (+ (cir/i64-of old) 1))]
+    (for u (range (cir/i64-of lo) (cir/i64-of hi))
+      (let [user (get (.use-user st) u)
+            k (get (.use-index st) u)
+            x (cir/val f user)]
+        (set! (mut (.operands f)) (cir/i64-of (+ (.opb x) k)) new)))
+    (let [dead (cir/val f c)]
+      (set! (.flags dead) (| (.flags dead) (: 8 u8)))
+      (set! (.nops dead) (: 0 u32))
+      (set! (.ntotal dead) (: 0 u32)))
+    (set! (mut (.touched st)) (cir/i64-of old) true)
+    (when (!= other (none)) (set! (mut (.touched st)) (cir/i64-of other) true))
+    (let [r (get (.root st) (cir/i64-of new))]
+      (when (!= r (none)) (set! (mut (.touched st)) (cir/i64-of r) true)))
+    (set! (mut (.dead-slot st)) (cir/i64-of old) true)))
+
+(defn drop-slots! [(st (ptr State))] (-> void)
+  (let [f (.f st) (mut kept) 0]
+    (for i (range 0 (len (.allocas f)))
+      (let [v (get (.allocas f) i)]
+        (unless (get (.dead-slot st) (cir/i64-of v))
+          (set! (.next (cir/val f v)) (cir/u32-of kept))
+          (set! (mut (.allocas f)) kept v)
+          (set! kept (+ kept 1)))))
+    (set! (.len (.allocas f)) kept)))
+
+
+; ---- sinking copies out of PHIs ----
+
+;;; Uses of every PHI by instructions and other PHIs.
+(defn phi-uses! [(f (ptr cir/Func)) (counts (mut (ArrayList u32)))] (-> void)
+  (fill-u32! (mut counts) (len (.values f)) (: 0 u32))
+  (for i (range 0 (+ (len (.insts f)) (len (.phis f))))
+    (let [x (cir/val f (each-user f i))]
+      (for k (range 0 (cir/i64-of (.nops x)))
+        (let [o (cir/i64-of (cir/operand f x (cir/u32-of k)))]
+          (when (= (opcode f (cir/u32-of o)) cir/OP-PHI)
+            (set! (mut counts) o (+ (get counts o) (: 1 u32)))))))))
+
+;;; Whether block b ends in an unconditional branch to `target`.
+(defn branches-to? [(f (ptr cir/Func)) (b u32) (target u32)] (-> bool)
+  (let [term (.term (cir/blk f b))]
+    (and (!= term (none))
+         (= (opcode f term) cir/OP-BR)
+         (= (successor f b (: 0 u32)) target))))
+
+;;; MEMCPY(dst <- PHI) as the first instruction of the PHI's block becomes one
+;;; copy before each predecessor's branch. dst must be an alloca or argument.
+(defn sink-copies! [(f (ptr cir/Func))] (-> i64)
+  (let [a (malloc-allocator)
+        (mut pending) (ArrayList::new [u32] a)
+        (mut dead-phis) (ArrayList::new [u32] a)
+        (mut counts) (ArrayList::new [u32] a)
+        (mut counted) false
+        (mut sunk) (: 0 i64)]
+    (for b (range 0 (cir/i64-of (cir/block-count f)))
+      (let [bb (load (cir/blk f (cir/u32-of b)))]
+        (when (< (.ibegin bb) (.iend bb))
+          (let [c (get (.insts f) (cir/i64-of (.ibegin bb)))
+                x (load (cir/val f c))]
+            (when (and (= (cast i64 (.op x)) cir/OP-MEMCPY)
+                       (= (& (.flags x) (: 8 u8)) (: 0 u8))
+                       (cir-value? f (cir/operand f (cir/val f c) (: 0 u32))))
+              (let [dst (cir/operand f (cir/val f c) (: 0 u32))
+                    src (cir/operand f (cir/val f c) (: 1 u32))
+                    y (load (cir/val f src))]
+                (when (and (= (cast i64 (.op y)) cir/OP-PHI)
+                           (= (.block y) (cir/u32-of b))
+                           (!= src dst))
+                  (let [(mut good) true]
+                    (for k (range 0 (cir/i64-of (.nops y)))
+                      (let [pred (cir/operand f (cir/val f src) (+ (.nops y) (cir/u32-of k)))]
+                        (unless (branches-to? f pred (cir/u32-of b)) (set! good false))))
+                    (when good
+                      (unless counted (phi-uses! f (mut counts)) (set! counted true))
+                      (for k (range 0 (cir/i64-of (.nops y)))
+                        (let [pred (cir/operand f (cir/val f src) (+ (.nops y) (cir/u32-of k)))
+                              incoming (cir/operand f (cir/val f src) (cir/u32-of k))
+                              v (cir/push-value! f cir/OP-MEMCPY cir/T-VOID (.imm x) 0)]
+                          (cir/push-operand! f dst (: 0 u32))
+                          (cir/push-operand! f incoming (: 0 u32))
+                          (cir/set-ops! f v (: 2 u32) (: 2 u32))
+                          (push! (mut pending) pred)
+                          (push! (mut pending) v)))
+                      (let [dead (cir/val f c)]
+                        (set! (.flags dead) (| (.flags dead) (: 8 u8)))
+                        (set! (.nops dead) (: 0 u32))
+                        (set! (.ntotal dead) (: 0 u32)))
+                      ; the copy was its only use
+                      (when (= (get counts (cir/i64-of src)) (: 1 u32))
+                        (push! (mut dead-phis) src))
+                      (set! sunk (+ sunk 1)))))))))))
+    (when (> sunk 0)
+      ; rebuild instruction ranges: sunk copies go before each terminator
+      (let [(mut out) (ArrayList::new [u32] a)]
+        (for b (range 0 (cir/i64-of (cir/block-count f)))
+          (let [bb (cir/blk f (cir/u32-of b))
+                lo (cir/i64-of (.ibegin bb))
+                hi (cir/i64-of (.iend bb))
+                term (.term bb)]
+            (set! (.ibegin bb) (cir/u32-of (len out)))
+            (for j (range lo hi)
+              (let [v (get (.insts f) j)]
+                (when (= v term)
+                  (for k (range 0 (/ (len pending) 2))
+                    (when (= (get pending (* k 2)) (cir/u32-of b))
+                      (push! (mut out) (get pending (+ (* k 2) 1))))))
+                (push! (mut out) v)))
+            (set! (.iend bb) (cir/u32-of (len out)))))
+        (clear! (mut (.insts f)))
+        (for v out (push! (mut (.insts f)) v))
+        (free! (mut out)))
+      (when (> (len dead-phis) 0)
+        (let [(mut kept) (ArrayList::new [u32] a)]
+          (for b (range 0 (cir/i64-of (cir/block-count f)))
+            (let [bb (cir/blk f (cir/u32-of b))
+                  begin (cir/u32-of (len kept))]
+              (for j (range (cir/i64-of (.phi-begin bb)) (cir/i64-of (+ (.phi-begin bb) (.phi-count bb))))
+                (let [phi (get (.phis f) j) (mut drop) false]
+                  (for d dead-phis (when (= d phi) (set! drop true)))
+                  (if drop
+                      (let [x (cir/val f phi)]
+                        (set! (.nops x) (: 0 u32))
+                        (set! (.ntotal x) (: 0 u32)))
+                      (push! (mut kept) phi))))
+              (set! (.phi-begin bb) begin)
+              (set! (.phi-count bb) (- (cir/u32-of (len kept)) begin))))
+          (clear! (mut (.phis f)))
+          (for v kept (push! (mut (.phis f)) v))
+          (free! (mut kept))))
+      (cir/compact-dead! f))
+    (free! (mut pending))
+    (free! (mut dead-phis))
+    (free! (mut counts))
+    sunk))
+
+;;; Forward aggregate copies until none applies (a few rounds at most).
+(defn forward-copies! [(f (ptr cir/Func))] (-> i64)
+  (let [(mut copies) false]
+    (for i (range 0 (len (.insts f)))
+      (when (= (opcode f (get (.insts f) i)) cir/OP-MEMCPY) (set! copies true)))
+    (if (or (not copies) (= (len (.allocas f)) 0))
+        0
+        (let [(mut st) (state-new f)
+              (mut removed) (: 0 i64)
+              (mut round) 0
+              (mut changed) true]
+          (while (and changed (< round 4))
+            (set! changed false)
+            (when (> (sink-copies! f) 0) (set! changed true))
+            (analyze! (mut st))
+            (dominators! (mut st))
+            (let [nb (cir/i64-of (cir/block-count f))
+                  ni (len (.insts f))]
+              (fill-u32! (mut (.mark-f st)) ni (: 0 u32))
+              (fill-u32! (mut (.mark-b st)) ni (: 0 u32))
+              (fill-u32! (mut (.enter-f st)) nb (: 0 u32))
+              (fill-u32! (mut (.enter-b st)) nb (: 0 u32))
+              (set! (.stamp st) (: 0 u32)))
+            (for i (range 0 (len (.insts f)))
+              (let [c (get (.insts f) i)]
+                (when (and (= (opcode f c) cir/OP-MEMCPY)
+                           (= (& (.flags (cir/val f c)) (: 8 u8)) (: 0 u8)))
+                  (when (or (try-into-source! (mut st) c)
+                            (try-into-destination! (mut st) c))
+                    (set! changed true)
+                    (set! removed (+ removed 1))))))
+            (when changed
+              (cir/compact-dead! f)
+              (drop-slots! (mut st)))
+            (set! round (+ round 1)))
+          (state-free! (mut st))
+          removed))))
