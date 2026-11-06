@@ -1612,3 +1612,6 @@ now revisit affected users. See validation/diamond-user-notification.
 
 
 Verifier semantic-family gate copied from coil-stogir d108f15, validation86a7f4e. Preserves all inner checks and their order, including overlapping families. Independent verifier source optimization; pinned upstream revision unchanged.71,050 exact-result/diagnostic differential cases and ASAN pass; two local paired timings show1.7–2.0% verifier improvement. No whole-bootstrap performance claim.
+
+
+Fused free-register choice copied from coil-stogir75ed841/docs532a9cd. Exact limit array and prior lower-ID selection/hint policy retained;69,984 differential policy cases plus native/ASAN allocation suite pass. Independent source optimization, pinned upstream unchanged. Mixed-hint LLVM microbenchmark regressed; actual-emitter evaluation pending, no whole-bootstrap claim.
