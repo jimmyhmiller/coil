@@ -1642,3 +1642,12 @@ ABI-shape comparison preserves calling convention and aggregate/group geometry,
 while treating signed/unsigned 32- and 64-bit scalar spelling equivalently.
 The private module validation note records the actual emitter mismatch and121
 scalar signature checks.
+
+## Unused assigned register prefix
+
+Imported coil-stogir fbfa8fa: the active-owner no-prior-use eviction rule from
+dstogov/ir ir_ra.c:ir_allocate_blocked_reg at pinned92171d0. Spill an unused
+assigned child from its start; preserve every earlier operand-use kind.
+Native/ASAN indexed-state and exact frontend-graph evidence is centralized in
+docs/validation/frontend-provider-transfers. Original LICENSE/NOTICE credit
+remains applicable. This is not the complete loop-aware split-position port.
