@@ -1598,3 +1598,9 @@ Iterative identity-only Phi cleanup copied from coil-stogir309d37e (audit51c44fd
 Independent extension, not upstream iterative-Phi parity: pinned ir_iter_opt also
 skips Phi folding. Existing affected-user rewrites/root COPYs and initial bulk
 seed walk are reused. See validation/iterative-phi-identity and value-diamond-audit.
+
+Affected-merge literal diamond reconsideration copied from coil-stogir19d6a1a.
+Follows pinned ir_iter_optimize_merge/ir_optimize_phi orchestration for the
+existing literal subset. One collapse operation serves bulk/local paths, with
+exact uses, rooted observations and normal control repair. Availability for
+arbitrary values and MIN/MAX/ABS remains outside scope. Validation/affected-merge-diamond.

@@ -140,3 +140,7 @@ types/widths/guards remain checked. See docs/validation/integer-operand-fields.
 Identity-only iterative Phi cleanup copied from coil-stogir309d37e.
 No new CFG/full scan; exact identity/self-edge rules preserve roots and barriers.
 Independent extension, with native/ASAN validation in docs/validation/iterative-phi-identity.
+
+Affected MERGE reconsideration copied from coil-stogir19d6a1a. Phi cleanup can
+expose existing literal diamond conversions; local iteration shares the bulk
+rewrite body and normal root/control repair. See docs/validation/affected-merge-diamond.
