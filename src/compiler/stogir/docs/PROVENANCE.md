@@ -1575,3 +1575,10 @@ use-list machinery. It preserves the initial read and zero-trip no-write path;
 volatile/atomic accesses and hard COPY barriers decline. Detailed proof, root
 protection, native semantic tests and actual allocator replay are documented in
 validation/memory-countdown. This is not an upstream loop-elimination port.
+
+Wide integer shared IF comparison fusion in a64/match.coil follows pinned
+ir_aarch64.dasc all_usages_are_fusable and IR_IF matching. The supported IF-only
+subset requires every scheduled use to be an IF condition, with explicit roots
+protected. Machine inputs are redirected before liveness. GUARD, narrow and
+floating-point coverage is unchanged; validation/shared-compare-fusion records
+native semantic, call-pressure and actual compiler-helper replay evidence.

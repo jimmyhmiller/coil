@@ -122,3 +122,8 @@ zero-trip no-write path; effects, volatile/atomic accesses, unsupported aliases
 and protected observations decline. No destructor semantics are changed.
 See validation/finite-countdown and validation/memory-countdown in docs; this is
 not claimed as a pinned upstream loop-elimination port. Credits remain centralized.
+
+Shared wide integer IF comparison fusion copied from coil-stogir f675d59.
+Follows pinned upstream all_usages_are_fusable for supported IF consumers;
+retains roots, data, hard COPY and unsupported GUARD consumers. All consumers
+read actual operands before liveness. See docs/validation/shared-compare-fusion.
