@@ -1682,3 +1682,15 @@ insertion and existing demand-driven SSA. Escapes/observed addresses, volatile
 accesses, displaced overlap and uninitialized paths retain memory.270 policy
 cases,22,680 native byte answers, ASAN and real allocator graph evidence:
 validation/partial-field-promotion. Original NOTICE/LICENSE credit remains.
+
+## Contained fields and bitwise literal parity
+
+Imported coil-stogir563478d andca519fe. Independent contained integer promotion
+uses widest-first canonical fields, byte-offset insertion/extraction and existing
+initialization/Phi/root safeguards. Crossing/noninteger/escape/volatile fallbacks
+remain. General AND/OR/XOR literal rules are adapted from pinned upstream
+ir_fold.h:2878–3060, including BOOL/CHAR and XOR-to-NOT unary restart:
+https://github.com/dstogov/ir/blob/92171d0a4a36b0acf707f2dea7998de615dd4acd/ir_fold.h#L2878
+180 exact original C decisions, native/ASAN checks and real node constructor
+replay are retained in validation/contained-field-promotion and
+validation/bit-literal-identities. Existing original LICENSE/NOTICE credit remains.
