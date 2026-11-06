@@ -388,7 +388,10 @@
    (program (ptr Program))
    (qualified (slice u8))
    (maps (ptr SemMapsSnap))
-   (artifact (ptr artifact/LoadedProvider))])
+   (artifact (ptr artifact/LoadedProvider))
+   ; the engine the first reading compiles, holding every provider of the
+   ; shared setup, which every later reading calls; null for an artifact provider
+   (engine (ptr ReaderEngineCache))])
 
 (defstruct ActiveSourceReaders
   [(items (ptr (ArrayList (ptr ActiveSourceReader))))])
@@ -1200,6 +1203,28 @@
       0)
     (load out)))
 
+;;; Free the providers the active readers compiled, their images and cache
+;;; arenas, before the readers are switched off.
+(defn free-active-reader-engines! [] (-> i64)
+  (let [xs (.items (active-source-readers))]
+    (unless (= (primitive/cast i64 xs) 0)
+      (for [i 0 (len (load xs))]
+        (let [engine (.engine (get (load xs) i))]
+          (unless (= (primitive/cast i64 engine) 0)
+            (reader-engine-cache-free! engine)
+            ; the readers of a shared setup share one engine
+            (for [k 0 (len (load xs))]
+              (let [r (get (load xs) k)]
+                (when (= (primitive/cast i64 (.engine r))
+                         (primitive/cast i64 engine))
+                  (set! (.engine r) (primitive/cast (ptr ReaderEngineCache) 0))
+                  0))
+              0)
+            0))
+        0)
+      0))
+  0)
+
 (defn run-reader-with-generated-units [(a (dyn Allocator))
                                        (setup (mut LS))
                                        (program (ptr Program))
@@ -1252,10 +1277,12 @@
                                        provider-module
                                        "' is not active")))
           (primitive/cast (ptr (ArrayList Sexp)) 0))
-        (let [(mut saved) (zeroed SemMapsSnap)]
+        (let [(mut saved) (zeroed SemMapsSnap)
+              prior-engine (load (reader-engine-cache-cell))]
           (unless (!= (primitive/cast i64 (.artifact r)) 0)
             (sem-maps-save (mut saved))
-            (sem-maps-restore (.maps r)))
+            (sem-maps-restore (.maps r))
+            (set! (reader-engine-cache-cell) (.engine r)))
           (let [run-span (tr/span-begin "reader.import.run-provider")
                 result
                   (if (!= (primitive/cast i64 (.artifact r)) 0)
@@ -1275,6 +1302,7 @@
                                                                           src
                                                                           "import")))
                 _run-end (tr/span-end run-span)]
+            (set! (reader-engine-cache-cell) prior-engine)
             (unless (!= (primitive/cast i64 (.artifact r)) 0)
               (sem-maps-save (.maps r))
               (sem-maps-restore (mut saved)))
@@ -1750,9 +1778,57 @@
       0)
     (load missing)))
 
-;;; Compile every distinct configured provider into its own retained setup. Separate
-;;; setups prevent helper-name collisions and preserve each reader's hygiene context;
-;;; the import hook dispatches by the provider module selected from the file suffix.
+;;; The setup that compiles every configured source provider in PROVIDERS but
+;;; the one ARTIFACT supplies (null for none), as one program: providers that
+;;; share modules share their compilation. Each provider module is imported
+;;; under an alias of its own, so helpers of the same name in two providers never
+;;; meet; the import hook dispatches by the provider module selected from the
+;;; file suffix.
+(defn shared-reader-setup-source [(a (dyn Allocator))
+                                  (providers (ptr (ArrayList ReaderProvider)))
+                                  (artifact (ptr artifact/LoadedProvider))
+                                  (excluded (mut (ArrayList (slice u8))))]
+  (-> (slice u8))
+  (let [(mut out)
+          (StrBuf::new a)
+        (mut imported) (ArrayList::new [(slice u8)] a)]
+    (push-str! (mut out) "(module coil-read-setup)\n(import \"coil.phase\")\n")
+    (for [i 0 (len (load providers))]
+      (let [pp (get (load providers) i)
+            selected
+              (and (!= (primitive/cast i64 artifact) 0)
+                   (= (.provider (.metadata artifact)) (.module pp)))
+            qual (sconcat3 a (.module pp) "." (.function pp))
+            (mut seen) false]
+        (for [k 0 (len (load excluded))]
+          (when (= (get (load excluded) k) qual) (set! seen true) 0))
+        (unless (or selected (load seen))
+          (let [(mut alias-index) -1]
+            (for [k 0 (len (load imported))]
+              (when (= (get (load imported) k) (.module pp))
+                (set! alias-index k)
+                0))
+            (when (< (load alias-index) 0)
+              (set! alias-index (len (load imported)))
+              (push! (mut imported) (.module pp))
+              (push-str! (mut out) "(import \"")
+              (push-str! (mut out) (.module pp))
+              (push-str! (mut out) "\" :as coil-reader-")
+              (push-str! (mut out) (i64->str a (load alias-index)))
+              (push-str! (mut out) ")\n")
+              0)
+            (push! (mut excluded) qual)
+            (push-str! (mut out) "(transform coil-reader-")
+            (push-str! (mut out) (i64->str a (load alias-index)))
+            (push-str! (mut out) "/")
+            (push-str! (mut out) (.function pp))
+            (push-str! (mut out) " :phase (coil.phase.Read))\n"))
+          0)))
+    (push-str! (mut out) "(defn main [] (-> i64) 0)\n")
+    (finish! (mut out))))
+
+;;; Activate every distinct configured provider: the artifact's from the artifact,
+;;; the rest from one setup they share (`shared-reader-setup-source`).
 (defn activate-configured-readers [(a (dyn Allocator))
                                    (state (mut LS))
                                    (cwd (slice u8))] (-> (Result i64 Diag))
@@ -1766,7 +1842,22 @@
                     (Err [d] (return-from :activate (Err [i64 Diag] d)))
                     (Ok [loaded] loaded)))
             (mut artifact-used) false
-            (mut active) (ArrayList::new [(ptr ActiveSourceReader)] a)]
+            (mut active) (ArrayList::new [(ptr ActiveSourceReader)] a)
+            (mut excluded) (ArrayList::new [(slice u8)] a)
+            setup-src
+              (shared-reader-setup-source a providers artifact (mut excluded))
+            ; null until a source provider needs it
+            (mut shared) (primitive/cast (ptr PreparedReaderSetup) 0)
+            shared-maps (box! a SemMapsSnap (zeroed SemMapsSnap))
+            ; whichever provider reads first compiles them all, into one engine
+            shared-engine
+              (if (= (len (load excluded)) 0)
+                  (primitive/cast (ptr ReaderEngineCache) 0)
+                  (reader-engine-cache-new a))]
+        (unless (= (primitive/cast i64 shared-engine) 0)
+          (set! (.together shared-engine)
+                (box-al [(slice u8)] a (load excluded)))
+          0)
         (set! (.items (active-source-readers))
               (box-al [(ptr ActiveSourceReader)] a (load active)))
         (for [i 0 (len (load providers))]
@@ -1776,60 +1867,61 @@
                 selected
                   (and (!= (primitive/cast i64 artifact) 0)
                        (= (.provider (.metadata artifact)) (.module pp)))
-                setup-src
-                  (sconcat3 a
-                            "(module coil-read-setup)\n(import \"coil.phase\")\n(import \""
-                            (.module pp)
-                            (sconcat3 a
-                                      "\" :use *)\n(transform "
-                                      (.function pp)
-                                      " :phase (coil.phase.Read))\n(defn main [] (-> i64) 0)\n"))
-                (mut excluded) (ArrayList::new [(slice u8)] a)]
-            (push! (mut excluded) qual)
-            (let [excludedp (box-al [(slice u8)] a (load excluded))
-                  prepared-result
+                prepared-result
+                  (cond selected
+                          (if (= (.entry (.metadata artifact)) qual)
+                              (do
+                                (set! artifact-used true)
+                                (Ok [PreparedReaderSetup Diag]
+                                    (PreparedReaderSetup
+                                      :state (.setup (.metadata artifact))
+                                      :checked (primitive/cast (ptr Program) 0))))
+                              (Err [PreparedReaderSetup Diag]
+                                   (derr "provider artifact entry does not match configured reader-provider")))
+                        (!= (primitive/cast i64 (load shared)) 0)
+                          (Ok [PreparedReaderSetup Diag] (load (load shared)))
+                        :else
+                          (match (prepare-reader-setup a
+                                                       setup-src
+                                                       cwd
+                                                       (box-al [(slice u8)]
+                                                               a
+                                                               (load excluded))
+                                                       false)
+                            (Err [d] (Err [PreparedReaderSetup Diag] d))
+                            (Ok [prepared]
+                                (do
+                                  (set! shared
+                                        (box! a PreparedReaderSetup prepared))
+                                  (sem-maps-save shared-maps)
+                                  (Ok [PreparedReaderSetup Diag] prepared)))))]
+            (match prepared-result
+              (Err [d] (return-from :activate (Err [i64 Diag] d)))
+              (Ok [prepared]
+                  (let [prep (primitive/alloc-stack PreparedReaderSetup)
+                        r
+                          (box! a ActiveSourceReader (zeroed ActiveSourceReader))]
+                    (set! prep prepared)
+                    (set! (.configured_module r) (sconcat a (.container pp) ""))
+                    (set! (.definition_module r) (sconcat a (.module pp) ""))
+                    (set! (.setup r) (load (field prep state)))
+                    (set! (.program r) (load (field prep checked)))
+                    (set! (.qualified r) qual)
                     (if selected
-                        (if (= (.entry (.metadata artifact)) qual)
-                            (do
-                              (set! artifact-used true)
-                              (Ok [PreparedReaderSetup Diag]
-                                  (PreparedReaderSetup
-                                    :state (.setup (.metadata artifact))
-                                    :checked (primitive/cast (ptr Program) 0))))
-                            (Err [PreparedReaderSetup Diag]
-                                 (derr "provider artifact entry does not match configured reader-provider")))
-                        (prepare-reader-setup a setup-src cwd excludedp false))]
-              (match prepared-result
-                (Err [d] (return-from :activate (Err [i64 Diag] d)))
-                (Ok [prepared]
-                    (let [prep (primitive/alloc-stack PreparedReaderSetup)
-                          r
-                            (box! a
-                                  ActiveSourceReader
-                                  (zeroed ActiveSourceReader))
-                          maps
-                            (box! a
-                                  SemMapsSnap
-                                  (zeroed SemMapsSnap))]
-                      (set! prep prepared)
-                      (set! (.configured_module r)
-                            (sconcat a (.container pp) ""))
-                      (set! (.definition_module r)
-                            (sconcat a (.module pp) ""))
-                      (set! (.setup r) (load (field prep state)))
-                      (set! (.program r) (load (field prep checked)))
-                      (set! (.qualified r) qual)
-                      (if selected
+                        (do
                           (set! (.artifact r) artifact)
-                          (sem-maps-save maps))
-                      (set! (.maps r) maps)
-                      (push! [(ptr ActiveSourceReader)] (mut active) r)
-                      (set! (.items (active-source-readers))
-                            (box-al [(ptr ActiveSourceReader)]
-                                    a
-                                    (load active)))
-                      0))))
-            0))
+                          (set! (.maps r)
+                                (box! a SemMapsSnap (zeroed SemMapsSnap))))
+                        (do
+                          ; the readers of the shared setup read through one
+                          ; set of maps, as one program
+                          (set! (.maps r) shared-maps)
+                          (set! (.engine r) shared-engine)))
+                    (push! [(ptr ActiveSourceReader)] (mut active) r)
+                    (set! (.items (active-source-readers))
+                          (box-al [(ptr ActiveSourceReader)] a (load active)))
+                    0))))
+          0)
         (when (and (!= (primitive/cast i64 artifact) 0)
                    (not (load artifact-used)))
           (return-from
