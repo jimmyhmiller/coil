@@ -8,6 +8,7 @@
 #   * two providers for one input is an error, not last-wins;
 #   * an error raised inside a provider names the file and the reader, and a
 #     provider that does not compile is located in the provider;
+#   * a cross build compiles its readers for the host;
 #   * readers that do not reflect on their program release its compilation, one
 #     that does keeps it, and a precompiled provider may not reflect;
 #   * a precompiled provider artifact is reused, invalidated and checked
@@ -64,6 +65,12 @@ case "$out" in
   *"coil-trace count reader.unit.released 1"*) ok "project: readers that do not reflect release their compilation" ;;
   *) bad "project: readers that do not reflect release their compilation" "$(printf '%s\n' "$out" | grep 'reader\.')" ;;
 esac
+
+# A reader's code runs in the compiler, so a cross build compiles it for the host:
+# rd.kv uses coil.meta, which only compiler code has.
+out=$(cd $R/json_project && "$COIL" check --target wasm32-unknown-unknown 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "project: a cross build reads with readers compiled for the host" \
+  || bad "project: a cross build reads with readers compiled for the host" "exit $rc: $out"
 
 # A source provider may reflect on its own program: rd.shape counts a struct's
 # fields, so its compilation stays, and 7 is 4 fields plus the file's 3. A
