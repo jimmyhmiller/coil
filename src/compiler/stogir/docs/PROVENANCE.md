@@ -1582,3 +1582,9 @@ subset requires every scheduled use to be an IF condition, with explicit roots
 protected. Machine inputs are redirected before liveness. GUARD, narrow and
 floating-point coverage is unchanged; validation/shared-compare-fusion records
 native semantic, call-pressure and actual compiler-helper replay evidence.
+
+Verifier extent-proven operand reads copied from coil-stogir78394b7.
+This independent implementation caches operand shape and reads signed operand
+words only after complete storage/extent/domain validation; reference membership,
+local/prototype and optional-reference checks remain. Validation includes255exact
+valid/malformed diagnostics and native/ASAN runs. See validation/structure-proven-operands.

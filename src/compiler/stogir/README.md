@@ -127,3 +127,8 @@ Shared wide integer IF comparison fusion copied from coil-stogir f675d59.
 Follows pinned upstream all_usages_are_fusable for supported IF consumers;
 retains roots, data, hard COPY and unsupported GUARD consumers. All consumers
 read actual operands before liveness. See docs/validation/shared-compare-fusion.
+
+Structural verifier operand reads copied from coil-stogir78394b7, combined
+with shared comparison fusionf675d59. Full extent and signed reference domain
+are checked before direct operand storage reads. Validation and centralized
+provenance are in docs/validation/structure-proven-operands and docs/PROVENANCE.md.
