@@ -1585,3 +1585,8 @@ persistent pre-liveness stage. Selected base/index operands participate in live
 ranges and register constraints; shared/rooted definitions retained.128 LLVM MC
 oracle cases and1040native integer/FP/SIMD cases plus volatile pressure pass.
 Original upstream credit/license unchanged; performance requires measurement.
+
+Register-offset follow-up: shifted ADD/SUB retirement subtracts selected machine
+operands, preserving scaled producers shared with memory through word-view
+chains. Independent1560case native matrix plus original failing compiler graph
+regression; no shape-specific exclusions. Compiler revalidation required.
