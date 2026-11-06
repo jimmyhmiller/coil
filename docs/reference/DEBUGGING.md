@@ -158,6 +158,15 @@ oversized shift amounts:
 coil: undefined behavior: integer division or remainder by zero (--sanitize=undefined)
 ```
 
+AddressSanitizer watches `malloc` and `free`, so an arena is invisible to it
+unless the arena says what it does. Under `address`, `coil.scratch` arenas do:
+each block is followed by a poisoned 16-byte gap, and what a reset, a rewind
+to a mark or a recycle gives back stays poisoned and is not handed out again,
+so a write past a block or a read through a stale pointer is reported. An
+allocator of your own can do the same with `asan-poison!` and
+`asan-unpoison!` from `coil.alloc`, which compile to nothing in any other
+build.
+
 Trust MemorySanitizer reports only when every native library the program
 calls is also instrumented. Coil does not sanitize metaprograms, because they
 run inside the compiler.

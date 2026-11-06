@@ -1818,6 +1818,37 @@ EOF
   if build "$T/asan.coil" "$T/asan" --sanitize=address -O0; then
     expect_crash_or_fail 'AddressSanitizer: heap-use-after-free' "--sanitize=address reports a use-after-free" "$T/asan"
   fi
+  # An arena tells ASan what it hands out and takes back (`asan-poison!`): a write past a
+  # block, a read after a rewind to a mark, a read after a recycle. Each argument
+  # count picks one.
+  cat > "$T/asan-arena.coil" <<'EOF'
+(module asan-arena)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.scratch" :as scratch)
+(defn one [(a (dyn Allocator))] (-> (ptr i64))
+  (unwrap-ptr [i64] (create [i64] a)))
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [arena (primitive/alloc-stack scratch/ScratchArena)]
+    (scratch/ScratchArena::init arena (malloc-allocator))
+    (let [a (scratch/ScratchArena::allocator arena)
+          kept (one a)
+          mark (scratch/ScratchArena::mark arena)
+          p (one a)]
+      (store! kept 1)
+      (store! p 41)
+      (cond (= argc (: 1 i32))
+              (do (store! (cast (ptr i64) (primitive/index (cast (ptr i8) p) 8)) 99) 0)
+            (= argc (: 2 i32))
+              (do (scratch/ScratchArena::reset-to! arena mark) (store! (one a) 7) (load p))
+            :else
+              (do (scratch/ScratchArena::recycle! arena) (store! (one a) 7) (load p))))))
+EOF
+  if build "$T/asan-arena.coil" "$T/asan-arena" --sanitize=address -O0; then
+    expect_crash_or_fail 'AddressSanitizer: use-after-poison' "--sanitize=address reports a write past an arena block" "$T/asan-arena"
+    expect_crash_or_fail 'AddressSanitizer: use-after-poison' "--sanitize=address reports a read after an arena rewind" "$T/asan-arena" rewind
+    expect_crash_or_fail 'AddressSanitizer: heap-use-after-free' "--sanitize=address reports a read after an arena recycle" "$T/asan-arena" rewind recycle
+  fi
   cat > "$T/tsan.coil" <<'EOF'
 (module tsan-race)
 (import "coil.primitive" :as primitive)
