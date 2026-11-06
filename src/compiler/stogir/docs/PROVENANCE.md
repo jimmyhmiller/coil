@@ -1672,3 +1672,13 @@ each control-changing drain before memory replacement. Prune/boundary users are
 drained with control folding enabled, without repeating SCCP analysis.
 Real graph regression and native/ASAN validation: validation/boolean-operand-shape.
 Original credit and license remain centralized in NOTICE/LICENSE.
+
+## Same-start partial integer field promotion
+
+Imported coil-stogir e440314. Independent extension beyond pinned92171d0
+ir_mem2ssa_add_split_var (ir_mem2ssa.c:574), which rejects unequal-width fields.
+Explicit little-endian promotion preserves prior high bytes through typed bit
+insertion and existing demand-driven SSA. Escapes/observed addresses, volatile
+accesses, displaced overlap and uninitialized paths retain memory.270 policy
+cases,22,680 native byte answers, ASAN and real allocator graph evidence:
+validation/partial-field-promotion. Original NOTICE/LICENSE credit remains.

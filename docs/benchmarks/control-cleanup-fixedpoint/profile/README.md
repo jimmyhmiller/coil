@@ -22,3 +22,7 @@ same-start unequal widths. Supporting partial-field insertion would therefore
 be an explicit extension, not a missing upstream port, and requires preserved
 untouched bytes, initialized-state proofs, loops/joins, byte-order policy,
 observed roots and alias/escape fallback. Do not silently drop padding writes.
+
+Corrected snapshot capture enables COIL_TPDE_STATS=1 as required by the existing
+trace gate. The initial capture contained no graph; the replacement has exactly
+one graph and1008 records, used by partial-field-promotion validation.
