@@ -1609,3 +1609,6 @@ Diamond rewrite consumer notification copied from coil-stogird2ab904.
 Restores pinned ir_optimize_phi/ir_iter_add_uses restart discipline when a
 producer changes form. No new fold rules. Existing Boolean comparison folds
 now revisit affected users. See validation/diamond-user-notification.
+
+
+Verifier semantic-family gate copied from coil-stogir d108f15, validation86a7f4e. Preserves all inner checks and their order, including overlapping families. Independent verifier source optimization; pinned upstream revision unchanged.71,050 exact-result/diagnostic differential cases and ASAN pass; two local paired timings show1.7–2.0% verifier improvement. No whole-bootstrap performance claim.

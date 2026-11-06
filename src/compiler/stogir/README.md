@@ -149,3 +149,6 @@ Diamond consumer wakeups copied from coil-stogird2ab904. Existing comparison
 folds must restart after a producer becomesCOND even when reference operands
 stay unchanged. See docs/validation/diamond-user-notification. Direct choice
 projectionf83436a is not included in this candidate.
+
+
+Verifier semantic-family gate copied from coil-stogir d108f15, validation86a7f4e. Preserves all inner checks and their order, including overlapping families. Independent verifier source optimization; pinned upstream revision unchanged.71,050 exact-result/diagnostic differential cases and ASAN pass; two local paired timings show1.7–2.0% verifier improvement. No whole-bootstrap performance claim.
