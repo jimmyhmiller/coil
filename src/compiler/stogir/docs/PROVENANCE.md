@@ -1590,3 +1590,8 @@ Register-offset follow-up: shifted ADD/SUB retirement subtracts selected machine
 operands, preserving scaled producers shared with memory through word-view
 chains. Independent1560case native matrix plus original failing compiler graph
 regression; no shape-specific exclusions. Compiler revalidation required.
+
+Natural-scale index follow-up reuses existing arithmetic tiles for MUL/SHL,
+commutes the scaled input and retains shifted ADD where fusion adds a shift.
+Independent cost refinement; native geometry/pressure matrix passes. Initial
+neutral measurements are preserved in docs/benchmarks/indexed-memory-initial.
