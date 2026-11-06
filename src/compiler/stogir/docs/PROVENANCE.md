@@ -1572,3 +1572,9 @@ observations, retain original RETURN machine ports, and materialize symbolic
 constant aliases after physical transfers. Central original-library attribution
 is unchanged. Native ABI, independent C linkage and captured compiler helper
 replay evidence is in the standalone library validation records.
+
+Optional inline-ranking experiment: coil-stogirbe66336. Bounded natural-loop
+weight per reserved cell replaces strict loop-depth-first sorting. Existing
+ordered APIs, semantic proofs and one512cell compiler growth ledger unchanged.
+Independent heuristic, not a pinned-upstream policy. Native registered-module
+suite passes; compiler performance/adoption still requires measurement.
