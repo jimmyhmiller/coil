@@ -405,7 +405,11 @@ imported like any module.
   several guest languages. A compilation compiles its readers once, together,
   so readers that share modules share that work, and each provider's helpers
   stay its own. The first reading compiles all of them to native code, and
-  every later reading calls that code.
+  every later reading calls that code. They are compiled apart from the
+  program they read into, and what compiling them took is freed once that code
+  exists, unless a reader reflects on its own program (`code-field-count`,
+  `definition-source` and the other semantic operations), which keeps it. A
+  provider precompiled with `coil build-provider` may not reflect.
 - A provider can hand text to the built-in configurable s-expression reader:
   ``(primitive/code-read source `(reader-config :unquote #\, :splice #\@))``.
 - `--use NAME` on the command line can install a reader for the entry file
