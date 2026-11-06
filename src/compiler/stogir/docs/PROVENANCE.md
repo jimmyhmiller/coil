@@ -1576,79 +1576,99 @@ volatile/atomic accesses and hard COPY barriers decline. Detailed proof, root
 protection, native semantic tests and actual allocator replay are documented in
 validation/memory-countdown. This is not an upstream loop-elimination port.
 
-Structural verification now consumes instruction operand words directly only
-after complete per-node extent/count/continuation checks. This uses pinned
-ir.h's four-word cell layout, as Graph.operand does. Referenced-node membership,
-prototype/optional/local-storage checks remain unchanged; no unchecked public
-Graph API is introduced. The signed instruction-reference domain is explicitly
-checked once, matching Graph.append's existing limit. Proof/differential/error
-and performance evidence are in validation/structure-proven-operands.
+Wide integer shared IF comparison fusion in a64/match.coil follows pinned
+ir_aarch64.dasc all_usages_are_fusable and IR_IF matching. The supported IF-only
+subset requires every scheduled use to be an IF condition, with explicit roots
+protected. Machine inputs are redirected before liveness. GUARD, narrow and
+floating-point coverage is unchanged; validation/shared-compare-fusion records
+native semantic, call-pressure and actual compiler-helper replay evidence.
 
-Integer verifier current-header operand reads are an independent implementation
-improvement in verify.coil, using the existing successful structural-validation
-precondition. Referenced cells and type/width/guard checks remain checked.
-See validation/integer-operand-fields for exact diagnostic and ASAN evidence.
+Verifier extent-proven operand reads copied from coil-stogir78394b7.
+This independent implementation caches operand shape and reads signed operand
+words only after complete storage/extent/domain validation; reference membership,
+local/prototype and optional-reference checks remain. Validation includes255exact
+valid/malformed diagnostics and native/ASAN runs. See validation/structure-proven-operands.
 
-Identity-only iterative Phi cleanup is an independent extension in iter-fold.coil
-and sccp-rewrite.coil's existing seed walk. Pinned ir_sccp.c also skips iterative
-PHI folding; this is not its port. Exact reference identity, self-edge handling,
-root preservation and native validation: validation/iterative-phi-identity.
+Integer verifier current-header operand reads copied from coil-stogir756b206.
+Independent implementation improvement using the existing successful structural
+validation precondition. Referenced-cell and all semantic checks remain. Exact
+92992-case diagnostic/native/ASAN evidence: validation/integer-operand-fields.
 
-Affected-merge literal diamond reconsideration follows pinned ir_sccp.c's
-ir_iter_optimize_merge/ir_optimize_phi orchestration for the existing literal
-subset. Bulk and local paths share one collapse operation; arbitrary-value
-availability and MIN/MAX/ABS remain unimplemented. See validation/affected-merge-diamond.
+Iterative identity-only Phi cleanup copied from coil-stogir309d37e (audit51c44fd).
+Independent extension, not upstream iterative-Phi parity: pinned ir_iter_opt also
+skips Phi folding. Existing affected-user rewrites/root COPYs and initial bulk
+seed walk are reused. See validation/iterative-phi-identity and value-diamond-audit.
 
-Diamond producer rewrites now notify existing users as pinned ir_optimize_phi
-notifies ir_iter_add_uses after conversion. This restores the affected-consumer
-restart contract without adding fold rules. See validation/diamond-user-notification.
+Affected-merge literal diamond reconsideration copied from coil-stogir19d6a1a.
+Follows pinned ir_iter_optimize_merge/ir_optimize_phi orchestration for the
+existing literal subset. One collapse operation serves bulk/local paths, with
+exact uses, rooted observations and normal control repair. Availability for
+arbitrary values and MIN/MAX/ABS remains outside scope. Validation/affected-merge-diamond.
+
+Diamond rewrite consumer notification copied from coil-stogird2ab904.
+Restores pinned ir_optimize_phi/ir_iter_add_uses restart discipline when a
+producer changes form. No new fold rules. Existing Boolean comparison folds
+now revisit affected users. See validation/diamond-user-notification.
 
 
-## Exact comparison choices
+Verifier semantic-family gate copied from coil-stogir d108f15, validation86a7f4e. Preserves all inner checks and their order, including overlapping families. Independent verifier source optimization; pinned upstream revision unchanged.71,050 exact-result/diagnostic differential cases and ASAN pass; two local paired timings show1.7–2.0% verifier improvement. No whole-bootstrap performance claim.
 
-The exact operand-identity diamond pattern follows dstogov/ir ir_sccp.c MIN/MAX handling at pinned92171d0a4a36b0acf707f2dea7998de615dd4acd. Coil retains COND in the generic graph so signed comparison semantics survive canonical unsigned CIR word types, then reuses the existing AArch64 signed/unsigned MIN/MAX CMP/CSEL recipes. No arbitrary-value availability or floating MIN/MAX transformation is implied. Validation is centralized under docs/validation/compare-choice-minmax; original license/credit remains in NOTICE.
 
-## Class-only free register decisions
+Fused free-register choice copied from coil-stogir75ed841/docs532a9cd. Exact limit array and prior lower-ID selection/hint policy retained;69,984 differential policy cases plus native/ASAN allocation suite pass. Independent source optimization, pinned upstream unchanged. Mixed-hint LLVM microbenchmark regressed; actual-emitter evaluation pending, no whole-bootstrap claim.
 
-Independent implementation optimization of the existing linear-scan decision policy: visit only admissible physical registers instead of materializing a complete limit vector inside the solver. Upstream hint and longest-availability choices are preserved. The complete-limit public API is unchanged. See validation/class-register-choice.
 
-## Scalar leaf register effects
+Exact ordered comparison choices copied from coil-stogir caa8275 (base33d6b59). Includes correctness-only active-reservation protection and verified-reader c89a0d5; excludes both rejected register-release retry policies. Exact comparison-input identities follow pinned ir_sccp.c MIN/MAX recognition. Generic graph retains COND; AArch64 chooses existing signed/unsigned CMP/CSEL recipes from comparison opcode, preserving canonical CIR word interpretation.1,219,680 original/selected nativeanswers in native and LLVM-ASAN runs pass, including literals, addressbits, sharedcomparisons and rooteddiamonds. No new full matching scan. Central LICENSE/NOTICE unchanged. No bootstrap performance claim.
 
-Independent closed instruction-effect analysis in a64/leaf-effects.coil, using existing encoder recipes and independent clang assembly validation. Unknown forms/control/metadata decline. This is not an ABI/private-binding certificate and does not relax caller clobbers. Sources and evidence: validation/leaf-register-effects. Original upstream credit remains in NOTICE.
 
-## Owned private leaf contexts
+Cheap guard ordering copied from coil-stogir e48c294: reject non-COND nodes before matcher flags/error equality, and reject nonordered/nonidentity choices before movability work. Pure predicates reordered;1,219,680 native answer regression passes. Initial f1b39ed6 compiler result was neutral/slower; this follow-up is measured separately.
 
-Independent a64/private-leaf.coil ownership and private-publication layer. It derives effects from closed emitted-byte analysis, retains the whole ordinary caller setup GP bank and preserves explicit private image bindings. It does not yet alter normal caller allocation. Central validation: validation/private-leaf-context. Original dstogov/ir credit and license remain in NOTICE.
 
-## Private leaf call allocation
+Class-only free register decisions copied from coil-stogir ab061ee. Independent implementation improvement preserving the existing pinned-upstream hint and longest-availability policy; only admissible candidate registers are visited in ascending order inside the solver. Complete-limit API and assignment/splitting machinery remain unchanged. 279,936 independent oracle cases, native/ASAN allocation and pressure checks pass. Microbenchmark benefit is not a whole-bootstrap claim. See validation/class-register-choice.
 
-Independent frozen private-call context and AArch64 clobber selection, with complete setup GP bank and full fallback for indirect/unknown/tail calls. Closed emitted-byte summaries drive target reservations without changing IR or linear-scan policy. The self-contained image entry binds calls to the owned private bytes before publishing. Whole-module Coil integration remains separate to preserve single body/function-address identity. Validation and qualified diagnostic timings: validation/private-call-allocation. Original dstogov/ir credit remains in NOTICE.
+## Private leaf module publication
 
-## Unused assigned prefix during eviction
+Imported AArch64 leaf effects, owned private contexts, private call reservations and
+module-bound caller generation from coil-stogir commit88ec58b (including72b3bff,
+638a30a andabc1e9f). Coil publishes candidate bodies once at their original local
+assembler symbols and verifies exact bytes and identity before finalization.
+Existing centralized LICENSE/NOTICE and upstream credit remain applicable.
+Validation notes live under docs/validation; whole-bootstrap benefit is unproven.
 
-Adapted the no-prior-use active-owner eviction rule from dstogov/ir ir_ra.c
-`ir_allocate_blocked_reg`, pinned92171d0a4a36b0acf707f2dea7998de615dd4acd.
-Spill the whole assigned child when it has no earlier operand use; preserve a
-used prefix. The independent indexed event/state implementations retain their
-existing contracts. Actual frontend replay and validation are centralized in
-validation/frontend-provider-transfers. Original license and credit remain in NOTICE.
+Follow-up address-taking correction: private untyped FUNC addresses preserve the
+module binding without granting reduced call effects; explicit ABI mismatches
+remain rejected. See the module-publication validation note.
 
-## Loop-aware active-owner splitting
+ABI-shape comparison preserves calling convention and aggregate/group geometry,
+while treating signed/unsigned 32- and 64-bit scalar spelling equivalently.
+The private module validation note records the actual emitter mismatch and121
+scalar signature checks.
 
-Adapted `ir_find_optimal_split_position` and its hole/block helpers from
-[dstogov/ir ir_ra.c at92171d0](https://github.com/dstogov/ir/blob/92171d0a4a36b0acf707f2dea7998de615dd4acd/ir_ra.c#L2595).
-The independent C oracle retains the exact pinned functions with position macros
-adapted to Coil's two-phase schedule. Native metadata reuses existing dominance
-and loop analyses; active eviction preserves past operands and legal stores.
-Free/reload split categories and complete irreducible classification remain open.
-Validation: validation/loop-aware-active-split. Original MIT credit is in NOTICE/LICENSE.
+## Unused assigned register prefix
+
+Imported coil-stogir fbfa8fa: the active-owner no-prior-use eviction rule from
+dstogov/ir ir_ra.c:ir_allocate_blocked_reg at pinned92171d0. Spill an unused
+assigned child from its start; preserve every earlier operand-use kind.
+Native/ASAN indexed-state and exact frontend-graph evidence is centralized in
+docs/validation/frontend-provider-transfers. Original LICENSE/NOTICE credit
+remains applicable. This is not the complete loop-aware split-position port.
+
+## Loop-entry-aware active eviction
+
+Imported coil-stogir5ab34a5, adapting pinned92171d0 ir_ra.c optimal split
+selection for active-owner eviction. Existing prepared dominators/loop depths
+provide immutable metadata; every past operand use remains before the cut.
+General odd reloads and free/restart categories are unchanged.19,880 exact C
+oracle answers, native pressure and real graph ASAN replay pass. Central
+validation: docs/validation/loop-aware-active-split. Original credit remains
+in LICENSE/NOTICE; no new per-file license headers.
 
 ## Iterative control cleanup boundary
 
-The affected-worklist fixed point follows the cleanup intent of
-[dstogov/ir ir_iter_opt and ir_iter_cleanup](https://github.com/dstogov/ir/blob/92171d0a4a36b0acf707f2dea7998de615dd4acd/ir_sccp.c#L4155).
-The Coil implementation independently retains explicit observation roots and
-checks reachability after each control-changing drain before memory replacement.
-Prune/boundary notifications are drained with control folding enabled; it does
-not repeat SCCP analysis. Real compiler graph regression: validation/boolean-operand-shape.
-Original source credit and MIT license remain centralized in NOTICE/LICENSE.
+Imported coil-stogir e594b30 (reproduction0051e46). The affected-worklist fixed
+point follows pinned dstogov/ir ir_iter_opt and ir_iter_cleanup:
+https://github.com/dstogov/ir/blob/92171d0a4a36b0acf707f2dea7998de615dd4acd/ir_sccp.c#L4155
+Coil independently retains explicit observations and checks reachability after
+each control-changing drain before memory replacement. Prune/boundary users are
+drained with control folding enabled, without repeating SCCP analysis.
+Real graph regression and native/ASAN validation: validation/boolean-operand-shape.
+Original credit and license remain centralized in NOTICE/LICENSE.
