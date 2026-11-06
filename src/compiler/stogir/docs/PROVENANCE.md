@@ -1694,3 +1694,6 @@ https://github.com/dstogov/ir/blob/92171d0a4a36b0acf707f2dea7998de615dd4acd/ir_f
 180 exact original C decisions, native/ASAN checks and real node constructor
 replay are retained in validation/contained-field-promotion and
 validation/bit-literal-identities. Existing original LICENSE/NOTICE credit remains.
+
+
+Complete existing-home resolution: coil-stogir3509fb3/4e068bc. Shared spill-home model follows pinned dstogov/ir assign_regs/needs_spill_reload (https://github.com/dstogov/ir/blob/92171d0a4a36b0acf707f2dea7998de615dd4acd/ir_ra.c); central LICENSE/NOTICE preserve original credit. Complete private-definition certificate removes contiguous and ordinary same-value CFG register-to-home stores; Phi transfers remain. Resolution owns certificate, emission borrows it through layout and edge lowering.432 native call/bypass/Phi answers, native/ASAN/real-graph checks and negative control pass. Earlier uniform/costed policies regressed; new runtime comparison remains pending. See docs/validation/spill-home-edges for scope/qualifications; full upstream phase/reload parity remains incomplete.
