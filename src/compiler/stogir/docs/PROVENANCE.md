@@ -1554,3 +1554,8 @@ Direct GP return ports also attach advisory allocation preferences through
 owners are resolved before hinting. The first existing preference wins for a
 shared value; no simultaneous hard x0/x1 constraints are imposed. Complete typed
 parallel return copies remain responsible for every result port and all cycles.
+
+Fixed-use constraint summary: coil-stogir3659161, constraints.coil and
+allocation.coil. Equivalent single-scan future fixed-use limits replace repeated
+per-register scans. Independent implementation optimization, no policy change;
+exact original-query oracle191232 cases, allocation and native pressure gates.
