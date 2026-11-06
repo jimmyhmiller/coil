@@ -66,9 +66,10 @@ def emit(name, host, backend):
     previous = next((r for r in report['rows'] if r['name'] == name), None)
     if previous:
         assert previous['compiler_sha256'] == sha(host) and previous['backend'] == backend
-        assert obj.is_file() and sha(obj) == previous['object_sha256']
+        completed_object = Path(previous['command'][-1])
+        assert completed_object.is_file() and sha(completed_object) == previous['object_sha256']
         print(name, 'reusing verified completed row', flush=True)
-        return obj
+        return completed_object
     command = ['/usr/bin/time', '-l', str(host), 'emit-obj', str(ROOT / 'src/compiler/main.coil'),
                '--backend', backend, '-O3', '--no-debug', '-o', str(obj)]
     before = snapshot()
