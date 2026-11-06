@@ -132,3 +132,7 @@ Structural verifier operand reads copied from coil-stogir78394b7, combined
 with shared comparison fusionf675d59. Full extent and signed reference domain
 are checked before direct operand storage reads. Validation and centralized
 provenance are in docs/validation/structure-proven-operands and docs/PROVENANCE.md.
+
+Integer verifier header operand reads copied from coil-stogir756b206.
+Successful structural validation proves current operand fields; referenced cells,
+types/widths/guards remain checked. See docs/validation/integer-operand-fields.

@@ -1588,3 +1588,8 @@ This independent implementation caches operand shape and reads signed operand
 words only after complete storage/extent/domain validation; reference membership,
 local/prototype and optional-reference checks remain. Validation includes255exact
 valid/malformed diagnostics and native/ASAN runs. See validation/structure-proven-operands.
+
+Integer verifier current-header operand reads copied from coil-stogir756b206.
+Independent implementation improvement using the existing successful structural
+validation precondition. Referenced-cell and all semantic checks remain. Exact
+92992-case diagnostic/native/ASAN evidence: validation/integer-operand-fields.
