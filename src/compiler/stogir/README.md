@@ -182,3 +182,6 @@ IF-entry edge moves and in-place return tails copied from coil-stogir 5766b5c (b
 
 
 Load/store pairing copied from coil-stogir ea4453e (base 5766b5c). After emission, adjacent same-base LDR or STR at consecutive scaled slots become LDP/STP plus NOP without moving any offset; labels, relocations, inline data and unsafe load aliasing keep both words. a64-pairing (new) passes; the full library suite passes except the pre-existing jit-parameter-specialize and private-leaf failures. Whole bootstrap reproduces the seed object.
+
+
+Owned SCCP, presized interner copies and SCCP-output image entries copied from coil-stogir c7d8a4a (base ea4453e). The adapter consumes its graph in optimize-memory-owned!, and emits definitions whose graphs are still SCCP output (clean templates, and callers whose inline expansion changed nothing) through the entries that skip the image's entry SCCP. jit-optimized-entry (new) passes; the full library suite passes except the pre-existing jit-parameter-specialize and private-leaf failures. Whole bootstrap reproduces the seed object.
