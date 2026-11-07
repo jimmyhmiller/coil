@@ -1315,6 +1315,10 @@ EOF
       "$COIL" run "$ROOT/tests/backend/cir-aggregate-ownership.coil" --backend llvm -O1 --no-debug --debug-checks --sanitize=address
     expect_rc 0 "CIR aggregate copy forwarding under ASAN" \
       "$COIL" run "$ROOT/tests/backend/cir-copy-forwarding.coil" --backend llvm -O1 --no-debug --debug-checks --sanitize=address
+    expect_rc 0 "scalar def reads fold to their initializer bytes (Stogir O3)" \
+      "$COIL" run "$ROOT/tests/backend/static-literal-reads.coil" --backend stogir -O3 --no-debug --debug-checks
+    expect_rc 0 "scalar def reads fold to their initializer bytes (TPDE)" \
+      "$COIL" run "$ROOT/tests/backend/static-literal-reads.coil" --backend tpde --no-debug --debug-checks
     expect_rc 0 "Stogir aggregate snapshots and zero-fill boundaries" \
       python3 "$ROOT/scripts/tests/stogir-runtime-bulk.py" "$COIL"
     expect_rc 0 "deferred Stogir graph ownership under ASAN" \

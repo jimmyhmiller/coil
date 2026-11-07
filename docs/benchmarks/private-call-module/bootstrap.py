@@ -20,6 +20,7 @@ p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--compiler', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--baseline', type=Path, help='optional previous compiler, same current source')
+p.add_argument('--stogir-only', action='store_true')
 p.add_argument('--resume', action='store_true', help='reuse verified completed rows from results.json')
 a = p.parse_args()
 compiler = a.compiler.resolve()
@@ -100,7 +101,7 @@ def emit(name, host, backend):
 hosts = {}
 libdir = subprocess.check_output(['llvm-config', '--libdir'], text=True).strip()
 archives = ROOT / 'build/bin/native/curl/arm64-macos'
-seeds = [('stogir', 'stogir', compiler), ('llvm', 'llvm', compiler)]
+seeds = [('stogir', 'stogir', compiler)] + ([] if a.stogir_only else [('llvm', 'llvm', compiler)])
 if a.baseline:
     seeds.append(('baseline', 'stogir', a.baseline.resolve()))
 for label, backend, seed in seeds:
