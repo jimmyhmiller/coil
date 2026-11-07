@@ -164,3 +164,6 @@ Cheap guard ordering copied from coil-stogir e48c294: reject non-COND nodes befo
 
 
 Phi-entry spill-home correction copied from coil-stogir 32c1770 (base 4e068bc). A Phi certifies its parent's home only when its block-entry location, where Phi transfers and literals write, is that home. Fixes a miscompile of `stogir.verify.integer-operations-target-structured` in the Stogir-built compiler (a831fb94 host failed `missing integer operand`). Real-graph property replay, native/ASAN suites and exact whole-bootstrap object reproduction pass. See coil-stogir docs/validation/phi-home-entry.
+
+
+Short-trip vector guards copied from coil-stogir fc1efb6 and result-only narrow normalization from 7075173 (base 32c1770). A vector prefix tests its trip count before evaluating its memory-range checks; AND/OR/XOR/ADD/SUB/MUL/NOT/NEG on 8/16-bit values extend only their result. Loop-guard/vectorize native, AOT and ASAN suites and narrow/bitwise/truth native and AOT suites pass. Whole bootstrap reproduces the seed object; runtime effect within noise.
