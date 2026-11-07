@@ -188,3 +188,6 @@ Owned SCCP, presized interner copies and SCCP-output image entries copied from c
 
 
 Vectorizer preparation reuse copied from coil-stogir dee6e58 (base c7d8a4a). When vectorization makes no edit, code generation reuses its CFG/schedule preparation after the complete native-input verification. Emitted objects are unchanged; the full library suite passes except the pre-existing jit-parameter-specialize and private-leaf failures. Whole bootstrap reproduces the seed object.
+
+
+Bulk array initialization copied from coil-stogir 342ffb7 (base dee6e58). fill/append! replaces 25 one-element-at-a-time initialization loops. Emitted objects are unchanged; the full library suite passes except the pre-existing jit-parameter-specialize and private-leaf failures. Whole bootstrap reproduces the seed object.
