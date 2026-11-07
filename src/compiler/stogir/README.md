@@ -185,3 +185,6 @@ Load/store pairing copied from coil-stogir ea4453e (base 5766b5c). After emissio
 
 
 Owned SCCP, presized interner copies and SCCP-output image entries copied from coil-stogir c7d8a4a (base ea4453e). The adapter consumes its graph in optimize-memory-owned!, and emits definitions whose graphs are still SCCP output (clean templates, and callers whose inline expansion changed nothing) through the entries that skip the image's entry SCCP. jit-optimized-entry (new) passes; the full library suite passes except the pre-existing jit-parameter-specialize and private-leaf failures. Whole bootstrap reproduces the seed object.
+
+
+Vectorizer preparation reuse copied from coil-stogir dee6e58 (base c7d8a4a). When vectorization makes no edit, code generation reuses its CFG/schedule preparation after the complete native-input verification. Emitted objects are unchanged; the full library suite passes except the pre-existing jit-parameter-specialize and private-leaf failures. Whole bootstrap reproduces the seed object.
