@@ -170,3 +170,6 @@ Short-trip vector guards copied from coil-stogir fc1efb6 and result-only narrow 
 
 
 Callee-saved atomic results copied from coil-stogir 03d2b10: the A64 atomic emitter accepts any allocatable GPR result (previously only x0-x15), fixing a compile failure for atomics whose value lives across a call. jit-atomic-across-call (new), jit-atomics, atomics and linked aot-atomics pass.
+
+
+Boolean view folds, zero-test branches and paired frame saves copied from coil-stogir 3860588 (base 03d2b10). EQ/NE of integer Boolean views (COND of 0/1 literals, and PHIs of them) fold back to BOOL predicates; IF/COND conditions are canonicalized through NOT and BOOL zero tests, and dominating-predicate checks compare truth normal forms. A64 IFs testing CMP Rn,#0 with EQ/NE emit CBZ/CBNZ, and FP/LR plus adjacent callee-saved GPRs are saved with STP/LDP. jit-boolean-folds (new), fixups, a64-encode and frame-memory pass; the full library suite passes except the pre-existing jit-parameter-specialize and private-leaf failures. Whole bootstrap reproduces the seed object.
