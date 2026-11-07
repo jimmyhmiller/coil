@@ -1,0 +1,366 @@
+;;; Reads through declared BUILTIN-MOVE calls into private stack objects. This is
+;;; a Coil extension in the spirit of LLVM's memcpy forwarding: it has no pinned
+;;; upstream counterpart. A load of a move's destination reads the move's source
+;;; instead, and a move into a private object that is no longer read is removed.
+(module stogir.copy-forward)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.types" :as types)
+(import "stogir.symbols" :as symbols)
+(import "stogir.strings" :as strings)
+(import "stogir.calls" :as calls)
+(import "stogir.call-groups" :as groups)
+(import "stogir.call-effects" :as effects)
+(import "stogir.address-alias" :as alias)
+(import "stogir.uses" :as uses)
+(import "stogir.mem2ssa" :as mem)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+(defstruct Move [(destination i32) (source i32) (size i64)])
+
+;;; A CALL whose attached prototype declares BUILTIN-MOVE with a constant count.
+(defn move [(graph g/Graph) (reference i32)] (-> (Option Move))
+  (if (<= reference 0)
+      (None)
+      (let [node (get (.instructions graph) (cast i64 reference))]
+        (if (or (!= (n/opcode node) 79)
+                (!= (get (.arities graph) (cast i64 reference)) 5))
+            (None)
+            (match (calls/signature graph (.op2 node) (n/type-id node) 3)
+              (Err [_] (None))
+              (Ok [signature]
+                  (if (= (.id signature) 0)
+                      (None)
+                      (match (strings/lookup (.strings graph) (.id signature))
+                        (None [] (None))
+                        (Some [bytes]
+                              (if (!= (groups/builtin bytes) groups/BUILTIN-MOVE)
+                                  (None)
+                                  (match (g/operand graph reference 5)
+                                    (None [] (None))
+                                    (Some [count]
+                                          (match (g/lookup graph count)
+                                            (None [] (None))
+                                            (Some [value]
+                                                  (if (or (>= count 0)
+                                                          (not (symbols/numeric? value))
+                                                          (not (types/integer? (cast i32 (n/type-id value))))
+                                                          (> (n/constant-bits value) 0x40000000))
+                                                      (None)
+                                                      (Some (Move
+                                                              :destination
+                                                                (match (g/operand graph reference 3)
+                                                                  (Some [d] d) (None [] 0))
+                                                              :source
+                                                                (match (g/operand graph reference 4)
+                                                                  (Some [s] s) (None [] 0))
+                                                              :size (cast i64 (n/constant-bits value)))))))))))))))))))
+
+;;; Raw stack-pointer, register, varargs, snapshot and inline-assembly operations
+;;; can observe or form stack addresses outside the def-use graph.
+(defn stack-opaque? [(graph g/Graph)] (-> bool)
+  (let [(mut opaque) false
+        (mut r) (: 1 i64)]
+    (while (and (not opaque) (< r (len (.instructions graph))))
+      (let [opcode (n/opcode (get (.instructions graph) r))]
+        (when (or (= opcode 65) (= opcode 66) (= opcode 89) (= opcode 90)
+                  (and (>= opcode 97) (<= opcode 103))
+                  (and (>= opcode 122) (<= opcode 125)))
+          (set! opaque true))
+        (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4)))))
+    opaque))
+
+;;; owners[r] is the static ALLOCA whose address r derives from, or zero.
+;;; escaped[alloca] is set when any derived address leaves the graph's view:
+;;; stored as a value, passed to a call other than as a move operand, merged by
+;;; a PHI, or observed as a root. readers[alloca] counts derived LOAD addresses
+;;; and move sources.
+(defstruct Objects [(owners (ArrayList i32))
+                    (escaped (ArrayList i32))
+                    (readers (ArrayList i32))])
+
+(defn pointer-type? [(ty u8)] (-> bool)
+  (or (= ty 6) (= ty 5) (= ty 11)))
+
+(defn classify! [(graph g/Graph)
+                 (edges uses/Uses)
+                 (objects (mut Objects))
+                 (owner i32)
+                 (moves (ArrayList i32))
+                 (a (dyn Allocator))] (-> void)
+  (let [(mut work) (ArrayList::new [i32] a)
+        (mut cursor) (: 0 i64)
+        (mut escaped) false
+        (mut readers) (: 0 i32)]
+    (push! (mut work) owner)
+    (set! (mut (.owners objects)) (cast i64 owner) owner)
+    (while (and (not escaped) (< cursor (len work)))
+      (let [pointer (get work cursor)
+            range (get (.ranges edges) (cast i64 pointer))]
+        (for [i (.offset range) (+ (.offset range) (.count range))]
+          (let [edge (get (.edges edges) i)
+                user (.user edge)
+                node (get (.instructions graph) (cast i64 user))
+                opcode (cast i32 (n/opcode node))]
+            (cond (and (= pointer owner)
+                       (= (.operand edge) 1)
+                       (op/control? opcode))
+                    0
+                  (and (= opcode 91) (= (.operand edge) 2))
+                    (set! readers (+ readers 1))
+                  (and (= opcode 93) (= (.operand edge) 2))
+                    0
+                  (and (= opcode 79)
+                       (or (= (.operand edge) 3) (= (.operand edge) 4))
+                       (> (get moves (cast i64 user)) 0)
+                       (match (g/operand graph user (if (= (.operand edge) 3) 4 3))
+                         (None [] false)
+                         (Some [other] (!= other pointer))))
+                    (when (= (.operand edge) 4) (set! readers (+ readers 1)))
+                  (and (or (= opcode 26) (= opcode 27) (= opcode 36) (= opcode 68))
+                       (= (.operand edge) 1)
+                       (pointer-type? (n/type-id node)))
+                    (when (= (get (.owners objects) (cast i64 user)) 0)
+                      (set! (mut (.owners objects)) (cast i64 user) owner)
+                      (push! (mut work) user))
+                  (and (= opcode 26)
+                       (= (.operand edge) 2)
+                       (pointer-type? (n/type-id node)))
+                    (when (= (get (.owners objects) (cast i64 user)) 0)
+                      (set! (mut (.owners objects)) (cast i64 user) owner)
+                      (push! (mut work) user))
+                  :else (set! escaped true))))
+        (set! cursor (+ cursor 1))))
+    (set! (mut (.escaped objects)) (cast i64 owner) (if escaped 1 0))
+    (set! (mut (.readers objects)) (cast i64 owner) readers)
+    (free! (mut work))))
+
+(defn owner [(objects Objects) (reference i32)] (-> i32)
+  (if (or (<= reference 0) (>= (cast i64 reference) (len (.owners objects))))
+      0
+      (get (.owners objects) (cast i64 reference))))
+
+(defn private? [(objects Objects) (object i32)] (-> bool)
+  (and (> object 0) (= (get (.escaped objects) (cast i64 object)) 0)))
+
+;;; Two accesses are disjoint when they share a decomposed origin with
+;;; non-overlapping offsets, or when one is inside a private object the other
+;;; does not derive from. A private object's address is known only through its
+;;; own derived values, so no other pointer can reach it.
+(defn separate? [(graph g/Graph) (objects Objects)
+                 (left alias/Address) (left-width i64)
+                 (right alias/Address) (right-width i64)] (-> bool)
+  (or (alias/disjoint? graph left right left-width right-width 8)
+      (let [l (owner objects (.base left))
+            r (owner objects (.base right))]
+        (and (!= l r) (or (private? objects l) (private? objects r))))))
+
+;;; Walk the memory chain back from a read of [address, address+width). Only
+;;; plain control, loads, allocations, memory-preserving calls, and stores or
+;;; moves separate from the read are crossed. Joins and loops stop the walk.
+;;; Returns the move whose destination contains the read, or zero.
+(defn defining-move [(graph g/Graph) (objects Objects) (moves (ArrayList i32))
+                     (start i32) (address alias/Address) (width i64)] (-> i32)
+  (let [(mut cursor) start
+        (mut steps) 0
+        (mut found) (: 0 i32)]
+    (while (and (> cursor 0) (< steps 64) (= found 0))
+      (let [prior (get (.instructions graph) (cast i64 cursor))
+            opcode (cast i32 (n/opcode prior))
+            next (.op1 prior)]
+        (cond (or (= opcode 91) (= opcode 81)
+                  (= opcode 107) (= opcode 108) (= opcode 109) (= opcode 110)
+                  (= opcode 111) (= opcode 114) (= opcode 116) (= opcode 117)
+                  (and (= opcode 106) (= (.op2 prior) 0)))
+                (set! cursor next)
+              (= opcode 93)
+                (let [value (match (g/lookup graph (.op3 prior))
+                              (Some [v] v) (None [] (n/make 0 0 0 0 0 0)))
+                      size (cast i64 (types/size (cast i32 (n/type-id value)) 8))]
+                  (if (and (> size 0)
+                           (separate? graph objects address width
+                                      (alias/decompose graph (.op2 prior) 8) size))
+                      (set! cursor next)
+                      (set! cursor 0)))
+              (and (= opcode 79) (> (get moves (cast i64 cursor)) 0))
+                (match (move graph cursor)
+                  (None [] (set! cursor 0))
+                  (Some [m]
+                        (let [target (alias/decompose graph (.destination m) 8)]
+                          (if (and (alias/same-origin? target address)
+                                   (>= (.offset address) (.offset target))
+                                   (<= (+ (.offset address) width)
+                                       (+ (.offset target) (.size m))))
+                              (set! found cursor)
+                              (if (separate? graph objects address width target (.size m))
+                                  (set! cursor next)
+                                  (set! cursor 0))))))
+              (and (= opcode 79) (effects/preserves-memory? graph cursor))
+                (set! cursor next)
+              :else (set! cursor 0)))
+      (set! steps (+ steps 1)))
+    found))
+
+;;; Every memory operation crossed between the move and the rewritten read must
+;;; also leave the source bytes unchanged, so the walk is repeated for them.
+(defn source-preserved? [(graph g/Graph) (objects Objects) (moves (ArrayList i32))
+                         (start i32) (stop i32) (address alias/Address) (width i64)]
+  (-> bool)
+  (let [(mut cursor) start
+        (mut good) true]
+    (while (and good (!= cursor stop))
+      (if (<= cursor 0)
+          (set! good false)
+          (let [prior (get (.instructions graph) (cast i64 cursor))
+                opcode (cast i32 (n/opcode prior))]
+            (cond (= opcode 93)
+                    (let [value (match (g/lookup graph (.op3 prior))
+                                  (Some [v] v) (None [] (n/make 0 0 0 0 0 0)))
+                          size (cast i64 (types/size (cast i32 (n/type-id value)) 8))]
+                      (unless (and (> size 0)
+                                   (separate? graph objects address width
+                                              (alias/decompose graph (.op2 prior) 8) size))
+                        (set! good false)))
+                  (and (= opcode 79) (> (get moves (cast i64 cursor)) 0))
+                    (match (move graph cursor)
+                      (None [] (set! good false))
+                      (Some [m]
+                            (unless (separate? graph objects address width
+                                               (alias/decompose graph (.destination m) 8)
+                                               (.size m))
+                              (set! good false))))
+                  :else 0)
+            (set! cursor (.op1 prior)))))
+    good))
+
+(defn address! [(graph (mut g/Graph)) (base i32) (delta i64)] (-> i32)
+  (if (= delta 0)
+      base
+      (match (g/intern-constant! (mut graph) 5 5 0 (cast u64 delta))
+        (None [] (panic "copy forwarding offset constant exhausted"))
+        (Some [constant]
+              (match (g/append-inputs! (mut graph) 26 6 [base constant])
+                (None [] (panic "copy forwarding address exhausted"))
+                (Some [r] r))))))
+
+(defn for-any? [(values (slice i32)) (value i32)] (-> bool)
+  (let [(mut found) false]
+    (for v values (when (= v value) (set! found true)))
+    found))
+
+;;; Requires a structurally verified 64-bit-target graph. Mutates the owned graph
+;;; in place, keeping every existing reference; roots are never removed.
+(defn run! [(graph (mut g/Graph))
+            (roots (slice i32))
+            (a (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [size (len (.instructions graph))
+        (mut moves) (mem/zeros size a)
+        (mut count) (: 0 i32)
+        (mut r) (: 1 i64)]
+    (while (< r size)
+      (when (= (n/opcode (get (.instructions graph) r)) 79)
+        (match (move graph (cast i32 r))
+          (None [] 0)
+          (Some [_] (set! (mut moves) r 1) (set! count (+ count 1)))))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    (if (or (= count 0) (stack-opaque? graph))
+        (do (free! (mut moves)) (Ok 0))
+        (let [(mut edges) (uses/build graph a)
+              (mut objects) (Objects :owners (mem/zeros size a)
+                                     :escaped (mem/zeros size a)
+                                     :readers (mem/zeros size a))
+              (mut changes) (: 0 i32)]
+          (set! r 1)
+          (while (< r size)
+            (let [node (get (.instructions graph) r)]
+              (when (and (= (n/opcode node) 81) (< (.op2 node) 0))
+                (classify! graph edges (mut objects) (cast i32 r) moves a)))
+            (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+          (for root roots
+            (let [object (owner objects root)]
+              (when (> object 0) (set! (mut (.escaped objects)) (cast i64 object) 1))))
+          ; Redirect reads of a private move destination to the move source.
+          (set! r 1)
+          (while (< r size)
+            (let [node (get (.instructions graph) r)
+                  opcode (n/opcode node)
+                  reference (cast i32 r)
+                  read (cond (= opcode 91) (.op2 node)
+                             (> (get moves r) 0)
+                               (match (g/operand graph reference 4) (Some [s] s) (None [] 0))
+                             :else 0)
+                  width (cond (= opcode 91)
+                                (cast i64 (types/size (cast i32 (n/type-id node)) 8))
+                              (> (get moves r) 0)
+                                (match (move graph reference) (Some [m] (.size m)) (None [] 0))
+                              :else 0)]
+              (when (and (> width 0) (!= read 0))
+                (let [address (alias/decompose graph read 8)
+                      object (owner objects (.base address))]
+                  (when (and (private? objects object) (= (.index address) 0))
+                    (let [defining (defining-move graph objects moves (.op1 node) address width)]
+                      (when (> defining 0)
+                        (match (move graph defining)
+                          (None [] 0)
+                          (Some [m]
+                                (let [target (alias/decompose graph (.destination m) 8)
+                                      source (alias/decompose graph (.source m) 8)
+                                      delta (- (.offset address) (.offset target))]
+                                  ; The move must not have overwritten its own source,
+                                  ; and the read must see the source bytes unchanged.
+                                  (when (and (separate? graph objects target (.size m) source (.size m))
+                                             (source-preserved? graph objects moves (.op1 node) defining
+                                                                (alias/Address :base (.base source)
+                                                                               :index (.index source)
+                                                                               :offset (+ (.offset source) delta))
+                                                                width))
+                                    (let [replacement (address! (mut graph) (.source m) delta)]
+                                      (unless (g/set-operand! (mut graph) reference
+                                                              (if (= opcode 91) 2 4) replacement)
+                                        (panic "copy forwarding address rewrite failed"))
+                                      (set! (mut (.readers objects)) (cast i64 object)
+                                            (- (get (.readers objects) (cast i64 object)) 1))
+                                      (set! changes (+ changes 1)))))))))))))
+            (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+          ; A move into a private object with no remaining reader is dead when its
+          ; result is unused: bypass its single control successor.
+          (uses/release! (mut edges))
+          (when (> changes 0)
+            (set! edges (uses/build graph a))
+            (set! r 1)
+            (while (< r size)
+              (when (> (get moves r) 0)
+                (match (move graph (cast i32 r))
+                  (None [] 0)
+                  (Some [m]
+                        (let [object (owner objects (.base (alias/decompose graph (.destination m) 8)))
+                              range (get (.ranges edges) r)
+                              node (get (.instructions graph) r)]
+                          (when (and (private? objects object)
+                                     (= (get (.readers objects) (cast i64 object)) 0)
+                                     (= (.count range) 1))
+                            (let [successor-use (get (.edges edges) (.offset range))
+                                  successor (.user successor-use)
+                                  previous (.op1 node)
+                                  successor-opcode (cast i32 (n/opcode (get (.instructions graph)
+                                                                            (cast i64 successor))))]
+                              (when (and (= (.operand successor-use) 1)
+                                         (op/control? successor-opcode)
+                                         (= (op/operand-code successor-opcode 1) op/OPERAND-SRC)
+                                         (not (for-any? roots (cast i32 r))))
+                                (unless (g/set-operand! (mut graph) successor 1 previous)
+                                  (panic "dead move control bypass failed"))
+                                (unless (g/make-nop! (mut graph) (cast i32 r))
+                                  (panic "dead move removal failed"))
+                                (set! changes (+ changes 1)))))))))
+              (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+            (uses/release! (mut edges)))
+          (free! (mut (.owners objects)))
+          (free! (mut (.escaped objects)))
+          (free! (mut (.readers objects)))
+          (free! (mut moves))
+          (Ok changes)))))
