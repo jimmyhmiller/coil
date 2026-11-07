@@ -1,0 +1,392 @@
+;;; Bottom-up inlining of small CIR functions into their direct callers.
+;;;
+;;; CIR keeps aggregates in memory (sret slots, by-reference arguments,
+;;; indirect copies), so a callee of any argument or result shape is cloned the
+;;; same way: its arguments become the call's operands, its slots new slots of
+;;; the caller, its RETs branches to the code after the call, and its results
+;;; PHIs there. Callees are processed before callers (call-graph SCCs in
+;;; reverse topological order) and recursive SCCs are never inlined into
+;;; themselves. Callees with tail calls, dynamic allocas, inline machine code
+;;; or shim calls stay calls.
+(module tpde.cir-inline)
+(import "tpde.cir" :as cir)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+
+(defn none [] (-> u32) (cir/none))
+
+(defn opcode [(f (ptr cir/Func)) (v u32)] (-> i64)
+  (cast i64 (.op (cir/val f v))))
+
+;;; Policy: a callee of at most SMALL instructions is inlined; a caller grows
+;;; by at most twice its own size plus SLACK instructions.
+(const SMALL 30)
+(const SLACK 256)
+
+(defn cloneable? [(g (ptr cir/Func))] (-> bool)
+  (let [(mut ok) (not (or (.has-tail-calls g) (.has-dynamic-alloca g)))]
+    (for v (.insts g)
+      (let [op (opcode g v)]
+        (when (or (= op cir/OP-TAILCALL) (= op cir/OP-MACHINE) (= op cir/OP-SHIMCALL)
+                  (= op cir/OP-DYNALLOCA))
+          (set! ok false))))
+    (and ok (> (cir/block-count g) 0))))
+
+;;; Number of values one RET of g returns, or -1 when its RETs disagree.
+(defn returned [(g (ptr cir/Func))] (-> i64)
+  (let [(mut n) (: -2 i64)]
+    (for v (.insts g)
+      (when (= (opcode g v) cir/OP-RET)
+        (let [k (cir/i64-of (.nops (cir/val g v)))]
+          (cond (= n -2) (set! n k)
+                (!= n k) (set! n -1)
+                :else 0))))
+    (if (= n -2) 0 n)))
+
+(defn successor-count [(f (ptr cir/Func)) (b u32)] (-> u32)
+  (let [term (.term (cir/blk f b))]
+    (if (= term (none)) (: 0 u32)
+        (let [x (cir/val f term)] (- (.ntotal x) (.nops x))))))
+
+(defn successor [(f (ptr cir/Func)) (b u32) (i u32)] (-> u32)
+  (let [x (cir/val f (.term (cir/blk f b)))]
+    (cir/operand f x (+ (.nops x) i))))
+
+;;; A fresh caller value copying g's value v (operands filled later).
+(defn clone-value! [(f (ptr cir/Func)) (g (ptr cir/Func)) (v u32)] (-> u32)
+  (let [x (load (cir/val g v))
+        op (cast i64 (.op x))]
+    (if (= op cir/OP-ALLOCA)
+        (cir/alloca! f (.imm x) (.imm2 x))
+        (let [n (cir/push-value! f op (cast i64 (.ty x)) (.imm x) (.imm2 x))
+              y (cir/val f n)]
+          (set! (.flags y) (& (.flags x) (: 0xD7 u8)))
+          (set! (.aux y) (.aux x))
+          n))))
+
+;;; Inline call c (at insts position `at`, in block b) of callee g. Records the
+;;; values standing for c's results in `replace`.
+(defn inline-site! [(f (ptr cir/Func)) (c u32) (at i64) (b u32) (g (ptr cir/Func))
+                    (replace (mut (ArrayList u32)))] (-> void)
+  (let [a (malloc-allocator)
+        gv (len (.values g))
+        (mut map) (ArrayList::new [u32] a)
+        (mut member) (ArrayList::new [bool] a)
+        base (cir/block-count f)
+        nb (cir/block-count g)
+        call (load (cir/val f c))
+        (mut rets) (ArrayList::new [u32] a)]
+    (for _ (range 0 gv) (push! (mut map) (none)))
+    (for _ (range 0 gv) (push! (mut member) false))
+    (for v (.insts g) (set! (mut member) (cir/i64-of v) true))
+    (for v (.phis g) (set! (mut member) (cir/i64-of v) true))
+    ; arguments are the call's operands
+    (for k (range 0 (len (.args g)))
+      (set! (mut map) (cir/i64-of (get (.args g) k))
+            (cir/operand f (cir/val f c) (cir/u32-of k))))
+    ; blocks: g's, then the continuation
+    (for _ (range 0 (cir/i64-of nb)) (cir/new-block! f))
+    (let [cont (cir/new-block! f)]
+      (for v (range 0 gv)
+        (let [x (load (cir/val g (cir/u32-of v)))
+              op (cast i64 (.op x))]
+          (when (and (= (get (.fwd g) v) (none))
+                     (= (get map v) (none))
+                     (or (= op cir/OP-CONST) (= op cir/OP-SYM) (= op cir/OP-ALLOCA)
+                         ; results of calls inlined into g are orphans
+                         (and (= op cir/OP-CALLRES) (< (cir/i64-of (.block x)) gv)
+                              (get member (cir/i64-of (.block x))))
+                         (get member v)))
+            (if (= op cir/OP-RET)
+                (let [br (cir/push-value! f cir/OP-BR cir/T-VOID 0 0)]
+                  (set! (mut map) v br)
+                  (push! (mut rets) (cir/u32-of v)))
+                (set! (mut map) v (clone-value! f g (cir/u32-of v)))))))
+      ; operands, block operands, case values, CALLRES owners, PHI blocks
+      (for v (range 0 gv)
+        (let [n (get map v)
+              x (load (cir/val g (cir/u32-of v)))
+              op (cast i64 (.op x))]
+          (when (and (!= n (none)) (!= (cast i64 (.op (cir/val f n))) cir/OP-ARG)
+                     (or (get member v) (= op cir/OP-CALLRES)))
+            (cond (= op cir/OP-RET)
+                    (let [begin (cir/u32-of (len (.operands f)))]
+                      (set! (.opb (cir/val f n)) begin)
+                      (cir/push-operand! f cont (: 0 u32))
+                      (cir/set-ops! f n (: 0 u32) (: 1 u32)))
+                  (= op cir/OP-CALLRES)
+                    (do
+                      (when (or (= (.block x) (none)) (>= (cir/i64-of (.block x)) gv)
+                                (= (get map (cir/i64-of (.block x))) (none)))
+                        (panic "CIR inlining: call result without its call in {}" (.name g)))
+                      (set! (.block (cir/val f n)) (get map (cir/i64-of (.block x)))))
+                  :else
+                    (let [begin (cir/u32-of (len (.operands f)))]
+                      (for k (range 0 (cir/i64-of (.ntotal x)))
+                        (let [o (cir/operand g (cir/val g (cir/u32-of v)) (cir/u32-of k))
+                              flags (get (.argflags g) (cir/i64-of (+ (.opb x) (cir/u32-of k))))]
+                          (if (< k (cir/i64-of (.nops x)))
+                              (let [mapped (get map (cir/i64-of o))]
+                                (when (= mapped (none))
+                                  (panic "CIR inlining: callee operand has no clone"))
+                                (cir/push-operand! f mapped flags))
+                              (cir/push-operand! f (+ base o) flags))))
+                      (set! (.opb (cir/val f n)) begin)
+                      (cir/set-ops! f n (.nops x) (.ntotal x))
+                      (when (= op cir/OP-PHI)
+                        (set! (.block (cir/val f n)) (+ base (.block x)))
+                        (set! (.next (cir/val f n)) (none)))
+                      (when (= op cir/OP-SWITCH)
+                        (let [first (len (.case-values f))]
+                          (for k (range 0 (- (cir/i64-of (.ntotal x)) 2))
+                            (push! (mut (.case-values f))
+                                   (get (.case-values g) (+ (.imm x) k))))
+                          (set! (.imm (cir/val f n)) first))))))))
+      ; cloned blocks: instructions, PHIs, terminators, edges
+      (for gb (range 0 (cir/i64-of nb))
+        (let [src (load (cir/blk g (cir/u32-of gb)))
+              dst (+ base (cir/u32-of gb))
+              begin (cir/u32-of (len (.insts f)))
+              phi-begin (cir/u32-of (len (.phis f)))]
+          (for j (range (cir/i64-of (.ibegin src)) (cir/i64-of (.iend src)))
+            (let [v (get map (cir/i64-of (get (.insts g) j)))]
+              (when (= v (none)) (panic "CIR inlining: unmapped instruction in {}" (.name g)))
+              (push! (mut (.insts f)) v)))
+          (for j (range (cir/i64-of (.phi-begin src)) (cir/i64-of (+ (.phi-begin src) (.phi-count src))))
+            (push! (mut (.phis f)) (get map (cir/i64-of (get (.phis g) j)))))
+          (let [bb (cir/blk f dst)]
+            (set! (.ibegin bb) begin)
+            (set! (.iend bb) (cir/u32-of (len (.insts f))))
+            (set! (.phi-begin bb) phi-begin)
+            (set! (.phi-count bb) (.phi-count src))
+            (set! (.sealed bb) true)
+            (set! (.term bb) (if (= (.term src) (none)) (none) (get map (cir/i64-of (.term src))))))))
+      (for gb (range 0 (cir/i64-of nb))
+        (let [dst (+ base (cir/u32-of gb))]
+          (for i (range 0 (cir/i64-of (successor-count f dst)))
+            (cir/add-edge! f dst (successor f dst (cir/u32-of i))))))
+      ; split b at the call: the call's slot becomes a branch into g's entry
+      (let [bb (load (cir/blk f b))
+            enter (cir/push-value! f cir/OP-BR cir/T-VOID 0 0)]
+        (cir/push-operand! f base (: 0 u32))
+        (cir/set-ops! f enter (: 0 u32) (: 1 u32))
+        (set! (mut (.insts f)) at enter)
+        (let [cb (cir/blk f cont)]
+          (set! (.ibegin cb) (cir/u32-of (+ at 1)))
+          (set! (.iend cb) (.iend bb))
+          (set! (.term cb) (.term bb))
+          (set! (.sealed cb) true)
+          (set! (.phi-begin cb) (cir/u32-of (len (.phis f))))
+          (set! (.phi-count cb) (: 0 u32)))
+        (let [fb (cir/blk f b)]
+          (set! (.iend fb) (cir/u32-of (+ at 1)))
+          (set! (.term fb) enter))
+        ; b's old successors now come from the continuation
+        (for i (range 0 (cir/i64-of (successor-count f cont)))
+          (let [s (successor f cont (cir/u32-of i))]
+            (let [(mut e) (.pred-first (cir/blk f s))]
+              (while (!= e (none))
+                (let [edge (get (.edges f) (cir/i64-of e))]
+                  (when (= (.from edge) b)
+                    (set! (.from (elem (mut (.edges f)) (cir/i64-of e))) cont))
+                  (set! e (.next edge)))))
+            (let [sb (load (cir/blk f s))]
+              (for j (range (cir/i64-of (.phi-begin sb)) (cir/i64-of (+ (.phi-begin sb) (.phi-count sb))))
+                (let [p (get (.phis f) j)
+                      x (load (cir/val f p))]
+                  (for k (range 0 (cir/i64-of (.nops x)))
+                    (let [at (+ (cir/i64-of (.opb x)) (cir/i64-of (.nops x)) k)]
+                      (when (= (get (.operands f) at) b)
+                        (set! (mut (.operands f)) at cont)))))))))
+        (cir/add-edge! f b base))
+      ; RET blocks branch to the continuation; results meet in PHIs there
+      (let [results (cir/i64-of (cast u32 (.aux call)))
+            preds (.npred (cir/blk f cont))]
+        (for i (range 0 results)
+          (let [old (+ c (cir/u32-of i))
+                ty (cast i64 (.ty (cir/val f old)))
+                value
+                  (cond (= preds (: 0 u32)) (cir/undef! f ty)
+                        (= preds (: 1 u32))
+                          (let [edge (get (.edges f) (cir/i64-of (.pred-first (cir/blk f cont))))]
+                            (returned-value f g map base (.from edge) i))
+                        :else
+                          (let [phi (cir/push-value! f cir/OP-PHI ty 0 0)
+                                begin (cir/u32-of (len (.operands f)))]
+                            (let [(mut e) (.pred-first (cir/blk f cont))]
+                              (while (!= e (none))
+                                (let [edge (get (.edges f) (cir/i64-of e))]
+                                  (cir/push-operand! f (returned-value f g map base (.from edge) i) (: 0 u32))
+                                  (set! e (.next edge)))))
+                            (let [(mut e) (.pred-first (cir/blk f cont))]
+                              (while (!= e (none))
+                                (let [edge (get (.edges f) (cir/i64-of e))]
+                                  (cir/push-operand! f (.from edge) (: 0 u32))
+                                  (set! e (.next edge)))))
+                            (set! (.opb (cir/val f phi)) begin)
+                            (cir/set-ops! f phi preds (* (: 2 u32) preds))
+                            (set! (.block (cir/val f phi)) cont)
+                            (push! (mut (.phis f)) phi)
+                            (let [cb (cir/blk f cont)]
+                              (set! (.phi-count cb) (+ (.phi-count cb) (: 1 u32))))
+                            phi))]
+            (set! (mut replace) (cir/i64-of old) value))))
+      (when (.has-calls g) (set! (.has-calls f) true))
+      (when (.frame-escapes g) (set! (.frame-escapes f) true)))
+    (free! (mut map)) (free! (mut member)) (free! (mut rets))))
+
+;;; Result i as returned by the RET that ended g's block (pred - base).
+(defn returned-value [(f (ptr cir/Func)) (g (ptr cir/Func)) (map (ArrayList u32))
+                      (base u32) (pred u32) (i i64)] (-> u32)
+  (let [gb (- pred base)
+        r (.term (cir/blk g gb))]
+    (get map (cir/i64-of (cir/operand g (cir/val g r) (cir/u32-of i))))))
+
+(defn block-of [(f (ptr cir/Func)) (at i64)] (-> u32)
+  (let [(mut found) (none)]
+    (for b (range 0 (cir/i64-of (cir/block-count f)))
+      (let [bb (cir/blk f (cir/u32-of b))]
+        (when (and (<= (cir/i64-of (.ibegin bb)) at) (< at (cir/i64-of (.iend bb))))
+          (set! found (cir/u32-of b)))))
+    found))
+
+;;; Whether call c of f may be replaced by g's body.
+(defn site-ok? [(f (ptr cir/Func)) (c u32) (g (ptr cir/Func))] (-> bool)
+  (let [x (load (cir/val f c))
+        results (returned g)]
+    (and (= (cast i64 (.op x)) cir/OP-CALL)
+         (>= (.imm x) 0)
+         (= (cir/i64-of (.nops x)) (len (.args g)))
+         (>= results 0)
+         (= results (cir/i64-of (cast u32 (.aux x)))))))
+
+;;; Inline the eligible direct calls of funcs[i]. `index` maps a symbol to its
+;;; function, `component` each function to its call-graph SCC.
+(defn inline-calls! [(funcs (slice (ptr cir/Func))) (i i64) (index (ArrayList i64))
+                     (component (ArrayList i64)) (never (slice bool)) (clean (ArrayList bool))]
+  (-> i64)
+  (let [a (malloc-allocator)
+        f (get funcs i)
+        original (len (.insts f))
+        limit (+ (* 2 original) SLACK)
+        (mut added) (: 0 i64)
+        (mut done) (: 0 i64)
+        (mut sites) (ArrayList::new [i64] a)
+        (mut replace) (ArrayList::new [u32] a)]
+    (for at (range 0 original)
+      (let [v (get (.insts f) at) x (load (cir/val f v))]
+        (when (and (= (cast i64 (.op x)) cir/OP-CALL) (>= (.imm x) 0) (< (.imm x) (len index)))
+          (let [j (get index (.imm x))]
+            (when (and (>= j 0) (!= (get component j) (get component i))
+                       (not (get never j)) (get clean j)
+                       (<= (len (.insts (get funcs j))) SMALL))
+              (push! (mut sites) at))))))
+    (for at sites
+      (let [c (get (.insts f) at)
+            j (get index (.imm (cir/val f c)))
+            g (get funcs j)
+            size (len (.insts g))]
+        (when (and (<= (+ added size) limit) (site-ok? f c g))
+          (while (< (len replace) (len (.values f))) (push! (mut replace) (none)))
+          (let [b (block-of f at)]
+            (when (= b (none)) (panic "CIR inlining: call outside every block in {}" (.name f)))
+            (inline-site! f c at b g (mut replace)))
+          (set! added (+ added size))
+          (set! done (+ done 1)))))
+    (when (> done 0)
+      (while (< (len replace) (len (.values f))) (push! (mut replace) (none)))
+      (for v (range 0 (len (.values f)))
+        (let [x (load (cir/val f (cir/u32-of v)))]
+          (for k (range 0 (cir/i64-of (.nops x)))
+            (let [at (+ (cir/i64-of (.opb x)) k)
+                  (mut o) (get (.operands f) at)]
+              (while (and (< (cir/i64-of o) (len replace)) (!= (get replace (cir/i64-of o)) (none)))
+                (set! o (get replace (cir/i64-of o))))
+              (set! (mut (.operands f)) at o))))))
+    (free! (mut sites)) (free! (mut replace))
+    done))
+
+;;; Inline small callees into their callers across `funcs` (defining `syms`).
+;;; `never[i]`: funcs[i] keeps every call to it. Returns the sites inlined.
+(defn inline-module! [(funcs (slice (ptr cir/Func))) (syms (slice u32)) (never (slice bool))]
+  (-> i64)
+  (let [a (malloc-allocator)
+        n (len funcs)
+        (mut index) (ArrayList::new [i64] a)
+        (mut component) (ArrayList::new [i64] a)
+        (mut clean) (ArrayList::new [bool] a)
+        (mut order) (ArrayList::new [i64] a)
+        (mut total) (: 0 i64)
+        (mut max) (: 0 i64)]
+    (for s syms (when (>= (cir/i64-of s) max) (set! max (+ (cir/i64-of s) 1))))
+    (for _ (range 0 max) (push! (mut index) -1))
+    (for i (range 0 n) (set! (mut index) (cir/i64-of (get syms i)) i))
+    (for i (range 0 n) (push! (mut clean) (cloneable? (get funcs i))))
+    (sccs! funcs (slice index) (mut component) (mut order))
+    ; components complete callees first
+    (for i order
+      (set! total (+ total (inline-calls! funcs i index component never clean)))
+      (set! (mut clean) i (cloneable? (get funcs i))))
+    (free! (mut index)) (free! (mut component)) (free! (mut clean)) (free! (mut order))
+    total))
+
+;;; Tarjan's SCCs over direct calls, iteratively. `order` lists functions in
+;;; component completion order (every callee's component before its caller's).
+(defn sccs! [(funcs (slice (ptr cir/Func))) (index (slice i64))
+             (component (mut (ArrayList i64))) (order (mut (ArrayList i64)))] (-> void)
+  (let [a (malloc-allocator)
+        n (len funcs)
+        (mut number) (ArrayList::new [i64] a)
+        (mut low) (ArrayList::new [i64] a)
+        (mut on-stack) (ArrayList::new [bool] a)
+        (mut stack) (ArrayList::new [i64] a)
+        ; DFS frames: (function, next instruction to scan)
+        (mut frames) (ArrayList::new [i64] a)
+        (mut counter) (: 0 i64)
+        (mut components) (: 0 i64)]
+    (for _ (range 0 n) (push! (mut number) -1) (push! (mut low) 0)
+      (push! (mut on-stack) false) (push! (mut component) -1))
+    (for root (range 0 n)
+      (when (< (get number root) 0)
+        (push! (mut frames) root) (push! (mut frames) 0)
+        (set! (mut number) root counter) (set! (mut low) root counter)
+        (set! counter (+ counter 1))
+        (push! (mut stack) root) (set! (mut on-stack) root true)
+        (while (> (len frames) 0)
+          (let [top (- (len frames) 2)
+                v (get frames top)
+                next (get frames (+ top 1))
+                f (get funcs v)]
+            (if (< next (len (.insts f)))
+                (let [x (load (cir/val f (get (.insts f) next)))]
+                  (set! (mut frames) (+ top 1) (+ next 1))
+                  (when (and (= (cast i64 (.op x)) cir/OP-CALL) (>= (.imm x) 0)
+                             (< (.imm x) (len index)) (>= (get index (.imm x)) 0))
+                    (let [w (get index (.imm x))]
+                      (cond (< (get number w) 0)
+                              (do (set! (mut number) w counter) (set! (mut low) w counter)
+                                  (set! counter (+ counter 1))
+                                  (push! (mut stack) w) (set! (mut on-stack) w true)
+                                  (push! (mut frames) w) (push! (mut frames) 0))
+                            (get on-stack w)
+                              (when (< (get number w) (get low v))
+                                (set! (mut low) v (get number w)))
+                            :else 0))))
+                (do
+                  (pop! (mut frames)) (pop! (mut frames))
+                  (when (> (len frames) 0)
+                    (let [parent (get frames (- (len frames) 2))]
+                      (when (< (get low v) (get low parent))
+                        (set! (mut low) parent (get low v)))))
+                  (when (= (get low v) (get number v))
+                    (let [(mut more) true]
+                      (while more
+                        (let [w (get stack (- (len stack) 1))]
+                          (pop! (mut stack))
+                          (set! (mut on-stack) w false)
+                          (set! (mut component) w components)
+                          (push! (mut order) w)
+                          (when (= w v) (set! more false)))))
+                    (set! components (+ components 1)))))))))
+    (free! (mut number)) (free! (mut low)) (free! (mut on-stack))
+    (free! (mut stack)) (free! (mut frames))))
