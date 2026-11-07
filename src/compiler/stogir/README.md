@@ -176,3 +176,6 @@ Boolean view folds, zero-test branches and paired frame saves copied from coil-s
 
 
 Direct switch dispatch and PHI-only empty blocks copied from coil-stogir ca6be1e (base 3860588). SWITCH edges without moves branch straight to their targets, a full-width unsigned selector is compared in place, up to three singleton cases use a linear compare chain, and blocks holding only PHIs between their start and END are skipped when their outgoing transfer is empty. jit-switch-direct (new) and the switch, PHI, loop, layout, spill-home and pressure suites pass; the full library suite passes except the pre-existing jit-parameter-specialize and private-leaf failures. Whole bootstrap reproduces the seed object.
+
+
+IF-entry edge moves and in-place return tails copied from coil-stogir 5766b5c (base ca6be1e). Taken IF edges whose moves would need an out-of-line stub run them at the single-predecessor projection's entry instead, and ENDs reaching a return tail (start, PHIs, RETURN, no in-block moves) return in place. jit-return-tail (new) passes; the full library suite passes except the pre-existing jit-parameter-specialize and private-leaf failures. Whole bootstrap reproduces the seed object.

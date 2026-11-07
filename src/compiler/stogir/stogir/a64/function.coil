@@ -169,7 +169,7 @@
   (-> (Result i32 (slice u8)))
   (let [(mut error) ""]
     (for stub stubs
-      (when (= error "")
+      (when (and (= error "") (>= (.label stub) 0))
         (set! (mut labels) (cast i64 (.label stub)) (len (.text output)))
         (if (code/append! (mut output) (.body stub))
             (switch-emit/branch! (mut output) (mut branches) (.target stub) -1)
@@ -416,6 +416,87 @@
             (set! result user)))))
     result))
 
+;;; One RETURN's result capture, ABI normalization, result transfer and
+;;; epilogue. A return tail (block start, PHIs, RETURN, no in-block moves)
+;;; may also be emitted at the end of a predecessor after its edge moves:
+;;; nothing happens between that edge and the RETURN's own position.
+(defn return! [(output (mut code/Buffer))
+               (graph g/Graph)
+               (assigned allocate/Assigned)
+               (resolved locations/View)
+               (operands machine/Plan)
+               (reference i32)
+               (position i64)
+               (frame-size i64)
+               (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions graph) (cast i64 reference))
+        (mut error) ""]
+                    ; RETURN has an ABI preference, not a hard allocation
+                    ; constraint. Capture its actual register/spill location.
+                    (when (and (> (.op2 node) 0) (> (n/type-id node) 0))
+                      (match (call/capture-at-with-locations! (mut output)
+                                                              graph
+                                                              resolved
+                                                              (.op2 node)
+                                                              position
+                                                              (if (registers/simd-type? (cast i32
+                                                                                              (n/type-id node)))
+                                                                  32
+                                                                  0)
+                                                              (.base assigned))
+                        (Err [msg] (set! error msg))
+                        (Ok [_] 0)))
+                    (when (< (.op2 node) 0)
+                      (match (g/lookup graph (.op2 node))
+                        (None [] (set! error "return constant missing"))
+                        (Some [constant]
+                              (match (value/constant! (mut output)
+                                                      graph
+                                                      (.op2 node)
+                                                      (if (registers/simd-type? (cast i32
+                                                                                      (n/type-id constant)))
+                                                          32
+                                                          0)
+                                                      16)
+                                (Err [msg] (set! error msg))
+                                (Ok [_] 0)))))
+                    (match (abi/normalize! (mut (.text output))
+                                           (n/type-id node)
+                                           0)
+                      (Err [msg] (set! error msg))
+                      (Ok [_] 0))
+                    (when (= error "")
+                      (match (if (and (= (.kind (.result assigned)) 1) (< (.result-slot assigned) 0))
+                                  (direct-return! (mut output) graph assigned operands
+                                                   reference position allocator)
+                                  (result-emit/return! (mut (.text output))
+                                                  (.result assigned)
+                                                  (.base assigned)
+                                                  (.result-slot assigned)))
+                        (Err [message] (set! error message))
+                        (Ok [_] 0)))
+                    (match (epilogue! (mut output) assigned frame-size)
+                      (Err [message] (set! error message))
+                      (Ok [_] 0))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; A block holding only its start, PHIs and a RETURN, with no moves inside, is
+;;; a return tail; an END reaching it can return directly instead of jumping.
+(defn return-tail [(graph g/Graph)
+                   (scheduled schedule/Schedule)
+                   (users uses/Uses)
+                   (selected (ArrayList bool))
+                   (reference i32)
+                   (tails (slice bool))] (-> i32)
+  (let [range (get (.ranges users) (cast i64 reference))
+        (mut target) (: 0 i32)]
+    (for [i 0 (.count range)]
+      (let [user (.user (get (.edges users) (+ (.offset range) i)))]
+        (when (and (get selected (cast i64 user))
+                   (op/block-start? (cast i32 (n/opcode (get (.instructions graph) (cast i64 user))))))
+          (set! target user))))
+    (if (and (> target 0) (get tails (cast i64 target))) target 0)))
+
 (defn body-ordered [(graph g/Graph)
                     (scheduled schedule/Schedule)
                     (assigned allocate/Assigned)
@@ -435,6 +516,7 @@
         (mut branches) (ArrayList::new [fixups/Branch] allocator)
         (mut relatives) (ArrayList::new [fixups/Relative] allocator)
         (mut stubs) (ArrayList::new [EdgeStub] allocator)
+        (mut tails) (ArrayList::new [bool] allocator)
         (mut indexed-users) (uses/build graph allocator)
         (mut selected) (ArrayList::new [bool] allocator)
         (mut frame-size) (: 0 i64)
@@ -455,6 +537,25 @@
         (set! j (+ j 1))))
     (for reference (.nodes scheduled)
       (set! (mut selected) (cast i64 reference) true))
+    (for [k 0 (len (.instructions graph))] (push! (mut tails) false))
+    (when (= error "")
+      (for reference (.nodes scheduled)
+        (when (op/block-start? (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference)))))
+          (let [range (get (.ranges scheduled) (cast i64 reference))
+                count (.count range)
+                last (get (.nodes scheduled) (- (+ (.offset range) count) 1))
+                begin (* (.offset range) 2)
+                (mut ok) (and (>= count 2)
+                              (= (n/opcode (get (.instructions graph) (cast i64 last))) 120))]
+            (for [k 1 (- count 1)]
+              (unless (= (n/opcode (get (.instructions graph)
+                                        (cast i64 (get (.nodes scheduled) (+ (.offset range) k)))))
+                         67)
+                (set! ok false)))
+            (for [pos (+ begin 1) (+ begin (* count 2))]
+              (when (and (< pos (len (.heads move-index))) (>= (get (.heads move-index) pos) 0))
+                (set! ok false)))
+            (set! (mut tails) (cast i64 reference) ok)))))
     (match (frame/aligned-size (.frame assigned) (.alignment assigned))
       (Err [msg] (set! error msg))
       (Ok [size] (set! frame-size size)))
@@ -490,7 +591,13 @@
                               (get (.alignment physical) (cast i64 reference))))
                      0)
             (bytes/append32! (mut (.text output)) 0xD503201F))
-          (set! (mut labels) (cast i64 reference) (len (.text output))))
+          (set! (mut labels) (cast i64 reference) (len (.text output)))
+          (for [k 0 (len stubs)]
+            (let [stub (get stubs k)]
+              (when (and (= error "") (= (.label stub) -1) (= (.target stub) reference))
+                (unless (code/append! (mut output) (.body stub))
+                  (set! error "invalid deferred entry code"))
+                (set! (.label (elem (mut stubs) k)) -2)))))
         ; The use and definition subpositions are ordered phases. In particular,
         ; a reload at the even use position must complete before an odd spill
         ; store preserves that same value ahead of a clobbering definition.
@@ -574,56 +681,33 @@
                   (= opcode 121))
               0
               (if (= opcode 120)
-                  (do
-                    ; RETURN has an ABI preference, not a hard allocation
-                    ; constraint. Capture its actual register/spill location.
-                    (when (and (> (.op2 node) 0) (> (n/type-id node) 0))
-                      (match (call/capture-at-with-locations! (mut output)
-                                                              graph
-                                                              resolved
-                                                              (.op2 node)
-                                                              position
-                                                              (if (registers/simd-type? (cast i32
-                                                                                              (n/type-id node)))
-                                                                  32
-                                                                  0)
-                                                              (.base assigned))
-                        (Err [msg] (set! error msg))
-                        (Ok [_] 0)))
-                    (when (< (.op2 node) 0)
-                      (match (g/lookup graph (.op2 node))
-                        (None [] (set! error "return constant missing"))
-                        (Some [constant]
-                              (match (value/constant! (mut output)
-                                                      graph
-                                                      (.op2 node)
-                                                      (if (registers/simd-type? (cast i32
-                                                                                      (n/type-id constant)))
-                                                          32
-                                                          0)
-                                                      16)
-                                (Err [msg] (set! error msg))
-                                (Ok [_] 0)))))
-                    (match (abi/normalize! (mut (.text output))
-                                           (n/type-id node)
-                                           0)
-                      (Err [msg] (set! error msg))
-                      (Ok [_] 0))
-                    (when (= error "")
-                      (match (if (and (= (.kind (.result assigned)) 1) (< (.result-slot assigned) 0))
-                                  (direct-return! (mut output) graph assigned (.operands matched)
-                                                   reference position allocator)
-                                  (result-emit/return! (mut (.text output))
-                                                  (.result assigned)
-                                                  (.base assigned)
-                                                  (.result-slot assigned)))
-                        (Err [message] (set! error message))
-                        (Ok [_] 0)))
-                    (match (epilogue! (mut output) assigned frame-size)
-                      (Err [message] (set! error message))
-                      (Ok [_] 0)))
+                  (match (return! (mut output) graph assigned resolved (.operands matched)
+                                  reference position frame-size allocator)
+                    (Err [message] (set! error message))
+                    (Ok [_] 0))
                   (if (or (= opcode 114) (= opcode 115))
-                      (match (unconditional-layout! (mut output)
+                      (match (let [tail (return-tail graph scheduled indexed-users selected
+                                                     reference (slice tails))
+                                   following (next-successor graph indexed-users selected reference
+                                                             (get (.next physical) i)
+                                                             (.aliases physical))]
+                               (if (and (> tail 0) (!= tail following))
+                                   (match (edge! (mut output) graph assigned scheduled analysis
+                                                 tail (+ position 1) allocator)
+                                     (Err [msg] (Err msg))
+                                     (Ok [_]
+                                         (let [ret (get (.nodes scheduled)
+                                                        (- (+ (.offset (get (.ranges scheduled) (cast i64 tail)))
+                                                              (.count (get (.ranges scheduled) (cast i64 tail))))
+                                                           1))]
+                                           (return! (mut output) graph assigned resolved (.operands matched)
+                                                    ret
+                                                    (* (- (+ (.offset (get (.ranges scheduled) (cast i64 tail)))
+                                                             (.count (get (.ranges scheduled) (cast i64 tail))))
+                                                          1)
+                                                       2)
+                                                    frame-size allocator))))
+                      (unconditional-layout! (mut output)
                                                     graph
                                                     assigned
                                                     scheduled
@@ -640,7 +724,7 @@
                                                                     (get (.next physical)
                                                                          i)
                                                                     (.aliases physical))
-                                                    allocator)
+                                                    allocator)))
                         (Err [msg] (set! error msg))
                         (Ok [_] 0))
                       (if (or (= opcode 116) (= opcode 117))
@@ -685,6 +769,7 @@
                                                                                         i)
                                                                                    (.aliases physical))
                                                                    (mut stubs)
+                                                                   (.aliases physical)
                                                                    allocator))
                             (Err [msg] (set! error msg))
                             (Ok [_] 0))
@@ -944,6 +1029,7 @@
         (Err [msg] (set! error msg))
         (Ok [_] 0)))
     (release-stubs! (mut stubs))
+    (free! (mut tails))
     (free! (mut relatives))
     (free! (mut selected))
     (uses/release! (mut indexed-users))
@@ -1322,6 +1408,9 @@
                            (stubs (mut (ArrayList EdgeStub)))
                            (allocator (dyn Allocator))]
   (-> (Result i32 (slice u8)))
+  ; No physical layout: every nonempty taken edge keeps its stub.
+  (let [(mut none) (ArrayList::new [i32] allocator)
+        result
   (if (> comparison 0)
       (match (select/comparison graph comparison)
         (Err [message] (Err message))
@@ -1341,6 +1430,7 @@
                                           tile
                                           next
                                           (mut stubs)
+                                          none
                                           allocator)))
       (conditional-layout-selected! (mut output)
                                     graph
@@ -1362,7 +1452,10 @@
                                       :immediate 0)
                                     next
                                     (mut stubs)
-                                    allocator)))
+                                    none
+                                    allocator))]
+    (free! (mut none))
+    result))
 
 ;;; The IF's own flag sequence ends in CMP Rn,#0 or CMP Rn,ZR and EQ/NE consumes
 ;;; NZCV only at this branch. Replace that final word with the condition's
@@ -1411,6 +1504,7 @@
                                     (tile select/Tile)
                                     (next i32)
                                     (stubs (mut (ArrayList EdgeStub)))
+                                    (aliases (ArrayList i32))
                                     (allocator (dyn Allocator))]
   (-> (Result i32 (slice u8)))
   (let [(mut yes) (: 0 i32)
@@ -1465,6 +1559,7 @@
                                             (mut labels)
                                             (mut branches)
                                             (mut stubs)
+                                            aliases
                                             allocator)
                     (Err [message] (Err message))
                     (Ok [_]
@@ -1486,6 +1581,27 @@
                                                        -1))
                                 (Ok 0)))))))))))))
 
+;;; An IF projection has exactly one predecessor, its IF. When it is emitted
+;;; later as its own block, the taken edge's moves run at its entry instead of
+;;; in an out-of-line stub, removing a taken branch. Skipped (empty) or
+;;; already-emitted targets, and a second entry for the same block, keep stubs.
+;;; Entry records use label -1 until the target block binds its label.
+(defn entry-placeable? [(graph g/Graph)
+                        (labels (ArrayList i64))
+                        (stubs (ArrayList EdgeStub))
+                        (aliases (ArrayList i32))
+                        (target i32)] (-> bool)
+  (and (> target 0)
+       (< (cast i64 target) (len aliases))
+       (= (get aliases (cast i64 target)) target)
+       (< (get labels (cast i64 target)) 0)
+       (let [opcode (n/opcode (get (.instructions graph) (cast i64 target)))]
+         (or (= opcode 107) (= opcode 108)))
+       (let [(mut free) true]
+         (for stub stubs
+           (when (and (= (.label stub) -1) (= (.target stub) target)) (set! free false)))
+         free)))
+
 ;;; Edge transfers belong to their selected path. Empty transfers branch directly;
 ;;; nonempty transfers are emitted out of line so the other path can fall through.
 (defn conditional-edge! [(output (mut code/Buffer))
@@ -1499,6 +1615,7 @@
                          (labels (mut (ArrayList i64)))
                          (branches (mut (ArrayList fixups/Branch)))
                          (stubs (mut (ArrayList EdgeStub)))
+                         (aliases (ArrayList i32))
                          (allocator (dyn Allocator))]
   (-> (Result i32 (slice u8)))
   (let [(mut transfer) (code/create allocator)]
@@ -1512,18 +1629,24 @@
                   allocator)
       (Err [message] (do (code/release! (mut transfer)) (Err message)))
       (Ok [_]
-          (let [label
-                  (if (= (len (.text transfer)) 0)
-                      target
-                      (let [id (cast i32 (len labels))]
-                        (push! (mut labels) -1)
-                        (push! (mut stubs)
-                               (EdgeStub
-                                 :label id
-                                 :target target
-                                 :body transfer))
-                        id))]
-            (when (= label target) (code/release! (mut transfer)))
+          (let [entry? (and (> (len (.text transfer)) 0)
+                            (entry-placeable? graph labels stubs aliases target))
+                label
+                  (cond (= (len (.text transfer)) 0) target
+                        entry?
+                          (do (push! (mut stubs)
+                                     (EdgeStub :label -1 :target target :body transfer))
+                              target)
+                        :else
+                          (let [id (cast i32 (len labels))]
+                            (push! (mut labels) -1)
+                            (push! (mut stubs)
+                                   (EdgeStub
+                                     :label id
+                                     :target target
+                                     :body transfer))
+                            id))]
+            (when (= (len (.text transfer)) 0) (code/release! (mut transfer)))
             (switch-emit/branch! (mut output) (mut branches) label condition)
             (Ok 0))))))
 
