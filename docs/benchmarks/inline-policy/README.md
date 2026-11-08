@@ -69,3 +69,43 @@ default 7.11 s; always 7.27 s (+2%); small40loop 7.68 s (+8%); small80any
   and splitting around cold calls are what would let the larger policies
   (pair, always, bigger templates) pay off; they stay available as settings
   to re-measure afterwards.
+
+## Layered options (later rounds)
+
+New settings: `small-leaf=1` (the small-callee exemption only for callees
+without calls), `always=1` (honor `:inline (Always)`), and
+`COIL_STOGIR_SHRINK_WRAP=1` (a64.shrink-wrap: build the frame only on paths
+that leave the frameless entry region; the allocator is re-run with late
+preserved-register assignment only for functions where x19..x28 alone block
+the region). Every A/B host emitted the identical compiler object; every
+shrink-wrapped host passes `tools/framecheck.py` (no frame-state fault in any
+Stogir-compiled function) and reproduces the default object when it compiles
+the compiler.
+
+Runtime, min cycles vs the same round's default (5 rounds each;
+`results/ab-hp3.log`, `ab-hp9.log`, `ab-hp10.log`). Generation from
+`tools/genenv.py` (3 rounds, min, load about 10). Noise about 2%.
+
+| setting | runtime | generation |
+|---|---:|---:|
+| always=1 | -1.5%, 0.0% | +0.5% |
+| shrink-wrap | -2.3%, -1.1% | +4.5% |
+| always + shrink-wrap | -0.7% | +6.1% |
+| leaf40 (small=40,any,leaf) | -4.1% | +2.5% |
+| **leaf80 (small=80,any,leaf)** | **-4.0%, -5.2%** | **+3.9%** |
+| leaf80 + always | -5.9% | +8.5% |
+| leaf40 + always + shrink-wrap | -5.0% | +9.5% |
+| leaf256 | -5.0%, -4.8% | +9.4% |
+| leaf256 + shrink-wrap | -4.4% | +15.9% |
+| small80any + shrink-wrap | -4.6% | +17.0% |
+| leaf256 + always + shrink-wrap | -5.0% | +24.9% |
+| pair + shrink-wrap | +5.4% | |
+
+- Leaf-only beats the plain exemption: the callees that hurt were those that
+  bring calls (and a frame) into their callers.
+- Shrink-wrapping helps alone (about 800 more functions skip the entry frame,
+  e.g. coil.scratch.bump's early exit) but does not add to inlining, and it
+  does not rescue `pair`: inlined slow paths still raise register pressure
+  inside hot loops, not only at entry.
+- Sweet spot: leaf80, about 4-5% fewer cycles for about 4% generation. That
+  is inside the current 5x margin (5.09-5.31x) only just.
