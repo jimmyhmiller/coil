@@ -94,13 +94,18 @@
 ;;; budget (a zero budget still disables inlining) and does not charge them.
 ;;; small-leaf restricts the small-callee exemption to callees without calls,
 ;;; so uncharged growth never brings a call (and its frame) into the caller.
+;;; hoist-frames clones a callee's function-lifetime frame objects into the
+;;; caller's entry allocation prefix as caller frame objects, instead of
+;;; bracketing call-local copies in a dynamic stack scope (see hoist-frames!).
 (defstruct Policy
   [(budget i32) (small-cells i32) (small-anywhere bool) (small-leaf bool)
-   (indirect-calls bool) (pair-result-calls bool) (honor-always bool)])
+   (indirect-calls bool) (pair-result-calls bool) (honor-always bool)
+   (hoist-frames bool)])
 
 (defn default-policy [(budget i32)] (-> Policy)
   (Policy :budget budget :small-cells 0 :small-anywhere false :small-leaf false
-          :indirect-calls false :pair-result-calls false :honor-always false))
+          :indirect-calls false :pair-result-calls false :honor-always false
+          :hoist-frames false))
 
 (defn with-budget [(policy Policy) (budget i32)] (-> Policy)
   (Policy :budget budget :small-cells (.small-cells policy)
@@ -108,7 +113,8 @@
           :small-leaf (.small-leaf policy)
           :indirect-calls (.indirect-calls policy)
           :pair-result-calls (.pair-result-calls policy)
-          :honor-always (.honor-always policy)))
+          :honor-always (.honor-always policy)
+          :hoist-frames (.hoist-frames policy)))
 
 ;;; Whether GRAPH contains no CALL or TAILCALL node.
 (defn leaf-graph? [(graph g/Graph)] (-> bool)
@@ -815,13 +821,60 @@
               (None [] (Err "inline stack restore space exhausted"))
               (Some [restored] (push! (mut seeds) restored) (Ok restored)))))))
 
+;;; Whether every stack operation of CALLEE is a function-lifetime frame object
+;;; (no raw ALLOCA, AFREE or stack scope) and there is at least one.
+(defn frame-objects-only? [(callee g/Graph)] (-> bool)
+  (let [(mut any) false (mut only) true (mut r) (: 1 i64)]
+    (while (< r (len (.instructions callee)))
+      (let [node (get (.instructions callee) r)
+            opcode (n/opcode node)]
+        (when (and (>= opcode 81) (<= opcode 84))
+          (if (stack/frame-object? node) (set! any true) (set! only false)))
+        (set! r (+ r (/ (+ (cast i64 (get (.arities callee) r)) 4) 4)))))
+    (and any only)))
+
+;;; The caller's entry allocation prefix: its last node (START or the last frame
+;;; object chained after it) and the unique control node that follows it, or
+;;; [0 0] when that successor is not unique.
+(defn entry-prefix [(graph g/Graph)] (-> (array i32 2))
+  (let [(mut tail) (: 0 i32) (mut r) (: 1 i64)]
+    (while (and (= tail 0) (< r (len (.instructions graph))))
+      (when (= (n/opcode (get (.instructions graph) r)) 104) (set! tail (cast i32 r)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    (let [(mut extended) true (mut successor) (: 0 i32) (mut count) (: 0 i32)]
+      (while (and (> tail 0) extended)
+        (set! extended false)
+        (set! successor 0) (set! count 0)
+        (set! r 1)
+        (while (< r (len (.instructions graph)))
+          (let [node (get (.instructions graph) r)
+                opcode (cast i32 (n/opcode node))]
+            (when (and (> (get (.arities graph) r) 0)
+                       (= (op/operand-code opcode 1) op/OPERAND-SRC)
+                       (= (.op1 node) tail))
+              (set! count (+ count 1))
+              (set! successor (cast i32 r))))
+          (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+        (when (and (= count 1)
+                   (stack/frame-object? (get (.instructions graph) (cast i64 successor))))
+          (set! tail successor)
+          (set! extended true)))
+      (if (and (> tail 0) (= count 1)) [tail successor] [(: 0 i32) 0]))))
+
 ;;; The graph is owned and eligible; all old references remain stable. Reserve
 ;;; every clone before patching edges so legal forward references remain legal.
+;;; With hoist, a callee whose stack objects are all frame objects gets them as
+;;; caller frame objects appended to the caller's entry prefix: their storage
+;;; is call-local by construction (a callee object cannot outlive its call), so
+;;; one function-lifetime slot per inlined object is equivalent and needs no
+;;; dynamic stack scope. Control edges to a hoisted object take the call's own
+;;; control input instead.
 (defn apply! [(graph (mut g/Graph))
               (roots (mut (ArrayList i32)))
               (reference i32)
               (target Callee)
               (seeds (mut (ArrayList i32)))
+              (hoist bool)
               (a (dyn Allocator))] (-> (Result i32 (slice u8)))
   (let [callee (.graph target)
         (mut call) (get (.instructions graph) (cast i64 reference))
@@ -831,8 +884,39 @@
         (mut inputs) (ArrayList::new [i32] a)
         (mut error) ""
         (mut scope) (: 0 i32)
+        (mut hoisted) (ArrayList::new [bool] a)
         (mut r) 1]
     (set! (mut mapping) (cast i64 (.entry target)) (.op1 call))
+    (fill/append! (mut hoisted) (len (.instructions callee)) false)
+    (when (and hoist (frame-objects-only? callee))
+      (let [prefix (entry-prefix graph)
+            (mut tail) (get prefix 0)
+            successor (get prefix 1)]
+        (when (> tail 0)
+          (let [(mut q) (: 1 i64)]
+            (while (and (= error "") (< q (len (.instructions callee))))
+              (let [node (get (.instructions callee) q)]
+                (when (= (n/opcode node) 81)
+                  (match (mapped! (mut graph) callee mapping (mut constants) (.op2 node))
+                    (Err [message] (set! error message))
+                    (Ok [size]
+                        (match (g/append-inputs-with-aux! (mut graph) 81 (n/type-id node) 32768
+                                                          [tail size (.op3 node)])
+                          (None [] (set! error "inline frame object space exhausted"))
+                          (Some [object]
+                                (set! (mut mapping) q object)
+                                (set! (mut hoisted) q true)
+                                (push! (mut seeds) object)
+                                (set! tail object))))))
+                (set! q (+ q (/ (+ (cast i64 (get (.arities callee) q)) 4) 4))))))
+          (when (= error "")
+            ; The node after the prefix now follows the hoisted objects; when it
+            ; is this call, the inlined body starts after them instead.
+            (if (= successor reference)
+                (set! (mut mapping) (cast i64 (.entry target)) tail)
+                (unless (g/set-operand! (mut graph) successor 1 tail)
+                  (set! error "inline frame prefix successor rewrite failed")))
+            (set! call (get (.instructions graph) (cast i64 reference)))))))
     (for [i 3 (+ (cast i64 (get (.arities graph) (cast i64 reference))) 1)]
       (match (g/operand graph reference (cast i32 i))
         (Some [input] (when (> input 0) (push! (mut seeds) input)))
@@ -861,6 +945,7 @@
                                             (push! (mut seeds) casted)))))))
                   (None [] (set! error "inline parameter missing")))
               (or (= opcode 0) (= opcode 104) (= opcode 120)) 0
+              (get hoisted r) 0
               :else
                 (do
                   (when (and (= opcode 81) (= scope 0))
@@ -894,13 +979,17 @@
             opcode (n/opcode node)
             count (get (.arities callee) r)
             cloned (get mapping r)]
-        (unless (or (= opcode 0) (= opcode 104) (= opcode 120) (= opcode 71))
+        (unless (or (= opcode 0) (= opcode 104) (= opcode 120) (= opcode 71) (get hoisted r))
           (for [i 1 (+ (cast i64 count) 1)]
             (match (g/operand callee (cast i32 r) (cast i32 i))
               (None [] (set! error "inline source operand missing"))
               (Some [input]
                     (let [value
-                            (cond (uses/edge-code? (op/operand-code (cast i32
+                            (cond (and (= (op/operand-code (cast i32 opcode) (cast i32 i)) op/OPERAND-SRC)
+                                       (> input 0) (< (cast i64 input) (len hoisted))
+                                       (get hoisted (cast i64 input)))
+                                    (Ok [i32 (slice u8)] (get mapping (cast i64 (.entry target))))
+                                  (uses/edge-code? (op/operand-code (cast i32
                                                                           opcode)
                                                                     (cast i32 i)))
                                     (mapped! (mut graph)
@@ -953,7 +1042,9 @@
                               callee
                               mapping
                               (mut constants)
-                              (.op1 ret)
+                              (if (and (> (.op1 ret) 0) (< (cast i64 (.op1 ret)) (len hoisted))
+                                       (get hoisted (cast i64 (.op1 ret))))
+                                  (.entry target) (.op1 ret))
                               scope
                               (mut seeds))
         (Err [message] (set! error message))
@@ -1007,6 +1098,7 @@
     (free! (mut inputs))
     (free! (mut constants))
     (free! (mut mapping))
+    (free! (mut hoisted))
     (if (= error "") (Ok 1) (Err error))))
 
 (defstruct Site [(reference i32) (target Callee)])
@@ -1597,6 +1689,7 @@
                                      reference
                                      target
                                      (mut seeds)
+                                     (.hoist-frames policy)
                                      a)
                         (Err [message] (set! error message))
                         (Ok [count]
