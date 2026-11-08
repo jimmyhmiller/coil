@@ -203,3 +203,5 @@ Proof-carrying code generation copied from coil-stogir 37f4a55 (base 9fe1d77): r
 
 
 Sign-extension fix copied from coil-stogir 4b4eda0 (base 37f4a55): SEXT of a signed load is emitted as a register copy only while the value is still in the register its load wrote (its original, unsplit allocation part); a 32-bit move or reload had left bits 32-63 zero. Found when a CSE experiment changed inlining enough to expose it in the self-built compiler. sext-load gains a case that moves the loaded value across a call. The full library suite passes except the pre-existing jit-parameter-specialize and private-leaf failures.
+
+Struct-promotion first step copied from coil-stogir 1716e81 (base 4b4eda0): SCCP skips the post-promotion content digest when promotion already reports changes (caafe51), and a call returning a two-word struct in x0/x1 projects its first piece into a register when the code never addresses the second (1716e81). The self-built compiler's output is unchanged.
