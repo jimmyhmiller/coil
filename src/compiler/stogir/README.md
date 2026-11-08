@@ -215,3 +215,5 @@ Generation work copied from coil-stogir 2883e06 (base c5f9979): range intersecti
 Work copied from coil-stogir ed893f6 (base 2883e06): uses/build reads inline operands from the node cell and counts into its cursor (cb9d1c2); small callees (at most 40 cloned cells) at ranked loop call sites inline without charging the caller's budget (b7d5d00; the adapter clamps its per-definition remainder at zero, since uncharged growth can exceed it); native tail jumps get no frame record, an indirect one capturing its target in a reserved x15 so x30 keeps the caller's return address (196a155); and the scalar type predicates and sizes are :inline (Always) (ed893f6).
 
 Schedule use lists copied from coil-stogir 765ca29 (base ed893f6): Prepared keeps the use lists schedule preparation built, and emission of the same graph borrows them instead of rebuilding.
+
+Frame records copied from coil-stogir b789424 (base 765ca29): a frame record at the bottom of a small, ordinarily aligned frame is stored with SP pre-decrement and reloaded with post-increment, folding the frame's SP adjustment into the pair.
