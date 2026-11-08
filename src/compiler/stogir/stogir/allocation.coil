@@ -374,6 +374,72 @@
 
 (defn no-late [] (-> Late) (Late :position -1 :mask 0))
 
+;;; Optional allocation policies; plain-tuning is the pinned behavior.
+;;; loop-reloads: reload a spilled value at the entry of the loop holding its
+;;; next use (reload-cut). loop-evict-mask: registers whose holder may be
+;;; evicted for a loop value (cold-owner); zero disables it.
+(defstruct Tuning [(late Late) (loop-reloads bool) (loop-evict-mask u64)])
+
+(defn plain-tuning [] (-> Tuning)
+  (Tuning :late (no-late) :loop-reloads false :loop-evict-mask 0))
+
+;;; End position of the loop region holding position: the run of laid-out blocks
+;;; from position's block with at least its loop depth. -1 outside loops.
+(defn loop-window [(blocks (slice split-position/Block)) (position i64)] (-> i64)
+  (let [at (split-position/block-at blocks position)]
+    (if (or (< at 0) (= (.depth (get blocks (cast i64 at))) 0))
+        -1
+        (let [depth (.depth (get blocks (cast i64 at)))
+              (mut cursor) (cast i64 at)]
+          (while (and (< (+ cursor 1) (len blocks))
+                      (>= (.depth (get blocks (+ cursor 1))) depth))
+            (set! cursor (+ cursor 1)))
+          (.end (get blocks cursor))))))
+
+;;; Spill-weight eviction for loops, after LLVM's greedy allocator: a part used
+;;; inside a loop that no free register can carry through the loop (a call
+;;; clobbers them) may take a register in mask from a holder with no register
+;;; use for the rest of that loop. The holder is spilled around the loop once
+;;; instead of the loop value moving around every call in every iteration.
+;;; Returns the holder's part index, or -1.
+(defn cold-owner [(parts (ArrayList Part)) (index i32) (position i64)
+                  (free (ArrayList i64)) (fixed-at (ArrayList i64))
+                  (blocks (slice split-position/Block)) (allowed u64) (mask u64)]
+  (-> i32)
+  (let [part (at parts (cast i64 index))
+        window (if (or (= mask 0) (= (len blocks) 0)) -1 (loop-window blocks position))
+        end (if (= (len (.ranges part)) 0) position
+                (.end (at (.ranges part) (- (len (.ranges part)) 1))))
+        target (if (< window end) window end)
+        next (c/next-use (.uses part) position 1)
+        admissible (& allowed (.allowed part))]
+    (if (or (< window 0) (<= target position) (< next 0) (>= next target)
+            (>= (c/required-at (.uses part) position) 0))
+        -1
+        (let [(mut best-free) position]
+          (for [i 0 (len free)]
+            (when (and (< i 64) (!= (& admissible (<< (: 1 u64) (cast u64 i))) 0)
+                       (> (get free i) best-free))
+              (set! best-free (get free i))))
+          (if (>= best-free target)
+              -1
+              (let [(mut victim) (: -1 i32) (mut victim-next) (: -1 i64)]
+                (for [k 0 (len parts)]
+                  (let [owner (at parts k)
+                        reg (.register owner)]
+                    (when (and (!= k (cast i64 index)) (>= (.parent owner) 0)
+                               (>= reg 0) (< reg 64)
+                               (!= (& (& mask admissible) (<< (: 1 u64) (cast u64 reg))) 0)
+                               (< (cast i64 reg) (len fixed-at))
+                               (>= (get fixed-at (cast i64 reg)) target)
+                               (range/covers? (.ranges owner) position))
+                      (let [use (c/next-use (.uses owner) position 1)
+                            later (if (< use 0) (: 0x7FFFFFFFFFFFFFFF i64) use)]
+                        (when (and (>= later target) (> later victim-next))
+                          (set! victim (cast i32 k))
+                          (set! victim-next later))))))
+                victim))))))
+
 (defn late-choice [(part Part) (availability (ArrayList i64)) (position i64) (end i64)
                    (allowed u64) (source i32) (boundary-step i64)
                    (extra-boundaries (slice i64)) (usual scan/Choice) (late Late)]
@@ -414,8 +480,36 @@
     (free! (mut limits))
     result))
 
+;;; Where a spilled part's register suffix begins. As pinned ir_ra.c applies
+;;; ir_find_optimal_split_position to the split before a blocked interval's next
+;;; use, a next use inside a loop the spill is not in reloads at that loop's
+;;; entry (the end of its preheader) rather than at the use, so the value enters
+;;; every iteration in a register instead of being reloaded in each. The cut
+;;; moves only when it leaves the use's loop for a shallower block; an odd
+;;; block-end becomes the following block start, an edge-resolved boundary.
+;;; Empty blocks keep the cut at the use. The cut never precedes floor, the
+;;; allocator's current position (an evicted owner's prefix starts earlier).
+(defn reload-cut [(part Part) (start i64) (next i64) (floor i64)
+                  (blocks (slice split-position/Block))]
+  (-> i64)
+  (let [minimum (if (> floor (+ start 1)) floor (+ start 1))]
+  (if (or (= (len blocks) 0) (<= next minimum))
+      next
+      (let [deep (split-position/block-at blocks next)]
+        (if (or (< deep 0) (= (.depth (get blocks (cast i64 deep))) 0))
+            next
+            (let [chosen (split-position/choose blocks (.ranges part) minimum next false)
+                  cut (+ chosen (% chosen 2))
+                  source (split-position/block-at blocks chosen)]
+              (if (and (>= source 0) (>= chosen minimum) (> cut start) (< cut next)
+                       (< (.depth (get blocks (cast i64 source)))
+                          (.depth (get blocks (cast i64 deep)))))
+                  cut
+                  next)))))))
+
 ;;; Spill only a prefix containing no register-required use. The suffix is queued
-;;; for reassignment at its next required position, preserving parent slot identity.
+;;; for reassignment at its next required position (or the loop entry before it,
+;;; see reload-cut), preserving parent slot identity.
 (defn spill-prefix-tracked! [(parts (mut (ArrayList Part)))
                              (unhandled (mut (ArrayList queue/Item)))
                              (index i32)
@@ -423,7 +517,9 @@
                              (size i64)
                              (alignment i64)
                              (allocator (dyn Allocator))
-                             (events (ptr fixed/Index))]
+                             (events (ptr fixed/Index))
+                             (reload-blocks (slice split-position/Block))
+                             (floor i64)]
   (-> (Result i64 (slice u8)))
   (let [part (elem (mut parts) (cast i64 index))]
     (if (= (len (.ranges part)) 0)
@@ -443,10 +539,11 @@
                       (set! (.spill-slot part) slot)
                       (set! (.register part) -1)
                       (when (and (> next start) (< next end))
-                        (let [child (split! part next allocator)
+                        (let [cut (reload-cut (load part) start next floor reload-blocks)
+                              child (split! part cut allocator)
                               child-index (cast i32 (len parts))]
                           (push! (mut parts) child)
-                          (notify-split! events index child-index next)
+                          (notify-split! events index child-index cut)
                           (let [suffix (at parts (cast i64 child-index))]
                             (when (> (len (.ranges suffix)) 0)
                               (queue/insert! (mut unhandled)
@@ -467,7 +564,9 @@
                       (size i64)
                       (alignment i64)
                       (allocator (dyn Allocator))
-                      (events (ptr fixed/Index))] (-> (Result i32 (slice u8)))
+                      (events (ptr fixed/Index))
+                      (reload-blocks (slice split-position/Block))
+                      (floor i64)] (-> (Result i32 (slice u8)))
   (let [part (elem (mut parts) (cast i64 index))]
     (if (or (= (len (.ranges part)) 0) (< (.register part) 0))
         (Err "eviction requires an assigned interval")
@@ -491,7 +590,9 @@
                                                 size
                                                 alignment
                                                 allocator
-                                                events)
+                                                events
+                                                reload-blocks
+                                                floor)
                     (Err [message] (Err message))
                     (Ok [_] (Ok index)))
                   (match (frame/spill-slot! (mut frame)
@@ -522,7 +623,9 @@
                                                                 size
                                                                 alignment
                                                                 allocator
-                                                                events)
+                                                                events
+                                                                reload-blocks
+                                                                floor)
                                     (Err [msg] (Err msg))
                                     (Ok [_] (Ok child-index)))))))))))))))
 
@@ -563,7 +666,9 @@
                          size
                          alignment
                          allocator
-                         (cast (ptr fixed/Index) 0)))
+                         (cast (ptr fixed/Index) 0)
+                         []
+                         -1))
 
 (defn evict! [(parts (mut (ArrayList Part)))
               (unhandled (mut (ArrayList queue/Item)))
@@ -582,7 +687,9 @@
                   size
                   alignment
                   allocator
-                  (cast (ptr fixed/Index) 0)))
+                  (cast (ptr fixed/Index) 0)
+                  []
+                  -1))
 
 (defstruct Pressure
   [(free (ArrayList i64))
@@ -1063,9 +1170,11 @@
                  (boundary-step i64)
                  (extra-boundaries (slice i64))
                  (split-blocks (slice split-position/Block))
-                 (late Late)
+                 (tuning Tuning)
                  (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
-  (let [(mut work) (ArrayList::new [queue/Item] allocator)
+  (let [late (.late tuning)
+        reload-blocks (if (.loop-reloads tuning) split-blocks [])
+        (mut work) (ArrayList::new [queue/Item] allocator)
         (mut limits) (ArrayList::new [i64] allocator)
         (mut events) (fixed/empty allocator)
         (mut assigned) (empty-assigned allocator)
@@ -1117,6 +1226,20 @@
                                               (& allowed
                                                  (.allowed (at parts (cast i64 index)))))
                   (set! error "allocator pressure query moved backwards"))
+                (when (and (= error "") (!= (.loop-evict-mask tuning) 0))
+                  (let [victim (cold-owner parts index position (.free summary) (.fixed-at summary)
+                                           split-blocks allowed (.loop-evict-mask tuning))]
+                    (when (>= victim 0)
+                      (let [owner-shape (shape-of (.parent (at parts (cast i64 victim))) shapes uniform)]
+                        (match (evict-tracked! (mut parts) (mut work) victim position (mut frame)
+                                               (.size owner-shape) (.alignment owner-shape) allocator
+                                               (cast (ptr fixed/Index) (mut events)) reload-blocks position)
+                          (Err [msg] (set! error msg))
+                          (Ok [_]
+                              (unless (pressure-class-into! parts index (mut events) (mut assigned)
+                                                            (mut summary)
+                                                            (& allowed (.allowed (at parts (cast i64 index)))))
+                                (set! error "allocator pressure query moved backwards"))))))))
                 (when (and (= error "")
                            (not (grant-free-impl! (mut parts)
                                                      (mut work)
@@ -1144,7 +1267,9 @@
                                                       (.alignment shape)
                                                       allocator
                                                       (cast (ptr fixed/Index)
-                                                            (mut events)))
+                                                            (mut events))
+                                                      reload-blocks
+                                                      position)
                           (Err [msg] (set! error msg))
                           (Ok [_] 0))
                         (if (= (.action decision) 2)
@@ -1173,7 +1298,9 @@
                                                              (.alignment owner-shape)
                                                              allocator
                                                              (cast (ptr fixed/Index)
-                                                                   (mut events)))
+                                                                   (mut events))
+                                                             reload-blocks
+                                                             position)
                                         (Err [msg] (set! error msg))
                                         (Ok [_] 0)))))
                                 (set! owner-index (+ owner-index 1)))
@@ -1234,7 +1361,7 @@
              1
              []
              []
-             (no-late)
+             (plain-tuning)
              allocator))
 
 ;;; Native use/definition schedules lower general moves at even input
@@ -1248,7 +1375,7 @@
                                     (allocator (dyn Allocator))]
   (-> (Result i32 (slice u8)))
   (run-impl! (mut parts) (mut layout) register-count allowed shapes
-             (SpillShape :size 0 :alignment 0) 2 definition-moves [] (no-late) allocator))
+             (SpillShape :size 0 :alignment 0) 2 definition-moves [] (plain-tuning) allocator))
 
 ;;; Prepared target metadata currently controls active-owner eviction only.
 ;;; Free assignment and reload restart retain their legal boundary policy.
@@ -1257,18 +1384,18 @@
                                (definition-moves (slice i64))
                                (split-blocks (slice split-position/Block))
                                (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
-  (run-shaped-with-splits-late! (mut parts) (mut layout) register-count allowed shapes
-    definition-moves split-blocks (no-late) allocator))
+  (run-shaped-with-tuning! (mut parts) (mut layout) register-count allowed shapes
+    definition-moves split-blocks (plain-tuning) allocator))
 
-;;; As run-shaped-with-splits!, assigning late's registers late (see Late).
-(defn run-shaped-with-splits-late! [(parts (mut (ArrayList Part))) (layout (mut frame/Frame))
-                                    (register-count i32) (allowed u64) (shapes (slice SpillShape))
-                                    (definition-moves (slice i64))
-                                    (split-blocks (slice split-position/Block))
-                                    (late Late)
-                                    (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+;;; As run-shaped-with-splits! under optional policies (see Tuning).
+(defn run-shaped-with-tuning! [(parts (mut (ArrayList Part))) (layout (mut frame/Frame))
+                               (register-count i32) (allowed u64) (shapes (slice SpillShape))
+                               (definition-moves (slice i64))
+                               (split-blocks (slice split-position/Block))
+                               (tuning Tuning)
+                               (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
   (run-impl! (mut parts) (mut layout) register-count allowed shapes
-    (SpillShape :size 0 :alignment 0) 2 definition-moves split-blocks late allocator))
+    (SpillShape :size 0 :alignment 0) 2 definition-moves split-blocks tuning allocator))
 
 ;;; Compatibility interface for targets whose values all share one spill shape.
 (defn run! [(parts (mut (ArrayList Part)))
@@ -1290,7 +1417,7 @@
                    1
                    []
                    []
-                   (no-late)
+                   (plain-tuning)
                    allocator))))
 
 ;;; Non-evictable fixed interference interval; parent=-1 has no virtual value.
