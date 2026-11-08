@@ -109,3 +109,27 @@ Runtime, min cycles vs the same round's default (5 rounds each;
   inside hot loops, not only at entry.
 - Sweet spot: leaf80, about 4-5% fewer cycles for about 4% generation. That
   is inside the current 5x margin (5.09-5.31x) only just.
+
+## Function-level comparison and the next round
+
+Comparing actual output (scratchpad tools, see the pad): on the 2,486 functions
+whose boundaries and callee sets are identical in both hosts, Stogir takes
+0.85x LLVM's samples at 1.06x the code. The gap is in code that inlining
+changes. Where the pair host inlines exactly what LLVM inlines (353
+functions), Stogir's code was 2x larger and 2.85x slower. ArrayList push!
+showed three systemic defects: inlined callees' frame objects in dynamic stack
+scopes (anchored frames, runtime SP changes, no mem2ssa); two-register results
+through memory; exhaustive enum matches with an extra compare and a dead brk.
+
+New settings: `COIL_STOGIR_INLINE=...,hoist=1` (inlined frame objects join the
+caller's static frame; dynamic-SP functions 1,384 -> 22) and
+`COIL_STOGIR_PRUNE_DEFAULT=1` (9,112 -> 143 two-way match sites; instructions
+-0.45%, cycles unchanged).
+
+Rounds `results/ab-hp11.log` and `ab-hp12.log` (min cycles vs that round's
+default): hoist -0.5%; leaf80 + hoist -2.1%; small80any + hoist -2.1% to
+-2.7%; with prune -3.0%; pair + hoist +4.6% (still worse: in
+primitive-providers-in the outer loop counter and six or seven loop-invariant
+values are reloaded from the stack on every inner iteration). Generation
+(min / median): hoist +5.9% / +2.2%, leaf80 + hoist +5.9% / +0.3%,
+small80any + hoist +18.7% / +11.9%.
