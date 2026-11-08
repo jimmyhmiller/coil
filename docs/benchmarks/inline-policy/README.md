@@ -133,3 +133,31 @@ primitive-providers-in the outer loop counter and six or seven loop-invariant
 values are reloaded from the stack on every inner iteration). Generation
 (min / median): hoist +5.9% / +2.2%, leaf80 + hoist +5.9% / +0.3%,
 small80any + hoist +18.7% / +11.9%.
+
+## Loop-aware allocation (round hp14/hp15)
+
+Allocation dump of resolve.primitive-providers-in (default host): in its
+innermost loop (depth 4, two calls) three preserved registers held values
+with no use in the loop for the whole loop, while four values the loop uses
+moved between caller-saved registers, preserved registers and the stack around
+each call and back on every back edge. Linear scan gives registers in start
+order, so early long-lived values keep the preserved registers.
+
+New settings: `COIL_STOGIR_LOOP_EVICT=1` (allocation.cold-owner: a value used
+in a loop that no free register can carry through it takes a preserved
+register from a holder unused in the rest of that loop, which is spilled
+around the loop; spill-weight eviction after LLVM's greedy allocator) and
+`COIL_STOGIR_LOOP_RELOAD=1` (reload-cut: a spilled value used inside a loop
+the spill is not in reloads at the loop entry). Loop eviction alone: register
+moves -6.1% (13.7K), instructions -1.5%.
+
+Against the goals (baseline about 1.31x LLVM runtime, 5.09-5.31x generation;
+runtime from min cycles vs the same round's default, noise about 2%):
+
+| setting | runtime | generation |
+|---|---:|---:|
+| evict + reload | ~1.28x | -1.6% (~5.2-5.4x) |
+| pair + hoist + evict | ~1.26-1.29x (was 1.37x without evict) | high |
+| leaf80 + hoist + evict | ~1.25x | +5.9% (~4.8-5.0x) |
+| small80 + hoist + evict + reload | ~1.24-1.26x | +18% (~4.3-4.5x) |
+| everything (incl. pair, always, shrink-wrap, prune) | ~1.25-1.29x | high |
