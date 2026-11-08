@@ -221,3 +221,5 @@ Frame records copied from coil-stogir b789424 (base 765ca29): a frame record at 
 Small-callee inlining at loop sites reverted in coil-stogir 4589058 (base b789424) to keep generation within the 5x budget; the adapter's per-definition budget accounting returns to plain subtraction.
 
 Inline policy copied from coil-stogir feature/inline-policy (base 4589058): call-inline takes an explicit Policy (per-caller budget; a small-callee exemption of N cloned cells at ranked loop sites or anywhere, b7d5d00 generalized; nested indirect PROTO calls; nested two-register-result calls), with the existing budget APIs as default-policy wrappers. The adapter reads COIL_STOGIR_INLINE for experiments and defaults to the previous fixed 512-cell budget and template bound, clamping its per-definition remainder at zero.
+
+Always policy copied from coil-stogir feature/inline-policy: Callee carries the source's :inline (Always); Policy honor-always (adapter setting always=1) inlines those templates at every site without charging the caller's budget. Off by default.
