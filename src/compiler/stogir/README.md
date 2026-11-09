@@ -242,3 +242,12 @@ Induction-range research vendored unchanged from coil-stogir 3752b9b (research/i
 
 Vendored coil-stogir `85f5b70341459a55ac90525b0c36fed292aec4e7` on `research/loop-load-hoist`.
 Adds the opt-in `COIL_STOGIR_HOIST_LOADS=1` pass before rotation and after successful rotation. It moves only must-execute header load chains from read-only natural loops, preserving control closure and read order. Calls, stores, volatile/atomic operations and lifetime changes are barriers. All existing verifiers remain active. This is research, disabled by default; matched runtime comparisons do not establish a gain, so it is not part of the best runtime policy. See library `docs/benchmarks/loop-load-hoist/README.md` for evidence.
+
+## Allocation-cost diagnostics
+
+Synchronized the library's version-2 allocation snapshot diagnostics on
+`research/region-recolor`. Traces now include canonical coalescing aliases and
+edge-indexed PHI copies. These records support allocation-cost research; they
+do not change allocation decisions or enable the independent-block prototype.
+
+Library diagnostics commit: `dd930d75d1c41baab94f02c1384e87e181c25a2a`.
