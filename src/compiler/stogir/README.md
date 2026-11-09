@@ -225,3 +225,9 @@ Inline policy copied from coil-stogir feature/inline-policy (base 4589058): call
 Always policy copied from coil-stogir feature/inline-policy: Callee carries the source's :inline (Always); Policy honor-always (adapter setting always=1) inlines those templates at every site without charging the caller's budget. Off by default.
 
 Shrink-wrapping and leaf inlining copied from coil-stogir feature/inline-policy: Policy small-leaf (adapter small-leaf=1) limits the small-callee exemption to call-free callees; a64.shrink-wrap, selected by the emission Context (adapter COIL_STOGIR_SHRINK_WRAP=1, module emission only), builds the frame only on paths that leave the frameless entry region, and makes the allocator assign preserved registers late. Both are off by default.
+
+November 8 allocation-region research: optional deterministic allocation input/output snapshots, selected through COIL_TPDE_STATS and COIL_STOGIR_GRAPH. Library files vendored unchanged from coil-stogir research/allocation-regions; replay equality validation pending.
+
+Allocation-region experiment: inherit predecessor locations through single-entry control-only blocks after linear scan, before assignment verification and location indexing. Source and regression checks in coil-stogir research/allocation-regions; workload evaluation pending.
+
+The retained region pass verifies allocation both before and after reassignment. The separate earlier proactive-eviction experiment was measured but not retained because its timing was inconsistent. Matched region-only hosts preserve the seed object and show roughly 1.3% lower minimum/median cycles in two rounds; complete validation remains pending.
