@@ -1,0 +1,120 @@
+;;; Integer relation facts established by dominating branch projections.
+;;; Only individual IF condition edges are rewritten; shared comparisons and
+;;; operands are unchanged. SCCP performs subsequent control/PHI/root repair.
+(module stogir.branch-facts)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.pipeline" :as pipeline)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+;;; mask uses LT=1, EQ=2, GT=4. Domain 0 is order-independent equality;
+;;; domain 1 is signed ordering, domain 2 unsigned. Width is in bytes.
+(defstruct Relation [(left i32) (right i32) (mask i32) (domain i32) (width i32)])
+(defstruct Change [(branch i32) (truth bool)])
+
+(defn type-of [(graph g/Graph) (ref i32)] (-> i32)
+  (match (g/lookup graph ref) (Some [node] (cast i32 (n/type-id node))) (None [] 0)))
+
+;;; Equal-width integer BITCASTs preserve all comparison operand bits. Do not
+;;; look through loads, extensions, truncations, floating casts or COPY barriers.
+(defn operand [(graph g/Graph) (ref i32)] (-> i32)
+  (let [(mut current) ref (mut left) (len (.instructions graph)) (mut done) false]
+    (while (and (> current 0) (> left 0) (not done))
+      (let [node (get (.instructions graph) (cast i64 current))
+            ty (cast i32 (n/type-id node))]
+        (if (and (= (n/opcode node) 36) (types/integer? ty)
+                 (types/integer? (type-of graph (.op1 node)))
+                 (= (types/size ty 8) (types/size (type-of graph (.op1 node)) 8)))
+            (set! current (.op1 node))
+            (set! done true)))
+      (set! left (- left 1)))
+    current))
+
+(defn swap-mask [(mask i32)] (-> i32)
+  (| (& mask 2) (<< (& mask 1) 2) (>> (& mask 4) 2)))
+
+(defn relation [(graph g/Graph) (ref i32)] (-> Relation)
+  (let [(mut out) (Relation :left 0 :right 0 :mask 0 :domain 0 :width 0)]
+    (when (> ref 0)
+      (let [node (get (.instructions graph) (cast i64 ref))
+            op (cast i32 (n/opcode node))]
+        (when (and (>= op 14) (<= op 23) (= (n/type-id node) 1)
+                   (types/integer? (type-of graph (.op1 node)))
+                   (= (type-of graph (.op1 node)) (type-of graph (.op2 node))))
+          (let [left (operand graph (.op1 node)) right (operand graph (.op2 node))
+                mask (cast i32 (match op (14 2) (15 5) (16 1) (17 6) (18 3) (19 4)
+                               (20 1) (21 6) (22 3) (23 4) (_ 0)))]
+            (set! out (Relation :left (if (< left right) left right)
+                       :right (if (< left right) right left)
+                       :mask (if (< left right) mask (swap-mask mask))
+                       :domain (if (< op 16) 0 (if (< op 20) 1 2))
+                       :width (types/size (type-of graph (.op1 node)) 8)))))))
+    out))
+
+;;; Domains may mix only when one relation is equality/inequality. Do not infer
+;;; signed ordering from unsigned ordering (or conversely) across the sign bit.
+(defn compatible? [(a Relation) (b Relation)] (-> bool)
+  (and (!= (.mask a) 0) (!= (.mask b) 0)
+       (= (.left a) (.left b)) (= (.right a) (.right b)) (= (.width a) (.width b))
+       (or (= (.domain a) (.domain b)) (= (.domain a) 0) (= (.domain b) 0))))
+
+;;; Result: -1 unknown, 0 false, 1 true. A fresh LOAD is a different SSA value,
+;;; so a write between two reads cannot accidentally inherit an earlier fact.
+(defn prove [(graph g/Graph) (prepared pipeline/Prepared) (branch i32)] (-> i32)
+  (let [query (relation graph (.op2 (get (.instructions graph) (cast i64 branch))))
+        (mut cursor) (get (.membership (.blocks prepared)) (cast i64 branch))
+        (mut signed) (: 7 i32) (mut unsigned) (: 7 i32) (mut result) (: -1 i32)]
+    (when (!= (.mask query) 0)
+      (while (and (> cursor 0) (< result 0))
+        (let [start (get (.instructions graph) (cast i64 cursor))
+              op (n/opcode start)
+              parent (get (.idom prepared) (cast i64 cursor))]
+          (when (or (= op 107) (= op 108))
+            (let [source (get (.instructions graph) (cast i64 (.op1 start)))
+                  fact (relation graph (.op2 source))]
+              (when (compatible? query fact)
+                (let [mask (if (= op 107) (.mask fact) (^ (.mask fact) 7))]
+                  ; Keep the two orderings independent even for an EQ/NE
+                  ; query: signed LE and unsigned GE do not imply equality.
+                  (when (!= (.domain fact) 2) (set! signed (& signed mask)))
+                  (when (!= (.domain fact) 1) (set! unsigned (& unsigned mask)))
+                  (for domain [(: 1 i32) 2]
+                    (when (or (= (.domain query) 0) (= (.domain query) domain))
+                      (let [available (if (= domain 1) signed unsigned)]
+                        (when (!= available 0)
+                          (if (= (& available (.mask query)) 0)
+                              (set! result 0)
+                              (when (= (& available (.mask query)) available)
+                                (set! result 1)))))))))))
+          (set! cursor (if (= parent cursor) 0 parent)))))
+    result))
+
+;;; Return an owned edited graph only when a branch outcome is proven. All
+;;; proofs use the original graph and dominators, independent of edit order.
+(defn run [(graph g/Graph) (entry i32) (roots (slice i32)) (allocator (dyn Allocator))]
+  (-> (Result (Option g/Graph) (slice u8)))
+  (match (pipeline/prepare graph entry roots allocator)
+    (Err [message] (Err message))
+    (Ok [prepared]
+      (let [(mut prepared) prepared (mut changes) (ArrayList::new [Change] allocator)]
+        (for ref (.nodes (.schedule prepared))
+          (when (= (n/opcode (get (.instructions graph) (cast i64 ref))) 116)
+            (let [truth (prove graph prepared ref)]
+              (when (>= truth 0)
+                (push! (mut changes) (Change :branch ref :truth (!= truth 0)))))))
+        (pipeline/release! (mut prepared))
+        (let [result
+          (if (= (len changes) 0)
+              (Ok [(Option g/Graph) (slice u8)] (None [g/Graph]))
+              (let [(mut working) (g/duplicate graph allocator)]
+                (for change changes
+                  (let [constant (match (g/intern-scalar! (mut working) 1 (if (.truth change) (: 1 u64) (: 0 u64)))
+                                   (Some [r] r) (None [] (panic "branch fact constant allocation failed")))]
+                    (unless (g/set-operand! (mut working) (.branch change) 2 constant)
+                      (panic "branch fact condition update failed"))))
+                (Ok [(Option g/Graph) (slice u8)] (Some working))))]
+          (free! (mut changes))
+          result)))))

@@ -231,3 +231,7 @@ November 8 allocation-region research: optional deterministic allocation input/o
 Allocation-region experiment: inherit predecessor locations through single-entry control-only blocks after linear scan, before assignment verification and location indexing. Source and regression checks in coil-stogir research/allocation-regions; workload evaluation pending.
 
 The retained region pass verifies allocation both before and after reassignment. The separate earlier proactive-eviction experiment was measured but not retained because its timing was inconsistent. Matched region-only hosts preserve the seed object and show roughly 1.3% lower minimum/median cycles in two rounds; complete validation remains pending.
+
+Branch-fact research from coil-stogir 3edd0e0 (research/branch-facts): opt-in dominating integer relation proofs rewrite individual IF condition edges, followed by SCCP control and PHI cleanup. Signed and unsigned relation masks remain independent. Adapter setting COIL_STOGIR_BRANCH_FACTS=1; off by default. The completed adapter passes Quick FAST and preserves the fixed seed object in all matched runtime runs; its runtime signal is mixed (minimum cycles -0.6%, median +1.2% against the region baseline). This remains an experimental option, not a claimed performance win. Full measurement and validation evidence is in coil-stogir docs/benchmarks/branch-facts/.
+
+Branch-fact option also applies to private leaf precompilation and modules without certified private callees, using an inactive private context (no unsealed registry access).
