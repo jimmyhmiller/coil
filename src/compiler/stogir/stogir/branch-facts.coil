@@ -6,6 +6,8 @@
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
 (import "stogir.pipeline" :as pipeline)
+(import "stogir.dominators" :as dom)
+(import "stogir.symbols" :as symbols)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [Allocator])
 (import "coil.result" :use [Result Ok Err Option Some None])
@@ -92,19 +94,166 @@
           (set! cursor (if (= parent cursor) 0 parent)))))
     result))
 
+;;; Signed mathematical intervals over integer bit patterns. Signedness of an
+;;; ordering comes from its opcode, not the scalar storage type (Coil uses u64
+;;; containers for signed word operations too). i128 keeps endpoint arithmetic
+;;; exact even at the 64-bit limits.
+(defstruct Range [(valid bool) (low i128) (high i128) (width i32)])
+
+(defn no-range [] (-> Range) (Range :valid false :low 0 :high 0 :width 0))
+(defn range-type? [(ty i32)] (-> bool)
+  (and (types/integer? ty) (> ty 1) (!= ty 6)))
+
+(defn literal-range [(graph g/Graph) (ref i32)] (-> Range)
+  (let [(mut out) (no-range)]
+    (when (< ref 0)
+      (match (g/lookup graph ref)
+        (None [] 0)
+        (Some [node]
+          (let [ty (cast i32 (n/type-id node)) width (types/size ty 8)]
+            (when (and (range-type? ty) (symbols/numeric? node))
+              (let [modulus (<< (: 1 i128) (cast i128 (* width 8)))
+                    bits (& (cast i128 (n/constant-bits node)) (- modulus 1))
+                    value (if (>= bits (/ modulus 2)) (- bits modulus) bits)]
+                (set! out (Range :valid true :low value :high value :width width))))))))
+    out))
+
+;;; A dominating signed strict comparison v < other establishes v <= MAX-1,
+;;; regardless of whether other is constant or loop-invariant. Only projections
+;;; within this iteration (from the back-edge block up to the header) count.
+(defn strict-upper? [(graph g/Graph) (prepared pipeline/Prepared)
+                    (value i32) (width i32) (header i32) (back i32)] (-> bool)
+  (let [(mut cursor) back (mut found) false (mut done) false]
+    (while (and (> cursor 0) (not found) (not done))
+      (let [node (get (.instructions graph) (cast i64 cursor)) op (n/opcode node)
+            parent (get (.idom prepared) (cast i64 cursor))]
+        (when (or (= op 107) (= op 108))
+          (let [source (get (.instructions graph) (cast i64 (.op1 node)))
+                fact (relation graph (.op2 source))
+                mask (if (= op 107) (.mask fact) (^ (.mask fact) 7))]
+            (when (and (= (.domain fact) 1) (= (.width fact) width))
+              (when (or (and (= (.left fact) value) (= mask 1))
+                        (and (= (.right fact) value) (= (swap-mask mask) 1)))
+                (set! found true)))))
+        (set! done (or (= cursor header) (= parent cursor)))
+        (set! cursor parent)))
+    found))
+
+;;; An intentionally small induction family, proved from the immutable graph:
+;;; one external entry, one natural back edge, and a unit ADD recurrence. MERGE
+;;; and LOOP_BEGIN are both accepted; CFG edge positions select the PHI inputs.
+;;; No inferred range is used to justify another recurrence.
+(defn induction! [(graph g/Graph) (prepared pipeline/Prepared) (ref i32)
+                  (ranges (mut (ArrayList Range)))] (-> void)
+  (let [phi (get (.instructions graph) (cast i64 ref)) ty (cast i32 (n/type-id phi))
+        header (.op1 phi) width (types/size ty 8)]
+    (when (and (= (n/opcode phi) 67) (range-type? ty)
+               (= (get (.arities graph) (cast i64 ref)) 3) (> header 0))
+      (let [region (get (.instructions graph) (cast i64 header))
+            (mut entry-slot) (: 0 i32) (mut back-slot) (: 0 i32)
+            (mut back) (: 0 i32) (mut valid) true]
+        (when (and (or (= (n/opcode region) 112) (= (n/opcode region) 113))
+                   (= (get (.arities graph) (cast i64 header)) 2))
+          (for edge (.edges (.blocks prepared))
+            (when (= (.to edge) header)
+              (if (or (<= (.from edge) 0) (= (get (.idom prepared) (cast i64 (.from edge))) 0))
+                  (set! valid false)
+                  (if (dom/dominates? (.idom prepared) header (.from edge))
+                      (if (!= back-slot 0) (set! valid false)
+                          (do (set! back-slot (.position edge)) (set! back (.from edge))))
+                      (if (!= entry-slot 0) (set! valid false)
+                          (set! entry-slot (.position edge)))))))
+          (when (and valid (!= entry-slot 0) (!= back-slot 0))
+            (let [initial (if (= entry-slot 1) (.op2 phi) (.op3 phi))
+                  next (operand graph (if (= back-slot 1) (.op2 phi) (.op3 phi)))
+                  seed (literal-range graph initial)
+                  maximum (- (<< (: 1 i128) (cast i128 (- (* width 8) 1))) 1)]
+              (when (and (.valid seed) (= (.width seed) width) (> next 0))
+                (let [update (get (.instructions graph) (cast i64 next))
+                      left (operand graph (.op1 update)) right (operand graph (.op2 update))
+                      step (literal-range graph (if (= left ref) right left))]
+                  (when (and (= (n/opcode update) 26)
+                             (range-type? (cast i32 (n/type-id update)))
+                             (= (types/size (cast i32 (n/type-id update)) 8) width)
+                             (or (= left ref) (= right ref))
+                             (.valid step) (= (.width step) width) (= (.low step) 1))
+                    (cond
+                      ; Back-edge guard on the updated value: PHI <= MAX-1.
+                      ; Hence the ADD is safe everywhere it can be observed.
+                      (and (< (.high seed) maximum)
+                           (strict-upper? graph prepared next width header back))
+                        (do
+                          (set! (mut ranges) (cast i64 ref)
+                            (Range :valid true :low (.low seed) :high (- maximum 1) :width width))
+                          (set! (mut ranges) (cast i64 next)
+                            (Range :valid true :low (+ (.low seed) 1) :high maximum :width width)))
+                      ; Guard on the old PHI: the update is safe on the back
+                      ; edge, but could wrap on an exit path. Record only PHI.
+                      (strict-upper? graph prepared ref width header back)
+                        (set! (mut ranges) (cast i64 ref)
+                          (Range :valid true :low (.low seed) :high maximum :width width))
+                      :else 0)))))))))))
+
+(defn induction-ranges [(graph g/Graph) (prepared pipeline/Prepared) (a (dyn Allocator))]
+  (-> (ArrayList Range))
+  (let [(mut ranges) (ArrayList::new [Range] a)]
+    (for [i 0 (len (.instructions graph))] (push! (mut ranges) (no-range)))
+    (for ref (.nodes (.schedule prepared))
+      (when (= (n/opcode (get (.instructions graph) (cast i64 ref))) 67)
+        (induction! graph prepared ref (mut ranges))))
+    ranges))
+
+(defn value-range [(graph g/Graph) (ranges (ArrayList Range)) (ref i32)] (-> Range)
+  (let [value (operand graph ref)]
+    (if (< value 0) (literal-range graph value)
+        (if (and (> value 0) (< (cast i64 value) (len ranges)))
+            (get ranges (cast i64 value)) (no-range)))))
+
+;;; An interval crossing the sign bit becomes the full unsigned domain. Do not
+;;; treat its signed endpoints as an ordered unsigned interval.
+(defn unsigned-range [(r Range)] (-> Range)
+  (let [modulus (<< (: 1 i128) (cast i128 (* (.width r) 8)))]
+    (if (>= (.low r) 0) r
+        (if (< (.high r) 0)
+            (Range :valid (.valid r) :low (+ (.low r) modulus) :high (+ (.high r) modulus) :width (.width r))
+            (Range :valid (.valid r) :low 0 :high (- modulus 1) :width (.width r))))))
+
+(defn prove-range [(graph g/Graph) (ranges (ArrayList Range)) (branch i32)] (-> i32)
+  (let [query (relation graph (.op2 (get (.instructions graph) (cast i64 branch))))
+        (mut result) (: -1 i32)]
+    (when (!= (.mask query) 0)
+      (let [left (value-range graph ranges (.left query))
+            right (value-range graph ranges (.right query))]
+        (when (and (.valid left) (.valid right) (= (.width left) (.width query))
+                   (= (.width right) (.width query)))
+          (let [l (if (= (.domain query) 2) (unsigned-range left) left)
+                r (if (= (.domain query) 2) (unsigned-range right) right)
+                possible (| (if (< (.low l) (.high r)) (: 1 i32) 0)
+                            (if (and (<= (.low l) (.high r)) (<= (.low r) (.high l))) (: 2 i32) 0)
+                            (if (> (.high l) (.low r)) (: 4 i32) 0))]
+            (if (= (& possible (.mask query)) 0) (set! result 0)
+                (when (= (& possible (.mask query)) possible) (set! result 1)))))))
+    result))
+
 ;;; Return an owned edited graph only when a branch outcome is proven. All
 ;;; proofs use the original graph and dominators, independent of edit order.
-(defn run [(graph g/Graph) (entry i32) (roots (slice i32)) (allocator (dyn Allocator))]
+(defn run-with-induction [(graph g/Graph) (entry i32) (roots (slice i32)) (allocator (dyn Allocator))
+                           (induction bool)]
   (-> (Result (Option g/Graph) (slice u8)))
   (match (pipeline/prepare graph entry roots allocator)
     (Err [message] (Err message))
     (Ok [prepared]
-      (let [(mut prepared) prepared (mut changes) (ArrayList::new [Change] allocator)]
+      (let [(mut prepared) prepared (mut changes) (ArrayList::new [Change] allocator)
+            (mut ranges) (if induction (induction-ranges graph prepared allocator)
+                              (ArrayList::new [Range] allocator))]
         (for ref (.nodes (.schedule prepared))
           (when (= (n/opcode (get (.instructions graph) (cast i64 ref))) 116)
-            (let [truth (prove graph prepared ref)]
+            (let [dominated (prove graph prepared ref)
+                  truth (if (or (>= dominated 0) (not induction)) dominated
+                            (prove-range graph ranges ref))]
               (when (>= truth 0)
                 (push! (mut changes) (Change :branch ref :truth (!= truth 0)))))))
+        (free! (mut ranges))
         (pipeline/release! (mut prepared))
         (let [result
           (if (= (len changes) 0)
@@ -118,3 +267,7 @@
                 (Ok [(Option g/Graph) (slice u8)] (Some working))))]
           (free! (mut changes))
           result)))))
+
+(defn run [(graph g/Graph) (entry i32) (roots (slice i32)) (allocator (dyn Allocator))]
+  (-> (Result (Option g/Graph) (slice u8)))
+  (run-with-induction graph entry roots allocator false))
