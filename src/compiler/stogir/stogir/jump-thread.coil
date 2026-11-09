@@ -1,0 +1,1376 @@
+;;; Jump threading over a MERGE whose block holds only PHIs and one IF/SWITCH
+;;; testing them. An incoming edge whose PHI inputs decide the test jumps
+;;; straight to the chosen projection; an edge carrying a comparison gets its
+;;; own copy of the IF. Values that the PHIs fed are repaired with new PHIs at
+;;; the joins this creates. An independent extension after LLVM's JumpThreading
+;;; and SSAUpdater; not an upstream ir pass. See docs/CONTROL.md.
+(module stogir.jump-thread)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.types" :as types)
+(import "stogir.uses" :as uses)
+(import "stogir.bitqueue" :as q)
+(import "stogir.bitset" :as bits)
+(import "stogir.conditional" :as conditional)
+(import "stogir.switch" :as switch)
+(import "stogir.fold" :as fold)
+(import "stogir.boolean-diamond" :as diamond)
+(import "stogir.iter-control" :as control)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+;;; Bounds. A candidate over any of them is left alone.
+(def MAX-EDGES (: 64 i64))      ; incoming edges after flattening
+(def MAX-PHIS (: 16 i64))       ; PHIs of the threaded MERGE
+(def MAX-SIDES (: 64 i64))      ; projections of the branch
+(def MAX-CLOSURE (: 256 i64))   ; floating values computed from the PHIs
+(def MAX-POINTS (: 1024 i64))   ; pinned uses of those values
+(def MAX-STEPS (: 4096 i64))    ; control nodes walked for one candidate
+(def TREE-DEPTH (: 4 i32))      ; operators between the PHIs and the test
+(def FLATTEN-DEPTH (: 8 i32))   ; nested empty MERGEs folded into the edges
+
+;;; Edge states: a side index, or one of these.
+(def UNKNOWN (: -1 i32))
+(def SPLIT (: -2 i32))
+;;; Token of a value whose uses see more than one definition.
+(def MIXED (: -1 i32))
+(def IN-PROGRESS (: -2147483648 i32))
+
+;;; A control or PHI operand that reads a repaired value at TOKEN.
+(defstruct Point [(user i32) (operand i32) (value i32) (token i32)])
+;;; The definition of VALUE that reaches TOKEN.
+(defstruct Version [(value i32) (token i32) (result i32)])
+;;; A new PHI whose inputs are still zero. kind 0: PHI b at the join of side
+;;; a. kind 1: value b at the existing MERGE a.
+(defstruct Fill [(phi i32) (kind i32) (a i32) (b i32)])
+(defstruct Val [(known bool) (ty u8) (bits u64)])
+
+(defstruct State
+  [(pointer-bytes i32)
+   (protected bits/Bits)
+   (protected-ready bool)
+   ; Control-flow facts for the whole graph, built on first need.
+   (flow-ready bool)
+   (flow (ArrayList u8))        ; depth-first state: 0 unseen, 1 open, 2 done
+   (back (ArrayList u8))        ; END that closes a cycle
+   ; Per-candidate stamps, valid when equal to epoch.
+   (epoch i32)
+   (mark (ArrayList i32))       ; member of the natural loop
+   (stamp (ArrayList i32))      ; memo holds this control node's token
+   (memo (ArrayList i32))
+   (member (ArrayList i32))     ; floating value computed from the PHIs
+   (token (ArrayList i32))      ; the one token its uses see, or MIXED
+   (steps i64)
+   ; The candidate.
+   (merge i32)
+   (branch i32)
+   (condition i32)
+   (dispatch bool)              ; branch is a SWITCH
+   (relevant u64)               ; PHIs the condition reads, by index
+   (phis (ArrayList i32))
+   (sides (ArrayList i32))      ; projections; an IF's are [true false]
+   (keys (ArrayList u64))       ; CASE_VAL keys
+   (default-side i64)
+   (joins (ArrayList i32))      ; per side: the block start that replaces it
+   (owns (ArrayList i32))       ; per side: 1 when the join's first input is the projection's END
+   (body i64)                   ; the side inside the loop this MERGE heads, or -1
+   (header bool)
+   ; Incoming edges after flattening, with one row of PHI inputs each.
+   (ends (ArrayList i32))
+   (parents (ArrayList i32))
+   (slots (ArrayList i32))
+   (states (ArrayList i32))
+   (edge-tokens (ArrayList i32))
+   (vias (ArrayList i32))       ; per edge: the flattened END it came through, or 0
+   (backs (ArrayList i32))      ; per edge: 1 when it closes a cycle
+   (values (ArrayList i32))
+   (row (ArrayList i32))
+   (gone (ArrayList i32))       ; flattened MERGEs and their PHIs
+   (gone-ends (ArrayList i32))
+   (gone-vias (ArrayList i32))  ; per flattened END: the one it came through
+   (closure (ArrayList i32))
+   (points (ArrayList Point))
+   (versions (ArrayList Version))
+   (fills (ArrayList Fill))
+   (path (ArrayList i32))
+   (work (ArrayList i32))
+   (scratch (ArrayList i32))
+   (inputs (ArrayList i32))
+   (pending (ArrayList i32))
+   (unknown-count i64)
+   (pruning bool)
+   (changes i32)])
+
+(defn create [(pointer-bytes i32) (a (dyn Allocator))] (-> State)
+  (State :pointer-bytes pointer-bytes
+         :protected (bits/create 0 a)
+         :protected-ready false
+         :flow-ready false
+         :flow (ArrayList::new [u8] a)
+         :back (ArrayList::new [u8] a)
+         :epoch 0
+         :mark (ArrayList::new [i32] a)
+         :stamp (ArrayList::new [i32] a)
+         :memo (ArrayList::new [i32] a)
+         :member (ArrayList::new [i32] a)
+         :token (ArrayList::new [i32] a)
+         :steps 0
+         :merge 0
+         :branch 0
+         :condition 0
+         :dispatch false
+         :relevant 0
+         :phis (ArrayList::new [i32] a)
+         :sides (ArrayList::new [i32] a)
+         :keys (ArrayList::new [u64] a)
+         :default-side -1
+         :joins (ArrayList::new [i32] a)
+         :owns (ArrayList::new [i32] a)
+         :body -1
+         :header false
+         :ends (ArrayList::new [i32] a)
+         :parents (ArrayList::new [i32] a)
+         :slots (ArrayList::new [i32] a)
+         :states (ArrayList::new [i32] a)
+         :edge-tokens (ArrayList::new [i32] a)
+         :vias (ArrayList::new [i32] a)
+         :backs (ArrayList::new [i32] a)
+         :values (ArrayList::new [i32] a)
+         :row (ArrayList::new [i32] a)
+         :gone (ArrayList::new [i32] a)
+         :gone-ends (ArrayList::new [i32] a)
+         :gone-vias (ArrayList::new [i32] a)
+         :closure (ArrayList::new [i32] a)
+         :points (ArrayList::new [Point] a)
+         :versions (ArrayList::new [Version] a)
+         :fills (ArrayList::new [Fill] a)
+         :path (ArrayList::new [i32] a)
+         :work (ArrayList::new [i32] a)
+         :scratch (ArrayList::new [i32] a)
+         :inputs (ArrayList::new [i32] a)
+         :pending (ArrayList::new [i32] a)
+         :unknown-count 0
+         :pruning false
+         :changes 0))
+
+(defn release! [(s (mut State))] (-> void)
+  (bits/release! (mut (.protected s)))
+  (free! (mut (.flow s)))
+  (free! (mut (.back s)))
+  (free! (mut (.mark s)))
+  (free! (mut (.stamp s)))
+  (free! (mut (.memo s)))
+  (free! (mut (.member s)))
+  (free! (mut (.token s)))
+  (free! (mut (.phis s)))
+  (free! (mut (.sides s)))
+  (free! (mut (.keys s)))
+  (free! (mut (.joins s)))
+  (free! (mut (.owns s)))
+  (free! (mut (.ends s)))
+  (free! (mut (.parents s)))
+  (free! (mut (.slots s)))
+  (free! (mut (.states s)))
+  (free! (mut (.edge-tokens s)))
+  (free! (mut (.vias s)))
+  (free! (mut (.backs s)))
+  (free! (mut (.values s)))
+  (free! (mut (.row s)))
+  (free! (mut (.gone s)))
+  (free! (mut (.gone-ends s)))
+  (free! (mut (.gone-vias s)))
+  (free! (mut (.closure s)))
+  (free! (mut (.points s)))
+  (free! (mut (.versions s)))
+  (free! (mut (.fills s)))
+  (free! (mut (.path s)))
+  (free! (mut (.work s)))
+  (free! (mut (.scratch s)))
+  (free! (mut (.inputs s)))
+  (free! (mut (.pending s))))
+
+(defn opcode [(graph g/Graph) (reference i32)] (-> i32)
+  (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference)))))
+
+(defn arity [(graph g/Graph) (reference i32)] (-> i32)
+  (get (.arities graph) (cast i64 reference)))
+
+(defn input [(graph g/Graph) (reference i32) (index i32)] (-> i32)
+  (match (g/operand graph reference index) (Some [value] value) (None [] 0)))
+
+(defn count [(edges uses/Uses) (reference i32)] (-> i64)
+  (.count (get (.ranges edges) (cast i64 reference))))
+
+(defn type-of [(graph g/Graph) (reference i32)] (-> u8)
+  (match (g/lookup graph reference) (Some [node] (n/type-id node)) (None [] (: 0 u8))))
+
+(defn merge-like? [(code i32)] (-> bool)
+  (or (= code 112) (= code 113)))
+
+;;; Entry of a per-node list, zero beyond its end.
+(defn cell [(list (ArrayList i32)) (reference i32)] (-> i32)
+  (if (and (>= reference 0) (< (cast i64 reference) (len list)))
+      (get list (cast i64 reference))
+      0))
+
+(defn put! [(list (mut (ArrayList i32))) (reference i32) (value i32)] (-> void)
+  (while (<= (len list) (cast i64 reference)) (push! (mut list) 0))
+  (set! (mut list) (cast i64 reference) value))
+
+(defn flag-at [(list (ArrayList u8)) (reference i32)] (-> u8)
+  (if (and (>= reference 0) (< (cast i64 reference) (len list)))
+      (get list (cast i64 reference))
+      (: 0 u8)))
+
+(defn flag! [(list (mut (ArrayList u8))) (reference i32) (value u8)] (-> void)
+  (while (<= (len list) (cast i64 reference)) (push! (mut list) (: 0 u8)))
+  (set! (mut list) (cast i64 reference) value))
+
+(defn grow-bits! [(set (mut bits/Bits)) (size i64)] (-> void)
+  (when (> size (.size set))
+    (let [rounded (* (/ (+ size 255) 256) 256)]
+      (while (< (* (len (.words set)) 64) rounded) (push! (mut (.words set)) (: 0 u64)))
+      (set! (.size set) rounded))))
+
+(defn protected? [(s State) (reference i32)] (-> bool)
+  (bits/contains? (.protected s) (cast i64 reference)))
+
+;;; Index of a PHI of the candidate MERGE, or -1. By identity: commit! may
+;;; already have rewritten the PHI in place.
+(defn source-index [(s State) (graph g/Graph) (value i32)] (-> i64)
+  (let [(mut found) (: -1 i64)]
+    (when (> value 0)
+      (for [j 0 (len (.phis s))]
+        (when (= (get (.phis s) j) value) (set! found j))))
+    found))
+
+(defn member? [(s State) (value i32)] (-> bool)
+  (and (> value 0) (= (cell (.member s) value) (.epoch s))))
+
+(defn side-index [(s State) (token i32)] (-> i64)
+  (let [(mut found) (: -1 i64)]
+    (for [i 0 (len (.sides s))]
+      (when (= (get (.sides s) i) token) (set! found i)))
+    found))
+
+(defn value-at [(s State) (edge i64) (phi i64)] (-> i32)
+  (get (.values s) (+ (* edge (len (.phis s))) phi)))
+
+;;; Operators the condition may apply to the MERGE's PHIs: comparisons and
+;;; wrapping integer arithmetic, Boolean NOT and integer extensions/views.
+(defn binary? [(code i32)] (-> bool)
+  (or (and (>= code 14) (<= code 23))
+      (and (>= code 26) (<= code 28))
+      (and (>= code 46) (<= code 51))))
+
+(defn unary? [(code i32)] (-> bool)
+  (or (= code 45) (and (>= code 33) (<= code 36))))
+
+;;; The condition is a small tree of such operators over the MERGE's PHIs.
+;;; Records which PHIs it reads.
+(defn depends! [(s (mut State)) (graph g/Graph) (value i32) (depth i32)] (-> bool)
+  (if (or (<= value 0) (<= depth 0))
+      false
+      (let [code (opcode graph value)
+            node (get (.instructions graph) (cast i64 value))]
+        (cond (= code 67)
+                (let [j (source-index s graph value)]
+                  (if (< j 0)
+                      false
+                      (do (set! (.relevant s) (| (.relevant s) (<< (: 1 u64) (cast u64 j))))
+                          true)))
+              (binary? code)
+                (let [left (depends! (mut s) graph (.op1 node) (- depth 1))
+                      right (depends! (mut s) graph (.op2 node) (- depth 1))]
+                  (or left right))
+              (unary? code)
+                (depends! (mut s) graph (.op1 node) (- depth 1))
+              :else false))))
+
+;;; The MERGE's users are PHIs and one IF or SWITCH whose condition reads them.
+(defn gather! [(s (mut State)) (graph g/Graph) (edges uses/Uses) (merge i32)] (-> bool)
+  (let [(mut good) (and (= (opcode graph merge) 112) (>= (arity graph merge) 2))
+        (mut branch) (: 0 i32)]
+    (clear! (mut (.phis s)))
+    (when good
+      (let [range (get (.ranges edges) (cast i64 merge))]
+        (for [i (.offset range) (+ (.offset range) (.count range))]
+          (let [edge (get (.edges edges) i)
+                code (opcode graph (.user edge))]
+            (cond (!= (.operand edge) 1) (set! good false)
+                  (= code 67) (push! (mut (.phis s)) (.user edge))
+                  (and (or (= code 116) (= code 117)) (= branch 0)) (set! branch (.user edge))
+                  :else (set! good false))))))
+    (when (or (= branch 0) (= (len (.phis s)) 0) (> (len (.phis s)) MAX-PHIS))
+      (set! good false))
+    (when good
+      (set! (.merge s) merge)
+      (set! (.branch s) branch)
+      (set! (.dispatch s) (= (opcode graph branch) 117))
+      (set! (.condition s) (input graph branch 2))
+      (set! (.relevant s) 0)
+      (unless (and (= (arity graph branch) 2)
+                   (> (.condition s) 0)
+                   (depends! (mut s) graph (.condition s) TREE-DEPTH))
+        (set! good false)))
+    good))
+
+(defn ensure-protected! [(s (mut State)) (graph g/Graph) (roots (ArrayList i32))] (-> void)
+  (unless (.protected-ready s)
+    (set! (.protected-ready s) true)
+    (grow-bits! (mut (.protected s)) (len (.instructions graph)))
+    (for root roots (bits/add! (mut (.protected s)) (cast i64 root)))))
+
+;;; Projections of the branch, none observed. An IF gives [true false]; a
+;;; SWITCH needs value cases and one default.
+(defn sides! [(s (mut State)) (graph g/Graph) (edges uses/Uses)] (-> bool)
+  (let [branch (.branch s)
+        range (get (.ranges edges) (cast i64 branch))
+        ty (cast i32 (type-of graph (.condition s)))
+        (mut good) true
+        (mut yes) (: 0 i32)
+        (mut no) (: 0 i32)]
+    (clear! (mut (.sides s)))
+    (clear! (mut (.keys s)))
+    (set! (.default-side s) -1)
+    (for [i (.offset range) (+ (.offset range) (.count range))]
+      (let [edge (get (.edges edges) i)
+            user (.user edge)
+            code (opcode graph user)]
+        (if (or (!= (.operand edge) 1) (protected? s user))
+            (set! good false)
+            (if (.dispatch s)
+                (cond (= code 109)
+                        (match (switch/key graph (input graph user 2) ty)
+                          (Err [_] (set! good false))
+                          (Ok [key]
+                              (push! (mut (.sides s)) user)
+                              (push! (mut (.keys s)) key)))
+                      (and (= code 111) (< (.default-side s) 0))
+                        (do (set! (.default-side s) (len (.sides s)))
+                            (push! (mut (.sides s)) user)
+                            (push! (mut (.keys s)) (: 0 u64)))
+                      :else (set! good false))
+                (cond (and (= code 107) (= yes 0)) (set! yes user)
+                      (and (= code 108) (= no 0)) (set! no user)
+                      :else (set! good false))))))
+    (if (.dispatch s)
+        (when (or (< (.default-side s) 0) (> (len (.sides s)) MAX-SIDES)) (set! good false))
+        (if (or (= yes 0) (= no 0))
+            (set! good false)
+            (do (push! (mut (.sides s)) yes)
+                (push! (mut (.sides s)) no))))
+    good))
+
+(defn gone? [(s State) (reference i32)] (-> bool)
+  (let [(mut found) false]
+    (for item (.gone s) (when (= item reference) (set! found true)))
+    found))
+
+;;; END reaches PARENT's input SLOT from a MERGE that holds only PHIs read by
+;;; PARENT's PHIs at that input, one of them by the condition. Such a MERGE
+;;; adds nothing but the choice of value, so its own edges can stand in.
+(defn flattenable? [(s State) (graph g/Graph) (edges uses/Uses) (end i32) (parent i32)
+                    (slot i32) (base i64) (depth i32)] (-> bool)
+  (let [inner (input graph end 1)
+        (mut good) (and (< depth FLATTEN-DEPTH)
+                        (> inner 0)
+                        (!= inner (.merge s))
+                        (= (opcode graph inner) 112)
+                        (not (protected? s inner))
+                        (not (gone? s inner)))
+        (mut hit) false]
+    (when good
+      (let [range (get (.ranges edges) (cast i64 inner))]
+        (for [i (.offset range) (+ (.offset range) (.count range))]
+          (let [edge (get (.edges edges) i)
+                user (.user edge)]
+            (cond (!= (.operand edge) 1) (set! good false)
+                  (= user end) 0
+                  (and (= (opcode graph user) 67)
+                       (not (protected? s user))
+                       (= (arity graph user) (+ (arity graph inner) 1)))
+                    (let [inside (get (.ranges edges) (cast i64 user))]
+                      (for [k (.offset inside) (+ (.offset inside) (.count inside))]
+                        (let [use (get (.edges edges) k)]
+                          (unless (and (= (opcode graph (.user use)) 67)
+                                       (= (input graph (.user use) 1) parent)
+                                       (= (.operand use) (+ slot 1)))
+                            (set! good false)))))
+                  :else (set! good false))))))
+    (when good
+      (for [j 0 (len (.phis s))]
+        (let [value (get (.row s) (+ base j))]
+          (when (and (!= (& (.relevant s) (<< (: 1 u64) (cast u64 j))) 0)
+                     (> value 0)
+                     (= (opcode graph value) 67)
+                     (= (input graph value 1) inner))
+            (set! hit true)))))
+    (and good hit)))
+
+;;; Record the edge through END, whose PHI inputs are row[base..]. Returns
+;;; false when the edge cannot be threaded at all.
+(defn add-edge! [(s (mut State)) (graph g/Graph) (edges uses/Uses) (end i32) (parent i32)
+                 (slot i32) (via i32) (base i64) (depth i32)] (-> bool)
+  (let [width (len (.phis s))
+        (mut good) (and (> end 0) (= (opcode graph end) 114) (= (count edges end) 1))]
+    (when good
+      (if (flattenable? s graph edges end parent slot base depth)
+          (let [inner (input graph end 1)
+                range (get (.ranges edges) (cast i64 inner))]
+            (push! (mut (.gone s)) inner)
+            (push! (mut (.gone-ends s)) end)
+            (push! (mut (.gone-vias s)) via)
+            (for [i (.offset range) (+ (.offset range) (.count range))]
+              (let [user (.user (get (.edges edges) i))]
+                (when (!= user end) (push! (mut (.gone s)) user))))
+            (for [k 1 (+ (cast i64 (arity graph inner)) 1)]
+              (when good
+                (let [next (len (.row s))]
+                  (for [j 0 width]
+                    (let [value (get (.row s) (+ base j))]
+                      (push! (mut (.row s))
+                             (if (and (> value 0)
+                                      (= (opcode graph value) 67)
+                                      (= (input graph value 1) inner))
+                                 (input graph value (cast i32 (+ k 1)))
+                                 value))))
+                  (unless (add-edge! (mut s) graph edges (input graph inner (cast i32 k))
+                                     inner (cast i32 k) end next (+ depth 1))
+                    (set! good false))
+                  (while (> (len (.row s)) next) (pop! (mut (.row s))))))))
+          (do
+            (push! (mut (.ends s)) end)
+            (push! (mut (.parents s)) parent)
+            (push! (mut (.slots s)) slot)
+            (push! (mut (.states s)) UNKNOWN)
+            (push! (mut (.edge-tokens s)) 0)
+            (push! (mut (.vias s)) via)
+            (for [j 0 width]
+              (let [value (get (.row s) (+ base j))]
+                (when (and (> value 0)
+                           (or (= (opcode graph value) 70) (= (opcode graph value) 72)))
+                  (set! good false))
+                (push! (mut (.values s)) value)))
+            (when (> (len (.ends s)) MAX-EDGES) (set! good false)))))
+    good))
+
+(defn flatten! [(s (mut State)) (graph g/Graph) (edges uses/Uses)] (-> bool)
+  (let [merge (.merge s)
+        (mut good) true]
+    (clear! (mut (.ends s)))
+    (clear! (mut (.parents s)))
+    (clear! (mut (.slots s)))
+    (clear! (mut (.states s)))
+    (clear! (mut (.edge-tokens s)))
+    (clear! (mut (.vias s)))
+    (clear! (mut (.gone-vias s)))
+    (clear! (mut (.values s)))
+    (clear! (mut (.gone s)))
+    (clear! (mut (.gone-ends s)))
+    (for phi (.phis s)
+      (when (or (protected? s phi)
+                (!= (arity graph phi) (+ (arity graph merge) 1))
+                (= (type-of graph phi) 0)
+                (not (types/valid-scalar? (cast i32 (type-of graph phi)))))
+        (set! good false)))
+    (when (or (protected? s merge) (protected? s (.branch s))) (set! good false))
+    (for [k 1 (+ (cast i64 (arity graph merge)) 1)]
+      (when good
+        (clear! (mut (.row s)))
+        (for phi (.phis s) (push! (mut (.row s)) (input graph phi (cast i32 (+ k 1)))))
+        (unless (add-edge! (mut s) graph edges (input graph merge (cast i32 k))
+                           merge (cast i32 k) 0 0 0)
+          (set! good false))))
+    good))
+
+(defn unknown [] (-> Val)
+  (Val :known false :ty 0 :bits 0))
+
+(defn width-mask [(ty i32) (pointer-bytes i32)] (-> u64)
+  (let [size (types/scalar-size ty pointer-bytes)]
+    (if (or (<= size 0) (>= size 8))
+        (: 0xFFFFFFFFFFFFFFFF u64)
+        (- (<< (: 1 u64) (cast u64 (* size 8))) 1))))
+
+;;; VALUE on incoming edge EDGE, when the PHI inputs there make it a constant.
+(defn evaluate [(s State) (graph g/Graph) (value i32) (edge i64) (depth i32)] (-> Val)
+  (if (< value 0)
+      (match (g/lookup graph value)
+        (None [] (unknown))
+        (Some [literal]
+              (if (and (= (n/opcode literal) (n/type-id literal))
+                       (types/integer? (cast i32 (n/type-id literal))))
+                  (Val :known true :ty (n/type-id literal) :bits (n/constant-bits literal))
+                  (unknown))))
+      (if (or (= value 0) (<= depth 0))
+          (unknown)
+          (let [node (get (.instructions graph) (cast i64 value))
+                code (opcode graph value)
+                ty (cast i32 (n/type-id node))
+                bytes (.pointer-bytes s)]
+            (cond (= code 67)
+                    (let [j (source-index s graph value)]
+                      (if (or (< j 0) (>= (value-at s edge j) 0))
+                          (unknown)
+                          (evaluate s graph (value-at s edge j) edge 1)))
+                  (and (>= code 14) (<= code 23))
+                    (let [left (evaluate s graph (.op1 node) edge (- depth 1))
+                          right (evaluate s graph (.op2 node) edge (- depth 1))]
+                      (if (and (.known left) (.known right) (= (.ty left) (.ty right)))
+                          (match (fold/integer-compare code (cast i32 (.ty left)) bytes
+                                                       (.bits left) (.bits right))
+                            (None [] (unknown))
+                            (Some [result] (Val :known true :ty 1 :bits result)))
+                          (unknown)))
+                  (binary? code)
+                    (let [left (evaluate s graph (.op1 node) edge (- depth 1))
+                          right (evaluate s graph (.op2 node) edge (- depth 1))]
+                      (if (and (.known left) (.known right)
+                               (= (cast i32 (.ty left)) ty)
+                               (or (= (.ty left) (.ty right)) (>= code 49)))
+                          (match (fold/integer-binary code ty bytes (.bits left) (.bits right))
+                            (None [] (unknown))
+                            (Some [result] (Val :known true :ty (cast u8 ty) :bits result)))
+                          (unknown)))
+                  (and (= code 45) (= ty 1))
+                    (let [source (evaluate s graph (.op1 node) edge (- depth 1))]
+                      (if (and (.known source) (= (.ty source) 1))
+                          (Val :known true :ty 1 :bits (if (= (& (.bits source) 1) 0) (: 1 u64) 0))
+                          (unknown)))
+                  (and (>= code 33) (<= code 36) (types/integer? ty))
+                    (let [source (evaluate s graph (.op1 node) edge (- depth 1))
+                          from (types/scalar-size (cast i32 (.ty source)) bytes)
+                          to (types/scalar-size ty bytes)
+                          low (& (.bits source) (width-mask (cast i32 (.ty source)) bytes))
+                          sign (and (= code 33)
+                                    (> from 0)
+                                    (< from 8)
+                                    (!= (& low (<< (: 1 u64) (cast u64 (- (* from 8) 1)))) 0))]
+                      (if (and (.known source)
+                               (> from 0)
+                               (> to 0)
+                               (cond (or (= code 33) (= code 34)) (<= from to)
+                                     (= code 35) (>= from to)
+                                     :else (= from to)))
+                          (Val :known true
+                               :ty (cast u8 ty)
+                               :bits (& (if sign
+                                            (| low (^ (width-mask (cast i32 (.ty source)) bytes)
+                                                      (: 0xFFFFFFFFFFFFFFFF u64)))
+                                            low)
+                                        (width-mask ty bytes)))
+                          (unknown)))
+                  :else (unknown))))))
+
+;;; Side an edge with a known condition value takes.
+(defn chosen-side [(s State) (graph g/Graph) (value Val)] (-> i32)
+  (let [masked (& (.bits value) (width-mask (cast i32 (.ty value)) (.pointer-bytes s)))]
+    (if (not (.dispatch s))
+        (if (!= masked 0) 0 1)
+        (if (!= (.ty value) (type-of graph (.condition s)))
+            UNKNOWN
+            (let [key (^ masked (switch/sign-mask (cast i32 (.ty value))))
+                  (mut side) (cast i32 (.default-side s))]
+              (for [i 0 (len (.sides s))]
+                (when (and (!= i (.default-side s)) (= (get (.keys s) i) key))
+                  (set! side (cast i32 i))))
+              side)))))
+
+;;; The condition is built only from the MERGE's PHIs and constants, so it
+;;; changes along an edge only if one of those PHIs does.
+(defn closed? [(s State) (graph g/Graph) (value i32) (depth i32)] (-> bool)
+  (if (< value 0)
+      true
+      (if (or (= value 0) (<= depth 0))
+          false
+          (let [code (opcode graph value)
+                node (get (.instructions graph) (cast i64 value))]
+            (cond (>= (source-index s graph value) 0) true
+                  (binary? code)
+                    (and (closed? s graph (.op1 node) (- depth 1))
+                         (closed? s graph (.op2 node) (- depth 1)))
+                  (unary? code)
+                    (closed? s graph (.op1 node) (- depth 1))
+                  :else false)))))
+
+;;; Every PHI the condition reads carries itself along this edge, and the
+;;; condition reads nothing else that varies: the edge lies below the branch,
+;;; which already decided the same condition.
+(defn self-edge? [(s State) (edge i64)] (-> bool)
+  (let [(mut same) true]
+    (for [j 0 (len (.phis s))]
+      (when (and (!= (& (.relevant s) (<< (: 1 u64) (cast u64 j))) 0)
+                 (!= (value-at s edge j) (get (.phis s) j)))
+        (set! same false)))
+    same))
+
+;;; The PHI whose truth is the IF's, up to the returned polarity; -1 if the
+;;; condition is not such a view.
+(defn truth-source [(s State) (graph g/Graph)] (-> i64)
+  (if (.dispatch s)
+      -1
+      (source-index s graph (.base (conditional/truth-normal graph (.condition s))))))
+
+;;; An unknown edge whose PHI input is a comparison used nowhere else: the
+;;; edge tests it directly instead of materializing it for the shared IF.
+(defn splittable? [(s State) (graph g/Graph) (edges uses/Uses) (edge i64) (source i64)] (-> bool)
+  (if (< source 0)
+      false
+      (let [value (value-at s edge source)]
+        (and (> value 0)
+             (= (count edges value) 1)
+             (not (protected? s value))
+             (types/integer? (cast i32 (type-of graph value)))
+             (let [base (.base (conditional/truth-normal graph value))]
+               (and (> base 0)
+                    (>= (opcode graph base) 14)
+                    (<= (opcode graph base) 23)))))))
+
+(defn classify! [(s (mut State)) (graph g/Graph) (edges uses/Uses)] (-> void)
+  (let [source (truth-source s graph)
+        closed (closed? s graph (.condition s) TREE-DEPTH)]
+    (for [i 0 (len (.ends s))]
+      (let [value (evaluate s graph (.condition s) i TREE-DEPTH)
+            (mut state) (if (.known value) (chosen-side s graph value) UNKNOWN)]
+        (when (and (= state UNKNOWN) (not (.dispatch s)))
+          (match (cond (and closed (self-edge? s i))
+                         (conditional/dominating-truth graph (get (.ends s) i) (.condition s))
+                       (and (>= (source-index s graph (.condition s)) 0)
+                            (> (value-at s i (source-index s graph (.condition s))) 0))
+                         (conditional/dominating-truth
+                           graph (get (.ends s) i)
+                           (value-at s i (source-index s graph (.condition s))))
+                       :else (: (None) (Option bool)))
+            (Some [truth] (set! state (if truth 0 1)))
+            (None [] 0)))
+        (when (and (= state UNKNOWN) (splittable? s graph edges i source))
+          (set! state SPLIT))
+        (set! (mut (.states s)) i state)))))
+
+;;; One depth-first walk over control successors from START marks every END
+;;; that closes a cycle. In reducible control these are exactly the loop back
+;;; edges, whatever the visiting order.
+(defn ensure-flow! [(s (mut State)) (graph g/Graph) (edges uses/Uses) (a (dyn Allocator))] (-> void)
+  (unless (.flow-ready s)
+    (set! (.flow-ready s) true)
+    (let [size (len (.instructions graph))
+          (mut nodes) (ArrayList::new [i32] a)
+          (mut cursors) (ArrayList::new [i64] a)]
+      (clear! (mut (.flow s)))
+      (clear! (mut (.back s)))
+      (extend-zeroed! (mut (.flow s)) size)
+      (extend-zeroed! (mut (.back s)) size)
+      (when (and (> size 1) (= (opcode graph 1) 104))
+        (push! (mut nodes) 1)
+        (push! (mut cursors) 0)
+        (set! (mut (.flow s)) 1 (: 1 u8)))
+      (while (> (len nodes) 0)
+        (let [top (- (len nodes) 1)
+              current (get nodes top)
+              range (get (.ranges edges) (cast i64 current))
+              (mut cursor) (get cursors top)
+              (mut next) (: 0 i32)]
+          (while (and (= next 0) (< cursor (.count range)))
+            (let [edge (get (.edges edges) (+ (.offset range) cursor))
+                  code (opcode graph (.user edge))]
+              (when (and (op/control? code)
+                         (= (op/operand-code code (.operand edge)) op/OPERAND-SRC))
+                (set! next (.user edge)))
+              (set! cursor (+ cursor 1))))
+          (set! (mut cursors) top cursor)
+          (if (= next 0)
+              (do (set! (mut (.flow s)) (cast i64 current) (: 2 u8))
+                  (pop! (mut nodes))
+                  (pop! (mut cursors)))
+              (let [seen (get (.flow s) (cast i64 next))]
+                (cond (= seen 0)
+                        (do (set! (mut (.flow s)) (cast i64 next) (: 1 u8))
+                            (push! (mut nodes) next)
+                            (push! (mut cursors) 0))
+                      (= seen 1) (set! (mut (.back s)) (cast i64 current) (: 1 u8))
+                      :else 0)))))
+      (free! (mut nodes))
+      (free! (mut cursors)))))
+
+;;; Threading must leave every cycle with one entry. A MERGE that heads a loop
+;;; is threaded only when exactly one projection stays in the loop: edges to
+;;; the others leave it, and edges to that one enter below the test. Entry
+;;; edges may do so only when the MERGE keeps no entry or no back edge.
+;;; Returns false when the candidate must be left alone.
+(defn loops! [(s (mut State)) (graph g/Graph) (edges uses/Uses) (a (dyn Allocator))] (-> bool)
+  (ensure-flow! (mut s) graph edges a)
+  (set! (.header s) false)
+  (set! (.body s) -1)
+  (let [merge (.merge s)
+        (mut good) (= (flag-at (.flow s) merge) 2)]
+    (clear! (mut (.work s)))
+    (clear! (mut (.backs s)))
+    (for [i 0 (len (.ends s))]
+      ; An edge through a flattened MERGE closes the cycle its END closed.
+      (let [(mut back) (!= (flag-at (.back s) (get (.ends s) i)) 0)
+            (mut via) (get (.vias s) i)]
+        (while (> via 0)
+          (when (!= (flag-at (.back s) via) 0) (set! back true))
+          (let [(mut above) (: 0 i32)]
+            (for [k 0 (len (.gone-ends s))]
+              (when (= (get (.gone-ends s) k) via) (set! above (get (.gone-vias s) k))))
+            (set! via above)))
+        (push! (mut (.backs s)) (if back 1 0))
+        (when back
+          (set! (.header s) true)
+          (push! (mut (.work s)) (get (.ends s) i)))))
+    (when (and good (.header s))
+      ; The natural loop: everything that reaches a back edge below the MERGE.
+      (while (and good (> (len (.work s)) 0))
+        (let [current (get (.work s) (- (len (.work s)) 1))]
+          (pop! (mut (.work s)))
+          (set! (.steps s) (+ (.steps s) 1))
+          (cond (or (<= current 0) (> (.steps s) MAX-STEPS)) (set! good false)
+                (or (= current merge) (= (cell (.mark s) current) (.epoch s))) 0
+                :else
+                  (let [code (opcode graph current)]
+                    (put! (mut (.mark s)) current (.epoch s))
+                    (if (merge-like? code)
+                        (for [k 1 (+ (cast i64 (arity graph current)) 1)]
+                          (push! (mut (.work s)) (input graph current (cast i32 k))))
+                        (if (and (op/control? code)
+                                 (= (op/operand-code code 1) op/OPERAND-SRC))
+                            (push! (mut (.work s)) (input graph current 1))
+                            (set! good false)))))))
+      (when good
+        (let [(mut inside) (: 0 i64)]
+          (for [i 0 (len (.sides s))]
+            (when (= (cell (.mark s) (get (.sides s) i)) (.epoch s))
+              (set! inside (+ inside 1))
+              (set! (.body s) i)))
+          (unless (= inside 1) (set! good false))))
+      (when good
+        (let [body (cast i32 (.body s))
+              (mut back-unknown) false
+              (mut entry-kept) false]
+          (for [i 0 (len (.ends s))]
+            (let [state (get (.states s) i)
+                  back (!= (get (.backs s) i) 0)]
+              (when (and back (= state UNKNOWN)) (set! back-unknown true))
+              (when (and (not back) (or (= state UNKNOWN) (= state SPLIT)))
+                (set! entry-kept true))))
+          (when (and back-unknown entry-kept)
+            (for [i 0 (len (.ends s))]
+              (let [state (get (.states s) i)]
+                (when (and (= (get (.backs s) i) 0)
+                           (or (= state SPLIT) (= state body)))
+                  (set! (mut (.states s)) i UNKNOWN))))))))
+    good))
+
+;;; A token settled once its MERGE's inputs agreed.
+(defn final [(s State) (graph g/Graph) (token i32)] (-> i32)
+  (let [(mut current) token
+        (mut moving) true]
+    (while moving
+      (if (or (<= current 0)
+              (= current (.merge s))
+              (>= (side-index s current) 0)
+              (!= (cell (.stamp s) current) (.epoch s))
+              (= (cell (.memo s) current) current))
+          (set! moving false)
+          (set! current (cell (.memo s) current))))
+    current))
+
+;;; Which definition of the MERGE's PHIs reaches control node START once the
+;;; edges are threaded: the MERGE itself (uses in its own block), a projection
+;;; of the branch (uses below it), or a MERGE where different ones meet. Zero
+;;; when START is not below the MERGE or the walk is too long.
+(defn resolve! [(s (mut State)) (graph g/Graph) (start i32)] (-> i32)
+  (let [base (len (.path s))
+        (mut current) start
+        (mut result) (: 0 i32)
+        (mut walking) true]
+    (while walking
+      (set! (.steps s) (+ (.steps s) 1))
+      (if (or (<= current 0) (> (.steps s) MAX-STEPS))
+          (set! walking false)
+          (if (= (cell (.stamp s) current) (.epoch s))
+              (do (set! result (final s graph (cell (.memo s) current)))
+                  (set! walking false))
+              (let [code (opcode graph current)
+                    node (get (.instructions graph) (cast i64 current))]
+                (cond (or (= current (.merge s)) (= current (.branch s)))
+                        (do (set! result (.merge s)) (set! walking false))
+                      (and (or (= code 107) (= code 108) (= code 109) (= code 111))
+                           (= (.op1 node) (.branch s)))
+                        (do (set! result current) (set! walking false))
+                      (merge-like? code)
+                        (let [(mut distinct) (: 0 i32)
+                              (mut several) false
+                              (mut failed) false]
+                          ; A cycle back to this MERGE contributes nothing new.
+                          (put! (mut (.stamp s)) current (.epoch s))
+                          (put! (mut (.memo s)) current current)
+                          (for [k 1 (+ (cast i64 (arity graph current)) 1)]
+                            (unless failed
+                              (let [token (resolve! (mut s) graph (input graph current (cast i32 k)))]
+                                (cond (= token 0) (set! failed true)
+                                      (= token current) 0
+                                      (= distinct 0) (set! distinct token)
+                                      (!= distinct token) (set! several true)
+                                      :else 0))))
+                          (cond (or failed (= distinct 0))
+                                  (put! (mut (.stamp s)) current 0)
+                                several (set! result current)
+                                :else
+                                  (do (put! (mut (.memo s)) current distinct)
+                                      (set! result distinct)))
+                          (set! walking false))
+                      (and (op/control? code) (= (op/operand-code code 1) op/OPERAND-SRC))
+                        (do (push! (mut (.path s)) current)
+                            (set! current (.op1 node)))
+                      :else (set! walking false))))))
+    (when (!= result 0)
+      (for [i base (len (.path s))]
+        (put! (mut (.stamp s)) (get (.path s) i) (.epoch s))
+        (put! (mut (.memo s)) (get (.path s) i) result)))
+    (while (> (len (.path s)) base) (pop! (mut (.path s))))
+    result))
+
+(defn join [(a i32) (b i32)] (-> i32)
+  (cond (= a 0) b
+        (= b 0) a
+        (= a b) a
+        :else MIXED))
+
+;;; Walk the users of VALUE (a PHI of the MERGE or a floating value computed
+;;; from one). Pinned users become points; floating users join the closure.
+;;; Returns the token all of VALUE's uses see, MIXED, zero for none, or
+;;; IN-PROGRESS when the candidate must be left alone.
+(defn collect! [(s (mut State)) (graph g/Graph) (edges uses/Uses) (value i32)] (-> i32)
+  (let [range (get (.ranges edges) (cast i64 value))
+        (mut result) (: 0 i32)
+        (mut failed) false]
+    (for [i (.offset range) (+ (.offset range) (.count range))]
+      (unless failed
+        (let [edge (get (.edges edges) i)
+              user (.user edge)
+              code (opcode graph user)
+              seen
+                (cond (= code 67)
+                        (let [home (input graph user 1)]
+                          (cond (or (<= (.operand edge) 1) (<= home 0) (not (merge-like? (opcode graph home))))
+                                  IN-PROGRESS
+                                (or (= home (.merge s)) (gone? s home))
+                                  ; An input of the threaded PHIs: every edge that carries it.
+                                  (let [(mut all) (: 0 i32)]
+                                    (for [e 0 (len (.ends s))]
+                                      (for [j 0 (len (.phis s))]
+                                        (when (and (= (value-at s e j) value) (!= all IN-PROGRESS))
+                                          (let [token (resolve! (mut s) graph (get (.ends s) e))]
+                                            (set! all (if (= token 0) IN-PROGRESS (join all token)))))))
+                                    all)
+                                :else
+                                  (let [token (resolve! (mut s) graph
+                                                        (input graph home (- (.operand edge) 1)))]
+                                    (if (= token 0)
+                                        IN-PROGRESS
+                                        (do (push! (mut (.points s))
+                                                   (Point :user user :operand (.operand edge)
+                                                          :value value :token token))
+                                            token)))))
+                      (= user (.branch s)) (.merge s)
+                      (op/control? code)
+                        (let [token (resolve! (mut s) graph user)]
+                          (if (= token 0)
+                              IN-PROGRESS
+                              (do (push! (mut (.points s))
+                                         (Point :user user :operand (.operand edge)
+                                                :value value :token token))
+                                  token)))
+                      (and (!= (& (op/properties code) op/FLAG-FLOATING-DATA) 0)
+                           (<= (arity graph user) 3)
+                           (not (protected? s user)))
+                        (if (member? s user)
+                            (cell (.token s) user)
+                            (do (put! (mut (.member s)) user (.epoch s))
+                                (put! (mut (.token s)) user IN-PROGRESS)
+                                (push! (mut (.closure s)) user)
+                                (let [token (collect! (mut s) graph edges user)]
+                                  (put! (mut (.token s)) user token)
+                                  token)))
+                      :else IN-PROGRESS)]
+          (if (or (= seen IN-PROGRESS)
+                  (> (len (.closure s)) MAX-CLOSURE)
+                  (> (len (.points s)) MAX-POINTS))
+              (set! failed true)
+              (set! result (join result seen))))))
+    (if failed IN-PROGRESS result)))
+
+;;; Everything commit! needs, decided without changing the graph.
+(defn plan! [(s (mut State)) (graph g/Graph) (edges uses/Uses) (a (dyn Allocator))] (-> bool)
+  (set! (.epoch s) (+ (.epoch s) 1))
+  (set! (.steps s) 0)
+  (clear! (mut (.closure s)))
+  (clear! (mut (.points s)))
+  (clear! (mut (.versions s)))
+  (clear! (mut (.fills s)))
+  (clear! (mut (.path s)))
+  (let [(mut good) (and (sides! (mut s) graph edges) (flatten! (mut s) graph edges))]
+    (when good
+      (classify! (mut s) graph edges)
+      (let [(mut known) false]
+        (for state (.states s) (when (!= state UNKNOWN) (set! known true)))
+        (unless known (set! good false))))
+    (when good (unless (loops! (mut s) graph edges a) (set! good false)))
+    (when good
+      ; What remains after the loop rules: something to thread, and a MERGE
+      ; that still fits its cells.
+      (let [(mut open) (: 0 i64)]
+        (for state (.states s)
+          (when (= state UNKNOWN) (set! open (+ open 1))))
+        (set! (.unknown-count s) open)
+        (when (or (= open (len (.states s)))
+                  (> open (cast i64 (arity graph (.merge s)))))
+          (set! good false))))
+    (when good
+      (for phi (.phis s)
+        (when good
+          (when (= (collect! (mut s) graph edges phi) IN-PROGRESS) (set! good false)))))
+    (when good
+      (for [i 0 (len (.ends s))]
+        (for [j 0 (len (.phis s))]
+          (let [value (value-at s i j)]
+            (when (and good
+                       (= (get (.edge-tokens s) i) 0)
+                       (or (>= (source-index s graph value) 0) (member? s value)))
+              (let [token (resolve! (mut s) graph (get (.ends s) i))]
+                (if (= token 0)
+                    (set! good false)
+                    (set! (mut (.edge-tokens s)) i token))))))))
+    good))
+
+(defn grow-queue! [(queue (mut q/Queue)) (size i64)] (-> void)
+  (grow-bits! (mut (.members queue)) size))
+
+;;; New definitions join the exact use lists and the affected-node queue.
+(defn append! [(graph (mut g/Graph)) (edges (mut uses/Uses)) (queue (mut q/Queue))
+               (code u8) (ty u8) (auxiliary u16) (inputs (slice i32))] (-> i32)
+  (let [reference (match (g/append-inputs-with-aux! (mut graph) code ty auxiliary inputs)
+                    (None [] (panic "jump threading instruction space exhausted"))
+                    (Some [r] r))]
+    (while (< (len (.ranges edges)) (len (.instructions graph)))
+      (push! (mut (.ranges edges)) (uses/Range :offset 0 :count 0)))
+    (for [i 0 (len inputs)]
+      (let [value (get inputs i)]
+        (when (and (> value 0)
+                   (uses/edge-code? (op/operand-code (cast i32 code) (cast i32 (+ i 1)))))
+          (uses/add! (mut edges) value (uses/Use :user reference :operand (cast i32 (+ i 1)))))))
+    (grow-queue! (mut queue) (len (.instructions graph)))
+    (q/add! (mut queue) (cast i64 reference))
+    reference))
+
+(defn set-input! [(graph (mut g/Graph)) (edges (mut uses/Uses)) (queue (mut q/Queue))
+                  (user i32) (index i32) (value i32)] (-> void)
+  (let [old (input graph user index)]
+    (when (!= old value)
+      (when (> old 0)
+        (unless (uses/remove! (mut edges) old (uses/Use :user user :operand index))
+          (panic "jump threading use edge missing"))
+        (q/add! (mut queue) (cast i64 old)))
+      (unless (g/set-operand! (mut graph) user index value)
+        (panic "jump threading operand rewrite failed"))
+      (when (> value 0)
+        (uses/add! (mut edges) value (uses/Use :user user :operand index)))
+      (q/add! (mut queue) (cast i64 user)))))
+
+;;; Every user of FROM except EXCEPT reads TO instead.
+(defn move-users! [(graph (mut g/Graph)) (edges (mut uses/Uses)) (queue (mut q/Queue))
+                   (from i32) (to i32) (except i32)] (-> void)
+  (let [(mut index) (: 0 i64)]
+    (while (< index (count edges from))
+      (let [range (get (.ranges edges) (cast i64 from))
+            edge (get (.edges edges) (+ (.offset range) index))]
+        (if (= (.user edge) except)
+            (set! index (+ index 1))
+            (set-input! (mut graph) (mut edges) (mut queue) (.user edge) (.operand edge) to))))))
+
+(defn literal! [(graph (mut g/Graph)) (ty u8) (bits u64)] (-> i32)
+  (match (g/intern-scalar! (mut graph) ty bits)
+    (None [] (panic "jump threading constant space exhausted"))
+    (Some [r] r)))
+
+(defn find-version [(s State) (value i32) (token i32)] (-> i32)
+  (let [(mut found) (: 0 i32)]
+    (for entry (.versions s)
+      (when (and (= (.value entry) value) (= (.token entry) token))
+        (set! found (.result entry))))
+    found))
+
+(defn remember! [(s (mut State)) (value i32) (token i32) (result i32)] (-> void)
+  (let [(mut done) false]
+    (for [i 0 (len (.versions s))]
+      (let [entry (get (.versions s) i)]
+        (when (and (= (.value entry) value) (= (.token entry) token))
+          (set! (mut (.versions s)) i (Version :value value :token token :result result))
+          (set! done true))))
+    (unless done
+      (push! (mut (.versions s)) (Version :value value :token token :result result)))))
+
+;;; The value PHI j carries along edge EDGE, as defined where that edge ends.
+(defn edge-value! [(s (mut State)) (graph (mut g/Graph)) (edges (mut uses/Uses))
+                   (queue (mut q/Queue)) (edge i64) (phi i64)] (-> i32)
+  (let [value (value-at s edge phi)]
+    (if (and (> value 0) (or (>= (source-index s graph value) 0) (member? s value)))
+        (version! (mut s) (mut graph) (mut edges) (mut queue) value (get (.edge-tokens s) edge))
+        value)))
+
+(defn new-phi! [(s (mut State)) (graph (mut g/Graph)) (edges (mut uses/Uses)) (queue (mut q/Queue))
+                (home i32) (ty u8) (inputs i64)] (-> i32)
+  (clear! (mut (.scratch s)))
+  (push! (mut (.scratch s)) home)
+  (for [i 0 inputs] (push! (mut (.scratch s)) 0))
+  (append! (mut graph) (mut edges) (mut queue) 67 ty (cast u16 (+ inputs 1)) (slice (.scratch s))))
+
+;;; The definition of VALUE that reaches TOKEN after threading: VALUE itself
+;;; where the MERGE still defines it, the PHI at a join or MERGE, or a copy of
+;;; a floating value over the definitions that reach there. Unreachable places
+;;; read zero.
+(defn version! [(s (mut State)) (graph (mut g/Graph)) (edges (mut uses/Uses))
+                (queue (mut q/Queue)) (value i32) (raw i32)] (-> i32)
+  (let [j (source-index s graph value)
+        inside (member? s value)]
+    (if (or (<= value 0) (and (< j 0) (not inside)))
+        value
+        (let [token (final s graph raw)
+              side (side-index s token)
+              live (> (.unknown-count s) 0)
+              ty (type-of graph value)]
+          (cond (and (= value (.condition s)) (not (.dispatch s)) (= side 1))
+                  (literal! (mut graph) ty 0)
+                (and (= value (.condition s)) (not (.dispatch s)) (= side 0) (= ty 1))
+                  (literal! (mut graph) ty 1)
+                (or (= token (.merge s))
+                    (and (>= side 0) (= (get (.joins s) side) 0)))
+                  (if live value (literal! (mut graph) ty 0))
+                (and (< j 0) (!= (cell (.token s) value) MIXED)) value
+                :else
+                  (let [known (find-version s value token)]
+                    (cond (= known IN-PROGRESS) (literal! (mut graph) ty 0)
+                          (!= known 0) known
+                          (and (>= j 0) (>= side 0))
+                            (side-value! (mut s) (mut graph) (mut edges) (mut queue)
+                                         value token side j)
+                          (>= j 0)
+                            (let [phi (new-phi! (mut s) (mut graph) (mut edges) (mut queue) token ty
+                                                (cast i64 (arity graph token)))]
+                              (remember! (mut s) value token phi)
+                              (push! (mut (.fills s)) (Fill :phi phi :kind 1 :a token :b value))
+                              ; A MERGE that gains a PHI may now test it.
+                              (push! (mut (.pending s)) token)
+                              phi)
+                          :else
+                            (clone! (mut s) (mut graph) (mut edges) (mut queue) value token))))))))
+
+;;; PHI j below projection SIDE: a new PHI at its join, or the one incoming
+;;; value when a single threaded edge is all that reaches it.
+(defn side-value! [(s (mut State)) (graph (mut g/Graph)) (edges (mut uses/Uses))
+                   (queue (mut q/Queue)) (value i32) (token i32) (side i64) (j i64)] (-> i32)
+  (let [block (get (.joins s) side)
+        ty (type-of graph value)
+        (mut threaded) (: 0 i64)
+        (mut only) (: 0 i64)]
+    (for [i 0 (len (.states s))]
+      (when (= (get (.states s) i) (cast i32 side))
+        (set! threaded (+ threaded 1))
+        (set! only i)))
+    (if (and (= (get (.owns s) side) 0) (= threaded 1))
+        (do (remember! (mut s) value token IN-PROGRESS)
+            (let [result (edge-value! (mut s) (mut graph) (mut edges) (mut queue) only j)]
+              (remember! (mut s) value token result)
+              result))
+        (let [phi (new-phi! (mut s) (mut graph) (mut edges) (mut queue) block ty
+                            (+ threaded (cast i64 (get (.owns s) side))))]
+          (remember! (mut s) value token phi)
+          (push! (mut (.fills s)) (Fill :phi phi :kind 0 :a (cast i32 side) :b (cast i32 j)))
+          phi))))
+
+;;; A copy of floating VALUE reading the definitions that reach TOKEN.
+(defn clone! [(s (mut State)) (graph (mut g/Graph)) (edges (mut uses/Uses))
+              (queue (mut q/Queue)) (value i32) (token i32)] (-> i32)
+  (let [node (get (.instructions graph) (cast i64 value))
+        code (opcode graph value)
+        inputs (arity graph value)
+        (mut operands) [(: 0 i32) 0 0]]
+    (for [k 0 (cast i64 inputs)]
+      (let [operand (input graph value (cast i32 (+ k 1)))]
+        (set! (mut operands) k
+              (if (uses/edge-code? (op/operand-code code (cast i32 (+ k 1))))
+                  (version! (mut s) (mut graph) (mut edges) (mut queue) operand token)
+                  operand))))
+    (let [result
+            (cond (= inputs 1)
+                    (append! (mut graph) (mut edges) (mut queue) (n/opcode node) (n/type-id node)
+                             (n/auxiliary node) [(get operands 0)])
+                  (= inputs 2)
+                    (append! (mut graph) (mut edges) (mut queue) (n/opcode node) (n/type-id node)
+                             (n/auxiliary node) [(get operands 0) (get operands 1)])
+                  (= inputs 3)
+                    (append! (mut graph) (mut edges) (mut queue) (n/opcode node) (n/type-id node)
+                             (n/auxiliary node) [(get operands 0) (get operands 1) (get operands 2)])
+                  :else (panic "jump threading cannot copy a value with {} inputs" inputs))]
+      (remember! (mut s) value token result)
+      result)))
+
+;;; Read the operands of floating VALUE at TOKEN, in place.
+(defn reread! [(s (mut State)) (graph (mut g/Graph)) (edges (mut uses/Uses))
+               (queue (mut q/Queue)) (value i32) (token i32)] (-> void)
+  (let [code (opcode graph value)]
+    (for [k 1 (+ (cast i64 (arity graph value)) 1)]
+      (when (uses/edge-code? (op/operand-code code (cast i32 k)))
+        (let [operand (input graph value (cast i32 k))]
+          (when (or (>= (source-index s graph operand) 0) (member? s operand))
+            (set-input! (mut graph) (mut edges) (mut queue) value (cast i32 k)
+                        (version! (mut s) (mut graph) (mut edges) (mut queue) operand token))))))))
+
+(defn nop! [(graph (mut g/Graph)) (edges (mut uses/Uses)) (queue (mut q/Queue)) (reference i32)]
+  (-> void)
+  (diamond/replace-node! (mut graph) (mut edges) (mut queue) reference 0 0 []))
+
+(defn commit! [(s (mut State)) (graph (mut g/Graph)) (roots (mut (ArrayList i32)))
+               (edges (mut uses/Uses)) (queue (mut q/Queue))] (-> void)
+  (let [merge (.merge s)
+        branch (.branch s)
+        width (len (.phis s))
+        live (> (.unknown-count s) 0)
+        source (truth-source s graph)
+        positive (.positive (conditional/truth-normal graph (.condition s)))
+        original (len (.ends s))
+        (mut entry-kept) false]
+    ; An edge that tests its own comparison: its END becomes the IF, and the
+    ; two new ENDs are threaded edges carrying the same PHI inputs.
+    (for [i 0 original]
+      (when (= (get (.states s) i) SPLIT)
+        (let [end (get (.ends s) i)]
+          (diamond/replace-node! (mut graph) (mut edges) (mut queue) end 116 0
+                                 [(input graph end 1) (value-at s i source)])
+          (let [yes (append! (mut graph) (mut edges) (mut queue) 107 0 2 [end (: 0 i32)])
+                no (append! (mut graph) (mut edges) (mut queue) 108 0 2 [end (: 0 i32)])
+                first (append! (mut graph) (mut edges) (mut queue) 114 0 1 [yes])
+                second (append! (mut graph) (mut edges) (mut queue) 114 0 1 [no])]
+            (set! (mut (.ends s)) i (if positive first second))
+            (set! (mut (.states s)) i 0)
+            (push! (mut (.ends s)) (if positive second first))
+            (push! (mut (.parents s)) end)
+            (push! (mut (.slots s)) (cast i32 i))
+            (push! (mut (.states s)) 1)
+            (push! (mut (.edge-tokens s)) (get (.edge-tokens s) i))
+            (push! (mut (.vias s)) 0)
+            (push! (mut (.backs s)) (get (.backs s) i))
+            (for [j 0 width] (push! (mut (.values s)) (value-at s i j)))))))
+    (for [i 0 (len (.ends s))]
+      ; Record which final edges close a cycle: those that stay at the MERGE
+      ; or enter the loop below its test. Edges to other projections leave.
+      (let [state (get (.states s) i)
+            back (and (!= (get (.backs s) i) 0)
+                      (or (= state UNKNOWN) (= (cast i64 state) (.body s))))]
+        (flag! (mut (.back s)) (get (.ends s) i) (if back 1 0))
+        (when (and (= state UNKNOWN) (= (get (.backs s) i) 0)) (set! entry-kept true))))
+    ; Joins: each projection that gains edges starts a block they also enter.
+    (clear! (mut (.joins s)))
+    (clear! (mut (.owns s)))
+    (for [side 0 (len (.sides s))]
+      (let [projection (get (.sides s) side)]
+        (clear! (mut (.work s)))
+        (for [i 0 (len (.ends s))]
+          (when (= (get (.states s) i) (cast i32 side))
+            (push! (mut (.work s)) (get (.ends s) i))))
+        (cond (= (len (.work s)) 0)
+                (do (push! (mut (.joins s)) 0) (push! (mut (.owns s)) 0))
+              live
+                (let [own (append! (mut graph) (mut edges) (mut queue) 114 0 1 [projection])]
+                  (clear! (mut (.scratch s)))
+                  (push! (mut (.scratch s)) own)
+                  (for end (.work s) (push! (mut (.scratch s)) end))
+                  (let [block (append! (mut graph) (mut edges) (mut queue) 112 0
+                                       (cast u16 (len (.scratch s))) (slice (.scratch s)))]
+                    (move-users! (mut graph) (mut edges) (mut queue) projection block own)
+                    ; The MERGE stays in the loop and is entered only from it.
+                    (flag! (mut (.back s)) own
+                           (if (and (.header s) (= side (.body s)) (not entry-kept)) 1 0))
+                    (flag! (mut (.flow s)) block 2)
+                    (push! (mut (.joins s)) block)
+                    (push! (mut (.owns s)) 1)))
+              (= (len (.work s)) 1)
+                (do (diamond/replace-node! (mut graph) (mut edges) (mut queue) projection 106 0
+                                           [(get (.work s) 0) (: 0 i32)])
+                    (flag! (mut (.flow s)) projection 2)
+                    (push! (mut (.joins s)) projection)
+                    (push! (mut (.owns s)) 0))
+              (<= (len (.work s)) 3)
+                (do (diamond/replace-node! (mut graph) (mut edges) (mut queue) projection 112 0
+                                           (slice (.work s)))
+                    (flag! (mut (.flow s)) projection 2)
+                    (push! (mut (.joins s)) projection)
+                    (push! (mut (.owns s)) 0))
+              :else
+                (let [block (append! (mut graph) (mut edges) (mut queue) 112 0
+                                     (cast u16 (len (.work s))) (slice (.work s)))]
+                  (move-users! (mut graph) (mut edges) (mut queue) projection block 0)
+                  (nop! (mut graph) (mut edges) (mut queue) projection)
+                  (flag! (mut (.flow s)) block 2)
+                  (push! (mut (.joins s)) block)
+                  (push! (mut (.owns s)) 0)))))
+    ; The MERGE keeps the undecided edges.
+    (when live
+      (clear! (mut (.work s)))
+      (for [i 0 (len (.ends s))]
+        (when (= (get (.states s) i) UNKNOWN) (push! (mut (.work s)) (cast i32 i))))
+      (if (= (len (.work s)) 1)
+          (let [only (cast i64 (get (.work s) 0))]
+            (diamond/replace-node! (mut graph) (mut edges) (mut queue) merge 106 0
+                                   [(get (.ends s) only) (: 0 i32)])
+            (for [j 0 width]
+              (let [phi (get (.phis s) j)
+                    ty (type-of graph phi)
+                    value (edge-value! (mut s) (mut graph) (mut edges) (mut queue) only j)]
+                (diamond/replace-node! (mut graph) (mut edges) (mut queue) phi 68 ty
+                                       [(if (= value phi) (literal! (mut graph) ty 0) value)
+                                        (: 0 i32)]))))
+          (do
+            (clear! (mut (.inputs s)))
+            (for index (.work s) (push! (mut (.inputs s)) (get (.ends s) (cast i64 index))))
+            (diamond/replace-node! (mut graph) (mut edges) (mut queue) merge 112 0
+                                   (slice (.inputs s)))
+            (for [j 0 width]
+              (let [phi (get (.phis s) j)
+                    ty (type-of graph phi)]
+                (clear! (mut (.inputs s)))
+                (push! (mut (.inputs s)) merge)
+                (for index (.work s)
+                  (let [value (edge-value! (mut s) (mut graph) (mut edges) (mut queue)
+                                           (cast i64 index) j)]
+                    (push! (mut (.inputs s)) value)))
+                (diamond/replace-node! (mut graph) (mut edges) (mut queue) phi 67 ty
+                                       (slice (.inputs s))))))))
+    ; Floating values whose uses all see one definition read it in place.
+    (for value (.closure s)
+      (let [token (cell (.token s) value)]
+        (when (and (!= token MIXED) (!= token 0))
+          (reread! (mut s) (mut graph) (mut edges) (mut queue) value token))))
+    (for point (.points s)
+      (set-input! (mut graph) (mut edges) (mut queue) (.user point) (.operand point)
+                  (version! (mut s) (mut graph) (mut edges) (mut queue) (.value point) (.token point))))
+    (for [i original (len (.ends s))]
+      ; parents holds the IF made for this split edge, slots its first half.
+      (let [test (get (.parents s) i)
+            half (cast i64 (get (.slots s) i))]
+        (set-input! (mut graph) (mut edges) (mut queue) test 2
+                    (edge-value! (mut s) (mut graph) (mut edges) (mut queue) half source))))
+    (while (> (len (.fills s)) 0)
+      (let [fill (get (.fills s) (- (len (.fills s)) 1))]
+        (pop! (mut (.fills s)))
+        (if (= (.kind fill) 0)
+            (let [side (cast i64 (.a fill))
+                  j (cast i64 (.b fill))
+                  (mut slot) (: 2 i32)]
+              (when (!= (get (.owns s) side) 0)
+                (set-input! (mut graph) (mut edges) (mut queue) (.phi fill) slot (get (.phis s) j))
+                (set! slot (+ slot 1)))
+              (for [i 0 (len (.ends s))]
+                (when (= (get (.states s) i) (cast i32 side))
+                  (set-input! (mut graph) (mut edges) (mut queue) (.phi fill) slot
+                              (edge-value! (mut s) (mut graph) (mut edges) (mut queue) i j))
+                  (set! slot (+ slot 1)))))
+            (for [k 1 (+ (cast i64 (arity graph (.a fill))) 1)]
+              (let [end (input graph (.a fill) (cast i32 k))]
+                (unless (= (cell (.stamp s) end) (.epoch s))
+                  (panic "jump threading lost the definition reaching a merge input"))
+                (set-input! (mut graph) (mut edges) (mut queue) (.phi fill) (cast i32 (+ k 1))
+                            (version! (mut s) (mut graph) (mut edges) (mut queue) (.b fill)
+                                      (cell (.memo s) end))))))))
+    (unless live
+      ; Every copy has been made: a copied or unused value's original dies
+      ; with the branch and must not keep the PHIs.
+      (for value (.closure s)
+        (let [token (cell (.token s) value)]
+          (when (or (= token MIXED) (= token 0))
+            (reread! (mut s) (mut graph) (mut edges) (mut queue) value merge))))
+      (nop! (mut graph) (mut edges) (mut queue) branch)
+      (nop! (mut graph) (mut edges) (mut queue) merge)
+      (for phi (.phis s) (nop! (mut graph) (mut edges) (mut queue) phi))
+      (for [side 0 (len (.sides s))]
+        (when (= (get (.joins s) side) 0)
+          ; Nothing reaches this projection: transient unreachable control.
+          (diamond/replace-node! (mut graph) (mut edges) (mut queue) (get (.sides s) side) 106 0
+                                 [(: 0 i32) 0])
+          (set! (.pruning s) true))))
+    ; The flattened MERGEs, their PHIs and the ENDs that left them.
+    (let [(mut observed) false]
+      (for reference (.gone s) (nop! (mut graph) (mut edges) (mut queue) reference))
+      (for reference (.gone-ends s)
+        (nop! (mut graph) (mut edges) (mut queue) reference)
+        (when (protected? s reference)
+          (set! observed true)
+          (bits/remove! (mut (.protected s)) (cast i64 reference))
+          (let [(mut kept) (: 0 i64)]
+            (for root roots
+              (unless (= root reference)
+                (set! (mut roots) kept root)
+                (set! kept (+ kept 1))))
+            (while (> (len roots) kept) (pop! (mut roots))))))
+      (for reference (.gone s)
+        (when (!= (count edges reference) 0) (panic "jump threading left a use of a flattened node")))
+      (unless live
+        (for phi (.phis s)
+          (when (!= (count edges phi) 0) (panic "jump threading left a use of a removed PHI"))))
+      ; Every path through an observed END that is gone crosses one of these.
+      (when observed
+        (grow-bits! (mut (.protected s)) (len (.instructions graph)))
+        (for end (.ends s)
+          (unless (protected? s end)
+            (bits/add! (mut (.protected s)) (cast i64 end))
+            (push! (mut roots) end)))))
+    (for block (.joins s)
+      (when (and (> block 0) (= (opcode graph block) 112)) (push! (mut (.pending s)) block)))
+    (when (and live (= (opcode graph merge) 112)) (push! (mut (.pending s)) merge))
+    (set! (.changes s) (+ (.changes s) 1))))
+
+(defn try! [(s (mut State)) (graph (mut g/Graph)) (roots (mut (ArrayList i32)))
+            (edges (mut uses/Uses)) (queue (mut q/Queue)) (merge i32) (a (dyn Allocator))] (-> void)
+  (when (gather! (mut s) graph edges merge)
+    (ensure-protected! (mut s) graph roots)
+    (when (plan! (mut s) graph edges a)
+      (commit! (mut s) (mut graph) (mut roots) (mut edges) (mut queue)))))
+
+;;; edges are exact and stay exact; new and changed nodes are queued for the
+;;; caller's cleanup. Returns the number of MERGEs threaded.
+(defn rewrite! [(graph (mut g/Graph))
+                (roots (mut (ArrayList i32)))
+                (edges (mut uses/Uses))
+                (queue (mut q/Queue))
+                (pointer-bytes i32)
+                (a (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [(mut s) (create pointer-bytes a)
+        size (len (.instructions graph))
+        (mut budget) (+ (* size 2) 64)
+        (mut error) ""
+        (mut r) (: 1 i64)]
+    (while (< r size)
+      (when (= (n/opcode (get (.instructions graph) r)) 112)
+        (try! (mut s) (mut graph) (mut roots) (mut edges) (mut queue) (cast i32 r) a))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    ; Joins and narrowed MERGEs can expose another test of their own PHIs.
+    (while (and (> (len (.pending s)) 0) (> budget 0))
+      (let [next (get (.pending s) (- (len (.pending s)) 1))]
+        (pop! (mut (.pending s)))
+        (set! budget (- budget 1))
+        (when (= (opcode graph next) 112)
+          (try! (mut s) (mut graph) (mut roots) (mut edges) (mut queue) next a))))
+    (when (.pruning s)
+      (grow-bits! (mut (.protected s)) (len (.instructions graph)))
+      (match (control/prune! (mut graph) (mut roots) (mut edges) (mut queue)
+                             (mut (.protected s)) a)
+        (Err [message] (set! error message))
+        (Ok [_] 0)))
+    (let [changes (.changes s)]
+      (release! (mut s))
+      (if (= error "") (Ok changes) (Err error)))))
