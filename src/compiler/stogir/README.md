@@ -237,3 +237,8 @@ Branch-fact research from coil-stogir 3edd0e0 (research/branch-facts): opt-in do
 Branch-fact option also applies to private leaf precompilation and modules without certified private callees, using an inactive private context (no unsealed registry access).
 
 Induction-range research vendored unchanged from coil-stogir 3752b9b (research/induction-ranges): COIL_STOGIR_INDUCTION=1 enables dominating branch facts plus overflow-checked unit-step recurrence ranges. Natural back edges are identified by dominance and matched to PHI input slots; signed ordering semantics come from the comparison opcode. Off by default. Focused semantic and native boundary tests pass; the full library run has only its two previously recorded standalone failures, all 73 linked consumers pass, and Quick FAST passes with the option enabled. The real primitive-providers-in negative-index check is removed. Measurements and scope are recorded in coil-stogir docs/benchmarks/induction-ranges/.
+
+## Must-execute loop load hoisting research
+
+Vendored coil-stogir `85f5b70341459a55ac90525b0c36fed292aec4e7` on `research/loop-load-hoist`.
+Adds the opt-in `COIL_STOGIR_HOIST_LOADS=1` pass before rotation and after successful rotation. It moves only must-execute header load chains from read-only natural loops, preserving control closure and read order. Calls, stores, volatile/atomic operations and lifetime changes are barriers. All existing verifiers remain active. This is research, disabled by default; matched runtime comparisons do not establish a gain, so it is not part of the best runtime policy. See library `docs/benchmarks/loop-load-hoist/README.md` for evidence.

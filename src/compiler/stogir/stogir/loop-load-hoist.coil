@@ -1,0 +1,201 @@
+;;; Hoist must-execute header loads from read-only natural loops. No speculative
+;;; reads: the first execution stays immediately after the unique entry END's
+;;; predecessor, in original control order. Body loads require rotation first.
+(module stogir.loop-load-hoist)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.dominators" :as dom)
+(import "stogir.adjacency" :as adj)
+(import "stogir.uses" :as uses)
+(import "stogir.loop-rotate" :as rotate)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Option Some None some?])
+
+(defstruct Plan [(header i32) (entry i32) (loads (ArrayList i32)) (redirects (ArrayList uses/Use))])
+(defstruct Moved [(graph (Option g/Graph)) (roots (ArrayList i32)) (loads i64)])
+
+(defn opcode [(graph g/Graph) (r i32)] (-> i32)
+  (cast i32 (n/opcode (get (.instructions graph) (cast i64 r)))))
+
+;;; A source used by exactly one control operation. PHI region references are
+;;; not control successors. A fork declines; no execution path may skip a load.
+(defn successor [(graph g/Graph) (users uses/Uses) (ref i32)] (-> i32)
+  (let [range (get (.ranges users) (cast i64 ref)) (mut out) (: 0 i32) (mut count) 0]
+    (for [i 0 (.count range)]
+      (let [edge (get (.edges users) (+ (.offset range) i)) code (opcode graph (.user edge))]
+        (when (and (op/control? code) (= (op/operand-code code (.operand edge)) op/OPERAND-SRC))
+          (set! count (+ count 1)) (set! out (.user edge)))))
+    (if (= count 1) out 0)))
+
+(defn includes? [(items (ArrayList i32)) (r i32)] (-> bool)
+  (let [(mut found) false] (for x items (when (= x r) (set! found true))) found))
+
+(defn release-plan! [(plan (mut Plan))] (-> void)
+  (free! (mut (.loads plan))) (free! (mut (.redirects plan))))
+
+;;; Union of all natural back-edge regions. Side entries and unreachable
+;;; predecessors decline: every included block must be dominated by HEADER.
+(defn members [(graph g/Graph) (prepared pipeline/Prepared) (pred adj/Index)
+               (header i32) (latches (ArrayList i32)) (a (dyn Allocator))]
+  (-> (Option (ArrayList bool)))
+  (let [(mut inside) (ArrayList::new [bool] a) (mut work) (ArrayList::new [i32] a)
+        (mut valid) true]
+    (extend-zeroed! (mut inside) (len (.instructions graph)))
+    (set! (mut inside) (cast i64 header) true)
+    (for latch latches
+      (unless (get inside (cast i64 latch))
+        (set! (mut inside) (cast i64 latch) true) (push! (mut work) latch)))
+    (while (and valid (> (len work) 0))
+      (let [block (match (pop! (mut work)) (Some [r] r) (None [] (panic "hoist worklist")))]
+        (if (not (dom/dominates? (.idom prepared) header block))
+            (set! valid false)
+            (let [range (get (.ranges pred) (cast i64 block))]
+              (for [i 0 (.count range)]
+                (let [edge (get (.edges (.blocks prepared)) (get (.edges pred) (+ (.offset range) i)))
+                      from (.from edge)]
+                  (unless (get inside (cast i64 from))
+                    (set! (mut inside) (cast i64 from) true) (push! (mut work) from))))))))
+    (free! (mut work))
+    (if valid (Some inside) (do (free! (mut inside)) (None)))))
+
+;;; Ordinary LOAD and structural control are the only permitted loop controls.
+;;; Stores (even apparently disjoint), calls, volatile/atomic operations, guards,
+;;; assembly, stack lifetimes and other effectful operations are barriers.
+(defn read-only? [(graph g/Graph) (prepared pipeline/Prepared) (inside (ArrayList bool))]
+  (-> bool)
+  (let [(mut valid) true]
+    (for block (.order prepared)
+      (when (get inside (cast i64 block))
+        (let [range (get (.ranges (.schedule prepared)) (cast i64 block))]
+          (for [i 0 (.count range)]
+            (let [ref (get (.nodes (.schedule prepared)) (+ (.offset range) i)) code (opcode graph ref)]
+              (when (and (op/control? code) (!= code 91) (not (and (>= code 106) (<= code 117))))
+                (set! valid false)))))))
+    valid))
+
+;;; Availability at the external entry, extended in header schedule order over
+;;; floating expressions and already selected loads. PHIs/control pinned within
+;;; the loop never become invariant merely because their inputs look alike.
+(defn prefix [(graph g/Graph) (prepared pipeline/Prepared) (owners (ArrayList i32))
+              (inside (ArrayList bool)) (header i32) (entry i32) (a (dyn Allocator))]
+  (-> (ArrayList i32))
+  (let [(mut known) (ArrayList::new [bool] a) (mut loads) (ArrayList::new [i32] a)
+        entry-block (get owners (cast i64 entry))
+        range (get (.ranges (.schedule prepared)) (cast i64 header))
+        (mut tail) header (mut done) false]
+    (extend-zeroed! (mut known) (len (.instructions graph)))
+    (for [i 1 (len owners)]
+      (let [owner (get owners i)]
+        (when (and (> owner 0) (not (get inside (cast i64 owner)))
+                   (dom/dominates? (.idom prepared) owner entry-block))
+          (set! (mut known) i true))))
+    (for [i 0 (.count range)]
+      (let [ref (get (.nodes (.schedule prepared)) (+ (.offset range) i))
+            node (get (.instructions graph) (cast i64 ref)) code (cast i32 (n/opcode node))]
+        (unless (or done (= ref header))
+          (cond
+            (!= (& (op/properties code) op/FLAG-FLOATING-DATA) 0)
+              (let [(mut invariant) true]
+                (for [j 1 (+ (cast i64 (get (.arities graph) (cast i64 ref))) 1)]
+                  (when (uses/edge-code? (op/operand-code code (cast i32 j)))
+                    (let [value (match (g/operand graph ref (cast i32 j))
+                                   (Some [r] r) (None [] (panic "hoist operand")))]
+                      (when (and (> value 0) (not (get known (cast i64 value))))
+                        (set! invariant false)))))
+                (when invariant (set! (mut known) (cast i64 ref) true)))
+            (op/control? code)
+              (if (and (= code 91) (= (.op1 node) tail)
+                       (= (successor graph (.users prepared) tail) ref)
+                       (or (< (.op2 node) 0) (get known (cast i64 (.op2 node)))))
+                  (do (push! (mut loads) ref) (set! (mut known) (cast i64 ref) true) (set! tail ref))
+                  (set! done true))
+            :else 0))))
+    (free! (mut known))
+    loads))
+
+(defn find [(graph g/Graph) (prepared pipeline/Prepared) (a (dyn Allocator))]
+  (-> (Option Plan))
+  (let [(mut owners) (rotate/block-map graph prepared a)
+        (mut pred) (adj/build (.blocks prepared) true a)
+        (mut found) (None [Plan])]
+    (for header (.order prepared)
+      (when (and (not (some? found)) (or (= (opcode graph header) 112) (= (opcode graph header) 113))
+                 (>= (get (.arities graph) (cast i64 header)) 2)
+                 (> (successor graph (.users prepared) header) 0))
+        (let [(mut entry) (: 0 i32) (mut valid) true (mut latches) (ArrayList::new [i32] a)]
+          (for edge (.edges (.blocks prepared))
+            (when (= (.to edge) header)
+              (if (or (<= (.from edge) 0) (= (get (.idom prepared) (cast i64 (.from edge))) 0))
+                  (set! valid false)
+                  (if (dom/dominates? (.idom prepared) header (.from edge))
+                      (push! (mut latches) (.from edge))
+                      (if (!= entry 0) (set! valid false) (set! entry (.source edge)))))))
+          (when (and valid (> entry 0) (> (len latches) 0)
+                     (or (= (opcode graph entry) 114) (= (opcode graph entry) 115))
+                     (= (successor graph (.users prepared) entry) header))
+            (match (members graph prepared pred header latches a)
+              (None [] 0)
+              (Some [inside]
+                (let [(mut inside) inside]
+                  (when (read-only? graph prepared inside)
+                    (let [(mut loads) (prefix graph prepared owners inside header entry a)]
+                      (if (= (len loads) 0) (free! (mut loads))
+                          (let [(mut redirects) (ArrayList::new [uses/Use] a)]
+                            (for load loads
+                              (let [range (get (.ranges (.users prepared)) (cast i64 load))]
+                                (for [i 0 (.count range)]
+                                  (let [edge (get (.edges (.users prepared)) (+ (.offset range) i))]
+                                    (when (and (= (op/operand-code (opcode graph (.user edge)) (.operand edge)) op/OPERAND-SRC)
+                                               (not (includes? loads (.user edge))))
+                                      (push! (mut redirects) edge))))))
+                            (set! found (Some (Plan :header header :entry entry :loads loads :redirects redirects)))))))
+                  (free! (mut inside))))))
+          (free! (mut latches)))))
+    (adj/release! (mut pred)) (free! (mut owners))
+    found))
+
+(defn patch! [(graph (mut g/Graph)) (ref i32) (operand i32) (value i32)] (-> void)
+  (unless (g/set-operand! (mut graph) ref operand value) (panic "hoist patch")))
+
+(defn apply! [(graph (mut g/Graph)) (roots (mut (ArrayList i32))) (plan Plan)] (-> void)
+  (let [predecessor (.op1 (get (.instructions graph) (cast i64 (.entry plan))))]
+    (for edge (.redirects plan) (patch! (mut graph) (.user edge) (.operand edge) (.header plan)))
+    (patch! (mut graph) (get (.loads plan) 0) 1 predecessor)
+    (patch! (mut graph) (.entry plan) 1 (get (.loads plan) (- (len (.loads plan)) 1)))
+    ; Preserve the original control closure even when the only externally
+    ; observed value was the LOAD or an expression using it. Hoisting must not
+    ; turn an observable loop into dead control.
+    (unless (includes? roots (.header plan)) (push! (mut roots) (.header plan)))))
+
+;;; Each iteration rebuilds analyses after edits. No stale scheduling, use-list
+;;; or dominance facts cross a mutation. A move exits a natural loop without
+;;; adding blocks/loads, so repeated hoisting through nested loops terminates.
+(defn run [(source g/Graph) (entry i32) (roots (slice i32)) (a (dyn Allocator))]
+  (-> (Result Moved (slice u8)))
+  (let [(mut working) (None [g/Graph]) (mut exits) (ArrayList::new [i32] a)
+        (mut loads) (: 0 i64) (mut done) false (mut error) ""]
+    (for root roots (push! (mut exits) root))
+    (while (and (not done) (= error ""))
+      (let [graph (match working (Some [owned] owned) (None [] source))]
+        (match (pipeline/prepare graph entry (slice exits) a)
+          (Err [message] (set! error message))
+          (Ok [prepared]
+            (let [(mut prepared) prepared plan (find graph prepared a)]
+              (pipeline/release! (mut prepared))
+              (match plan
+                (None [] (set! done true))
+                (Some [selected]
+                  (let [(mut selected) selected
+                        (mut owned) (match working (Some [owned] owned) (None [] (g/duplicate source a)))]
+                    (apply! (mut owned) (mut exits) selected)
+                    (set! loads (+ loads (len (.loads selected))))
+                    (release-plan! (mut selected))
+                    (set! working (Some owned))))))))))
+    (if (= error "")
+        (Ok (Moved :graph working :roots exits :loads loads))
+        (do
+          (match working (None [] 0) (Some [owned] (let [(mut owned) owned] (g/release! (mut owned)))))
+          (free! (mut exits)) (Err error)))))
