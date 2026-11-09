@@ -1,0 +1,168 @@
+;;; CFG-selected allocation regions and exact block-boundary partitions.
+;;; The search and native transfer bridge remain separate: this module neither
+;;; invents physical copies nor changes an assignment while partitioning it.
+(module stogir.allocation-regional)
+(import "stogir.allocation" :as allocation)
+(import "stogir.interval" :as range)
+(import "stogir.constraints" :as constraints)
+(import "stogir.graph" :as g)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.schedule" :as schedule)
+(import "stogir.block-layout" :as layout)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defstruct Region [(anchor i32) (rank i32) (count i64) (spans (ArrayList range/Range))])
+(defstruct Plan [(regions (ArrayList Region)) (weights (ArrayList i64))])
+(defstruct Partition [(parts (ArrayList allocation/Part)) (mutable (ArrayList bool))])
+
+(defn empty [(a (dyn Allocator))] (-> Plan)
+  (Plan :regions (ArrayList::new [Region] a) :weights (ArrayList::new [i64] a)))
+(defn release! [(plan (mut Plan))] (-> void)
+  (for region (.regions plan) (let [(mut region) region] (free! (mut (.spans region)))))
+  (free! (mut (.regions plan))) (free! (mut (.weights plan))))
+(defn release-parts! [(parts (mut (ArrayList allocation/Part)))] (-> void)
+  (for [i 0 (len parts)] (allocation/release! (elem (mut parts) i)))
+  (free! (mut parts)))
+(defn release-partition! [(partition (mut Partition))] (-> void)
+  (release-parts! (mut (.parts partition))) (free! (mut (.mutable partition))))
+
+;;; Following a single-successor arm can pass pure setup blocks before a loop
+;;; header. A cycle or another branch stops classification conservatively.
+(defn enters-loop? [(facts layout/Facts) (start i32) (depth i32)] (-> bool)
+  (let [(mut block) start (mut left) (len (.items facts)) (mut answer) false (mut done) false]
+    (while (and (not done) (> left 0))
+      (let [current (get (.items facts) (cast i64 block))]
+        (cond (> (.depth current) depth) (do (set! answer true) (set! done true))
+              (or (< (.depth current) depth) (!= (layout/degree facts block) 1)) (set! done true)
+              :else (set! block (layout/successor facts block 0))))
+      (set! left (- left 1)))
+    answer))
+
+(defn discover [(facts layout/Facts) (scheduled schedule/Schedule) (a (dyn Allocator))]
+  (-> (ArrayList Region))
+  (let [(mut result) (ArrayList::new [Region] a)
+        (mut selected) (ArrayList::new [bool] a) (mut pending) (ArrayList::new [i32] a)]
+    (for [i 0 (len (.items facts))] (push! (mut selected) false))
+    (for [i 1 (len (.items facts))]
+      (let [anchor (cast i32 i) block (get (.items facts) i)]
+        (when (= (layout/degree facts anchor) 2)
+          (let [first (layout/successor facts anchor 0) second (layout/successor facts anchor 1)
+                first-loop (enters-loop? facts first (.depth block))
+                second-loop (enters-loop? facts second (.depth block))]
+            (when (!= first-loop second-loop)
+              (for [j 0 (len selected)] (set! (mut selected) j false))
+              (set! (mut selected) i true) (clear! (mut pending))
+              (push! (mut pending) (if first-loop second first))
+              (let [body (if first-loop first second) (mut count) (: 1 i64)]
+                (while (> (len pending) 0)
+                  (let [next (match (pop! (mut pending)) (Some [value] value) (None [] (panic "empty region worklist")))]
+                    (when (and (> next anchor) (!= next body) (not (get selected (cast i64 next)))
+                               (= (.depth (get (.items facts) (cast i64 next))) (.depth block)))
+                      (set! (mut selected) (cast i64 next) true) (set! count (+ count 1))
+                      (for [j 0 (layout/degree facts next)]
+                        (push! (mut pending) (layout/successor facts next j))))))
+                (when (> count 1)
+                  (let [(mut region) (Region :anchor (.reference block) :rank anchor :count count
+                                      :spans (ArrayList::new [range/Range] a))]
+                    (for [j 1 (len selected)]
+                      (when (get selected j)
+                        (let [ref (.reference (get (.items facts) j))
+                              span (get (.ranges scheduled) (cast i64 ref))]
+                          (assert (> (.count span) 0))
+                          (range/add! (mut (.spans region)) (* (.offset span) 2)
+                            (* (+ (.offset span) (.count span)) 2)))))
+                    (push! (mut result) region)))))))))
+    ; Smallest regions first; ties retain CFG order, independently of ref IDs.
+    (for [i 1 (len result)]
+      (let [region (get result i) (mut j) i]
+        (while (and (> j 0) (> (.count (get result (- j 1))) (.count region)))
+          (set! (mut result) j (get result (- j 1))) (set! j (- j 1)))
+        (set! (mut result) j region)))
+    (free! (mut selected)) (free! (mut pending)) result))
+
+(defn integer-weight [(frequency f64) (scale f64)] (-> i64)
+  (let [scaled (+ (* frequency scale) 0.5)]
+    (cond (< scaled 1.0) 1 (> scaled 1000000.0) 1000000 :else (cast i64 scaled))))
+
+(defn prepare [(graph g/Graph) (prepared pipeline/Prepared) (a (dyn Allocator))]
+  (-> (Result Plan (slice u8)))
+  (let [(mut empty-blocks) (ArrayList::new [bool] a) (mut plan) (empty a) (mut error) ""]
+    (for [i 0 (len (.instructions graph))] (push! (mut empty-blocks) false))
+    (let [(mut facts) (layout/facts graph prepared empty-blocks a)]
+      (free! (mut (.regions plan)))
+      (set! (.regions plan) (discover facts (.schedule prepared) a))
+      (when (> (len (.regions plan)) 0)
+        (layout/predict! graph prepared (mut facts) a)
+        (match (layout/expected-frequencies facts a)
+          (Err [message] (set! error message))
+          (Ok [frequencies]
+            (match frequencies
+              (None [] 0) ; The bounded loop-depth transfer costs remain valid.
+              (Some [owned]
+                (let [(mut values) owned (mut maximum) (: 0.0 f64)
+                      edges (len (.edges (.blocks prepared))) (mut dense-edge) (: 0 i64)]
+                  (for value values (when (> value maximum) (set! maximum value)))
+                  (let [scale (if (> maximum 100.0) (/ 1000000.0 maximum) 10000.0)]
+                    (for [i 0 (+ edges (* 2 (len (.nodes (.schedule prepared)))))]
+                      (push! (mut (.weights plan)) 1))
+                    (for [i 0 edges]
+                      (let [edge (get (.edges (.blocks prepared)) i)
+                            from (get (.ranks facts) (cast i64 (.from edge)))
+                            to (get (.ranks facts) (cast i64 (.to edge)))]
+                        (when (and (> from 0) (> to 0))
+                          (let [dense (get (.edges facts) dense-edge)]
+                            (assert (and (= (.from dense) from) (= (.to dense) to)
+                                         (= (.position dense) (.position edge))))
+                            (set! (mut (.weights plan)) i
+                              (integer-weight (* (get values (cast i64 from))
+                                                  (layout/flow-probability facts dense-edge)) scale)))
+                          (set! dense-edge (+ dense-edge 1)))))
+                    (assert (= dense-edge (len (.edges facts))))
+                    (for [i 1 (len (.items facts))]
+                      (let [ref (.reference (get (.items facts) i))
+                            span (get (.ranges (.schedule prepared)) (cast i64 ref))
+                            weight (integer-weight (get values i) scale)]
+                        (for [position (* (.offset span) 2) (* (+ (.offset span) (.count span)) 2)]
+                          (set! (mut (.weights plan)) (+ edges position) weight)))))
+                  (free! (mut values))))))))
+      (layout/release-facts! (mut facts)))
+    (free! (mut empty-blocks))
+    (if (= error "") (Ok plan) (do (release! (mut plan)) (Err error)))))
+
+(defn blank-like [(part allocation/Part) (a (dyn Allocator))] (-> allocation/Part)
+  (let [(mut result) part]
+    (set! (.ranges result) (ArrayList::new [range/Range] a))
+    (set! (.uses result) (ArrayList::new [constraints/Use] a)) result))
+
+;;; Deep-copy each original child into inside/outside pieces, retaining exact
+;;; holes and uses. Regions contain whole blocks, so every new transition is a
+;;; CFG boundary. Original internal split positions remain unchanged. The
+;;; caller owns the candidate; a no-change search can discard it atomically.
+(defn partition [(parts (ArrayList allocation/Part)) (region Region) (a (dyn Allocator))]
+  (-> Partition)
+  (let [(mut result) (Partition :parts (ArrayList::new [allocation/Part] a)
+                      :mutable (ArrayList::new [bool] a))]
+    (for part parts
+      (let [(mut inside) (blank-like part a) (mut outside) (blank-like part a)]
+        (for live (.ranges part)
+          (let [(mut cursor) (.start live)]
+            (for span (.spans region)
+              (let [lo (if (> (.start span) cursor) (.start span) cursor)
+                    hi (if (< (.end span) (.end live)) (.end span) (.end live))]
+                (when (< lo hi)
+                  (when (< cursor lo) (range/add! (mut (.ranges outside)) cursor lo))
+                  (range/add! (mut (.ranges inside)) lo hi) (set! cursor hi))))
+            (when (< cursor (.end live)) (range/add! (mut (.ranges outside)) cursor (.end live)))))
+        (for use (.uses part)
+          (if (range/covers? (.spans region) (.position use))
+            (push! (mut (.uses inside)) use) (push! (mut (.uses outside)) use)))
+        (if (or (> (len (.ranges inside)) 0) (> (len (.uses inside)) 0))
+          (do (push! (mut (.parts result)) inside) (push! (mut (.mutable result)) (>= (.parent part) 0)))
+          (allocation/release! (mut inside)))
+        (if (or (> (len (.ranges outside)) 0) (> (len (.uses outside)) 0)
+                (and (= (len (.ranges part)) 0) (= (len (.uses part)) 0)))
+          (do (push! (mut (.parts result)) outside) (push! (mut (.mutable result)) false))
+          (allocation/release! (mut outside)))))
+    result))
