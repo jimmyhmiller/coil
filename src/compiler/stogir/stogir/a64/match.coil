@@ -9,6 +9,7 @@
 (import "stogir.schedule" :as schedule)
 (import "stogir.matched-uses" :as machine)
 (import "stogir.conditional" :as conditional)
+(import "stogir.nonnegative" :as nonnegative)
 (import "stogir.a64.select" :as select)
 (import "stogir.a64.address" :as address)
 (import "stogir.a64.memory" :as memory)
@@ -45,12 +46,51 @@
                  (= opcode 58)
                  (= opcode 59))))))
 
+;;; A full-width integer comparison of one register value with an encodable
+;;; immediate. Repeating it at a later use needs only that value, which SSA
+;;; dominance supplies; RLOAD inputs are pinned to their original position.
+(defn immediate-comparison? [(graph g/Graph) (tile select/Tile) (reference i32)] (-> bool)
+  (and (>= (.rule tile) 20) (<= (.rule tile) 33) (.wide tile)
+       (= (.right tile) 0) (> (.left tile) 0)
+       (conditional/movable-condition? graph reference)))
+
+;;; For EQ/NE(ZEXT(Boolean integer comparison), 0), the inner comparison;
+;;; otherwise zero. Floating predicates are excluded: scalar-tile? selects
+;;; integer comparisons only, and their inversion would need unordered codes.
+(defn truth-source [(graph g/Graph) (tiles (ArrayList select/Tile)) (tile select/Tile)] (-> i32)
+  (if (and (or (= (.rule tile) 20) (= (.rule tile) 21)) (.wide tile)
+           (= (.right tile) 0) (= (.immediate tile) 0) (> (.left tile) 0))
+      (let [view (get (.instructions graph) (cast i64 (.left tile)))
+            inner (.op1 view)]
+        (if (and (= (n/opcode view) 34) (> inner 0)
+                 (= (n/type-id (get (.instructions graph) (cast i64 inner))) 1)
+                 (>= (.rule (get tiles (cast i64 inner))) 20)
+                 (<= (.rule (get tiles (cast i64 inner))) 33))
+            inner
+            0))
+      0))
+
+;;; The flags recipe of a fused IF or COND: an IF may carry its own (possibly
+;;; inverted) recipe; otherwise the absorbed comparison's selected tile.
+(defn condition-tile [(plan Plan) (reference i32)] (-> select/Tile)
+  (let [own (get (.tiles plan) (cast i64 reference))]
+    (if (and (>= (.rule own) 20) (<= (.rule own) 33))
+        own
+        (get (.tiles plan) (cast i64 (get (.comparisons plan) (cast i64 reference)))))))
+
 ;;; A plan borrows graph references and becomes invalid after graph mutation.
-;;; Branch fusion mirrors IR_CMP_AND_BRANCH_INT. The optional independent
-;;; COND extension consumes a single-use, unobserved, same-block 64-bit integer
-;;; comparison for a word integer result. Other rules keep ordinary def/uses.
+;;; Branch fusion mirrors IR_CMP_AND_BRANCH_INT: a single-use, unobserved,
+;;; same-block full-width integer comparison is consumed by its IF, and with
+;;; fuse-selects by an integer COND. Beyond upstream, a comparison with an
+;;; encodable immediate is repeated at every IF/COND user wherever it was
+;;; placed, and IF(EQ/NE(ZEXT(such a comparison), 0)) uses its flags directly.
+;;; The comparison keeps its definition only while another user needs the
+;;; Boolean. Other rules keep ordinary def/uses.
+;;; idom is indexed by block-start reference (pipeline dominators); an empty
+;;; list restricts signed power-of-two division proofs to expression structure.
 (defn build-with-selects [(graph g/Graph)
              (scheduled schedule/Schedule)
+             (idom (ArrayList i32))
              (roots (slice i32))
              (fuse bool)
              (fuse-selects bool)
@@ -137,7 +177,17 @@
         (when (scalar-tile? graph node)
           (match (select/select graph reference)
             (Err [message] (set! error message))
-            (Ok [tile] (set! (mut tiles) index tile)))))) (set! for-index-1 (+ for-index-1 1))))
+            ; A signed power-of-two DIV/MOD of a dividend proven non-negative
+            ; at this block equals the unsigned one: a single LSR or AND.
+            (Ok [tile]
+              (set! (mut tiles) index
+                    (if (and fuse (or (= (.rule tile) 45) (= (.rule tile) 47))
+                             (>= (types/scalar-size (cast i32 (n/type-id node)) 8) 4)
+                             (nonnegative/proven? graph idom block (.left tile)))
+                        (select/Tile :rule (- (.rule tile) 1) :wide (.wide tile)
+                                     :left (.left tile) :right 0
+                                     :immediate (.immediate tile))
+                        tile))))))) (set! for-index-1 (+ for-index-1 1))))
     ; Remove only each consumed Boolean edge. Shared/protected comparisons
     ; remain definitions; no new arithmetic edges are speculated.
     (for reference choices
@@ -157,13 +207,16 @@
         (let [node (get (.instructions graph) (cast i64 reference))
               selection (and fuse-selects (= (n/opcode node) 60)
                              (types/integer? (cast i32 (n/type-id node)))
-                             (>= (types/scalar-size (cast i32 (n/type-id node)) 8) 4)
                              (= (.rule (get tiles (cast i64 reference))) 0))
               source (if selection (.op1 node) (.op2 node))]
           (when (and (or selection (= (n/opcode node) 116)) (> source 0))
             (let [index (cast i64 source)
                   tile (get tiles index)]
-              (when (and (= (get counts index) 1)
+              (let [inner (if selection 0 (truth-source graph tiles tile))
+                    inverted (and (> inner 0)
+                                  (immediate-comparison? graph (get tiles (cast i64 inner)) inner))]
+                (if (and (not inverted)
+                         (= (get counts index) 1)
                          (not (get protected index))
                          (= (get blocks index)
                             (get blocks (cast i64 reference)))
@@ -171,9 +224,52 @@
                          (<= (.rule tile) 33)
                          (.wide tile)
                          (or (not selection) (conditional/movable-condition? graph source)))
-                (set! (mut omitted) index true)
-                (set! (mut comparisons) (cast i64 reference) source)
-                (when selection (push! (mut selects) reference))))))) (set! for-index-2 (+ for-index-2 1)))))
+                    (do
+                      (set! (mut omitted) index true)
+                      (set! (mut comparisons) (cast i64 reference) source)
+                      (when selection (push! (mut selects) reference)))
+                    (if inverted
+                        ; IF(EQ/NE(ZEXT(comparison), 0)) branches on the inner
+                        ; flags, inverted for EQ. Each absorbed edge is released
+                        ; in turn; a still-used link keeps its definition.
+                        (let [base (get tiles (cast i64 inner))
+                              operand (cast i64 (.left base))
+                              (mut link) source
+                              (mut live) true]
+                          (set! (mut comparisons) (cast i64 reference) inner)
+                          (set! (mut tiles) (cast i64 reference)
+                                (select/Tile :rule (if (= (.rule tile) 20)
+                                                       (+ 20 (^ (- (.rule base) 20) 1))
+                                                       (.rule base))
+                                             :wide true :left (.left base) :right 0
+                                             :immediate (.immediate base)))
+                          (set! (mut counts) operand (+ (get counts operand) 1))
+                          (while live
+                            (let [slot (cast i64 link)]
+                              (set! (mut counts) slot (- (get counts slot) 1))
+                              (if (and (= (get counts slot) 0) (not (get protected slot)))
+                                  (do
+                                    (set! (mut omitted) slot true)
+                                    (if (= link inner)
+                                        (do
+                                          (set! (mut counts) operand (- (get counts operand) 1))
+                                          (set! live false))
+                                        (set! link (if (= link source) (.left tile) inner))))
+                                  (set! live false)))))
+                        ; A shared or earlier-placed comparison with an encodable
+                        ; immediate is repeated at each IF and word COND: its one
+                        ; register input replaces the Boolean one-for-one in every
+                        ; live range, so pressure never grows. Two-register forms
+                        ; stay Booleans unless single-use in the same block.
+                        (when (and (or selection (= (n/opcode node) 116))
+                                   (immediate-comparison? graph tile source))
+                          (set! (mut comparisons) (cast i64 reference) source)
+                          (when selection (push! (mut selects) reference))
+                          (set! (mut counts) index (- (get counts index) 1))
+                          (if (and (= (get counts index) 0) (not (get protected index)))
+                              (set! (mut omitted) index true)
+                              (set! (mut counts) (cast i64 (.left tile))
+                                    (+ (get counts (cast i64 (.left tile))) 1))))))))))) (set! for-index-2 (+ for-index-2 1)))))
     ; TRUNC(SHR/SAR) extracts a field; SHL(SHR/SAR) with matching counts
     ; clears low bits with one AND. Both select a single machine input.
     ; Redirect each use first, then retire a producer only after all actual
@@ -475,7 +571,10 @@
 
 (defn build [(graph g/Graph) (scheduled schedule/Schedule) (roots (slice i32))
              (fuse bool) (a (dyn Allocator))] (-> (Result Plan (slice u8)))
-  (build-with-selects graph scheduled roots fuse false a))
+  (let [(mut idom) (ArrayList::new [i32] a)
+        result (build-with-selects graph scheduled idom roots fuse false a)]
+    (free! (mut idom))
+    result))
 
 (defn release! [(plan (mut Plan))] (-> void)
   (free! (mut (.static-sizes plan)))
