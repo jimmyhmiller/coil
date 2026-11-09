@@ -1,0 +1,363 @@
+;;; Loop-invariant constant registers. A literal that an instruction inside a
+;;; loop would rebuild in a scratch register on every iteration is defined once
+;;; by a COPY of that literal in the nearest dominating block outside the loop.
+;;; This is an independent target extension: pinned upstream materializes such
+;;; operands at each use. The caller's graph is never changed; the rewritten
+;;; working copy shares its constant namespace.
+(module stogir.a64.constant-hoist)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.types" :as types)
+(import "stogir.symbols" :as symbols)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.allocation" :as allocation)
+(import "stogir.matched-uses" :as machine)
+(import "stogir.a64.select" :as select)
+(import "stogir.a64.address" :as address)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; graph is the caller's graph when nodes is empty, otherwise an owned
+;;; instruction overlay of it. nodes are the appended COPY definitions.
+(defstruct Hoisted [(graph g/Graph) (nodes (ArrayList i32))])
+
+(defn release! [(hoisted (mut Hoisted))] (-> void)
+  (when (> (len (.nodes hoisted)) 0)
+    (g/release-overlay! (mut (.graph hoisted))))
+  (free! (mut (.nodes hoisted))))
+
+;;; A nonzero 32/64-bit integer or address literal. Zero reads WZR/XZR or is a
+;;; single move; symbolic addresses keep their relocated materialization.
+(defn literal? [(graph g/Graph) (reference i32)] (-> bool)
+  (and (< reference 0)
+       (match (g/lookup graph reference)
+         (None [] false)
+         (Some [node]
+           (let [ty (cast i32 (n/type-id node))
+                 size (types/scalar-size ty 8)]
+             (and (symbols/numeric? node)
+                  (types/integer? ty)
+                  (or (= size 4) (= size 8))
+                  (!= (n/constant-bits node) 0)))))))
+
+;;; The selected arithmetic or comparison tile of reference reads this operand
+;;; from a register. Immediate, shift-count and power-of-two forms do not.
+(defn register-operand? [(tile select/Tile) (value i32)] (-> bool)
+  (and (< value 0)
+       (or (= (.left tile) value)
+           (and (!= (.right tile) 0) (= (.right tile) value)))))
+
+;;; Bit k-1 set: operand k of reference is a literal that its instruction reads
+;;; from a register. Covers selected arithmetic and comparison tiles, the value
+;;; of a STORE (when stores is set) and one literal arm of an integer COND.
+;;; Excluded, because later matching inspects the literal itself: an ADD
+;;; displacement an address mode may absorb; a comparison literal that a COND
+;;; of it may also select (MIN/MAX against a literal); the literal of a
+;;; comparison with a word extension (W-form narrowing); and a COND with two
+;;; literal arms (Boolean and constant-pair selections).
+(defn operands [(graph g/Graph) (prepared pipeline/Prepared) (reference i32) (stores bool)]
+  (-> i32)
+  (let [node (get (.instructions graph) (cast i64 reference))
+        opcode (cast i32 (n/opcode node))
+        comparison? (and (>= opcode 14) (<= opcode 23))
+        arithmetic? (and (types/integer? (cast i32 (n/type-id node)))
+                         (or (and (>= opcode 26) (<= opcode 30))
+                             (and (>= opcode 46) (<= opcode 53))
+                             (= opcode 58)
+                             (= opcode 59)))]
+    (cond
+      (= opcode 93)
+        (if (and stores (literal? graph (.op3 node))) 4 0)
+      (= opcode 60)
+        (let [left (literal? graph (.op2 node))
+              right (literal? graph (.op3 node))
+              arm (if left (.op2 node) (.op3 node))]
+          (if (or (not (types/integer? (cast i32 (n/type-id node))))
+                  (= left right)
+                  (< (if left (.op3 node) (.op2 node)) 0)
+                  (<= (.op1 node) 0))
+              0
+              (let [condition (get (.instructions graph) (cast i64 (.op1 node)))]
+                (if (and (>= (n/opcode condition) 14) (<= (n/opcode condition) 23)
+                         (or (= (.op1 condition) arm) (= (.op2 condition) arm)))
+                    0
+                    (if left 2 4)))))
+      (or (not (or comparison? arithmetic?))
+          (and (>= (.op1 node) 0) (>= (.op2 node) 0)))
+        0
+      :else
+        (match (select/select graph reference)
+          (Err [_] 0)
+          (Ok [tile]
+            (let [(mut mask) (: 0 i32)]
+              (when (and (register-operand? tile (.op1 node)) (literal? graph (.op1 node)))
+                (set! mask (| mask 1)))
+              (when (and (register-operand? tile (.op2 node)) (literal? graph (.op2 node)))
+                (set! mask (| mask 2)))
+              (when (and (!= mask 0) (= opcode 26))
+                (for [slot (: 1 i32) 3]
+                  (when (!= (& mask slot) 0)
+                    (match (address/numeric-word graph (if (= slot 1) (.op1 node) (.op2 node)))
+                      (None [] 0)
+                      (Some [offset]
+                        (when (and (>= offset -256) (<= offset 65520))
+                          (set! mask (& mask (- 3 slot)))))))))
+              ; A 64-bit comparison of a word extension with a literal is
+              ; narrowed to the W form by matching, which reads the literal.
+              (when (and (!= mask 0) comparison?
+                         (or (select/word-extension? graph (.op1 node))
+                             (select/word-extension? graph (.op2 node))))
+                (set! mask 0))
+              (when (and (!= mask 0) comparison?)
+                (let [range (get (.ranges (.users prepared)) (cast i64 reference))]
+                  (for [i 0 (.count range)]
+                    (let [user (get (.instructions graph)
+                                    (cast i64 (.user (get (.edges (.users prepared))
+                                                          (+ (.offset range) i)))))]
+                      (when (= (n/opcode user) 60)
+                        (for [slot (: 1 i32) 3]
+                          (let [literal (if (= slot 1) (.op1 node) (.op2 node))]
+                            (when (or (= (.op2 user) literal) (= (.op3 user) literal))
+                              (set! mask (& mask (- 3 slot)))))))))))
+              mask))))))
+
+;;; The nearest dominator of block with a smaller loop depth, when a node can
+;;; be scheduled before its block end; zero otherwise. Dominators of a block
+;;; that lie inside its innermost natural loop are at least as deep, so the
+;;; result is outside that loop and runs once per entry to it.
+(defn preheader [(graph g/Graph) (prepared pipeline/Prepared) (block i32)] (-> i32)
+  (let [idom (.idom prepared)
+        depths (.depths prepared)
+        depth (get depths (cast i64 block))
+        (mut current) block
+        (mut found) (: 0 i32)
+        (mut done) false]
+    (while (not done)
+      (let [parent (get idom (cast i64 current))]
+        (if (or (<= parent 0) (= parent current))
+            (set! done true)
+            (if (< (get depths (cast i64 parent)) depth)
+                (do (set! found parent) (set! done true))
+                (set! current parent)))))
+    (if (= found 0)
+        0
+        (let [range (get (.ranges (.schedule prepared)) (cast i64 found))]
+          (if (and (>= (.count range) 2)
+                   (op/block-end?
+                     (cast i32
+                           (n/opcode (get (.instructions graph)
+                                          (cast i64 (get (.nodes (.schedule prepared))
+                                                         (- (+ (.offset range) (.count range)) 1))))))))
+              found
+              0)))))
+
+;;; Loop facts gathered once per function, on its first candidate. header marks
+;;; each natural-loop header; calling marks the headers of loops that hold a
+;;; CALL, directly or in a nested loop. unknown is set when a loop holding a
+;;; CALL has no recognized header: every loop then counts as calling.
+(defstruct Loops [(header (ArrayList bool)) (calling (ArrayList bool)) (unknown bool)])
+
+(defn release-loops! [(loops (mut Loops))] (-> void)
+  (free! (mut (.header loops)))
+  (free! (mut (.calling loops))))
+
+;;; The header of the innermost natural loop holding block (depth above zero):
+;;; its nearest dominator, itself included, that is a header of the same depth.
+;;; A header strictly inside that loop is deeper, and one outside it that is as
+;;; deep cannot dominate block from nearer. Zero when none is found.
+(defn loop-header [(prepared pipeline/Prepared) (loops Loops) (block i32)] (-> i32)
+  (let [idom (.idom prepared)
+        depths (.depths prepared)
+        depth (get depths (cast i64 block))
+        (mut current) block
+        (mut found) (: 0 i32)
+        (mut done) false]
+    (while (not done)
+      (if (and (= (get depths (cast i64 current)) depth)
+               (get (.header loops) (cast i64 current)))
+          (do (set! found current) (set! done true))
+          (let [parent (get idom (cast i64 current))]
+            (if (or (<= parent 0) (= parent current)
+                    (< (get depths (cast i64 parent)) depth))
+                (set! done true)
+                (set! current parent)))))
+    found))
+
+;;; Header of the loop directly around the loop of header, whose depth is above
+;;; one. Dominators of header up to the surrounding loop's header lie in that
+;;; loop, so the first of the next depth out belongs directly to it.
+(defn outer-header [(prepared pipeline/Prepared) (loops Loops) (header i32)] (-> i32)
+  (let [idom (.idom prepared)
+        depths (.depths prepared)
+        wanted (- (get depths (cast i64 header)) 1)
+        (mut current) (get idom (cast i64 header))
+        (mut found) (: 0 i32)
+        (mut done) false]
+    (while (not done)
+      (if (<= current 0)
+          (set! done true)
+          (if (= (get depths (cast i64 current)) wanted)
+              (do (set! found (loop-header prepared loops current)) (set! done true))
+              (let [parent (get idom (cast i64 current))]
+                (if (= parent current) (set! done true) (set! current parent))))))
+    found))
+
+;;; An edge whose target dominates its source is a back edge. The source then
+;;; lies in the target's loop, as do its dominators up to the target, so the
+;;; walk stops at the first shallower block.
+(defn back-edge? [(prepared pipeline/Prepared) (from i32) (to i32)] (-> bool)
+  (let [idom (.idom prepared)
+        depths (.depths prepared)
+        depth (get depths (cast i64 to))
+        (mut current) from
+        (mut found) false
+        (mut done) (= depth 0)]
+    (while (not done)
+      (if (= current to)
+          (do (set! found true) (set! done true))
+          (let [parent (get idom (cast i64 current))]
+            (if (or (<= parent 0) (= parent current)
+                    (< (get depths (cast i64 current)) depth))
+                (set! done true)
+                (set! current parent)))))
+    found))
+
+;;; A value live around a loop that calls survives only in a preserved register,
+;;; so a literal is not hoisted out of one.
+(defn loops [(graph g/Graph) (prepared pipeline/Prepared) (allocator (dyn Allocator))]
+  (-> Loops)
+  (let [(mut result) (Loops :header (ArrayList::new [bool] allocator)
+                            :calling (ArrayList::new [bool] allocator)
+                            :unknown false)
+        size (len (.membership (.blocks prepared)))]
+    (extend-zeroed! (mut (.header result)) size)
+    (extend-zeroed! (mut (.calling result)) size)
+    (for edge (.edges (.blocks prepared))
+      (when (back-edge? prepared (.from edge) (.to edge))
+        (set! (mut (.header result)) (cast i64 (.to edge)) true)))
+    (for block (.starts (.blocks prepared))
+      (let [range (get (.ranges (.schedule prepared)) (cast i64 block))
+            (mut calls) false]
+        (when (> (get (.depths prepared) (cast i64 block)) 0)
+          (for [i (.offset range) (+ (.offset range) (.count range))]
+            (when (= (n/opcode (get (.instructions graph)
+                                    (cast i64 (get (.nodes (.schedule prepared)) i))))
+                     79)
+              (set! calls true))))
+        (when calls
+          ; Mark the innermost loop and each loop around it.
+          (let [(mut header) (loop-header prepared result block)
+                (mut done) false]
+            (while (not done)
+              (if (= header 0)
+                  (do (set! (.unknown result) true) (set! done true))
+                  (if (get (.calling result) (cast i64 header))
+                      (set! done true)
+                      (do
+                        (set! (mut (.calling result)) (cast i64 header) true)
+                        (if (<= (get (.depths prepared) (cast i64 header)) 1)
+                            (set! done true)
+                            (set! header (outer-header prepared result header)))))))))))
+    result))
+
+;;; Whether the innermost loop holding block may call.
+(defn calling? [(prepared pipeline/Prepared) (loops Loops) (block i32)] (-> bool)
+  (let [header (loop-header prepared loops block)]
+    (or (.unknown loops) (= header 0) (get (.calling loops) (cast i64 header)))))
+
+;;; The definition of literal in block target, appended to work on first use.
+;;; Zero reports reference-space exhaustion.
+(defn definition! [(work (mut g/Graph)) (source g/Graph) (literal i32) (target i32)
+                   (nodes (mut (ArrayList i32))) (blocks (mut (ArrayList i32)))
+                   (literals (mut (ArrayList i32))) (allocator (dyn Allocator))] (-> i32)
+  (let [(mut found) (: 0 i32)
+        constant (get (.constants source) (- (- 0 (cast i64 literal)) 1))]
+    (for [k 0 (len nodes)]
+      (when (and (= (get literals k) literal) (= (get blocks k) target))
+        (set! found (get nodes k))))
+    (when (= found 0)
+      (when (= (len nodes) 0)
+        (set! work (g/instruction-overlay source allocator)))
+      (match (g/append-inputs! (mut work) 68 (n/type-id constant) [literal (: 1 i32)])
+        (None [] 0)
+        (Some [created]
+          (set! found created)
+          (push! (mut nodes) created)
+          (push! (mut blocks) target)
+          (push! (mut literals) literal))))
+    found))
+
+;;; prepared describes graph and is updated in place to describe the result.
+;;; One COPY serves every use of a literal that shares a preheader. stores
+;;; admits STORE values; the caller clears it when selected return values name
+;;; stored operands of this graph.
+(defn run [(graph g/Graph) (prepared (mut pipeline/Prepared)) (stores bool)
+           (allocator (dyn Allocator))]
+  (-> (Result Hoisted (slice u8)))
+  (let [(mut nodes) (ArrayList::new [i32] allocator)
+        (mut blocks) (ArrayList::new [i32] allocator)
+        (mut literals) (ArrayList::new [i32] allocator)
+        (mut work) graph
+        (mut facts) (Loops :header (ArrayList::new [bool] allocator)
+                           :calling (ArrayList::new [bool] allocator)
+                           :unknown false)
+        (mut scanned) false
+        (mut error) ""]
+    (for block (.starts (.blocks prepared))
+      (let [range (get (.ranges (.schedule prepared)) (cast i64 block))
+            (mut target) (: -1 i32)]
+        (when (> (get (.depths prepared) (cast i64 block)) 0)
+          (for [i (.offset range) (+ (.offset range) (.count range))]
+            (let [reference (get (.nodes (.schedule prepared)) i)
+                  mask (operands graph prepared reference stores)]
+              (when (!= mask 0)
+                (when (< target 0)
+                  ; The loop scan runs once, for the first candidate only.
+                  (unless scanned
+                    (release-loops! (mut facts))
+                    (set! facts (loops graph prepared allocator))
+                    (set! scanned true))
+                  (set! target
+                        (if (calling? prepared facts block) 0 (preheader graph prepared block))))
+                (when (> target 0)
+                  (for [slot (: 1 i32) 4]
+                    (when (and (!= (& mask (<< (: 1 i32) (- slot 1))) 0) (= error ""))
+                      (let [node (get (.instructions graph) (cast i64 reference))
+                            literal (if (= slot 1) (.op1 node)
+                                        (if (= slot 2) (.op2 node) (.op3 node)))
+                            definition (definition! (mut work) graph literal target (mut nodes)
+                                                    (mut blocks) (mut literals) allocator)]
+                        (if (= definition 0)
+                            (set! error "constant hoisting exhausted graph references")
+                            (g/write-input-word! (mut work) reference slot definition))))))))))))
+    (when (and (= error "") (> (len nodes) 0))
+      (match (pipeline/schedule-appended! (mut prepared) work (slice nodes) (slice blocks)
+                                          allocator)
+        (Err [message] (set! error message))
+        (Ok [_] 0)))
+    (release-loops! (mut facts))
+    (free! (mut blocks))
+    (free! (mut literals))
+    (let [(mut result) (Hoisted :graph work :nodes nodes)]
+      (if (= error "")
+          (Ok result)
+          (do (release! (mut result)) (Err error))))))
+
+;;; After allocation: hoisted definitions some part of which sits in a spill
+;;; slot. Each should instead be rebuilt at its uses, never stored and reloaded.
+;;; Appends to pressured and returns its length.
+(defn pressured! [(parts (ArrayList allocation/Part)) (nodes (slice i32))
+                  (operands machine/Plan) (pressured (mut (ArrayList i32)))] (-> i64)
+  (when (> (len nodes) 0)
+    (for [i 0 (len parts)]
+      (let [part (at parts i)]
+        (when (and (< (.register part) 0) (> (len (.ranges part)) 0))
+          (for node nodes
+            (when (and (= (.parent part) node)
+                       (not (machine/rematerialized? operands node)))
+              (let [(mut known) false]
+                (for seen pressured (when (= seen node) (set! known true)))
+                (unless known (push! (mut pressured) node)))))))))
+  (len pressured))
