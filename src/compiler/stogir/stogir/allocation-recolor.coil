@@ -1,0 +1,262 @@
+;;; Bounded post-allocation ejection chains. Whole children retain their exact
+;;; ranges and uses; only physical assignments change. See the independent
+;;; replay and cost-model limitations in docs/benchmarks/frequency-allocation/.
+(module stogir.allocation-recolor)
+(import "stogir.allocation" :as a)
+(import "stogir.allocation-check" :as check)
+(import "stogir.interval" :as ranges)
+(import "stogir.locations" :as loc)
+(import "stogir.frame" :as frame)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err])
+
+;;; An endpoint is an allocation child or a validated read-only recipe. Spill
+;;; identities use virtual parents while searching; actual typed homes are
+;;; allocated only when committing a successful transaction.
+(defstruct Endpoint [(part i32) (literal loc/Location)])
+(defstruct Copy [(source Endpoint) (target i32) (site i64) (weight i64)])
+(defstruct Domain [(registers u64) (spill bool)])
+(defstruct Problem [(domains (ArrayList Domain)) (neighbors (ArrayList (ArrayList i32)))])
+(defstruct Change [(part i32) (register i32) (depth i32)])
+(defstruct Candidate [(part i32) (register i32) (score i64)])
+(defstruct Search [(plan (ArrayList Change)) (best (ArrayList Change)) (score i64) (visits i32)])
+
+(defn allocated [(part i32)] (-> Endpoint)
+  (Endpoint :part part :literal (loc/Location :kind 0 :value 0)))
+(defn recipe [(location loc/Location)] (-> Endpoint) (Endpoint :part -1 :literal location))
+(defn same-endpoint? [(a Endpoint) (b Endpoint)] (-> bool)
+  (and (= (.part a) (.part b)) (or (>= (.part a) 0) (loc/same? (.literal a) (.literal b)))))
+
+;;; Sites must be appended contiguously. Exact identities are deduplicated here;
+;;; SCORE additionally deduplicates physical copies after proposed assignments.
+(defn add-copy! [(copies (mut (ArrayList Copy))) (source Endpoint) (target i32)
+                 (site i64) (weight i64)] (-> void)
+  (unless (= (.part source) target)
+    (let [(mut found) false (mut i) (- (len copies) 1)]
+      (while (and (>= i 0) (= (.site (get copies i)) site) (not found))
+        (let [old (get copies i)]
+          (when (and (= (.target old) target) (same-endpoint? (.source old) source)) (set! found true)))
+        (set! i (- i 1)))
+      (unless found (push! (mut copies) (Copy :source source :target target :site site :weight weight))))))
+
+(defn mask [(register i32)] (-> u64)
+  (if (and (>= register 0) (< register 64)) (<< (: 1 u64) (cast u64 register)) 0))
+(defn permits? [(domain Domain) (register i32)] (-> bool)
+  (if (< register 0) (.spill domain) (!= (& (.registers domain) (mask register)) 0)))
+(defn singleton [(domain Domain)] (-> u64)
+  (let [bits (.registers domain)]
+    (if (and (not (.spill domain)) (!= bits 0) (= (& bits (- bits 1)) 0)) bits 0)))
+
+(defn create [(parts (ArrayList a/Part)) (allowed u64) (allocator (dyn Allocator))] (-> Problem)
+  (let [(mut out) (Problem :domains (ArrayList::new [Domain] allocator)
+                    :neighbors (ArrayList::new [(ArrayList i32)] allocator))]
+    (for part parts
+      (let [(mut bits) (& allowed (.allowed part)) (mut spill) (>= (.parent part) 0)]
+        (if (< (.parent part) 0)
+            (set! bits (mask (.register part)))
+            (for use (.uses part)
+              (when (>= (.kind use) 1) (set! spill false))
+              (when (= (.kind use) 2) (set! bits (& bits (mask (.register use)))))))
+        (push! (mut (.domains out)) (Domain :registers bits :spill spill))
+        (push! (mut (.neighbors out)) (ArrayList::new [i32] allocator))))
+    (for [i 0 (len parts)]
+      (for [j (+ i 1) (len parts)]
+        (when (and (!= (& (.allowed (get parts i)) (.allowed (get parts j))) 0)
+                   (>= (ranges/intersection (.ranges (get parts i)) (.ranges (get parts j)) 0) 0))
+          (push! (elem (mut (.neighbors out)) i) (cast i32 j))
+          (push! (elem (mut (.neighbors out)) j) (cast i32 i)))))
+    (let [(mut changed) true]
+      (while changed
+        (set! changed false)
+        (for [i 0 (len parts)]
+          (let [old (get (.domains out) i) (mut bits) (.registers old)]
+            (for neighbor (get (.neighbors out) i)
+              (set! bits (& bits (^ (singleton (get (.domains out) (cast i64 neighbor))) (: 0xFFFFFFFFFFFFFFFF u64)))))
+            (when (!= bits (.registers old))
+              (set! (mut (.domains out)) i (Domain :registers bits :spill (.spill old)))
+              (set! changed true))))))
+    out))
+
+(defn release! [(problem (mut Problem))] (-> void)
+  (for list (.neighbors problem) (let [(mut list) list] (free! (mut list))))
+  (free! (mut (.neighbors problem))) (free! (mut (.domains problem))))
+(defn changed-index [(plan (ArrayList Change)) (part i32)] (-> i64)
+  (let [(mut found) (: -1 i64)]
+    (for [i 0 (len plan)] (when (= (.part (get plan i)) part) (set! found i))) found))
+(defn register-at [(parts (ArrayList a/Part)) (plan (ArrayList Change)) (part i32)] (-> i32)
+  (let [index (changed-index plan part)]
+    (if (>= index 0) (.register (get plan index)) (.register (get parts (cast i64 part))))))
+(defn location [(parts (ArrayList a/Part)) (plan (ArrayList Change)) (endpoint Endpoint)] (-> loc/Location)
+  (if (< (.part endpoint) 0) (.literal endpoint)
+      (let [reg (register-at parts plan (.part endpoint))]
+        (loc/Location :kind (if (>= reg 0) 0 1)
+          :value (cast i64 (if (>= reg 0) reg (.parent (get parts (cast i64 (.part endpoint))))))))))
+
+(defn score [(parts (ArrayList a/Part)) (copies (ArrayList Copy)) (plan (ArrayList Change))] (-> i64)
+  (let [(mut result) (: 0 i64)]
+    (for [i 0 (len copies)]
+      (let [copy (get copies i) source (location parts plan (.source copy))
+            target (location parts plan (allocated (.target copy)))
+            (mut duplicate) false (mut j) (- i 1)]
+        (unless (loc/same? source target)
+          (while (and (>= j 0) (= (.site (get copies j)) (.site copy)) (not duplicate))
+            (let [previous (get copies j)]
+              (when (and (loc/same? source (location parts plan (.source previous)))
+                         (loc/same? target (location parts plan (allocated (.target previous)))))
+                (set! duplicate true)))
+            (set! j (- j 1)))
+          (unless duplicate
+            (set! result (+ result (* (.weight copy) (if (or (= (.kind source) 1) (= (.kind target) 1)) 3 1))))))))
+    result))
+
+(defn key [(parts (ArrayList a/Part)) (candidate Candidate)] (-> i64)
+  (if (>= (.register candidate) 0) (cast i64 (.register candidate))
+      (+ 64 (cast i64 (.parent (get parts (cast i64 (.part candidate))))))))
+(defn before? [(parts (ArrayList a/Part)) (left Candidate) (right Candidate)] (-> bool)
+  (or (< (.score left) (.score right))
+      (and (= (.score left) (.score right))
+           (or (< (.part left) (.part right))
+               (and (= (.part left) (.part right)) (< (key parts left) (key parts right)))))))
+(defn insert! [(items (mut (ArrayList Candidate))) (candidate Candidate) (parts (ArrayList a/Part))] (-> void)
+  (let [(mut present) false]
+    (for item items
+      (when (and (= (.part item) (.part candidate)) (= (.register item) (.register candidate))) (set! present true)))
+    (unless present
+      (push! (mut items) candidate)
+      (let [(mut i) (- (len items) 1)]
+        (while (and (> i 0) (before? parts candidate (get items (- i 1))))
+          (set! (mut items) i (get items (- i 1))) (set! i (- i 1)))
+        (set! (mut items) i candidate)))))
+
+;;; Every planned color is locked for this branch. Resolve the first remaining
+;;; conflict by moving its unplanned owner; cycles conflicting with two locked
+;;; colors reject. The depth and visit limits bound search, not correctness.
+(defn search! [(parts (ArrayList a/Part)) (copies (ArrayList Copy)) (problem Problem)
+                (state (mut Search)) (allocator (dyn Allocator))] (-> void)
+  (when (< (.visits state) 100)
+    (set! (.visits state) (+ (.visits state) 1))
+    (let [(mut victim) (: -1 i32) (mut depth) (: 0 i32) (mut forbidden) (: -1 i32)
+          (mut valid) true (mut i) (: 0 i64)]
+      (while (and valid (< victim 0) (< i (len (.plan state))))
+        (let [change (get (.plan state) i)]
+          (when (>= (.register change) 0)
+            (let [neighbors (get (.neighbors problem) (cast i64 (.part change))) (mut j) (: 0 i64)]
+              (while (and valid (< victim 0) (< j (len neighbors)))
+                (let [neighbor (get neighbors j)]
+                  (when (= (register-at parts (.plan state) neighbor) (.register change))
+                    (if (>= (changed-index (.plan state) neighbor) 0) (set! valid false)
+                        (do (set! victim neighbor) (set! depth (.depth change))
+                            (set! forbidden (.register change))))))
+                (set! j (+ j 1))))))
+        (set! i (+ i 1)))
+      (when valid
+        (if (< victim 0)
+            (let [cost (score parts copies (.plan state))]
+              (when (or (< cost (.score state))
+                        (and (= cost (.score state)) (> (len (.best state)) 0)
+                             (< (len (.plan state)) (len (.best state)))))
+                (set! (.score state) cost) (clear! (mut (.best state)))
+                (for change (.plan state) (push! (mut (.best state)) change))))
+            (when (and (> depth 0) (< (len (.plan state)) 8))
+              (let [(mut alternatives) (ArrayList::new [Candidate] allocator)
+                    domain (get (.domains problem) (cast i64 victim))]
+                (for [r (: -1 i32) 64]
+                  (when (and (!= r forbidden) (permits? domain r))
+                    (push! (mut (.plan state)) (Change :part victim :register r :depth (- depth 1)))
+                    (insert! (mut alternatives) (Candidate :part victim :register r :score (score parts copies (.plan state))) parts)
+                    (pop! (mut (.plan state)))))
+                (for option alternatives
+                  (when (< (.visits state) 100)
+                    (push! (mut (.plan state)) (Change :part victim :register (.register option) :depth (- depth 1)))
+                    (search! parts copies problem (mut state) allocator)
+                    (pop! (mut (.plan state)))))
+                (free! (mut alternatives)))))))))
+
+(defn offer! [(parts (ArrayList a/Part)) (copies (ArrayList Copy)) (problem Problem)
+               (roots (mut (ArrayList Candidate))) (scratch (mut (ArrayList Change)))
+               (target i32) (neighbor i32)] (-> void)
+  (when (and (>= target 0) (>= neighbor 0) (!= target neighbor))
+    (let [part (get parts (cast i64 target)) source (get parts (cast i64 neighbor)) desired (.register source)]
+      (when (and (>= (.parent part) 0) (> (len (.ranges part)) 0)
+                 (!= desired (.register part)) (permits? (get (.domains problem) (cast i64 target)) desired)
+                 (or (>= desired 0) (= (.parent part) (.parent source))))
+        (push! (mut scratch) (Change :part target :register desired :depth 3))
+        (insert! (mut roots) (Candidate :part target :register desired :score (score parts copies scratch)) parts)
+        (pop! (mut scratch))))))
+
+(defn commit! [(parts (mut (ArrayList a/Part))) (layout (mut frame/Frame))
+                (shapes (slice a/SpillShape)) (plan (ArrayList Change))] (-> (Result i32 (slice u8)))
+  (let [(mut error) "" (mut changed) (: 0 i32)]
+    (for change plan
+      (when (and (= error "") (< (.register change) 0))
+        (let [parent (.parent (get parts (cast i64 (.part change))))]
+          (if (or (< parent 0) (>= (cast i64 parent) (len shapes)))
+              (set! error "recolor spill shape missing")
+              (let [shape (get shapes (cast i64 parent))]
+                (match (frame/spill-slot! (mut layout) parent (.size shape) (.alignment shape))
+                  (Err [message] (set! error message))
+                  (Ok [offset]
+                    (for [i 0 (len parts)]
+                      (when (= (.parent (get parts i)) parent)
+                        (set! (.spill-slot (elem (mut parts) i)) offset))))))))))
+    (when (= error "")
+      (for change plan
+        (let [part (elem (mut parts) (cast i64 (.part change)))]
+          (when (!= (.register part) (.register change)) (set! changed (+ changed 1)))
+          (set! (.register part) (.register change)))))
+    (if (= error "") (Ok changed) (Err error))))
+
+(defn run! [(parts (mut (ArrayList a/Part))) (layout (mut frame/Frame))
+             (shapes (slice a/SpillShape)) (copies (ArrayList Copy))
+             (register-count i32) (allowed u64) (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (match (check/verify parts register-count allowed)
+    (Err [message] (Err message))
+    (Ok [_]
+      (let [(mut error) "" (mut site) (: -1 i64) (mut site-weight) (: 0 i64)]
+        (when (> (len copies) 2147483647) (set! error "recolor copy count overflow"))
+        (for copy copies
+          (when (or (< (.target copy) 0) (>= (cast i64 (.target copy)) (len parts))
+                    (< (.part (.source copy)) -1) (>= (cast i64 (.part (.source copy))) (len parts))
+                    (< (.site copy) site)
+                    (and (= (.site copy) site) (!= (.weight copy) site-weight))
+                    (<= (.weight copy) 0) (> (.weight copy) 1000000)
+                    (and (< (.part (.source copy)) 0)
+                         (or (< (.kind (.literal (.source copy))) 2) (> (.kind (.literal (.source copy))) 4))))
+            (set! error "invalid recolor copy"))
+          (set! site (.site copy)) (set! site-weight (.weight copy)))
+        (if (!= error "") (Err error)
+            (if (= (len copies) 0) (Ok 0)
+            (let [(mut problem) (create parts (& allowed (if (< register-count 64) (- (<< (: 1 u64) (cast u64 register-count)) 1) (: 0xFFFFFFFFFFFFFFFF u64))) allocator)
+                  (mut state) (Search :plan (ArrayList::new [Change] allocator)
+                                :best (ArrayList::new [Change] allocator) :score 0 :visits 0)
+                  (mut roots) (ArrayList::new [Candidate] allocator)
+                  (mut total) (: 0 i32) (mut round) 0 (mut done) false]
+              (for [i 0 (len parts)]
+                (when (and (> (len (.ranges (get parts i))) 0)
+                           (not (permits? (get (.domains problem) i) (.register (get parts i)))))
+                  (set! error "recolor domain rejected original assignment")))
+              (while (and (= error "") (not done) (< round 32))
+                (set! round (+ round 1)) (clear! (mut roots)) (clear! (mut (.best state)))
+                (set! (.score state) (score parts copies (.plan state)))
+                (for copy copies
+                  (offer! parts copies problem (mut roots) (mut (.plan state)) (.target copy) (.part (.source copy)))
+                  (offer! parts copies problem (mut roots) (mut (.plan state)) (.part (.source copy)) (.target copy)))
+                (for root roots
+                  (set! (.visits state) 0)
+                  (push! (mut (.plan state)) (Change :part (.part root) :register (.register root) :depth 3))
+                  (search! parts copies problem (mut state) allocator)
+                  (pop! (mut (.plan state))))
+                (if (= (len (.best state)) 0) (set! done true)
+                    (match (commit! (mut parts) (mut layout) shapes (.best state))
+                      (Err [message] (set! error message))
+                      (Ok [count]
+                        (set! total (+ total count))
+                        (match (check/verify parts register-count allowed)
+                          (Err [message] (set! error message)) (Ok [_] 0))
+                        (unless (= (score parts copies (.plan state)) (.score state))
+                          (set! error "recolor committed cost differs from plan"))))))
+              (free! (mut roots)) (free! (mut (.plan state))) (free! (mut (.best state)))
+              (release! (mut problem))
+              (if (= error "") (Ok total) (Err error)))))))))
