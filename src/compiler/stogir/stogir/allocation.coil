@@ -378,10 +378,88 @@
 ;;; loop-reloads: reload a spilled value at the entry of the loop holding its
 ;;; next use (reload-cut). loop-evict-mask: registers whose holder may be
 ;;; evicted for a loop value (cold-owner); zero disables it.
-(defstruct Tuning [(late Late) (loop-reloads bool) (loop-evict-mask u64)])
+;;; call-holes: a value whose best register a call clobbers, with no register
+;;; free for its whole interval, keeps that register on both sides of the call
+;;; and sits in its slot only at the clobber (call-hole!).
+(defstruct Tuning [(late Late) (loop-reloads bool) (loop-evict-mask u64) (call-holes bool)])
 
 (defn plain-tuning [] (-> Tuning)
-  (Tuning :late (no-late) :loop-reloads false :loop-evict-mask 0))
+  (Tuning :late (no-late) :loop-reloads false :loop-evict-mask 0 :call-holes false))
+
+;;; Split around a call, after LLVM's split-around-call: when the best free
+;;; register for the current part is clobbered by a call at an odd definition
+;;; position u (a one-position reservation, the register otherwise free right
+;;; after it) and no register lasts the part's interval, the part becomes
+;;; [start, u) to be assigned that register now, [u, u+1) in its spill slot
+;;; (stored at the call, as call transitions are lowered), and [u+1, end)
+;;; queued preferring the same register. The value then leaves its register only
+;;; where the call runs, instead of for the rest of its interval.
+(defn call-hole! [(parts (mut (ArrayList Part))) (unhandled (mut (ArrayList queue/Item)))
+                  (index i32) (free (ArrayList i64)) (allowed u64)
+                  (boundary-step i64) (extra-boundaries (slice i64))
+                  (frame (mut frame/Frame)) (shape SpillShape)
+                  (events (ptr fixed/Index)) (allocator (dyn Allocator))]
+  (-> (Result bool (slice u8)))
+  (let [part (at parts (cast i64 index))]
+    (if (= (len (.ranges part)) 0)
+        (Ok false)
+        (let [start (.start (at (.ranges part) 0))
+              end (.end (at (.ranges part) (- (len (.ranges part)) 1)))
+              usual (free-decision-for-class (load part) free start allowed -1
+                                             boundary-step extra-boundaries)
+              reg (.register usual)
+              u (.until usual)
+              ; The clobber: a one-position reservation of reg at u or u + 1
+              ; (the limit is rounded down to an input boundary).
+              (mut clobber) (: -1 i64)
+              (mut blocked) false]
+          (when (and (>= reg 0) (< u end) (> u start))
+            (for [k 0 (len parts)]
+              (let [other (at parts k)]
+                (when (and (!= k (cast i64 index)) (= (.register other) reg)
+                           (< (.parent other) 0) (= (len (.ranges other)) 1)
+                           (= (.end (at (.ranges other) 0)) (+ (.start (at (.ranges other) 0)) 1))
+                           (or (= (.start (at (.ranges other) 0)) u)
+                               (= (.start (at (.ranges other) 0)) (+ u 1))))
+                  (set! clobber (.start (at (.ranges other) 0))))))
+            (when (>= clobber 0)
+              (for [k 0 (len parts)]
+                (let [other (at parts k)]
+                  (when (and (!= k (cast i64 index)) (= (.register other) reg)
+                             (not (and (< (.parent other) 0)
+                                       (= (.start (at (.ranges other) 0)) clobber)))
+                             (or (range/covers? (.ranges other) u)
+                                 (range/covers? (.ranges other) clobber)
+                                 (range/covers? (.ranges other) (+ clobber 1))))
+                    (set! blocked true))))))
+          (if (or (< clobber 0) blocked (>= (+ clobber 1) end)
+                  (not (range/covers? (.ranges part) u))
+                  (not (range/covers? (.ranges part) (+ clobber 1)))
+                  (let [first (c/next-use (.uses part) u 0)]
+                    (and (>= first 0) (<= first (+ clobber 1)))))
+              (Ok false)
+              (match (frame/spill-slot! (mut frame) (.parent part) (.size shape) (.alignment shape))
+                (Err [message] (Err message))
+                (Ok [slot]
+                    (let [hole (split! (elem (mut parts) (cast i64 index)) u allocator)
+                          hole-index (cast i32 (len parts))]
+                      (push! (mut parts) hole)
+                      (notify-split! events index hole-index u)
+                      (let [after (split! (elem (mut parts) (cast i64 hole-index)) (+ clobber 1) allocator)
+                            after-index (cast i32 (len parts))]
+                        (push! (mut parts) after)
+                        (notify-split! events hole-index after-index (+ clobber 1))
+                        (let [middle (elem (mut parts) (cast i64 hole-index))]
+                          (set! (.spill-slot middle) slot)
+                          (set! (.register middle) -1))
+                        (let [suffix (elem (mut parts) (cast i64 after-index))]
+                          (set! (.spill-slot suffix) slot)
+                          (set! (.preferred suffix) reg)
+                          (when (> (len (.ranges suffix)) 0)
+                            (queue/insert! (mut unhandled)
+                                           (queue/Item :position (.start (at (.ranges suffix) 0))
+                                                       :interval after-index))))
+                        (Ok true))))))))))
 
 ;;; End position of the loop region holding position: the run of laid-out blocks
 ;;; from position's block with at least its loop depth. -1 outside loops.
@@ -1226,6 +1304,14 @@
                                               (& allowed
                                                  (.allowed (at parts (cast i64 index)))))
                   (set! error "allocator pressure query moved backwards"))
+                (when (and (= error "") (.call-holes tuning))
+                  (let [shape (shape-of (.parent (at parts (cast i64 index))) shapes uniform)]
+                    (match (call-hole! (mut parts) (mut work) index (.free summary)
+                                       (& allowed (.allowed (at parts (cast i64 index))))
+                                       boundary-step extra-boundaries (mut frame) shape
+                                       (cast (ptr fixed/Index) (mut events)) allocator)
+                      (Err [msg] (set! error msg))
+                      (Ok [_] 0))))
                 (when (and (= error "") (!= (.loop-evict-mask tuning) 0))
                   (let [victim (cold-owner parts index position (.free summary) (.fixed-at summary)
                                            split-blocks allowed (.loop-evict-mask tuning))]

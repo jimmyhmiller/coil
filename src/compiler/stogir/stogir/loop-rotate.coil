@@ -1,0 +1,417 @@
+;;; Loop rotation: a header that only tests the exit is duplicated into a guard
+;;; before the loop and into the latch, so the loop body becomes the header and
+;;; code at the loop's boundary runs only when the loop is entered. An
+;;; independent extension after LLVM's LoopRotate; not an upstream ir pass.
+;;;
+;;; A candidate header H (MERGE or LOOP_BEGIN) has one entry END and one back
+;;; END; its block holds only its PHIs, floating data, LOADs and the exit IF.
+;;; Header values are H's PHIs, its LOADs and floating data depending on them.
+;;; Each is cloned twice: entry clones read the PHIs' entry inputs, latch clones
+;;; their back inputs. A new header H2 starts the body arm; its PHIs merge the
+;;; two clones for uses in the loop. A new MERGE X starts the exit arm; its PHIs
+;;; merge them for uses after the loop. A loop is rotated only when every use of
+;;; a header value outside the header is in the loop or dominated by the exit
+;;; arm, so these two PHI sets repair SSA exactly.
+(module stogir.loop-rotate)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.adjacency" :as adj)
+(import "stogir.dominators" :as dom)
+(import "stogir.uses" :as uses)
+(import "stogir.fill" :as fill)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None Option some?])
+
+(def MAX-HEADER-NODES (: 48 i64))
+(def MAX-ROUNDS (: 64 i64))
+
+(defstruct Candidate [(header i32) (entry-end i32) (back-end i32) (entry-index i32)
+                      (branch i32) (body-arm i32) (exit-arm i32)])
+
+;;; ROOTS are the input roots with each removed control node replaced by its
+;;; rotated counterpart (owned by the result).
+(defstruct Rotated [(graph (Option g/Graph)) (roots (ArrayList i32)) (rotations i64)])
+
+(defn opcode-of [(graph g/Graph) (reference i32)] (-> i32)
+  (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference)))))
+
+(defn operand-at [(graph g/Graph) (reference i32) (index i32)] (-> i32)
+  (match (g/operand graph reference index)
+    (Some [value] value)
+    (None [] (panic "loop rotation: missing operand {} of {}" index reference))))
+
+(defn inputs-of [(graph g/Graph) (reference i32) (allocator (dyn Allocator))] (-> (ArrayList i32))
+  (let [(mut out) (ArrayList::new [i32] allocator)
+        count (get (.arities graph) (cast i64 reference))]
+    (for [i 1 (+ (cast i64 count) 1)]
+      (push! (mut out) (operand-at graph reference (cast i32 i))))
+    out))
+
+;;; An exact copy of REFERENCE (opcode, type, auxiliary) with INPUTS.
+(defn clone! [(graph (mut g/Graph)) (reference i32) (inputs (slice i32))] (-> i32)
+  (let [node (get (.instructions graph) (cast i64 reference))]
+    (append! (mut graph) (n/opcode node) (n/type-id node) (n/auxiliary node) inputs)))
+
+(defn append! [(graph (mut g/Graph)) (opcode u8) (ty u8) (auxiliary u16) (inputs (slice i32))]
+  (-> i32)
+  (match (g/append-inputs-with-aux! (mut graph) opcode ty auxiliary inputs)
+    (Some [r] r)
+    (None [] (panic "loop rotation: instruction reference space exhausted"))))
+
+(defn patch-operand! [(graph (mut g/Graph)) (reference i32) (index i32) (value i32)] (-> void)
+  (unless (g/set-operand! (mut graph) reference index value)
+    (panic "loop rotation: cannot set operand {} of {}" index reference)))
+
+;;; Block start of every scheduled node (zero when unscheduled).
+(defn block-map [(graph g/Graph) (prepared pipeline/Prepared) (allocator (dyn Allocator))]
+  (-> (ArrayList i32))
+  (let [(mut out) (ArrayList::new [i32] allocator)
+        schedule (.schedule prepared)]
+    (fill/append! (mut out) (len (.instructions graph)) 0)
+    (for block (.order prepared)
+      (let [range (get (.ranges schedule) (cast i64 block))]
+        (for [k 0 (.count range)]
+          (set! (mut out) (cast i64 (get (.nodes schedule) (+ (.offset range) k))) block))))
+    out))
+
+;;; Blocks of the natural loop of the back edge from LATCH to HEADER.
+(defn loop-blocks [(graph g/Graph) (prepared pipeline/Prepared) (header i32) (latch i32)
+                   (allocator (dyn Allocator))] (-> (ArrayList bool))
+  (let [(mut inside) (ArrayList::new [bool] allocator)
+        (mut work) (ArrayList::new [i32] allocator)
+        (mut predecessors) (adj/build (.blocks prepared) true allocator)]
+    (fill/append! (mut inside) (len (.instructions graph)) false)
+    (set! (mut inside) (cast i64 header) true)
+    (unless (get inside (cast i64 latch))
+      (set! (mut inside) (cast i64 latch) true)
+      (push! (mut work) latch))
+    (while (> (len work) 0)
+      (let [block (match (pop! (mut work)) (Some [b] b) (None [] (panic "loop rotation: empty worklist")))
+            range (get (.ranges predecessors) (cast i64 block))]
+        (for [k 0 (.count range)]
+          (let [edge (get (.edges (.blocks prepared)) (get (.edges predecessors) (+ (.offset range) k)))
+                from (.from edge)]
+            (unless (get inside (cast i64 from))
+              (set! (mut inside) (cast i64 from) true)
+              (push! (mut work) from))))))
+    (adj/release! (mut predecessors))
+    (free! (mut work))
+    inside))
+
+;;; The block a use of a value lives in: a PHI's operand is used at the end of
+;;; the matching predecessor of its merge.
+(defn use-block [(graph g/Graph) (blocks (ArrayList i32)) (user i32) (operand i32)] (-> i32)
+  (if (and (= (opcode-of graph user) 67) (>= operand 2))
+      (let [merge (operand-at graph user 1)
+            control (operand-at graph merge (- operand 1))]
+        (get blocks (cast i64 control)))
+      (get blocks (cast i64 user))))
+
+;;; 1: inside the loop; 2: dominated by the exit arm; 0: neither.
+(defn use-side [(prepared pipeline/Prepared) (inside (ArrayList bool)) (exit-arm i32) (block i32)]
+  (-> i32)
+  (cond (<= block 0) 0
+        (get inside (cast i64 block)) 1
+        (dom/dominates? (.idom prepared) exit-arm block) 2
+        :else 0))
+
+;;; Header values: PHIs of the header, its LOADs, and floating data in its
+;;; block that depends on them, in schedule order (excluding header and IF).
+(defn header-values [(graph g/Graph) (prepared pipeline/Prepared) (c Candidate)
+                     (allocator (dyn Allocator))] (-> (ArrayList i32))
+  (let [(mut out) (ArrayList::new [i32] allocator)
+        (mut variant) (ArrayList::new [bool] allocator)
+        range (get (.ranges (.schedule prepared)) (cast i64 (.header c)))]
+    (fill/append! (mut variant) (len (.instructions graph)) false)
+    (for [k 0 (.count range)]
+      (let [r (get (.nodes (.schedule prepared)) (+ (.offset range) k))
+            opcode (opcode-of graph r)]
+        (unless (or (= r (.header c)) (= r (.branch c)))
+          (let [(mut depends) (or (= opcode 67) (= opcode 91))]
+            (unless depends
+              (for [i 1 (+ (cast i64 (get (.arities graph) (cast i64 r))) 1)]
+                (let [x (operand-at graph r (cast i32 i))]
+                  (when (and (> x 0) (get variant (cast i64 x))) (set! depends true)))))
+            (when depends
+              (set! (mut variant) (cast i64 r) true)
+              (push! (mut out) r))))))
+    (free! (mut variant))
+    out))
+
+;;; SKIP lists headers this pass created: rotating one again would peel an
+;;; iteration instead of rotating.
+(defn find [(graph g/Graph) (prepared pipeline/Prepared) (roots (slice i32))
+            (blocks (ArrayList i32)) (skip (slice i32)) (allocator (dyn Allocator))]
+  (-> (Option Candidate))
+  (let [(mut found) (None [Candidate])
+        membership (.membership (.blocks prepared))]
+    (for header (.order prepared)
+      (when (and (not (some? found))
+                 (not (let [(mut seen) false] (for h skip (when (= h header) (set! seen true))) seen))
+                 (or (= (opcode-of graph header) 112) (= (opcode-of graph header) 113))
+                 (= (get (.arities graph) (cast i64 header)) 2))
+        (let [first (operand-at graph header 1)
+              second (operand-at graph header 2)
+              first-back (dom/dominates? (.idom prepared) header (get blocks (cast i64 first)))
+              second-back (dom/dominates? (.idom prepared) header (get blocks (cast i64 second)))
+              range (get (.ranges (.schedule prepared)) (cast i64 header))]
+          (when (and (!= first-back second-back) (> (.count range) 1)
+                     (!= (get blocks (cast i64 (if first-back first second))) header)
+                     (<= (.count range) MAX-HEADER-NODES))
+            (let [entry-end (if first-back second first)
+                  back-end (if first-back first second)
+                  branch (get (.nodes (.schedule prepared)) (- (+ (.offset range) (.count range)) 1))
+                  (mut allowed) (= (opcode-of graph branch) 116)]
+              ; Only PHIs, floating data and LOADs besides the header and IF.
+              (for [k 0 (.count range)]
+                (let [r (get (.nodes (.schedule prepared)) (+ (.offset range) k))
+                      opcode (opcode-of graph r)]
+                  (unless (or (= r header) (= r branch) (= opcode 91)
+                              (and (= opcode 67) (= (operand-at graph r 1) header))
+                              (= (get membership (cast i64 r)) 0))
+                    (set! allowed false))
+                  (for root roots
+                    (when (and (= root r) (!= r header)) (set! allowed false)))))
+              (when allowed
+                (let [(mut arms) (ArrayList::new [i32] allocator)
+                      users (.users prepared)
+                      urange (get (.ranges users) (cast i64 branch))]
+                  (for [k 0 (.count urange)]
+                    (let [u (.user (get (.edges users) (+ (.offset urange) k)))]
+                      (when (or (= (opcode-of graph u) 107) (= (opcode-of graph u) 108))
+                        (push! (mut arms) u))))
+                  (when (= (len arms) 2)
+                    (let [latch (get blocks (cast i64 back-end))
+                          (mut inside) (loop-blocks graph prepared header latch allocator)
+                          a (get arms 0) b (get arms 1)
+                          a-in (get inside (cast i64 a)) b-in (get inside (cast i64 b))]
+                      (when (!= a-in b-in)
+                        (let [c (Candidate :header header :entry-end entry-end :back-end back-end
+                                           :entry-index (if first-back 2 1) :branch branch
+                                           :body-arm (if a-in a b) :exit-arm (if a-in b a))
+                              (mut values) (header-values graph prepared c allocator)
+                              (mut members) (ArrayList::new [bool] allocator)
+                              (mut ok) true]
+                          (fill/append! (mut members) (len (.instructions graph)) false)
+                          (for v values (set! (mut members) (cast i64 v) true))
+                          (for v values
+                            (let [vrange (get (.ranges users) (cast i64 v))]
+                              (for [k 0 (.count vrange)]
+                                (let [edge (get (.edges users) (+ (.offset vrange) k))
+                                      u (.user edge)]
+                                  (unless (or (get members (cast i64 u)) (= u branch))
+                                    (when (= (use-side prepared inside (.exit-arm c)
+                                                       (use-block graph blocks u (.operand edge)))
+                                             0)
+                                      (set! ok false)))))))
+                          (when ok (set! found (Some c)))
+                          (free! (mut members))
+                          (free! (mut values))))
+                      (free! (mut inside))))
+                  (free! (mut arms)))))))))
+    found))
+
+(defn map-input [(map (ArrayList i32)) (x i32)] (-> i32)
+  (if (and (> x 0) (< (cast i64 x) (len map)) (!= (get map (cast i64 x)) 0))
+      (get map (cast i64 x))
+      x))
+
+;;; Clone the header values after CHAIN with PHIs taken from MAP (already
+;;; holding each PHI's mapping). Returns the new chain end.
+(defn clone-header! [(graph (mut g/Graph)) (values (ArrayList i32)) (map (mut (ArrayList i32)))
+                     (chain i32) (allocator (dyn Allocator))] (-> i32)
+  (let [(mut tail) chain]
+    (for v values
+      (unless (= (opcode-of graph v) 67)
+        (let [(mut ins) (inputs-of graph v allocator)]
+          (for [i 0 (len ins)] (set! (mut ins) i (map-input map (get ins i))))
+          (when (= (opcode-of graph v) 91) (set! (mut ins) 0 tail))
+          (let [copy (clone! (mut graph) v (slice ins))]
+            (when (= (opcode-of graph v) 91) (set! tail copy))
+            (set! (mut map) (cast i64 v) copy))
+          (free! (mut ins)))))
+    tail))
+
+(defn rotate! [(graph (mut g/Graph)) (prepared pipeline/Prepared) (c Candidate)
+               (blocks (ArrayList i32)) (roots (mut (ArrayList i32)))
+               (created (mut (ArrayList i32))) (allocator (dyn Allocator))] (-> void)
+  (let [size (len (.instructions graph))
+        header (.header c) branch (.branch c)
+        body (.body-arm c) exit (.exit-arm c)
+        back-index (- 3 (.entry-index c))
+        (mut values) (header-values graph prepared c allocator)
+        (mut members) (ArrayList::new [bool] allocator)
+        (mut entry-map) (ArrayList::new [i32] allocator)
+        (mut latch-map) (ArrayList::new [i32] allocator)
+        (mut body-phi) (ArrayList::new [i32] allocator)
+        (mut exit-phi) (ArrayList::new [i32] allocator)
+        (mut need-body) (ArrayList::new [bool] allocator)
+        (mut need-exit) (ArrayList::new [bool] allocator)
+        (mut inside) (loop-blocks graph prepared header (get blocks (cast i64 (.back-end c))) allocator)
+        users (.users prepared)
+        condition (operand-at graph branch 2)]
+    (fill/append! (mut members) size false)
+    (fill/append! (mut entry-map) size 0)
+    (fill/append! (mut latch-map) size 0)
+    (fill/append! (mut body-phi) size 0)
+    (fill/append! (mut exit-phi) size 0)
+    (fill/append! (mut need-body) size false)
+    (fill/append! (mut need-exit) size false)
+    (for v values (set! (mut members) (cast i64 v) true))
+    ; Which merged values the body and the code after the loop need.
+    (for v values
+      (let [vrange (get (.ranges users) (cast i64 v))]
+        (for [k 0 (.count vrange)]
+          (let [edge (get (.edges users) (+ (.offset vrange) k))
+                u (.user edge)]
+            (unless (or (get members (cast i64 u)) (= u branch))
+              (if (= (use-side prepared inside exit (use-block graph blocks u (.operand edge))) 1)
+                  (set! (mut need-body) (cast i64 v) true)
+                  (set! (mut need-exit) (cast i64 v) true)))))))
+    (for v values
+      (when (= (opcode-of graph v) 67)
+        (let [back (operand-at graph v (+ back-index 1))]
+          (when (and (> back 0) (get members (cast i64 back)))
+            (set! (mut need-body) (cast i64 back) true)))))
+    ; Entry guard.
+    (for v values
+      (when (= (opcode-of graph v) 67)
+        (set! (mut entry-map) (cast i64 v) (operand-at graph v (+ (.entry-index c) 1)))))
+    (let [entry-tail (clone-header! (mut graph) values (mut entry-map)
+                                    (operand-at graph (.entry-end c) 1) allocator)
+          guard (clone! (mut graph) branch [entry-tail (map-input entry-map condition)])
+          guard-body (clone! (mut graph) body [guard (operand-at graph body 2)])
+          guard-exit (clone! (mut graph) exit [guard (operand-at graph exit 2)])
+          guard-body-end (clone! (mut graph) (.entry-end c) [guard-body])
+          guard-exit-end (append! (mut graph) 114 0 1 [guard-exit])
+          new-header (clone! (mut graph) header [guard-body-end 0])]
+      ; Loop-carried PHIs at the new header (latch inputs patched below).
+      (for v values
+        (when (get need-body (cast i64 v))
+          (let [node (get (.instructions graph) (cast i64 v))]
+            (set! (mut body-phi) (cast i64 v)
+                  (append! (mut graph) 67 (n/type-id node) 3
+                           [new-header (map-input entry-map v) 0])))))
+      ; Latch copy of the test.
+      (for v values
+        (when (= (opcode-of graph v) 67)
+          (let [back (operand-at graph v (+ back-index 1))]
+            (set! (mut latch-map) (cast i64 v)
+                  (if (and (> back 0) (get members (cast i64 back)))
+                      (get body-phi (cast i64 back))
+                      back)))))
+      (let [latch-control (operand-at graph (.back-end c) 1)
+            latch-tail (clone-header! (mut graph) values (mut latch-map)
+                                      (if (= latch-control body) new-header latch-control)
+                                      allocator)
+            test (clone! (mut graph) branch [latch-tail (map-input latch-map condition)])
+            test-body (clone! (mut graph) body [test (operand-at graph body 2)])
+            test-exit (clone! (mut graph) exit [test (operand-at graph exit 2)])
+            test-body-end (clone! (mut graph) (.back-end c) [test-body])
+            test-exit-end (append! (mut graph) 114 0 1 [test-exit])
+            exit-merge (append! (mut graph) 112 0 2 [guard-exit-end test-exit-end])]
+        (patch-operand! (mut graph) new-header 2 test-body-end)
+        (for v values
+          (when (get need-body (cast i64 v))
+            (patch-operand! (mut graph) (get body-phi (cast i64 v)) 3 (map-input latch-map v)))
+          (when (get need-exit (cast i64 v))
+            (let [node (get (.instructions graph) (cast i64 v))]
+              (set! (mut exit-phi) (cast i64 v)
+                    (append! (mut graph) 67 (n/type-id node) 3
+                             [exit-merge (map-input entry-map v) (map-input latch-map v)])))))
+        ; Rewire the original uses (the analysis' use lists describe the
+        ; original graph, which the clones above did not change).
+        (for v values
+          (let [vrange (get (.ranges users) (cast i64 v))]
+            (for [k 0 (.count vrange)]
+              (let [edge (get (.edges users) (+ (.offset vrange) k))
+                    u (.user edge)]
+                (unless (or (get members (cast i64 u)) (= u branch))
+                  (patch-operand! (mut graph) u (.operand edge)
+                        (if (= (use-side prepared inside exit (use-block graph blocks u (.operand edge))) 1)
+                            (get body-phi (cast i64 v))
+                            (get exit-phi (cast i64 v)))))))))
+        (for [arm-index 0 2]
+          (let [arm (if (= arm-index 0) body exit)
+                replacement (if (= arm-index 0) new-header exit-merge)
+                arange (get (.ranges users) (cast i64 arm))]
+            (for [k 0 (.count arange)]
+              (let [edge (get (.edges users) (+ (.offset arange) k))]
+                (patch-operand! (mut graph) (.user edge) (.operand edge) replacement)))))
+        (push! (mut created) new-header)
+        ; Unscheduled (dead) PHIs of the old header move to the new one with
+        ; inputs that stay valid references; nothing live reads them.
+        (let [hrange (get (.ranges users) (cast i64 header))]
+          (for [k 0 (.count hrange)]
+            (let [u (.user (get (.edges users) (+ (.offset hrange) k)))]
+              (when (and (= (opcode-of graph u) 67) (not (get members (cast i64 u))))
+                (let [entry-value (operand-at graph u (+ (.entry-index c) 1))
+                      back (operand-at graph u (+ back-index 1))
+                      back-value (if (and (> back 0) (get members (cast i64 back)))
+                                     (if (!= (get body-phi (cast i64 back)) 0)
+                                         (get body-phi (cast i64 back))
+                                         entry-value)
+                                     back)]
+                  (patch-operand! (mut graph) u 1 new-header)
+                  (patch-operand! (mut graph) u 2 entry-value)
+                  (patch-operand! (mut graph) u 3 back-value))))))
+        ; Roots naming removed control move to their counterparts: the back
+        ; edge to the latch test's, the entry END to the guard's, the arms and
+        ; header to the new blocks.
+        (for [i 0 (len roots)]
+          (let [r (get roots i)]
+            (cond (= r (.back-end c)) (set! (mut roots) i test-body-end)
+                  (= r (.entry-end c)) (set! (mut roots) i guard-body-end)
+                  (or (= r body) (= r header)) (set! (mut roots) i new-header)
+                  (= r exit) (set! (mut roots) i exit-merge)
+                  :else 0)))
+        ; The original header, its block, the test arms and both ENDs are dead.
+        (for v values (g/make-nop! (mut graph) v))
+        (for r [header branch body exit (.entry-end c) (.back-end c)] (g/make-nop! (mut graph) r))))
+    (free! (mut inside))
+    (free! (mut need-exit)) (free! (mut need-body))
+    (free! (mut exit-phi)) (free! (mut body-phi))
+    (free! (mut latch-map)) (free! (mut entry-map))
+    (free! (mut members)) (free! (mut values))))
+
+;;; Rotate every candidate loop, one per analysis round. Returns the rotated
+;;; copy (None when nothing qualified) and its roots. The result is verified
+;;; by preparation.
+(defn run [(graph g/Graph) (entry i32) (roots (slice i32)) (allocator (dyn Allocator))]
+  (-> (Result Rotated (slice u8)))
+  (let [(mut working) (None [g/Graph])
+        (mut current-roots) (ArrayList::new [i32] allocator)
+        (mut created) (ArrayList::new [i32] allocator)
+        (mut rotations) (: 0 i64)
+        (mut error) ""
+        (mut done) false]
+    (for r roots (push! (mut current-roots) r))
+    (while (and (not done) (= error "") (< rotations MAX-ROUNDS))
+      (let [current (match working (Some [w] w) (None [] graph))]
+        (match (pipeline/prepare current entry (slice current-roots) allocator)
+          (Err [message] (set! error message))
+          (Ok [prepared]
+              (let [(mut prepared) prepared
+                    (mut blocks) (block-map current prepared allocator)]
+                (match (find current prepared (slice current-roots) blocks (slice created) allocator)
+                  (None [] (set! done true))
+                  (Some [c]
+                        (let [(mut next) (match working (Some [w] w) (None [] (g/duplicate graph allocator)))]
+                          (rotate! (mut next) prepared c blocks (mut current-roots) (mut created) allocator)
+                          (set! working (Some next))
+                          (set! rotations (+ rotations 1)))))
+                (free! (mut blocks))
+                (pipeline/release! (mut prepared)))))))
+    (when (and (= error "") (some? working) (not done))
+      (match (pipeline/prepare (match working (Some [w] w) (None [] graph)) entry
+                               (slice current-roots) allocator)
+        (Err [message] (set! error message))
+        (Ok [prepared] (let [(mut prepared) prepared] (pipeline/release! (mut prepared))))))
+    (free! (mut created))
+    (if (= error "")
+        (Ok (Rotated :graph working :roots current-roots :rotations rotations))
+        (do (match working (Some [w] (let [(mut w) w] (g/release! (mut w)))) (None [] 0))
+            (free! (mut current-roots))
+            (Err error)))))

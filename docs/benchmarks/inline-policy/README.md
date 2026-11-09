@@ -161,3 +161,48 @@ runtime from min cycles vs the same round's default, noise about 2%):
 | leaf80 + hoist + evict | ~1.25x | +5.9% (~4.8-5.0x) |
 | small80 + hoist + evict + reload | ~1.24-1.26x | +18% (~4.3-4.5x) |
 | everything (incl. pair, always, shrink-wrap, prune) | ~1.25-1.29x | high |
+
+## Exact instruction comparison and the 10% push (hp16-hp18)
+
+New measurement: exact dynamic instruction counts for both hosts. Stogir
+hosts use COIL_STOGIR_BBCOUNT (scratch worktree stogir-ra-audit); the LLVM
+host is rebuilt from `coil emit-ir` with `opt -passes='default<O3>'` + llc
+(reproduces the real LLVM host: 139.8B vs 139.9B instructions, same output)
+with the same six-instruction counter inserted per IR block as inline asm.
+Tools in stogir-ra-audit `build/bbcount/` (mixdump, fold, annot, taken,
+checks, stackcls, predeval).
+
+Counted code, base config (small80+hoist+evict+reload) vs LLVM O3:
+
+| | Stogir | LLVM |
+|---|---:|---:|
+| instructions (counted) | 191.0B | 118.1B |
+| basic blocks executed | 43.2B | 25.0B |
+| taken branches (lower bound) | 20.0B | 8.8B |
+| loads incl. stack (accesses) | 41.7B | 28.5B |
+| stack loads: spill reloads / cs restores / locals | 8.3 / 5.2 / 3.4B | ~7B total |
+| branches to a trap (bounds checks) | 3.19B | 0.10B |
+
+- In functions both binaries define, Stogir executes 119.5B vs LLVM 114.8B
+  (LLVM's figure includes what it inlined). The gap is the 71.5B Stogir runs
+  in callees LLVM inlined away; per function (folded) everything is
+  1.3-2.9x, no single hot spot.
+- primitive-providers-in alone holds 2.4B of the 8.3B spill reloads: values
+  evicted for a rarely entered inner loop are reloaded at its exit on every
+  outer iteration. LLVM keeps them in registers and spills the inner values.
+
+Results (min cycles vs that round's base; noise ~1%, load was high):
+
+| setting | runtime | generation |
+|---|---:|---:|
+| profile-guided layout (diagnostic bound, not an option) | -3.5% to -3.9% | |
+| COIL_STOGIR_PREDICT=1 (static branch prediction) | -0.5% to -0.9% | +0.5% |
+| COIL_STOGIR_CALL_HOLES=1 | worse (+0.7B/+1.3B instructions) | |
+| COIL_STOGIR_ROTATE=1 (IR loop rotation) | -0.7% / +0.9% (neutral) | +31% |
+| rotate + call-holes | +2% to +4% | |
+
+Taken branches: base 20.0B, predict 17.9B, profile layout 14.1B, LLVM >= 8.8B.
+Rotation is correct (identical self-compiled object) but does not fix the
+primitive-providers-in reloads: linear scan still evicts at the inner values'
+start, which is before the new guard. That needs region splitting with
+frequencies (LLVM greedy), not a split-position tweak.

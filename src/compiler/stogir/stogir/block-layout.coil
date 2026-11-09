@@ -193,6 +193,143 @@
                       (cold! (mut result) predecessor))))))))
       result)))
 
+;;; Static branch prediction (an independent extension, not upstream ir_cfg.c).
+;;; Ball-Larus heuristics combined by Dempster-Shafer, as GCC's predict.c does,
+;;; give IF_TRUE/IF_FALSE arms percentages where the graph carries none and no
+;;; arm is a cold UNREACHABLE stop. Percent of the first piece of evidence p,
+;;; combined with q, is p*q / (p*q + (1-p)*(1-q)).
+(defn combine [(p f64) (q f64)] (-> f64)
+  (/ (* p q) (+ (* p q) (* (- 1.0 p) (- 1.0 q)))))
+
+(defn node-at [(graph g/Graph) (reference i32)] (-> n/Node)
+  (if (> reference 0)
+      (get (.instructions graph) (cast i64 reference))
+      (get (.constants graph) (- (- 0 (cast i64 reference)) 1))))
+
+(defn zero-constant? [(graph g/Graph) (reference i32)] (-> bool)
+  (and (< reference 0)
+       (let [node (node-at graph reference)]
+         (and (>= (n/opcode node) 1) (<= (n/opcode node) 11) (= (n/constant-bits node) 0)))))
+
+;;; The last scheduled node of the block starting at REFERENCE.
+(defn block-end [(graph g/Graph) (prepared pipeline/Prepared) (reference i32)] (-> n/Node)
+  (let [range (get (.ranges (.schedule prepared)) (cast i64 reference))]
+    (get (.instructions graph)
+         (cast i64 (get (.nodes (.schedule prepared)) (- (+ (.offset range) (.count range)) 1))))))
+
+;;; Whether an arm (followed while it has a single successor with no other
+;;; predecessor, at most three blocks) calls, or ends in RETURN.
+(defstruct Arm [(calls bool) (returns bool) (enters-loop bool)])
+
+(defn arm [(graph g/Graph) (prepared pipeline/Prepared) (facts Facts) (rank i32) (depth i32)] (-> Arm)
+  (let [(mut current) rank (mut steps) 0 (mut calls) false (mut returns) false
+        (mut enters) false (mut done) false]
+    (while (not done)
+      (let [block (get (.items facts) (cast i64 current))
+            range (get (.ranges (.schedule prepared)) (cast i64 (.reference block)))]
+        (for [k 0 (.count range)]
+          (let [opcode (n/opcode (get (.instructions graph)
+                                      (cast i64 (get (.nodes (.schedule prepared)) (+ (.offset range) k)))))]
+            (when (= opcode 79) (set! calls true))))
+        (when (= (.end-op block) 120) (set! returns true))
+        (when (and (.header block) (> (.depth block) depth)) (set! enters true))
+        (set! steps (+ steps 1))
+        (if (or (>= steps 3) (!= (degree facts current) 1))
+            (set! done true)
+            (let [next (successor facts current 0)]
+              (if (or (<= next current)
+                      (!= (.count (get (.ranges (.predecessors facts)) (cast i64 next))) 1))
+                  (do (when (and (.header (get (.items facts) (cast i64 next)))
+                                 (> (.depth (get (.items facts) (cast i64 next))) depth))
+                        (set! enters true))
+                      (set! done true))
+                  (set! current next))))))
+    (Arm :calls calls :returns returns :enters-loop enters)))
+
+;;; Blocks every path from which reaches UNREACHABLE (not after a TAILCALL),
+;;; computed backward over ranks in reverse RPO order. A successor at a lower
+;;; rank (a backedge) counts as warm, so loops are never cold.
+(defn cold-blocks [(graph g/Graph) (prepared pipeline/Prepared) (facts Facts)
+                   (allocator (dyn Allocator))] (-> (ArrayList bool))
+  (let [(mut cold) (ArrayList::new [bool] allocator)
+        count (len (.items facts))]
+    (fill/append! (mut cold) count false)
+    (let [(mut i) (- count 1)]
+      (while (>= i 1)
+        (let [block (get (.items facts) i)
+              degree (degree facts (cast i32 i))]
+          (if (= (.end-op block) 121)
+              (let [ending (block-end graph prepared (.reference block))]
+                (when (!= (n/opcode (get (.instructions graph) (cast i64 (.op1 ending)))) 80)
+                  (set! (mut cold) i true)))
+              (when (> degree 0)
+                (let [(mut all) true]
+                  (for [k 0 degree]
+                    (let [target (successor facts (cast i32 i) k)]
+                      (unless (and (> target (cast i32 i)) (get cold (cast i64 target)))
+                        (set! all false))))
+                  (when all (set! (mut cold) i true))))))
+        (set! i (- i 1))))
+    cold))
+
+(defn predict! [(graph g/Graph) (prepared pipeline/Prepared) (facts (mut Facts))
+                (allocator (dyn Allocator))] (-> void)
+  (let [(mut cold) (cold-blocks graph prepared facts allocator)]
+  (for [i 1 (len (.items facts))]
+    (let [block (get (.items facts) i)]
+      (when (and (= (.end-op block) 116) (= (degree facts (cast i32 i)) 2))
+        (let [a (successor facts (cast i32 i) 0)
+              b (successor facts (cast i32 i) 1)
+              first (get (.items facts) (cast i64 a))
+              second (get (.items facts) (cast i64 b))]
+          (when (and (= (.probability first) 0) (= (.probability second) 0)
+                     (or (and (= (.start-op first) 107) (= (.start-op second) 108))
+                         (and (= (.start-op first) 108) (= (.start-op second) 107))))
+            (let [true-rank (if (= (.start-op first) 107) a b)
+                  false-rank (if (= (.start-op first) 107) b a)
+                  t (get (.items facts) (cast i64 true-rank))
+                  f (get (.items facts) (cast i64 false-rank))
+                  depth (.depth block)
+                  condition (.op2 (block-end graph prepared (.reference block)))
+                  true-cold (get cold (cast i64 true-rank))
+                  false-cold (get cold (cast i64 false-rank))
+                  (mut p) (: 0.5 f64)]
+              ; Noreturn: an arm that can only reach UNREACHABLE is cold.
+              (cond (and true-cold (not false-cold)) (set! p (combine p 0.01))
+                    (and false-cold (not true-cold)) (set! p (combine p 0.99))
+                    :else 0)
+              ; Loop branch: staying in the loop is likely.
+              (cond (and (>= (.depth t) depth) (< (.depth f) depth)) (set! p (combine p 0.88))
+                    (and (< (.depth t) depth) (>= (.depth f) depth)) (set! p (combine p 0.12))
+                    :else 0)
+              ; Opcode and pointer heuristics on the condition.
+              (when (> condition 0)
+                (let [c (node-at graph condition)
+                      opcode (n/opcode c)
+                      pointer (= (n/type-id (node-at graph (.op1 c))) 6)
+                      zero (zero-constant? graph (.op2 c))]
+                  (cond (= opcode 14) (set! p (combine p (if pointer 0.3 0.34)))
+                        (= opcode 15) (set! p (combine p (if pointer 0.7 0.66)))
+                        (and zero (or (= opcode 16) (= opcode 18))) (set! p (combine p 0.36))
+                        (and zero (or (= opcode 17) (= opcode 19))) (set! p (combine p 0.64))
+                        :else 0)))
+              (let [ta (arm graph prepared facts true-rank depth)
+                    fa (arm graph prepared facts false-rank depth)]
+                ; Loop header: an arm entering a loop is likely.
+                (when (and (.enters-loop ta) (not (.enters-loop fa))) (set! p (combine p 0.75)))
+                (when (and (.enters-loop fa) (not (.enters-loop ta))) (set! p (combine p 0.25)))
+                ; Call heuristic: an arm that calls is unlikely.
+                (when (and (.calls ta) (not (.calls fa))) (set! p (combine p 0.22)))
+                (when (and (.calls fa) (not (.calls ta))) (set! p (combine p 0.78)))
+                ; Return heuristic: an arm that returns is unlikely.
+                (when (and (.returns ta) (not (.returns fa))) (set! p (combine p 0.28)))
+                (when (and (.returns fa) (not (.returns ta))) (set! p (combine p 0.72))))
+              (let [percent (cast i32 (+ (* p 100.0) 0.5))
+                    clamped (cond (< percent 2) 2 (> percent 98) 98 :else percent)]
+                (set! (.probability (elem (mut (.items facts)) (cast i64 true-rank))) clamped)
+                (set! (.probability (elem (mut (.items facts)) (cast i64 false-rank))) (- 100 clamped)))))))))
+  (free! (mut cold))))
+
 (defn cold! [(facts (mut Facts)) (rank i32)] (-> void)
   (let [block (elem (mut (.items facts)) (cast i64 rank))]
     (when (and (= (.probability block) 0)
@@ -601,11 +738,13 @@
 (defn build [(graph g/Graph)
              (prepared pipeline/Prepared)
              (empty (ArrayList bool))
+             (predict bool)
              (allocator (dyn Allocator))] (-> Plan)
   (let [(mut metadata) (facts graph prepared empty allocator)
         (mut aligned) (ArrayList::new [bool] allocator)
         large (or (.irreducible metadata) (> (len (.items metadata)) 257))
         (mut ranks) (ArrayList::new [i32] allocator)]
+    (when predict (predict! graph prepared (mut metadata) allocator))
     (fill/append! (mut aligned) (len (.items metadata)) false)
     (set! ranks
           (if (<= (len (.items metadata)) 3)
