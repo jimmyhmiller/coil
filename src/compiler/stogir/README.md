@@ -251,3 +251,5 @@ edge-indexed PHI copies. These records support allocation-cost research; they
 do not change allocation decisions or enable the independent-block prototype.
 
 Library diagnostics commit: `dd930d75d1c41baab94f02c1384e87e181c25a2a`.
+
+Research: vendors the general integer diamond if-conversion extension from coil-stogir research/general-if-conversion. `COIL_STOGIR_IF_CONVERT=1` enables it after branch-fact cleanup and before loop transforms. The pass proves availability or bounded nontrapping integer speculation, supports multiple PHIs, preserves roots, and rebuilds analyses after each immutable batch. Disabled by default; workload measurement and broad validation pending.
