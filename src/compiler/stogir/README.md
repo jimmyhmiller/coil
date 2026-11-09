@@ -253,3 +253,5 @@ do not change allocation decisions or enable the independent-block prototype.
 Library diagnostics commit: `dd930d75d1c41baab94f02c1384e87e181c25a2a`.
 
 Research: vendors the general integer diamond if-conversion extension from coil-stogir research/general-if-conversion. `COIL_STOGIR_IF_CONVERT=1` enables it after branch-fact cleanup and before loop transforms. The pass proves availability or bounded nontrapping integer speculation, supports multiple PHIs, preserves roots, and rebuilds analyses after each immutable batch. Disabled by default; workload measurement and broad validation pending.
+
+The if-conversion research option now also enables persistent comparison-to-COND fusion: single-use, unobserved, same-block 64-bit integer predicates with word integer results. Matching redirects comparison and choice operands before liveness, constraints keep all inputs available, and emission uses the selected condition flags directly. Existing matching callers and the default backend remain unchanged. Focused matrix (87,480 native answers), high-pressure and linked AOT checks pass; full validation and matched measurements follow.
