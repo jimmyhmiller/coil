@@ -19,6 +19,7 @@
 ;;; 50/51=ADD/SUB with constant word shift, chosen by persistent matching.
 ;;; Their immediate packs shift-kind in bits8..9 and amount in bits0..5.
 ;;; 52=MUL by 2^k+1 as ADD with the same source shifted by k.
+;;; 53=sign extension of the low word of a 64-bit source (SXTW).
 ;;; Operands remain graph references until allocation. Immediate holds unsigned
 ;;; arithmetic bits/fields or the signed CMP/CMN displacement bit pattern.
 (defstruct Tile [(rule i32) (wide bool) (left i32) (right i32) (immediate u64)])
@@ -345,6 +346,35 @@
                                     :right 0
                                     :immediate (| (<< lsb 8) (cast u64 width)))))))))))))
 
+;;; SEXT/ZEXT of a 32-bit TRUNC view of a 64-bit integer reads the low word
+;;; of that integer: one SXTW or UBFX #0,#32 from the original register,
+;;; whether or not the view was given a register of its own. A matcher must
+;;; redirect the machine use before this tile can be emitted.
+(defn word-view-extension [(graph g/Graph) (reference i32)] (-> (Option Tile))
+  (let [node (get (.instructions graph) (cast i64 reference))
+        ty (n/type-id node)
+        view (.op1 node)]
+    (if (or (not (or (= (n/opcode node) 33) (= (n/opcode node) 34)))
+            (not (or (= ty 5) (= ty 11)))
+            (<= view 0))
+        (None)
+        (let [truncation (get (.instructions graph) (cast i64 view))
+              narrow (n/type-id truncation)
+              source (.op1 truncation)]
+          (if (or (!= (n/opcode truncation) 35)
+                  (not (or (= narrow 4) (= narrow 10)))
+                  (<= source 0))
+              (None)
+              (let [input (get (.instructions graph) (cast i64 source))
+                    from (n/type-id input)]
+                (if (or (not (or (= from 5) (= from 11))) (= (n/opcode input) 89))
+                    (None)
+                    (Some (if (= (n/opcode node) 34)
+                              (Tile :rule 48 :wide true :left source :right 0
+                                    :immediate 32)
+                              (Tile :rule 53 :wide true :left source :right 0
+                                    :immediate 0))))))))))
+
 (defn swapped-condition [(condition i32)] (-> i32)
   (case condition 2 9 3 8 8 3 9 2 10 13 11 12 12 11 13 10 condition))
 
@@ -383,6 +413,124 @@
                           :right 0
                           :immediate (cast u64 value))
                         tile))))))))
+
+;;; The 32-bit source of a SEXT/ZEXT into a 64-bit integer word, or zero.
+;;; Narrower sources are excluded: their register bits above the value are
+;;; not defined, so a W-form comparison would observe them. RLOAD keeps its
+;;; pinned position. Kind is the extension opcode: 33=SEXT, 34=ZEXT.
+(defn word-extension-source [(graph g/Graph) (reference i32) (kind u8)] (-> i32)
+  (if (<= reference 0)
+      0
+      (let [node (get (.instructions graph) (cast i64 reference))
+            ty (n/type-id node)
+            source (.op1 node)]
+        (if (or (!= (n/opcode node) kind) (not (or (= ty 5) (= ty 11))) (<= source 0))
+            0
+            (let [input (get (.instructions graph) (cast i64 source))
+                  from (n/type-id input)]
+              (if (and (or (= from 4) (= from 10)) (!= (n/opcode input) 89))
+                  source
+                  0))))))
+
+;;; Case literal BITS of a SWITCH on the extension SELECTOR can be compared as
+;;; a word: it is the extension of its own low word. An unsigned 64-bit
+;;; selector orders cases as unsigned values, which both extensions preserve.
+(defn word-case? [(graph g/Graph) (selector i32) (literal i32)] (-> bool)
+  (match (numeric-bits graph literal)
+    (None [] false)
+    (Some [bits]
+          (if (= (n/opcode (get (.instructions graph) (cast i64 selector))) 34)
+              (<= bits 0xFFFFFFFF)
+              (let [value (cast i64 bits)]
+                (and (>= value -2147483648) (<= value 2147483647)))))))
+
+;;; The SWITCH selector as a retirable unsigned 64-bit word extension, or zero.
+(defn switch-extension [(graph g/Graph) (node n/Node)] (-> i32)
+  (let [selector (.op2 node)]
+    (if (and (word-extension? graph selector)
+             (= (n/type-id (get (.instructions graph) (cast i64 selector))) 5)
+             (> (word-extension-source graph selector
+                  (n/opcode (get (.instructions graph) (cast i64 selector))))
+                0))
+        selector
+        0)))
+
+(defn word-extension? [(graph g/Graph) (reference i32)] (-> bool)
+  (and (> reference 0)
+       (let [opcode (n/opcode (get (.instructions graph) (cast i64 reference)))]
+         (or (= opcode 33) (= opcode 34)))))
+
+;;; Signed order on two zero-extended words is unsigned order on the words.
+(defn unsigned-condition [(condition i32)] (-> i32)
+  (case condition 10 2 11 3 12 8 13 9 condition))
+
+;;; A 64-bit comparison whose inputs are extensions of 32-bit values is the
+;;; 32-bit comparison of the sources, exactly in these cases:
+;;;   SEXT(x) ? c, c in [-2^31, 2^31): every condition is unchanged. Sign
+;;;     extension is strictly increasing for the signed order, and for the
+;;;     unsigned order too (negative words map above all nonnegative ones).
+;;;   ZEXT(x) ? c, c in [0, 2^32): equality and unsigned order are unchanged;
+;;;     signed order becomes unsigned, as both 64-bit values are nonnegative.
+;;;   SEXT(x) ? SEXT(y) and ZEXT(x) ? ZEXT(y): likewise.
+;;; A literal outside the stated range, mixed extension kinds and non-word
+;;; sources keep the 64-bit comparison. An immediate tile already holds the
+;;; signed literal; a literal left in a register must also be a W-form
+;;; constant, so a signed one is narrowed only when nonnegative.
+;;; The caller must replace the machine uses before liveness.
+(defn narrowed-comparison [(graph g/Graph) (tile Tile)] (-> (Option Tile))
+  (if (or (not (.wide tile)) (< (.rule tile) 20) (> (.rule tile) 33))
+      (None)
+      (let [condition (- (.rule tile) 20)
+            left (.left tile)
+            right (.right tile)
+            kind (if (> left 0)
+                     (n/opcode (get (.instructions graph) (cast i64 left)))
+                     (if (> right 0)
+                         (n/opcode (get (.instructions graph) (cast i64 right)))
+                         (: 0 u8)))
+            rule (+ 20 (if (= kind 34) (unsigned-condition condition) condition))]
+        (if (not (or (= kind 33) (= kind 34)))
+            (None)
+            (let [first (word-extension-source graph left kind)
+                  second (word-extension-source graph right kind)]
+              (cond (= right 0)
+                      (if (or (= first 0)
+                              (and (= kind 34) (< (cast i64 (.immediate tile)) 0)))
+                          (None)
+                          (Some (Tile :rule rule :wide false :left first :right 0
+                                      :immediate (.immediate tile))))
+                    (and (> first 0) (> second 0))
+                      (Some (Tile :rule rule :wide false :left first :right second
+                                  :immediate 0))
+                    :else
+                      (let [literal (if (> first 0) right left)
+                            limit (if (= kind 34) (: 0xFFFFFFFF u64) (: 0x7FFFFFFF u64))]
+                        (if (and (or (> first 0) (> second 0)) (< literal 0))
+                            (match (numeric-bits graph literal)
+                              (None [] (None))
+                              (Some [bits]
+                                    (if (> bits limit)
+                                        (None)
+                                        (Some (Tile :rule rule :wide false
+                                                    :left (if (> first 0) first left)
+                                                    :right (if (> first 0) right second)
+                                                    :immediate 0)))))
+                            (None)))))))))
+
+;;; A comparison tile whose flags come from one X- or W-form CMP/CMN of its
+;;; operands as they are held: X form, or W form with every operand at least a
+;;; word. Byte and halfword operands need normalization first.
+(defn direct-comparison? [(graph g/Graph) (tile Tile)] (-> bool)
+  (and (>= (.rule tile) 20) (<= (.rule tile) 33)
+       (or (.wide tile)
+           (and (match (g/lookup graph (.left tile))
+                  (None [] false)
+                  (Some [operand] (>= (types/scalar-size (cast i32 (n/type-id operand)) 8) 4)))
+                (or (= (.right tile) 0)
+                    (match (g/lookup graph (.right tile))
+                      (None [] false)
+                      (Some [operand]
+                            (>= (types/scalar-size (cast i32 (n/type-id operand)) 8) 4))))))))
 
 (defn comparison [(graph g/Graph) (reference i32)] (-> (Result Tile (slice u8)))
   (match (g/lookup graph reference)
