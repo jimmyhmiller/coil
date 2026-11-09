@@ -1,0 +1,157 @@
+;;; Independent global redundant-load elimination. Reuse an exact typed scalar
+;;; load only after a dominance proof and a memory-preservation proof over every
+;;; intervening control path. No load is speculated or inserted.
+(module stogir.global-load-forward)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.dominators" :as dom)
+(import "stogir.address-alias" :as alias)
+(import "stogir.call-effects" :as effects)
+(import "stogir.load-forward" :as forward)
+(import "stogir.mem2ssa" :as mem)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+(defstruct Load [(reference i32) (block i32) (position i64) (type u8)
+                 (width i64) (address alias/Address)])
+(defstruct Forwarded [(graph (Option g/Graph)) (roots (ArrayList i32)) (loads i64)])
+
+(defn loads [(graph g/Graph) (prepared pipeline/Prepared) (a (dyn Allocator))]
+  (-> (ArrayList Load))
+  (let [(mut out) (ArrayList::new [Load] a)]
+    (for block (.order prepared)
+      (let [range (get (.ranges (.schedule prepared)) (cast i64 block))]
+        (for [i 0 (.count range)]
+          (let [position (+ (.offset range) i)
+                ref (get (.nodes (.schedule prepared)) position)
+                node (get (.instructions graph) (cast i64 ref)) ty (n/type-id node)]
+            (when (and (= (n/opcode node) 91) (forward/scalar? ty 8))
+              (push! (mut out) (Load :reference ref :block block :position position :type ty
+                :width (cast i64 (types/size (cast i32 ty) 8))
+                :address (alias/decompose graph (.op2 node) 8))))))))
+    out))
+
+;;; Dominating candidates are totally ordered. Pick the deepest, and then the
+;;; latest within its block. Do not assume reference order or loop block layout
+;;; is dominance order. Distinct symbols/indices never imply address equality.
+(defn prior [(values (ArrayList Load)) (dominance dom/Index) (target Load)] (-> i64)
+  (let [(mut best) (: -1 i64)]
+    (for [i 0 (len values)]
+      (let [candidate (get values i)]
+        (when (and (!= (.reference candidate) (.reference target))
+                   (= (.type candidate) (.type target))
+                   (alias/same-origin? (.address candidate) (.address target))
+                   (= (.offset (.address candidate)) (.offset (.address target)))
+                   (dom/indexed-dominates? dominance (.block candidate) (.block target))
+                   (or (!= (.block candidate) (.block target))
+                       (< (.position candidate) (.position target))))
+          (if (< best 0) (set! best i)
+              (let [previous (get values best)]
+                (when (and (dom/indexed-dominates? dominance (.block previous) (.block candidate))
+                           (or (!= (.block previous) (.block candidate))
+                               (> (.position candidate) (.position previous))))
+                  (set! best i)))))))
+    best))
+
+;;; Dominance/availability is checked separately. Traverse the complete backward
+;;; control closure, stopping only at SOURCE. Visited nodes bound cycles; they
+;;; do not establish availability. A reachable entry or any unsupported effect
+;;; encountered without SOURCE rejects. Stores after TARGET on a back edge are
+;;; visited too, so a value cannot be reused across a writing iteration.
+(defn preserved? [(graph g/Graph) (source i32) (target Load)
+                  (seen (mut (ArrayList i32))) (work (mut (ArrayList i32)))] (-> bool)
+  (let [stamp (.reference target) (mut valid) true (mut reached) false]
+    (clear! (mut work))
+    (push! (mut work) (.op1 (get (.instructions graph) (cast i64 stamp))))
+    (while (and valid (> (len work) 0))
+      (let [ref (match (pop! (mut work)) (Some [r] r) (None [] (panic "forward worklist")))]
+        (if (= ref source) (set! reached true)
+            (if (<= ref 0) (set! valid false)
+                (when (!= (get seen (cast i64 ref)) stamp)
+                  (set! (mut seen) (cast i64 ref) stamp)
+                  (let [node (get (.instructions graph) (cast i64 ref)) code (n/opcode node)
+                        (mut chain) false]
+                    (cond
+                      (or (= code 112) (= code 113))
+                        (for [i 1 (+ (cast i64 (get (.arities graph) (cast i64 ref))) 1)]
+                          (match (g/operand graph ref (cast i32 i))
+                            (Some [input] (push! (mut work) input))
+                            (None [] (set! valid false))))
+                      (= code 93)
+                        (let [width (match (g/lookup graph (.op3 node))
+                                      (None [] (: 0 i64))
+                                      (Some [stored] (cast i64 (types/size (cast i32 (n/type-id stored)) 8))))]
+                          (if (alias/disjoint? graph (.address target)
+                                (alias/decompose graph (.op2 node) 8) (.width target) width 8)
+                              (set! chain true) (set! valid false)))
+                      (= code 79)
+                        (if (effects/preserves-address? graph ref (.address target) (.width target) 8)
+                            (set! chain true) (set! valid false))
+                      (or (= code 91) (and (= code 106) (= (.op2 node) 0))
+                          (and (>= code 107) (<= code 111))
+                          (and (>= code 114) (<= code 117)))
+                        (set! chain true)
+                      :else (set! valid false))
+                    (when chain (push! (mut work) (.op1 node)))))))))
+    (and valid reached)))
+
+;;; All queries read the same immutable graph; mutation uses the same exact
+;;; value/control remapping as local load forwarding, including observed loads.
+(defn batch [(graph g/Graph) (prepared pipeline/Prepared) (roots (mut (ArrayList i32)))
+             (a (dyn Allocator))] (-> (Option g/Graph))
+  (let [(mut values) (loads graph prepared a) (mut dominance) (dom/build-index (.idom prepared) a)
+        (mut seen) (mem/zeros (len (.instructions graph)) a)
+        (mut work) (ArrayList::new [i32] a)
+        (mut data) (mem/zeros (len (.instructions graph)) a)
+        (mut control) (mem/zeros (len (.instructions graph)) a) (mut changes) false]
+    (for target values
+      (let [index (prior values dominance target)]
+        (when (>= index 0)
+          (let [source (.reference (get values index)) ref (.reference target)]
+            (when (preserved? graph source target (mut seen) (mut work))
+              (set! (mut data) (cast i64 ref) source)
+              (set! (mut control) (cast i64 ref) (.op1 (get (.instructions graph) (cast i64 ref))))
+              (set! changes true))))))
+    (let [output (if changes
+                    (let [(mut owned) (g/duplicate graph a)]
+                      (forward/apply-maps! (mut owned) (mut roots) data control) (Some owned))
+                    (None [g/Graph]))]
+      (free! (mut values)) (dom/release-index! (mut dominance))
+      (free! (mut seen)) (free! (mut work)) (free! (mut data)) (free! (mut control))
+      output)))
+
+(defn count-loads [(graph g/Graph)] (-> i64)
+  (let [(mut count) (: 0 i64) (mut ref) (: 1 i64)]
+    (while (< ref (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) ref)) 91) (set! count (+ count 1)))
+      (set! ref (+ ref (/ (+ (cast i64 (get (.arities graph) ref)) 4) 4))))
+    count))
+
+;;; A batch may expose equal address expressions by forwarding pointer loads.
+;;; Rebuild all facts after each batch; strictly fewer LOADs ensures termination.
+(defn run [(source g/Graph) (entry i32) (roots (slice i32)) (a (dyn Allocator))]
+  (-> (Result Forwarded (slice u8)))
+  (let [(mut working) (None [g/Graph]) (mut exits) (ArrayList::new [i32] a)
+        initial (count-loads source) (mut done) false (mut error) ""]
+    (for root roots (push! (mut exits) root))
+    (while (and (not done) (= error ""))
+      (let [graph (match working (Some [owned] owned) (None [] source))]
+        (match (pipeline/prepare graph entry (slice exits) a)
+          (Err [message] (set! error message))
+          (Ok [prepared]
+            (let [(mut prepared) prepared next (batch graph prepared (mut exits) a)]
+              (pipeline/release! (mut prepared))
+              (match next
+                (None [] (set! done true))
+                (Some [owned]
+                  (unless (< (count-loads owned) (count-loads graph)) (panic "forwarding did not remove a load"))
+                  (match working (None [] 0) (Some [old] (let [(mut old) old] (g/release! (mut old)))))
+                  (set! working (Some owned)))))))))
+    (if (= error "")
+        (Ok (Forwarded :graph working :roots exits
+              :loads (- initial (match working (None [] initial) (Some [owned] (count-loads owned))))))
+        (do (match working (None [] 0) (Some [owned] (let [(mut owned) owned] (g/release! (mut owned)))))
+            (free! (mut exits)) (Err error)))))
