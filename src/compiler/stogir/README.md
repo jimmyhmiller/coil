@@ -272,3 +272,6 @@ Allocation scoring is updated unchanged from coil-stogir `59edaf4`. A child-to-t
 
 
 November 9, 2026 — library `2342f7e` adds optional modular affine loop strength reduction. The library sources are vendored unchanged. `COIL_STOGIR_STRENGTH=1` enables it in the module, cached-leaf and fallback native paths; default behavior stays disabled. It proves entry-invariant inputs and a single natural recurrence, preserves wrapping widths, and carries shared affine addresses through loops. Library arithmetic, nested JIT, C-linked and captured-graph checks pass; compiler-host runtime and full acceptance validation remain pending.
+
+
+November 9, 2026 — library `da3e6b0` includes direct recurrence PHIs (`6423076`) and general zero-offset full-width address-view selection. Sources are copied unchanged. The optional strength pass keeps its original reference as the PHI. Normal matching now absorbs integer/address BITCAST chains even when there is no ADD to fold, preserving explicit uses, roots, COPY barriers and width-changing definitions. Expanded native address, nested strength and C-linked tests pass; the old-matcher negative control fails as expected. The first strength-only runtime experiment was mixed and did not meet the target. Fresh controls and runtime measurements are required for this general matching change.
