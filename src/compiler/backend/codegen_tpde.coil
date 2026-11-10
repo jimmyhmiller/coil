@@ -88,6 +88,34 @@
 
 (extern cgtpde.close :as "close" [i32] (-> i32))
 
+(extern cgtpde.clock :as "clock" [] (-> i64))
+
+;;; One stage of native generation, for `--timings` (a span named NAME) and,
+;;; with COIL_NATIVE_STAGES set, a line on stderr
+;;;   native-stage <TAB> NAME <TAB> elapsed microseconds <TAB> process CPU microseconds
+;;; The CPU figure is the whole process's (clock(3)), so a stage that runs on
+;;; worker threads shows more CPU than elapsed time. The time between the end
+;;; of one stage and the beginning of the next is in neither.
+(defstruct Stage [(span tr/Span) (name (slice u8)) (wall i64) (cpu i64) (report bool)])
+
+(defn stage-begin [(name (slice u8))] (-> Stage)
+  (let [report (!= (primitive/cast i64 (cgtpde.getenv c"COIL_NATIVE_STAGES")) 0)]
+    (Stage
+      :span (tr/span-begin name)
+      :name name
+      :wall (if report (ticks) 0)
+      :cpu (if report (cgtpde.clock) 0)
+      :report report)))
+
+(defn stage-end [(stage Stage)] (-> i64)
+  (when (.report stage)
+    (eprintln "native-stage\t{}\t{}\t{}"
+              (.name stage)
+              (- (ticks) (.wall stage))
+              (- (cgtpde.clock) (.cpu stage))))
+  (tr/span-end (.span stage))
+  0)
+
 (extern cgtpde.memchr :as "memchr" [(ptr u8) i32 usize] (-> (ptr u8)))
 
 ; ============================ state ==========================================
@@ -4387,12 +4415,97 @@
             (free! (mut items))
             running)))))
 
+;;; A run of consecutive functions for one phase of module copy forwarding.
+(defstruct CopyChunk
+  [(forward (ptr copies/ModuleForward)) (phase i64) (begin i64) (end i64)])
+
+;;; A worker's part of copies/forward-module!: the steps of one chunk, and
+;;; after the last phase's step of a function its snapshot fusion, which
+;;; nothing in copy forwarding reads. Each step touches its own function only.
+(defn copy-chunk-task [(argument (ptr i8))] (-> (ptr i8))
+  (let [chunk (primitive/cast (ptr CopyChunk) argument)
+        forward (.forward chunk)
+        last (= (.phase chunk) (- copies/MODULE-FORWARD-PHASES 1))
+        (mut scratch) (copies/module-forward-scratch)]
+    (for [i (.begin chunk) (.end chunk)]
+      (copies/module-forward-step! forward (mut scratch) (.phase chunk) i)
+      (when last (cir/fuse-snapshots! (get (.funcs forward) i))))
+    (copies/module-forward-scratch-free! (mut scratch))
+    (primitive/cast (ptr i8) 0)))
+
+;;; Module copy forwarding (copies/forward-module!) and snapshot fusion of
+;;; every function. With more than one generation thread the per-function
+;;; steps of each phase run on workers, in chunks of about equal size; the
+;;; joins between phases run here. A step's result depends on its function
+;;; and the last join alone, so the functions come out the same as serially.
+(defn stogir-forward-copies! [(tl (ptr Tl)) (funcs (slice (ptr cir/Func))) (syms (slice u32))]
+  (-> void)
+  (let [threads (if (and (tl-threads?) (not (.stats tl))) (stogir/generation-threads) 1)
+        phases copies/MODULE-FORWARD-PHASES
+        (mut state) (copies/module-forward-new funcs syms)
+        forward (cast (ptr copies/ModuleForward) (mut state))
+        (mut chunks) (ArrayList::new [CopyChunk] (malloc-allocator))
+        (mut ok) true]
+    (when (> threads 1)
+      (let [(mut total) 0]
+        (for [i 0 (len funcs)] (set! total (+ total 16 (len (.values (get funcs i))))))
+        (let [target (+ (/ total (* threads 16)) 1)
+              (mut begin) 0
+              (mut weight) 0]
+          (for [i 0 (len funcs)]
+            (set! weight (+ weight 16 (len (.values (get funcs i)))))
+            (when (or (>= weight target) (= i (- (len funcs) 1)))
+              (push! (mut chunks) (CopyChunk :forward forward :phase 0 :begin begin :end (+ i 1)))
+              (set! begin (+ i 1))
+              (set! weight 0))))))
+    (let [per (len chunks)
+          pool (if (> per 0)
+                   (stogir/pool-start (fnptr-of copy-chunk-task) (* per phases) threads)
+                   (primitive/cast (ptr stogir/Pool) 0))
+          parallel (!= (primitive/cast usize pool) 0)]
+      ; One descriptor per phase and chunk, all made before the first task is
+      ; submitted: the list does not move while workers hold pointers into it.
+      (when parallel
+        (for [phase 1 phases]
+          (for [c 0 per]
+            (let [chunk (get chunks c)]
+              (push! (mut chunks)
+                     (CopyChunk :forward forward :phase phase
+                                :begin (.begin chunk) :end (.end chunk)))))))
+      (for [phase 0 phases]
+        (when ok
+          (let [xs (stage-begin "backend.stogir.copies.steps")]
+          (if parallel
+              (do
+                (for [c 0 per]
+                  (unless (= (stogir/pool-submit! pool
+                                                  (primitive/cast (ptr i8)
+                                                                  (elem (mut chunks)
+                                                                        (+ (* phase per) c))))
+                             (+ (* phase per) c))
+                    (tl-fail "copy forwarding: task index differs from its chunk")))
+                (for [c 0 per] (stogir/pool-await! pool (+ (* phase per) c))))
+              (let [(mut scratch) (copies/module-forward-scratch)]
+                (for [i 0 (len funcs)]
+                  (copies/module-forward-step! forward (mut scratch) phase i))
+                (copies/module-forward-scratch-free! (mut scratch))))
+          (stage-end xs))
+          (let [xj (stage-begin "backend.stogir.copies.join")]
+          (set! ok (copies/module-forward-join! forward phase))
+          (stage-end xj))))
+      (when parallel (stogir/pool-finish! pool))
+      (unless ok (tl-fail "copy forwarding weakened a callee argument summary"))
+      (unless parallel (for [i 0 (len funcs)] (cir/fuse-snapshots! (get funcs i)))))
+    (copies/module-forward-free! forward)
+    (free! (mut chunks))))
+
 (defn pipe-finish! [(p (ptr Pipe))] (-> void)
   (when (.collect p)
     (let [tl (.tl p)
           (mut module) (stogir/module-create (.a tl) (.stats tl))
           mp (primitive/cast (ptr stogir/Module) (mut module))
-          started (tr/codegen-start)]
+          started (tr/codegen-start)
+          copies-stage (stage-begin "backend.stogir.copies")]
       (let [(mut funcs) (ArrayList::new [(ptr cir/Func)] (malloc-allocator))
             (mut syms) (ArrayList::new [u32] (malloc-allocator))]
         (for [i 0 (len (.pending p))]
@@ -4400,14 +4513,14 @@
             (when (= (.kind j) JOB-COMPILE)
               (push! (mut funcs) (.fp j))
               (push! (mut syms) (.tsym j)))))
-        (unless (copies/forward-module! (slice funcs) (slice syms))
-          (tl-fail "copy forwarding weakened a callee argument summary"))
-        (for f funcs (cir/fuse-snapshots! f))
+        (stogir-forward-copies! tl (slice funcs) (slice syms))
         (free! (mut funcs))
         (free! (mut syms)))
+      (stage-end copies-stage)
       ; Template optimization runs on worker threads when more than one is
       ; configured (stogir/preparation-*); the module is the same either way.
-      (let [threads (if (and (tl-threads?) (not (.stats tl))) (stogir/generation-threads) 1)
+      (let [prepare-stage (stage-begin "backend.stogir.prepare")
+            threads (if (and (tl-threads?) (not (.stats tl))) (stogir/generation-threads) 1)
             preparation
               (if (> threads 1)
                   (stogir/preparation-start mp (.ta tl) (len (.pending p)) threads)
@@ -4425,11 +4538,17 @@
                 (if parallel
                     (stogir/preparation-submit! preparation (.fp j) (.tsym j) never always)
                     (stogir/module-prepare! mp (.fp j) (.ta tl) (.tsym j) never always))))))
-        (when parallel (stogir/preparation-finish! preparation)))
-      (stogir/module-finish! mp)
-      (let [(mut plan) (stogir-emission-plan p mp)]
+        (when parallel (stogir/preparation-finish! preparation))
+        (stage-end prepare-stage))
+      (let [finish-stage (stage-begin "backend.stogir.finalize")]
+        (stogir/module-finish! mp)
+        (stage-end finish-stage))
+      (let [plan-stage (stage-begin "backend.stogir.plan")
+            (mut plan) (stogir-emission-plan p mp)]
+        (stage-end plan-stage)
         (when (> (.stogir-level tl) 1)
-          (let [native-start (if (.stats tl) (ticks) 0)]
+          (let [native-start (if (.stats tl) (ticks) 0)
+                leaf-stage (stage-begin "backend.stogir.leaf-cache")]
             (stogir/begin-native! mp (.ta tl))
             (for [i 0 (len (.pending p))]
               (let [j (elem (mut (.pending p)) i)]
@@ -4437,18 +4556,22 @@
                   (stogir/precompile-native-leaf! mp (.fp j) (.ta tl) (.tsym j)
                     (mut (.stogir-text-data tl)) (.stogir-level tl)))))
             (stogir/seal-native! mp (.ta tl))
+            (stage-end leaf-stage)
             (when (.stats tl)
               (set! (.t-compile tl) (+ (.t-compile tl) (- (ticks) native-start))))))
         (tr/codegen-end "stogir" "ir-codegen" started)
         (set! (.stogir-module tl) mp)
-        (unless (stogir-emit-parallel! p mp plan)
-          (for [i 0 (len (.pending p))]
-            (let [j (elem (mut (.pending p)) i)]
-              (when (get (.live plan) i) (job-run! tl j))
-              (when (= (.kind j) JOB-COMPILE)
-                (stogir/release-emission-body! mp (.tsym j))
-                (cir/func-free! (.fp j))))))
-        (let [finish-start (tr/codegen-start)]
+        (let [emit-stage (stage-begin "backend.stogir.emit")]
+          (unless (stogir-emit-parallel! p mp plan)
+            (for [i 0 (len (.pending p))]
+              (let [j (elem (mut (.pending p)) i)]
+                (when (get (.live plan) i) (job-run! tl j))
+                (when (= (.kind j) JOB-COMPILE)
+                  (stogir/release-emission-body! mp (.tsym j))
+                  (cir/func-free! (.fp j))))))
+          (stage-end emit-stage))
+        (let [finish-start (tr/codegen-start)
+              close-stage (stage-begin "backend.stogir.close")]
         (stogir/verify-native! mp (.ta tl))
         ; Every relocation produced by native lowering must agree with the plan.
         (for relocation (.relocs (load (.ta tl)))
@@ -4466,6 +4589,7 @@
         (set! (.stogir-module tl) (primitive/cast (ptr stogir/Module) 0))
         (free! (mut (.live plan))) (free! (mut (.by-symbol plan)))
         (stogir/module-release-callees! mp)
+        (stage-end close-stage)
         (tr/codegen-end "stogir" "ir-codegen" finish-start)))))
   (when (.threaded p)
     (let [j (pipe-claim p)]
@@ -4870,7 +4994,9 @@
                               "tpde: no code generator for the architecture "
                               arch)))
         t-setup0 (ticks)
+        setup-stage (stage-begin "backend.native.setup")
         g (tl-module-setup! a mp)
+        _ (stage-end setup-stage)
         t-setup (- (ticks) t-setup0)
         (mut ta) (tasm/Asm::new)
         tap (cast (ptr tasm/Asm) (mut ta))
@@ -4958,7 +5084,8 @@
           (mut pipe) (zeroed Pipe)
           pp (cast (ptr Pipe) (mut pipe))
           span (tr/span-begin "backend.tpde-functions")
-          fs (load (field (.program g) funcs))]
+          fs (load (field (.program g) funcs))
+          lower-stage (stage-begin "backend.native.lower")]
       (tl-reach-setup! tlp)
       (pipe-start! pp
                    tlp
@@ -4979,6 +5106,7 @@
                 (None [] (tl-func! tlp pp fd)))
               (tl-reach-data! tlp))
             (set! cursor (+ cursor 1))))
+        (stage-end lower-stage)
         (pipe-finish! pp))
       (tr/span-end span)
       (when (!= (primitive/cast i64 (cgtpde.getenv c"COIL_TPDE_STATS")) 0)
@@ -4994,10 +5122,12 @@
                   (.t-compile tlp)
                   (.t-dwarf tlp)))
       (let [t-merge0 (ticks)
-            codegen-start (if (.reach-enabled tlp) (tr/codegen-start) 0)]
+            codegen-start (if (.reach-enabled tlp) (tr/codegen-start) 0)
+            merge-stage (stage-begin "backend.native.merge")]
         (tl-merge! tlp)
         (g-place-export-aliases! g)
         (tl-reach-finish! tlp)
+        (stage-end merge-stage)
         (tr/codegen-end (if stogir "stogir" "tpde") "ir-codegen" codegen-start)
         (when (.dbg tlp)
           (let [span (tr/span-begin "backend.tpde-dwarf")]
@@ -5007,7 +5137,9 @@
           (eprintln "tpde: module setup {}us merge {}us"
                     t-setup
                     (- (ticks) t-merge0))))
-      (tl-free! tlp pp))
+      (let [free-stage (stage-begin "backend.native.release")]
+        (tl-free! tlp pp)
+        (stage-end free-stage)))
     (.obj g)))
 
 ;;; Release what tpde allocated for the build: the merge copied the code,
@@ -5311,14 +5443,17 @@
         t0 (ticks)
         object-start
           (match where (OnTarget [] (tr/codegen-start)) (OnHost [] 0))
+        encode-stage (stage-begin "backend.native.object-encode")
         bytes
           (cond elf
                   (let [(mut e) (tl-elf-object a (mut o))] (elf-write (mut e)))
                 (= (tl-arch where) "x86_64") (macho-write-x64 (mut o))
                 :else (macho-write (mut o)))
         t1 (ticks)
+        _ (stage-end encode-stage)
         _object-end
           (tr/codegen-end (if stogir "stogir" "tpde") "ir-codegen" object-start)
+        write-stage (stage-begin "backend.native.object-write")
         fd (fs/create-file objpath 420)]
     (set! (native-last-needs-curl-cell)
           (mobj-references-undefined? (mut o)
@@ -5343,6 +5478,7 @@
           (when (<= wrote 0) (cga-fail "object write failed"))
           (set! off (+ off (primitive/cast i64 wrote))))))
     (cgtpde.close (primitive/cast i32 fd))
+    (stage-end write-stage)
     0))
 
 ;;; Target object through the selected native engine. No engine fallback.

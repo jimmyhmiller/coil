@@ -115,7 +115,9 @@
    ; ADDIs of slots/arguments to move to the entry block before compaction
    (hoist (ArrayList u32))
    (touched (ArrayList bool))
-   (dead-slot (ArrayList bool))])
+   (dead-slot (ArrayList bool))
+   ; analyze-uses!'s cursor per value while it places the uses
+   (fill (ArrayList u32))])
 
 (defn none [] (-> u32) (cir/none))
 
@@ -155,7 +157,15 @@
       :work-writes (ArrayList::new [u32] a)
       :hoist (ArrayList::new [u32] a)
       :touched (ArrayList::new [bool] a)
-      :dead-slot (ArrayList::new [bool] a))))
+      :dead-slot (ArrayList::new [bool] a)
+      :fill (ArrayList::new [u32] a))))
+
+;;; Turn ST to another function. Every analysis fills what it reads from the
+;;; function at hand, so a state serves any number of functions in turn.
+(defn state-retarget! [(st (ptr State)) (f (ptr cir/Func)) (sums (ptr Summaries))] (-> void)
+  (set! (.f st) f)
+  (set! (.sums st) sums)
+  (clear! (mut (.hoist st))))
 
 (defn state-free! [(st (ptr State))] (-> void)
   (free! (mut (.at st))) (free! (mut (.block-of st)))
@@ -169,7 +179,8 @@
   (free! (mut (.reached st))) (free! (mut (.work st))) (free! (mut (.starts st)))
   (free! (mut (.work-writes st)))
   (free! (mut (.hoist st)))
-  (free! (mut (.touched st))) (free! (mut (.dead-slot st))))
+  (free! (mut (.touched st))) (free! (mut (.dead-slot st)))
+  (free! (mut (.fill st))))
 
 ;; One allocation and a store loop, not n capacity-checked pushes.
 (defn fill-u32! [(xs (mut (ArrayList u32))) (n i64) (v u32)] (-> void)
@@ -399,14 +410,13 @@
       (set! (mut (.use-start st)) nv total)
       (fill-u32! (mut (.use-user st)) (cir/i64-of total) (: 0 u32))
       (fill-u32! (mut (.use-index st)) (cir/i64-of total) (: 0 u32)))
-    (let [(mut fill) (ArrayList::new [u32] (malloc-allocator))]
-      (extend! (mut fill) (.data (.use-start st)) nv)
-      (for i (range 0 users)
-        (let [user (each-user f i)
-              x (cir/val f user)]
-          (for k (range 0 (cir/i64-of (.nops x)))
-            (place-use! st (mut fill) (cir/operand f x (cir/u32-of k)) user (cir/u32-of k)))))
-      (free! (mut fill)))))
+    (clear! (mut (.fill st)))
+    (extend! (mut (.fill st)) (.data (.use-start st)) nv)
+    (for i (range 0 users)
+      (let [user (each-user f i)
+            x (cir/val f user)]
+        (for k (range 0 (cir/i64-of (.nops x)))
+          (place-use! st (mut (.fill st)) (cir/operand f x (cir/u32-of k)) user (cir/u32-of k)))))))
 
 (defn analyze! [(st (ptr State))] (-> void)
   (analyze-uses! st)
@@ -944,20 +954,33 @@
   (forward-copies-with! f (p/cast (ptr Summaries) 0)))
 
 (defn forward-copies-with! [(f (ptr cir/Func)) (sums (ptr Summaries))] (-> i64)
+  (let [(mut modified) false
+        (mut st) (state-new f sums)
+        removed (forward-copies-in! (mut st) f sums (mut modified))]
+    (state-free! (mut st))
+    removed))
+
+;;; forward-copies-with! using the analysis storage of ST (any state), also
+;;; storing in MODIFIED whether F was changed at all. A rewrite that does not
+;;; apply leaves F as it was, and a sunk copy counts as a change although it
+;;; removes none.
+(defn forward-copies-in! [(st (ptr State)) (f (ptr cir/Func)) (sums (ptr Summaries))
+                          (modified (mut bool))] (-> i64)
+  (set! modified false)
   (let [(mut copies) false]
     (for i (range 0 (len (.insts f)))
       (when (= (opcode f (get (.insts f) i)) cir/OP-MEMCPY) (set! copies true)))
     (if (or (not copies) (= (len (.allocas f)) 0))
         0
-        (let [(mut st) (state-new f sums)
-              (mut removed) (: 0 i64)
+        (let [(mut removed) (: 0 i64)
               (mut round) 0
               (mut changed) true]
+          (state-retarget! st f sums)
           (while (and changed (< round 4))
             (set! changed false)
             (when (> (sink-copies! f) 0) (set! changed true))
-            (analyze! (mut st))
-            (dominators! (mut st))
+            (analyze! st)
+            (dominators! st)
             (let [nb (cir/i64-of (cir/block-count f))
                   ni (len (.insts f))]
               (fill-u32! (mut (.mark-f st)) ni (: 0 u32))
@@ -969,16 +992,16 @@
               (let [c (get (.insts f) i)]
                 (when (and (= (opcode f c) cir/OP-MEMCPY)
                            (= (& (.flags (cir/val f c)) (: 8 u8)) (: 0 u8)))
-                  (when (or (try-into-source! (mut st) c)
-                            (try-into-destination! (mut st) c))
+                  (when (or (try-into-source! st c)
+                            (try-into-destination! st c))
                     (set! changed true)
                     (set! removed (+ removed 1))))))
             (when changed
-              (hoist! (mut st))
+              (set! modified true)
+              (hoist! st)
               (cir/compact-dead! f)
-              (drop-slots! (mut st)))
+              (drop-slots! st))
             (set! round (+ round 1)))
-          (state-free! (mut st))
           removed))))
 
 ; ---- argument summaries ----
@@ -1020,9 +1043,36 @@
     (free! (mut work))
     bits))
 
-;;; Summaries for every function in `funcs` (defining `syms`), to a fixpoint:
-;;; start from "neither retained nor written" and weaken through call edges.
-(defn summarize! [(sums (ptr Summaries)) (funcs (slice (ptr cir/Func))) (syms (slice u32))]
+;;; One function's contribution to the module's summaries: per argument its
+;;; local verdict and the callee arguments it flows into. It depends on that
+;;; function's CIR alone.
+(defstruct Local [(bits (ArrayList u8)) (edge-count (ArrayList u32)) (edges (ArrayList Edge))])
+
+(defn local-new [] (-> Local)
+  (let [a (malloc-allocator)]
+    (Local :bits (ArrayList::new [u8] a) :edge-count (ArrayList::new [u32] a)
+           :edges (ArrayList::new [Edge] a))))
+
+(defn local-free! [(local (ptr Local))] (-> void)
+  (free! (mut (.bits local))) (free! (mut (.edge-count local))) (free! (mut (.edges local))))
+
+(defn local-summarize! [(st (ptr State)) (f (ptr cir/Func)) (local (ptr Local))] (-> void)
+  (clear! (mut (.bits local))) (clear! (mut (.edge-count local))) (clear! (mut (.edges local)))
+  (let [n (len (.args f))]
+    ; without arguments there is nothing to say, and no use analysis is needed
+    (when (> n 0)
+      (state-retarget! st f (p/cast (ptr Summaries) 0))
+      (analyze-uses! st)
+      (for k (range 0 n)
+        (let [begin (len (.edges local))
+              bits (local-argument! f st (get (.args f) k) (mut (.edges local)))]
+          (push! (mut (.bits local)) bits)
+          (push! (mut (.edge-count local)) (cir/u32-of (- (len (.edges local)) begin))))))))
+
+;;; Summaries for every function (function i defines `syms[i]` and contributes
+;;; `locals[i]`), to a fixpoint: start from each argument's local verdict and
+;;; weaken through call edges.
+(defn summarize-locals! [(sums (ptr Summaries)) (locals (slice Local)) (syms (slice u32))]
   (-> void)
   (let [(mut max) (: 0 i64)]
     (for s syms (when (>= (cir/i64-of s) max) (set! max (+ (cir/i64-of s) 1))))
@@ -1030,28 +1080,28 @@
     (fill-u32! (mut (.count sums)) max (: 0 u32))
     (clear! (mut (.flags sums))) (clear! (mut (.edge-first sums)))
     (clear! (mut (.edge-count sums))) (clear! (mut (.edges sums)))
-    (let [(mut local) (ArrayList::new [u8] (malloc-allocator))]
-      (for i (range 0 (len funcs))
-        (let [f (get funcs i)
+    (let [(mut initial) (ArrayList::new [u8] (malloc-allocator))]
+      (for i (range 0 (len locals))
+        (let [local (get locals i)
               symbol (cir/i64-of (get syms i))
-              n (len (.args f))]
+              n (len (.bits local))
+              (mut edge) 0]
           (set! (mut (.first sums)) symbol (cir/u32-of (+ (len (.flags sums)) 1)))
           (set! (mut (.count sums)) symbol (cir/u32-of n))
-          (let [(mut st) (state-new f (p/cast (ptr Summaries) 0))]
-            (analyze-uses! (mut st))
-            (for k (range 0 n)
-              (let [begin (cir/u32-of (len (.edges sums)))
-                    bits (local-argument! f (mut st) (get (.args f) k) (mut (.edges sums)))]
-                (push! (mut local) bits)
-                (push! (mut (.flags sums)) bits)
-                (push! (mut (.edge-first sums)) begin)
-                (push! (mut (.edge-count sums)) (- (cir/u32-of (len (.edges sums))) begin))))
-            (state-free! (mut st)))))
+          (for k (range 0 n)
+            (let [count (get (.edge-count local) k)]
+              (push! (mut initial) (get (.bits local) k))
+              (push! (mut (.flags sums)) (get (.bits local) k))
+              (push! (mut (.edge-first sums)) (cir/u32-of (len (.edges sums))))
+              (push! (mut (.edge-count sums)) count)
+              (for e (range edge (+ edge (cir/i64-of count)))
+                (push! (mut (.edges sums)) (get (.edges local) e)))
+              (set! edge (+ edge (cir/i64-of count)))))))
       (let [(mut changed) true]
         (while changed
           (set! changed false)
           (for slot (range 0 (len (.flags sums)))
-            (let [(mut bits) (get local slot)
+            (let [(mut bits) (get initial slot)
                   first (cir/i64-of (get (.edge-first sums) slot))]
               (for e (range first (+ first (cir/i64-of (get (.edge-count sums) slot))))
                 (let [edge (get (.edges sums) e)]
@@ -1059,7 +1109,7 @@
               (when (!= bits (get (.flags sums) slot))
                 (set! (mut (.flags sums)) slot bits)
                 (set! changed true))))))
-      (free! (mut local)))))
+      (free! (mut initial)))))
 
 ;;; Whether every argument fact in `after` still holds what `before` promised.
 (defn summaries-hold? [(before (ptr Summaries)) (after (ptr Summaries))] (-> bool)
@@ -1086,20 +1136,118 @@
 ;;; copies with argument summaries of the module as it stands, then summarizes
 ;;; again: rewrites may only strengthen facts (copies sunk out of PHIs remove
 ;;; uses that looked retaining), and a weakened fact is reported as an error.
-(defn forward-module! [(funcs (slice (ptr cir/Func))) (syms (slice u32))] (-> bool)
-  (let [(mut even) (summaries-new)
-        (mut odd) (summaries-new)
-        (mut ok) true]
-    (summarize! (mut even) funcs syms)
-    (for round (range 0 2)
+;;;
+;;; The work is three phases of per-function steps, each followed by a join:
+;;;
+;;;   phase 0  step: the function's local summary       join: summaries
+;;;   phase 1  step: forward with them, local summary   join: summaries, check
+;;;   phase 2  step: forward with those, local summary  join: summaries, check
+;;;
+;;; A step (module-forward-step!) reads the summaries of the last join and
+;;; reads and writes only its own function and that function's entries here,
+;;; so the steps of one phase may run in any order or at the same time; a
+;;; join (module-forward-join!) runs alone. What a step computes is a function
+;;; of its function's CIR and the summaries, so two cases are answered without
+;;; recomputing: a function the last forwarding left unchanged keeps its local
+;;; summary, and in phase 2 a function that phase 1 left unchanged, none of
+;;; whose direct callees' facts changed in between, is not forwarded again
+;;; (it would be the same computation that found nothing to do).
+(defstruct ModuleForward
+  [(funcs (slice (ptr cir/Func)))
+   (syms (slice u32))
+   (locals (ArrayList Local))
+   ; per function: whether the last forwarding of it changed it
+   (modified (ArrayList bool))
+   (current Summaries)
+   (next Summaries)
+   ; per symbol: a fact of it differs between the last two joins
+   (strengthened (ArrayList bool))
+   (any-strengthened bool)])
+
+(const MODULE-FORWARD-PHASES 3)
+
+(defn module-forward-new [(funcs (slice (ptr cir/Func))) (syms (slice u32))] (-> ModuleForward)
+  (let [a (malloc-allocator)
+        (mut locals) (ArrayList::new [Local] a)
+        (mut modified) (ArrayList::new [bool] a)]
+    (reserve! (mut locals) (len funcs))
+    (for i (range 0 (len funcs)) (push! (mut locals) (local-new)))
+    (fill-bool! (mut modified) (len funcs) false)
+    (ModuleForward :funcs funcs :syms syms :locals locals :modified modified
+                   :current (summaries-new) :next (summaries-new)
+                   :strengthened (ArrayList::new [bool] a) :any-strengthened false)))
+
+(defn module-forward-free! [(m (ptr ModuleForward))] (-> void)
+  (for i (range 0 (len (.locals m))) (local-free! (elem (mut (.locals m)) i)))
+  (free! (mut (.locals m))) (free! (mut (.modified m)))
+  (summaries-free! (field m current)) (summaries-free! (field m next))
+  (free! (mut (.strengthened m))))
+
+;;; Whether F calls a function one of whose facts changed at the last join.
+(defn calls-strengthened? [(m (ptr ModuleForward)) (f (ptr cir/Func))] (-> bool)
+  (let [(mut found) false]
+    (when (.any-strengthened m)
+      (for i (range 0 (len (.insts f)))
+        (let [x (cir/val f (get (.insts f) i))]
+          (when (and (= (cast i64 (.op x)) cir/OP-CALL) (>= (.imm x) 0)
+                     (< (.imm x) (len (.strengthened m)))
+                     (get (.strengthened m) (.imm x)))
+            (set! found true)))))
+    found))
+
+;;; SCRATCH is analysis storage of the calling thread (module-forward-scratch).
+(defn module-forward-step! [(m (ptr ModuleForward)) (scratch (ptr State)) (phase i64) (i i64)]
+  (-> void)
+  (let [f (get (.funcs m) i)
+        local (elem (mut (.locals m)) i)]
+    (if (= phase 0)
+        (local-summarize! scratch f local)
+        (when (or (= phase 1) (get (.modified m) i) (calls-strengthened? m f))
+          (let [(mut modified) false]
+            (forward-copies-in! scratch f (field m current) (mut modified))
+            (set! (mut (.modified m)) i modified)
+            (when modified (local-summarize! scratch f local)))))))
+
+(defn module-forward-scratch [] (-> State)
+  (state-new (p/cast (ptr cir/Func) 0) (p/cast (ptr Summaries) 0)))
+
+(defn module-forward-scratch-free! [(scratch (ptr State))] (-> void)
+  (state-free! scratch))
+
+;;; Close PHASE after every function's step of it: the summaries of the module
+;;; as it now stands become current. False when a fact was weakened (reported).
+(defn module-forward-join! [(m (ptr ModuleForward)) (phase i64)] (-> bool)
+  (summarize-locals! (field m next) (slice (.locals m)) (.syms m))
+  (let [(mut ok) true]
+    (when (> phase 0)
+      (unless (summaries-hold? (field m current) (field m next))
+        (report-weakened! (.funcs m) (.syms m) (field m current) (field m next))
+        (set! ok false))
       (when ok
-        (let [current (if (= (% round 2) 0) (p/cast (ptr Summaries) (mut even)) (p/cast (ptr Summaries) (mut odd)))
-              next (if (= (% round 2) 0) (p/cast (ptr Summaries) (mut odd)) (p/cast (ptr Summaries) (mut even)))]
-          (for f funcs (forward-copies-with! f current))
-          (summarize! next funcs syms)
-          (unless (summaries-hold? current next)
-            (report-weakened! funcs syms current next)
-            (set! ok false)))))
-    (summaries-free! (mut even))
-    (summaries-free! (mut odd))
+        ; both were built from the same functions: the layouts agree
+        (fill-bool! (mut (.strengthened m)) (len (.first (.next m))) false)
+        (set! (.any-strengthened m) false)
+        (for symbol (range 0 (len (.first (.next m))))
+          (let [first (get (.first (.next m)) symbol)]
+            (when (!= first (: 0 u32))
+              (for k (range 0 (cir/i64-of (get (.count (.next m)) symbol)))
+                (let [slot (+ (- (cir/i64-of first) 1) k)]
+                  (when (!= (get (.flags (.next m)) slot) (get (.flags (.current m)) slot))
+                    (set! (mut (.strengthened m)) symbol true)
+                    (set! (.any-strengthened m) true)))))))))
+    (let [previous (.current m)]
+      (set! (.current m) (.next m))
+      (set! (.next m) previous))
+    ok))
+
+(defn forward-module! [(funcs (slice (ptr cir/Func))) (syms (slice u32))] (-> bool)
+  (let [(mut m) (module-forward-new funcs syms)
+        (mut scratch) (module-forward-scratch)
+        (mut ok) true]
+    (for phase (range 0 MODULE-FORWARD-PHASES)
+      (when ok
+        (for i (range 0 (len funcs)) (module-forward-step! (mut m) (mut scratch) phase i))
+        (set! ok (module-forward-join! (mut m) phase))))
+    (module-forward-scratch-free! (mut scratch))
+    (module-forward-free! (mut m))
     ok))
