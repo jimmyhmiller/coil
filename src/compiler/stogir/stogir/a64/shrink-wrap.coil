@@ -19,6 +19,26 @@
 ;;; SWITCH stubs) observe that prologue, so no path enters an outside block
 ;;; without it.
 ;;;
+;;; With frame-split (see allocate/Assigned) there is a second frameless set,
+;;; the after region: blocks that qualify as above, closed under successors,
+;;; and reached from the entry region through such blocks alone. No path from
+;;; one comes back to code that needs the frame, so every transfer into one
+;;; from a block that runs with the frame releases it, after that edge's moves
+;;; (see function.edge!), and its RETURNs need no epilogue. A path through
+;;; both regions never builds the frame; any other path builds it at most once
+;;; and releases it at most once, as before. The after region replaces shared
+;;; return tails, which are the after-region blocks of a single RETURN.
+;;;
+;;; Releasing the frame before the RETURN must not be observable. Spill slots
+;;; and preserved registers are covered by the block test. Storage whose
+;;; address the program holds is not: a pointer into an ALLOCA, a variable or
+;;; the frame itself may have been copied anywhere before the frame is
+;;; released. So when the function has any such storage (addressable?), an
+;;; after-region block may not access memory at all (memory-opcode?); a
+;;; function whose frame holds only the compiler's own slots has no such
+;;; limit. With that, frame-split also wraps anchored frames (dynamic stack
+;;; objects): the release restores the fixed SP like any epilogue.
+;;;
 ;;; ignore-preserved answers whether preserved registers alone stand in the
 ;;; way: the allocator can then be asked to assign them late and retried.
 ;;;
@@ -48,6 +68,18 @@
       (and (>= opcode 82) (<= opcode 90))    ; AFREE..RSTORE
       (= opcode 95)                          ; TLS_ADDR
       (and (>= opcode 97) (<= opcode 103)))) ; VA_*, GUARD*, SNAPSHOT
+
+;;; Opcodes that create storage in the frame whose address the program holds:
+;;; ALLOCA, VADDR, FRAME_ADDR and the variadic cursor operations.
+(defn addressable-opcode? [(opcode i32)] (-> bool)
+  (or (= opcode 81) (= opcode 65) (= opcode 66)
+      (and (>= opcode 97) (<= opcode 100))))
+
+;;; Opcodes that read or write memory through an address held in a value:
+;;; LOAD and STORE forms, inline assembly and the atomic operations.
+(defn memory-opcode? [(opcode i32)] (-> bool)
+  (or (and (>= opcode 91) (<= opcode 94))
+      (and (>= opcode 122) (<= opcode 130))))
 
 ;;; A frame-address recipe: the value is recomputed from x29 or SP at each use.
 (defn frame-recipe? [(assigned allocate/Assigned) (value i32)] (-> bool)
@@ -109,7 +141,7 @@
           (if (or (not (needs-frame? assigned size))
                   (>= (.entry-slot assigned) 0)
                   (> (.alignment assigned) 16)
-                  (!= (.reg (.base assigned)) 31)
+                  (and (!= (.reg (.base assigned)) 31) (not (.frame-split assigned)))
                   (>= (.result-slot assigned) 0)
                   (= (len (.nodes scheduled)) 0)
                   (!= (n/opcode (get (.instructions graph)
@@ -159,7 +191,13 @@
                     (set! live (+ live (get pressure i)))
                     (when (> live 0)
                       (set! (mut bad) (cast i64 (get block-of (cast i64 (get (.nodes scheduled) i)))) true))))
+                ; A contiguous split at a block's own start is never emitted
+                ; there: incoming edges reconcile it (see function.coil).
                 (for move moves
+                  (unless (let [index (/ (.position move) 2)]
+                            (and (= (% (.position move) 2) 0) (>= index 0) (< index slots)
+                                 (= (get block-of (cast i64 (get (.nodes scheduled) index)))
+                                    (get (.nodes scheduled) index))))
                   (let [index (/ (.position move) 2)]
                     (when (and (>= index 0) (< index slots))
                       (set! (mut moved) (cast i64 (get block-of (cast i64 (get (.nodes scheduled) index)))) true)))
@@ -172,7 +210,7 @@
                                  (preserved? (cast i32 (.value (.destination move))))))
                     (let [index (/ (.position move) 2)]
                       (when (and (>= index 0) (< index slots))
-                        (set! (mut bad) (cast i64 (get block-of (cast i64 (get (.nodes scheduled) index)))) true)))))
+                        (set! (mut bad) (cast i64 (get block-of (cast i64 (get (.nodes scheduled) index)))) true))))))
                 (for reference (.nodes scheduled)
                   (let [opcode (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference))))
                         block (get block-of (cast i64 reference))]
@@ -192,7 +230,13 @@
                             (None [] 0)
                             (Some [input]
                                   (when (and (let [code (op/operand-code opcode (cast i32 i))]
-                                               (not (or (= code op/OPERAND-SRC) (= code op/OPERAND-LBL))))
+                                               ; Control links, and plain numbers (an
+                                               ; alignment, a probability, a register,
+                                               ; a name) that are not references at all
+                                               ; but may equal a recipe's.
+                                               (not (or (= code op/OPERAND-SRC) (= code op/OPERAND-LBL)
+                                                        (= code 1) (= code 5) (= code 7)
+                                                        (= code 10) (= code 13))))
                                              (frame-recipe? assigned input)
                                              (not (has-parts? assigned input)))
                                     (set! (mut bad) (cast i64 block) true)))))))
@@ -229,9 +273,76 @@
                 ; no moves, entered by ENDs both inside and outside the region.
                 ; Inside ENDs emit the tail in place without the frame.
                 (let [(mut shared) (ArrayList::new [bool] allocator)
+                      (mut after) (ArrayList::new [bool] allocator)
+                      (mut reached) (ArrayList::new [bool] allocator)
+                      split (and (.frame-split assigned) (get inside (cast i64 entry)))
                       (mut returns) false]
                   (fill/append! (mut shared) count false)
-                  (when (get inside (cast i64 entry))
+                  (fill/append! (mut reached) count false)
+                  (when split
+                    ; After region: good blocks all of whose successors are in
+                    ; it. A block outside removes its control predecessors;
+                    ; sweeping backward settles all but back edges at once.
+                    (fill/append! (mut after) count false)
+                    (for start starts
+                      (set! (mut after) (cast i64 start) (not (get bad (cast i64 start)))))
+                    ; Addressable frame storage: no memory access after release.
+                    (let [(mut addressable) false]
+                      (for reference (.nodes scheduled)
+                        (when (addressable-opcode?
+                                (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference)))))
+                          (set! addressable true)))
+                      (when addressable
+                        (for reference (.nodes scheduled)
+                          (when (memory-opcode?
+                                  (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference)))))
+                            (set! (mut after) (cast i64 (get block-of (cast i64 reference))) false)))))
+                    (let [(mut changed) true]
+                      (while changed
+                        (set! changed false)
+                        (let [(mut s) (- (len starts) 1)]
+                          (while (>= s 0)
+                            (let [start (get starts s)]
+                              (unless (get after (cast i64 start))
+                                (let [arity (cast i64 (get (.arities graph) (cast i64 start)))]
+                                  (for [i 1 (+ arity 1)]
+                                    (match (g/operand graph start (cast i32 i))
+                                      (None [] 0)
+                                      (Some [input]
+                                            (when (and (> input 0)
+                                                       (< (cast i64 input) count)
+                                                       (op/control? (cast i32 (n/opcode (get (.instructions graph)
+                                                                                             (cast i64 input)))))
+                                                       (> (get block-of (cast i64 input)) 0)
+                                                       (get after (cast i64 (get block-of (cast i64 input)))))
+                                              (set! (mut after) (cast i64 (get block-of (cast i64 input))) false)
+                                              (set! changed true))))))))
+                            (set! s (- s 1))))))
+                    ; Reached: after-region blocks outside the entry region
+                    ; with a predecessor in the entry region or already reached.
+                    (let [(mut changed) true]
+                      (while changed
+                        (set! changed false)
+                        (for start starts
+                          (when (and (get after (cast i64 start))
+                                     (not (get inside (cast i64 start)))
+                                     (not (get reached (cast i64 start))))
+                            (let [arity (cast i64 (get (.arities graph) (cast i64 start)))]
+                              (for [i 1 (+ arity 1)]
+                                (match (g/operand graph start (cast i32 i))
+                                  (None [] 0)
+                                  (Some [input]
+                                        (when (and (> input 0)
+                                                   (< (cast i64 input) count)
+                                                   (op/control? (cast i32 (n/opcode (get (.instructions graph)
+                                                                                         (cast i64 input)))))
+                                                   (> (get block-of (cast i64 input)) 0)
+                                                   (not (get reached (cast i64 start)))
+                                                   (let [from (cast i64 (get block-of (cast i64 input)))]
+                                                     (or (get inside from) (get reached from))))
+                                          (set! (mut reached) (cast i64 start) true)
+                                          (set! changed true)))))))))))
+                  (when (and (not split) (get inside (cast i64 entry)))
                     (for start starts
                       (when (and (not (get inside (cast i64 start)))
                                  (not (get bad (cast i64 start)))
@@ -268,20 +379,27 @@
                       (when (and (= (n/opcode (get (.instructions graph) (cast i64 reference))) 120)
                                  (get inside (cast i64 (get block-of (cast i64 reference)))))
                         (set! returns true))))
+                  (when split
+                    (for reference (.nodes scheduled)
+                      (when (and (= (n/opcode (get (.instructions graph) (cast i64 reference))) 120)
+                                 (let [block (cast i64 (get block-of (cast i64 reference)))]
+                                   (or (get inside block) (get reached block))))
+                        (set! returns true))))
                   (when returns
                     (fill/append! (mut result) count (: 0 u8))
                     (for reference (.nodes scheduled)
                       (let [block (cast i64 (get block-of (cast i64 reference)))]
                         (cond (get inside block) (set! (mut result) (cast i64 reference) (: 1 u8))
                               (get shared block) (set! (mut result) (cast i64 reference) (: 2 u8))
+                              (get reached block) (set! (mut result) (cast i64 reference) (: 3 u8))
                               :else 0))))
-                  (free! (mut shared)))
+                  (free! (mut shared)) (free! (mut after)) (free! (mut reached)))
                 (free! (mut block-of)) (free! (mut pressure)) (free! (mut bad))
                 (free! (mut inside)) (free! (mut starts)) (free! (mut moved))
                 (Ok result)))))))
 
 ;;; Region state of reference R: 0 outside (or disabled), 1 inside, 2 a shared
-;;; return tail that inside ENDs emit in place.
+;;; return tail that inside ENDs emit in place, 3 in the after region.
 (defn state [(region (slice u8)) (r i32)] (-> u8)
   (if (and (> (len region) 0) (> r 0) (< (cast i64 r) (len region)))
       (get region (cast i64 r)) (: 0 u8)))
@@ -289,3 +407,9 @@
 (defn frameless? [(region (slice u8)) (r i32)] (-> bool) (= (state region r) 1))
 
 (defn shared-tail? [(region (slice u8)) (r i32)] (-> bool) (= (state region r) 2))
+
+(defn after? [(region (slice u8)) (r i32)] (-> bool) (= (state region r) 3))
+
+;;; Whether R runs without the frame: in the entry region or the after region.
+(defn unframed? [(region (slice u8)) (r i32)] (-> bool)
+  (let [s (state region r)] (or (= s 1) (= s 3))))
