@@ -401,7 +401,7 @@ Why the object is identical for any thread count and scheduling:
 
 Each worker item has its own `ScratchArena` over the process allocator. In emission the arena owns the image and is closed by the merging thread after the merge; in preparation it holds the adapted and optimized graph until the commit has copied the definition into the module. At most `lead` items are outstanding per stage, which bounds the retained arenas.
 
-Option. `COIL_STOGIR_THREADS=N` (1 to 64; anything else is a hard error) sets the number of workers; 1 is the serial path, with no thread started. Unset, it is the online processors, at most eight. `COIL_TPDE_SERIAL` (set to anything) always selects the serial path, as it does for TPDE. While `COIL_CODEGEN_TIMINGS` is on and `COIL_STOGIR_THREADS` is unset the path is also serial, because those records are summed as serial CPU time (`docs/benchmarks/idioms/tools/mkhost-env.sh` sets `COIL_TPDE_SERIAL=1` and keeps its meaning). With both `COIL_CODEGEN_TIMINGS` and an explicit `COIL_STOGIR_THREADS` above one, the parallel stages each contribute one record of elapsed time, so the sum is the wall-clock time of generation. Levels one and two do not build a module and keep the two-stage lowering/compiling pipeline shared with TPDE.
+Option. `COIL_STOGIR_THREADS=N` (1 to 64; anything else is a hard error) sets the number of workers; 1 is the serial path, with no thread started. Unset, it is the online processors, at most eight. It is read by `execution-read`, beside `settings-read` and through the same readers, into a separate `Execution` structure that is never rendered into a unit's key: the worker count cannot change the object, so a cached unit is reused across counts (`scripts/tests/stogir-unit-settings.py` checks both that and that every `Settings` field is in the key). `COIL_TPDE_SERIAL` (set to anything) always selects the serial path, as it does for TPDE. While `COIL_CODEGEN_TIMINGS` is on and `COIL_STOGIR_THREADS` is unset the path is also serial, because those records are summed as serial CPU time (`docs/benchmarks/idioms/tools/mkhost-env.sh` sets `COIL_TPDE_SERIAL=1` and keeps its meaning). With both `COIL_CODEGEN_TIMINGS` and an explicit `COIL_STOGIR_THREADS` above one, the parallel stages each contribute one record of elapsed time, so the sum is the wall-clock time of generation. Levels one and two do not build a module and keep the two-stage lowering/compiling pipeline shared with TPDE.
 
 Measurements (November 10, 2026; the compiler workload, `coil build src/compiler/main.coil --backend stogir -O3 --no-debug` and `emit-obj` of the same with `COIL_CODEGEN_TIMINGS=1`, run by the LLVM-built candidate; minimum of three on a machine shared with other jobs, load average about 6, so the ratios mean more than the seconds):
 
@@ -416,3 +416,45 @@ Measurements (November 10, 2026; the compiler workload, `coil build src/compiler
 Serial generation by stage, from one instrumented run (seconds): copy forwarding 0.35, template preparation 1.01 (about 0.4 of it adaptation), finalization 1.38, emission planning 0.59, native leaf cache 0.14, emission 3.38. With eight workers what is left is about 2.9 s of serial stages plus the parallel ones at about 0.4 s, so generation is 2.0x faster and the build 1.32x; about 7.5 s of the build is not Stogir generation at all (parsing, checking, lowering to CIR, object writing, linking). The serial path costs what it did: 156.45B generator instructions against 156.51B before (`COIL_TPDE_SERIAL=1`, minimum of three). The object of the compiler workload is the same file at 1, 2, 4, 8 and the default number of workers (five runs each), in the stage-two and stage-three self builds, and under ThreadSanitizer (`--sanitize=thread` build of the compiler, eight workers, no report; a deliberately unsynchronized counter in the worker is reported). `scripts/tests/stogir-parallel-emission.py` checks identity and the settings on a generated 400-function module.
 
 What stays serial, and what moving it would take. Finalization and emission planning both expand call sites through `inlining/Registry`, which registers snapshots and fills a bounded specialization cache as it goes; running templates of one call-graph level concurrently needs an expansion entry that only reads the registry, with registration and cache insertion done afterwards in a fixed order, and planning additionally discovers which bodies exist as it goes. Adaptation creates import symbols in the assembler; recording the names and binding them at the commit would let it move to the workers. None of that is done here.
+
+### Against the 5x target (November 10, 2026, later)
+
+The target is Stogir generation wall time at one fifth of the LLVM backend's on the compiler workload. `coil build --timings` reports both directly. LLVM: `backend.llvm-lower` 0.73 s (serial lowering into eight partitions) plus `backend.parallel.workers` 4.90 s wall (30.6 s of worker CPU), 5.63 s together, so the target is about 1.13 s. Stogir's comparable span is `backend.tpde-object`: 3.57 s with eight workers. By stage, from an instrumented compiler on the same workload (seconds; the machine was shared):
+
+| Stage | serial | 8 workers | state |
+|---|---|---|---|
+| lowering to CIR (Coil side, before the adapter) | 0.43 | 0.43 | serial |
+| copy forwarding | 0.32 | 0.32 | serial |
+| template preparation | 0.99 | 0.34 | SCCP on workers; adaptation and commit serial |
+| finalization | 1.37 | 1.37 | serial |
+| emission planning | 0.60 | 0.58 | serial |
+| native leaf cache | 0.13 | 0.13 | serial |
+| emission | 3.52 | 0.51 (0.45 with 12) | images on workers; the merging thread is busy 0.05 to 0.09 s of it |
+| writing the module into the object | 0.01 | 0.01 | serial |
+| total | 7.37 | 3.70 | |
+
+All of generation is 7.4 s of CPU, so eight workers scaling perfectly would give 0.92 s. The target therefore needs about 97% of the work on workers at better than 7x, which means every serial row above has to move, including the two that are not Stogir's (CIR lowering and copy forwarding). Emission shows what the mechanism achieves when a stage is fully on workers: 6.9x with eight, 7.8x with twelve. With only finalization and planning moved at that scaling the total would be about 2.0 s; with adaptation as well, about 1.7 s; the last 0.75 s is Coil-side lowering and copy forwarding. So this design reaches the target only if those are parallelized too; it is not reached here.
+
+What finalization needs, measured on this workload (18,387 definitions in finalization order):
+
+- The registry's specialization cache stops changing early. It admits 128 creation attempts in total; the 128th happens at position 1,228 of 18,387, after 4% of the stage's time. From then on `context-for!` can only select an existing context, so expansion reads the registry and (apart from a memo cell, `closed`, which caches a pure predicate) writes nothing. Running the first part serially until `context-attempts` reaches 128 and everything after it on workers keeps the cache, and so the object, exactly as today. A module that never reaches 128 attempts would stay serial.
+- The work is almost independent: with each definition waiting only for the definitions it calls, the longest dependency chain is 0.2% of the stage's time. But committing results in finalization order and letting a definition start only when its callees are committed loses nearly all of that (a simulation of the measured costs gives 1.6x with eight workers), because the order takes the lowest-numbered ready definition and so puts callers directly behind their callees. Letting a definition start when its callees' tasks are done gives 5.6x with eight in the same simulation.
+- That needs two versions of a definition to be visible at once. The 3,538 definitions that are not templates (cycle members and everything that calls into a cycle, a third of the stage's time) read the effect records of definitions later in the order as they were before finalization, and of earlier ones as finalized. So workers must publish results into a side table and read a callee's entry by position, with the module's own list untouched until a serial install at the end.
+- In the library: a test that the cache is closed; an expansion entry that takes each site's callee as an explicit frozen snapshot (or a handle registered before the parallel part), never appends to the registry and does not write `closed`; and a way to build a registry snapshot on a worker and append it later in O(1), so that registration is not a per-definition copy on the submitting thread.
+
+Emission planning expands through the same registry after it is closed, so the same entry serves it; its order of discovery fixes the order in which bodies are adapted and therefore assembler symbol numbers, which is the same problem as adaptation: `symbol!` creates assembler symbols as it meets names, and SHIMCALL thunks are defined there. Moving adaptation to workers means recording the names a function needs and binding them at the commit in submission order.
+
+None of the steps in this subsection is implemented.
+
+Generation wall time on the merged base (`coil build --timings`, minimum of two to three runs, load average about 7; Stogir is `backend.tpde-object`, LLVM is `backend.llvm-lower` plus `backend.parallel.workers`):
+
+| | generation, wall s | whole build, wall s | whole build, CPU s |
+|---|---|---|---|
+| Stogir, 1 worker | 6.88 | 14.29 | 14.4 |
+| Stogir, 2 | 4.65 | 12.06 | 14.5 |
+| Stogir, 4 | 3.75 | 11.44 | 15.0 |
+| Stogir, 8 (default) | 3.46 | 11.17 | 15.5 |
+| Stogir, 12 | 3.41 | 10.89 | 15.6 |
+| LLVM, 8 partitions | 5.66 | 13.31 | 39.9 |
+
+So generation is 1.63x faster than LLVM's in wall time today, against a target of 5x.
