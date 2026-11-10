@@ -1,0 +1,183 @@
+;;; Keep values out of preserved registers where the function runs frameless.
+;;;
+;;; The caller supplies the spans of the schedule expected to run with the
+;;; frame built (a64.frame-spans); every call lies in one. Before the scan, a
+;;; value that lives through a call and is also live outside the spans is cut
+;;; in two: its lifetime inside the spans becomes one child part, and the rest
+;;; stays behind with lifetime holes there. The rest crosses no call, so the
+;;; scan can give it one call-clobbered register for all the frameless code;
+;;; the child is allocated like any value that crosses a call. Spans are whole
+;;; blocks, so the value changes location only on CFG edges between frameless
+;;; and framed code, which edge reconciliation already lowers: a transfer into
+;;; the child's location where the frame is built, and one back to the rest's
+;;; register at any merge where framed code rejoins frameless code. A path
+;;; builds the frame at most once (see a64.shrink-wrap), so each transfer runs
+;;; at most once per entry.
+;;;
+;;; A value that lives only inside the spans is left alone, as is one that
+;;; crosses no call or crosses one outside every span.
+(module stogir.allocation-spans)
+(export cut!)
+(import "stogir.allocation" :as a)
+(import "stogir.interval" :as range)
+(import "stogir.constraints" :as c)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+
+;;; Index of the first call position at or after position.
+(defn first-call [(calls (slice i64)) (position i64)] (-> i64)
+  (let [(mut lo) 0 (mut hi) (len calls)]
+    (while (< lo hi)
+      (let [mid (+ lo (/ (- hi lo) 2))]
+        (if (< (get calls mid) position) (set! lo (+ mid 1)) (set! hi mid))))
+    lo))
+
+;;; Index of the span holding position, or -1.
+(defn within [(spans (slice range/Range)) (position i64)] (-> i64)
+  (let [(mut lo) 0 (mut hi) (len spans)]
+    (while (< lo hi)
+      (let [mid (+ lo (/ (- hi lo) 2))]
+        (if (<= (.end (get spans mid)) position) (set! lo (+ mid 1)) (set! hi mid))))
+    (if (and (< lo (len spans)) (<= (.start (get spans lo)) position)) lo -1)))
+
+;;; Move the stretches of part inside spans into a new part, with the
+;;; constraints positioned there. The original keeps the rest, holes included.
+(defn carve! [(part (ptr a/Part)) (spans (slice range/Range)) (allocator (dyn Allocator))]
+  (-> a/Part)
+  (let [(mut child) (a/create (.parent part) allocator)
+        (mut kept) (ArrayList::new [range/Range] allocator)
+        (mut kept-uses) (ArrayList::new [c/Use] allocator)
+        (mut next) (: 0 i64)]
+    (set! (.allowed child) (.allowed part))
+    (set! (.spill-slot child) (.spill-slot part))
+    (set! (.preferred child) (.preferred part))
+    (set! (.hint child) (.hint part))
+    (let [items-104 (.ranges part) (mut for-index-104) (: 0 i64)] (while (< for-index-104 (len items-104)) (let [live (get items-104 for-index-104)]
+      (let [(mut cursor) (.start live)]
+        (while (and (< next (len spans)) (<= (.end (get spans next)) cursor))
+          (set! next (+ next 1)))
+        ; Spans overlapping this range, in order; the last may reach past it
+        ; into later ranges, so it is not consumed here.
+        (let [(mut k) next]
+          (while (and (< k (len spans)) (< (.start (get spans k)) (.end live)))
+            (let [span (get spans k)
+                  lo (if (> (.start span) cursor) (.start span) cursor)
+                  hi (if (< (.end span) (.end live)) (.end span) (.end live))]
+              (when (< cursor lo)
+                (push! (mut kept) (range/Range :start cursor :end lo)))
+              (push! (mut (.ranges child)) (range/Range :start lo :end hi))
+              (set! cursor hi))
+            (set! k (+ k 1))))
+        (when (< cursor (.end live))
+          (push! (mut kept) (range/Range :start cursor :end (.end live)))))) (set! for-index-104 (+ for-index-104 1))))
+    (let [items-103 (.uses part) (mut for-index-103) (: 0 i64)] (while (< for-index-103 (len items-103)) (let [use (get items-103 for-index-103)]
+      (if (>= (within spans (.position use)) 0)
+          (push! (mut (.uses child)) use)
+          (push! (mut kept-uses) use))) (set! for-index-103 (+ for-index-103 1))))
+    (free! (mut (.ranges part)))
+    (free! (mut (.uses part)))
+    (set! (.ranges part) kept)
+    (set! (.uses part) kept-uses)
+    child))
+
+;;; Whether a lifetime passes through a call inside [start, end): one of its
+;;; ranges holds both q - 1, where the call at the odd position q reads its operands,
+;;; and q, where its results appear (adjacent ranges are merged).
+(defn crosses? [(ranges (ArrayList range/Range)) (calls (slice i64)) (start i64) (end i64)]
+  (-> bool)
+  (let [(mut k) (first-call calls start)
+        (mut found) false]
+    (while (and (not found) (< k (len calls)) (< (get calls k) end))
+      (let [q (get calls k)]
+        (when (and (range/covers? ranges q) (range/covers? ranges (- q 1)))
+          (set! found true)))
+      (set! k (+ k 1)))
+    found))
+
+;;; calls are the ascending odd definition positions of the function's calls;
+;;; spans the ascending, disjoint framed spans; last the ascending blocks
+;;; inside them after which no call follows. A part is cut when it lives
+;;; through a call and is also live outside the spans. Its child takes its
+;;; lifetime inside the spans, except in the blocks of last whose call it does
+;;; not live through: nothing later needs it preserved, and no path leads from
+;;; there back to a block where its child lives. Parents of cut parts are
+;;; appended to parents in part order. Returns the number of parts cut.
+;;; Reservations, assigned parts and empty parts are never cut, nor is a part
+;;; that lives through a call outside every span.
+(defn cut! [(parts (mut (ArrayList a/Part)))
+            (calls (slice i64))
+            (spans (slice range/Range))
+            (last (slice range/Range))
+            (parents (mut (ArrayList i32)))
+            (allocator (dyn Allocator))] (-> i32)
+  (let [original (len parts)
+        (mut made) (: 0 i32)
+        (mut pieces) (ArrayList::new [range/Range] allocator)
+        ; Whether some call lies outside every span; otherwise the first
+        ; crossed call settles a part.
+        (mut stray) false]
+    (let [items-102 calls (mut for-index-102) (: 0 i64)] (while (< for-index-102 (len items-102)) (let [call (get items-102 for-index-102)] (when (< (within spans call) 0) (set! stray true))) (set! for-index-102 (+ for-index-102 1))))
+    (when (and (> (len calls) 0) (> (len spans) 0))
+      (for [index 0 original]
+        (let [part (at parts index)
+              count (len (.ranges part))]
+          (when (and (>= (.parent part) 0) (< (.register part) 0) (> count 0)
+                     ; No call inside the bounding span: nothing is crossed.
+                     (let [k (first-call calls (+ (.start (at (.ranges part) 0)) 1))]
+                       (and (< k (len calls))
+                            (< (get calls k) (.end (at (.ranges part) (- count 1)))))))
+            (let [(mut crossed) false
+                  (mut whole) false
+                  (mut outside) false]
+              (let [items-101 (.ranges part) (mut for-index-101) (: 0 i64)] (while (< for-index-101 (len items-101)) (let [live (get items-101 for-index-101)]
+                (let [(mut k) (first-call calls (+ (.start live) 1))]
+                  (while (and (not whole) (or stray (not crossed))
+                              (< k (len calls)) (< (get calls k) (.end live)))
+                    (if (< (within spans (get calls k)) 0)
+                        (set! whole true)
+                        (set! crossed true))
+                    (set! k (+ k 1))))
+                ; Live outside the spans: before the span holding its start,
+                ; or past that span's end.
+                (unless outside
+                  (let [span (within spans (.start live))]
+                    (when (or (< span 0) (< (.end (get spans span)) (.end live)))
+                      (set! outside true))))) (set! for-index-101 (+ for-index-101 1))))
+              (when (and crossed outside (not whole))
+                ; The spans the part meets, less the last blocks it only
+                ; dies in.
+                (clear! (mut pieces))
+                (let [first (.start (at (.ranges part) 0))
+                      final (.end (at (.ranges part) (- count 1)))
+                      (mut s) (let [(mut lo) 0 (mut hi) (len spans)]
+                                (while (< lo hi)
+                                  (let [mid (+ lo (/ (- hi lo) 2))]
+                                    (if (<= (.end (get spans mid)) first)
+                                        (set! lo (+ mid 1)) (set! hi mid))))
+                                lo)
+                      (mut t) (let [(mut lo) 0 (mut hi) (len last)]
+                                (while (< lo hi)
+                                  (let [mid (+ lo (/ (- hi lo) 2))]
+                                    (if (<= (.end (get last mid)) first)
+                                        (set! lo (+ mid 1)) (set! hi mid))))
+                                lo)]
+                  (while (and (< s (len spans)) (< (.start (get spans s)) final))
+                    (let [span (get spans s)
+                          (mut cursor) (.start span)]
+                      (while (and (< t (len last)) (< (.start (get last t)) (.end span)))
+                        (let [block (get last t)]
+                          (when (and (>= (.start block) cursor)
+                                     (not (crosses? (.ranges part) calls (.start block) (.end block))))
+                            (when (< cursor (.start block))
+                              (push! (mut pieces) (range/Range :start cursor :end (.start block))))
+                            (set! cursor (.end block))))
+                        (set! t (+ t 1)))
+                      (when (< cursor (.end span))
+                        (push! (mut pieces) (range/Range :start cursor :end (.end span)))))
+                    (set! s (+ s 1))))
+                (let [child (carve! (elem (mut parts) index) (slice pieces) allocator)]
+                  (push! (mut parts) child)
+                  (push! (mut parents) (.parent (at parts index)))
+                  (set! made (+ made 1)))))))))
+    (free! (mut pieces))
+    made))
