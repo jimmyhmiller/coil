@@ -470,3 +470,44 @@ Template preparation is bound by its submitting thread, not by the workers: at e
 Where the generator's instructions go. One SCCP run (30,652 on this workload) walks its graph for structure about four times (entry, block construction in memory promotion, analysis input, the rewritten graph, the final graph: 147K structure walks, the largest single function at 4% of generation in the LLVM-built compiler), builds a use index two to three times, and 77% of runs end in a compaction. Every one of those checks is on a graph edited since the previous one; a run whose input was already proven happens 48 times. List growth is about 20M reallocations (6% of generation), spread over hundreds of sites, the largest being per-value range and use lists in allocation. No single remaining item is above 1%.
 
 Output-preserving savings (library `feature/idiom-cpu`): compaction's refusal test and its keep set read every operand in one walk (`compact/compact-checked`) and kept cells are copied a run at a time, 72.87B to 72.57B (0.4%); tail splitting decides whether any RETURN will be split before it copies the graph (about 5M instructions; 58% of its candidates were copied and then declined).
+
+### Finalization, planning and adaptation on workers (November 10, 2026, afternoon)
+
+The three stages that the subsection above left serial now run their per-function work on worker threads. The object is the serial path's at every worker count; nothing about the serial path changed.
+
+**Finalization** (`module-finish!`, `finish-parallel!`, `Finishing`). The serial loop runs until the registry's specialization cache is closed (`inlining/registry-closed?`: its 128 creation attempts are spent; on the compiler workload after 1,228 of 18,387 definitions). Up to there the cache is filled in finalization order as before. The remaining definitions are finalized by workers:
+
+- A worker expands through `inlining/optimize-frozen-specialized-policy`, which reads the closed registry and writes nothing, and builds the registry snapshot of its result itself (`inlining/snapshot-create`, in its own arena) instead of registering it.
+- The serial loop reads a definition before the current one as finalized and one after it as it was before finalization (the 3,538 definitions outside the acyclic order call later ones). Workers keep that: the module's list is not written while they run; a worker writes its result into a side table and reads another definition's version by position (`visible`). A later definition that has no registry handle is read through a borrowed snapshot made before the workers start.
+- A definition starts when the earlier definitions it calls have finished, not when everything before it has. It cannot come to read any other unfinished definition, because a clone only brings calls of definitions that precede the cloned one, and those finished before it; a read of an unfinished entry is checked and is a hard error, not a wait.
+- When the workers have stopped, the results are installed in finalization order and the registry adopts each new snapshot in O(1) (`inlining/registry-adopt!`).
+- A worker never writes, releases or reallocates anything the module owns: its graph is borrowed, its lists are copies, everything it keeps lives in its own arena, which the module releases after the registry.
+
+A module that never spends the 128 attempts is finalized serially as before. No formulation was found that keeps the bytes while the cache is still open: which specializations exist then depends on the order of the attempts.
+
+Threads. `COIL_STOGIR_THREADS=N` is still the number of worker threads. In finalization the pipeline thread is one more worker, and in template preparation and planning it runs unclaimed tasks itself whenever it would otherwise wait for a worker (`Pool` `helping`, `pool-await!`), so with two workers these stages use three threads. A task runs once whoever takes it. Emission is unchanged: its submitting thread only merges.
+
+**Emission planning** (`stogir-emission-plan`, `planning-*`). Planning walks the functions reachable from the module's roots in discovery order, and preparing a function's body is what discovers more. The functions discovered and not yet prepared form a wave: workers prepare their bodies (the final expansion through the read-only registry entry, and for a function without a template its adaptation and optimization), and when the whole wave is done the driver commits it in discovery order, which appends the next wave exactly as the serial walk does. On the compiler workload there are 24 waves; the first six hold 7,686 of the functions. Planning is serial when the registry is still open.
+
+**Adaptation** (in planning and in template preparation). An adapted graph contains the numbers of the assembler symbols it names, and adaptation creates the symbol of a runtime routine (memmove, the 128-bit division helpers) on first use, so those numbers depend on the order of adaptation. A worker adapts with the assembler read-only (`Adapter` `lookup-only`): it finds existing symbols and SHIMCALL thunks and creates none. A symbol it finds was created at the commit of an earlier function, so it has the number the serial path gives it. If one is missing, the worker's result is void and the commit prepares that function again serially, at its place in the order, where the symbol is created as on the serial path (about 14 functions of the compiler workload in template preparation, none of the planned bodies). In template preparation commits run while workers adapt later functions, so the workers' reads of the assembler and of the thunk table and the commits' additions take one mutex, and `prepare-note!` (which defines thunks) moved from submission to the commit, keeping thunks and runtime symbols in the serial order. In planning no worker runs during a wave's commits and no lock is needed. Which functions are prepared twice can depend on timing in template preparation; what is committed cannot.
+
+Evidence, on the compiler workload (R): the object is the same file on the serial path and with 1, 2, 4, 8, 12 and the default number of workers, five runs each; in a `--debug-checks` build of the compiler with 8 and 3 workers; under ThreadSanitizer with 8 workers (no report); the fixed seed object is reproduced by the host built from it; stage 2 equals stage 3 (also against a serial stage 3). `scripts/tests/stogir-parallel-emission.py` has a module that closes the cache, has a call cycle, and has functions that are the first to need a runtime routine in each stage; it checks through `COIL_TRACE` counts that workers finalized, that planning ran in waves, and that both stages prepared some function again. The 28 other benchmark programs give the same object serially and with 3 and 8 workers.
+
+Stage wall time (`coil build --timings`, spans `backend.stogir.*` under `backend.tpde-object`; milliseconds, minimum of 3 runs, base and new alternating; the machine was heavily shared, load average 13 to 52, so the twelve-worker column in particular is noise-bound):
+
+| Stage | | 1 | 2 | 4 | 8 | 12 workers |
+|---|---|---|---|---|---|---|
+| template preparation | before | 1029 | 383 | 315 | 355 | 358 |
+| | after | 1034 | 358 | 265 | 145 | 194 |
+| finalization | before | 1446 | 1433 | 1440 | 1424 | 1423 |
+| | after | 1434 | 549 | 397 | 253 | 303 |
+| emission planning | before | 617 | 628 | 626 | 598 | 610 |
+| | after | 616 | 212 | 153 | 91 | 101 |
+| all of `backend.tpde-object` | before | 7376 | 4961 | 4062 | 3683 | 3638 |
+| | after | 7258 | 3629 | 2473 | 1674 | 1959 |
+
+"Before" is the same base with only the stage spans added. The other stages did not change (copy forwarding about 325, native leaf cache about 137, emission 3,400 to 480). With eight workers the three stages together take 0.49 s where they took 2.38 s, and generation 1.67 s against a target of 1.09 s; what is left is copy forwarding, the leaf cache, emission and the Coil-side work outside these spans (about 0.26 s).
+
+Serial generator cost is unchanged: 156.72B instructions for the whole `emit-obj` on the serial path against 156.68B for the base (runs vary by 0.3B). Peak resident memory of the whole `emit-obj`: 4.66 GB serially (as before), 4.89 to 5.07 GB with eight workers (the base measured 5.20 GB in one run), 5.3 to 5.6 GB with twelve.
+
+What limits these stages now is their total CPU time (about 1.0 s, 1.3 s and 0.6 s serially), not serial sections: of finalization's wall time with eight workers about 45 ms is the serial prefix up to the closing of the cache, 25 ms ordering and scheduling, and the rest workers. In template preparation the submitting thread (commits) and the workers are about equally loaded.
