@@ -6,7 +6,7 @@
 (import "coil.scratch" :as scratch)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.hashmap" :use [HashMap])
-(import "coil.str" :as str :use [keyops-borrowed])
+(import "coil.str" :as str :use [keyops keyops-borrowed])
 (import "coil.result" :use *)
 (import "coil.cc" :as cc)
 
@@ -76,7 +76,10 @@
    (import-ids (ArrayList u32))
    ; g belongs to a frozen definition: an expansion replaces it without
    ; releasing it, and then owns its result as usual.
-   (borrowed bool)])
+   (borrowed bool)
+   ; The module's :shim thunks by convention key (shim-thunk!), or null when
+   ; the function is compiled outside a module.
+   (shims (ptr (HashMap (slice u8) u32)))])
 
 (defn require [(s (ptr Adapter)) (result (Result i32 (slice u8)))] (-> i32)
   (match result (Ok [r] r) (Err [message] (fail (.name (.f s)) message))))
@@ -419,6 +422,192 @@
          (= (.binding target) 1)
          (or (= name "_memcmp") (= name "_bcmp"))
          (groups/builtin-shape? groups/BUILTIN-COMPARE (cast u8 result) types))))
+
+;;; A call under a :shim convention (CIR SHIMCALL) pins each argument to a named
+;;; general register, names the result register and an exact clobber set, and
+;;; either calls a symbol or runs bytes held in place of the call. The library
+;;; knows the C register assignment only, so the call goes through a thunk that
+;;; is itself a C function: arguments (and, for a called symbol, its address
+;;; last) arrive in x0.., the thunk moves them to the pinned registers and
+;;; returns the result register in x0. One thunk serves every call with the
+;;; same registers, result, clobbers and bytes.
+
+;;; What distinguishes one thunk from another: argument registers in order, the
+;;; result register, the clobber mask, and the inline bytes (none: the target
+;;; address is the last argument).
+(defn shim-key [(f (ptr cir/Func)) (x (ptr cir/Value)) (a (dyn Allocator))]
+  (-> (ArrayList u8))
+  (let [(mut key) (ArrayList::new [u8] a)]
+    (push! (mut key) (cast u8 (.nops x)))
+    (for [i 0 (cast i64 (.nops x))]
+      (push! (mut key) (cast u8 (get (.argflags f) (+ (cast i64 (.opb x)) i)))))
+    (push! (mut key) (.aux x))
+    (for [i 0 8]
+      (push! (mut key) (cast u8 (& (>> (p/cast u64 (.imm2 x)) (cast u64 (* i 8))) 255))))
+    (push! (mut key) (if (>= (.imm x) 0) (: 0 u8) 1))
+    (when (< (.imm x) 0)
+      (for [k (cast i64 (.block x)) (+ (cast i64 (.block x)) (cast i64 (.next x)))]
+        (push! (mut key) (get (.bytes f) k))))
+    key))
+
+(defn shim-word! [(code (mut (ArrayList u8))) (word u32)] (-> void)
+  (for [i 0 4]
+    (push! (mut code) (cast u8 (& (>> word (cast u32 (* i 8))) 255)))))
+
+;;; The thunk's machine code for the SHIMCALL X of F (AArch64).
+;;;   stp x29, x30, [sp, #-16]! ; mov x29, sp
+;;;   push each of x19..x28 the convention may change (pinned, result, clobbered)
+;;;   store x0.. to a stack area, load each pinned register from it (the
+;;;     assignment is a parallel move), and the target into a free scratch
+;;;   blr scratch, or the inline bytes
+;;;   mov x0, result ; pops ; ldp x29, x30, [sp], #16 ; ret
+;;; Every other register the convention clobbers is one a C call may change.
+(defn shim-code [(f (ptr cir/Func)) (x (ptr cir/Value)) (a (dyn Allocator))]
+  (-> (ArrayList u8))
+  (let [(mut code) (ArrayList::new [u8] a)
+        (mut saved) (ArrayList::new [u32] a)
+        name (.name f)
+        n (cast i64 (.nops x))
+        indirect (>= (.imm x) 0)
+        slots (+ n (if indirect 1 0))
+        area (* 16 (/ (+ slots 1) 2))
+        result (cast i64 (.aux x))
+        (mut pinned) (: 0 u64)
+        (mut changed) (p/cast u64 (.imm2 x))
+        (mut scratch) (: -1 i64)]
+    (when (> slots 8)
+      (fail name "a :shim call with more than eight register arguments (seven and a called symbol) is not implemented"))
+    (for [i 0 n]
+      (let [r (cast i64 (get (.argflags f) (+ (cast i64 (.opb x)) i)))]
+        (when (or (< r 0) (> r 28) (= r 18))
+          (fail name "a :shim argument register must be x0..x17 or x19..x28"))
+        (when (!= (& pinned (<< (: 1 u64) (cast u64 r))) 0)
+          (fail name "a :shim convention names one register for two arguments"))
+        (set! pinned (| pinned (<< (: 1 u64) (cast u64 r))))))
+    (when (and (!= result 255) (or (> result 30) (= result 18)))
+      (fail name "a :shim result register must be a general register other than x18"))
+    (when (!= (& changed (: 0xFFFFFFFF80040000 u64)) 0)
+      (fail name "a :shim convention may clobber general registers other than x18 and sp only"))
+    (set! changed (| changed pinned))
+    (when (!= result 255) (set! changed (| changed (<< (: 1 u64) (cast u64 result)))))
+    (when indirect
+      (for r [(: 16 i64) 17 15 14 13 12 11 10 9 8]
+        (when (and (< scratch 0) (= (& pinned (<< (: 1 u64) (cast u64 r))) 0))
+          (set! scratch r)))
+      (when (< scratch 0)
+        (fail name "a :shim convention pins every scratch register a called symbol could use")))
+    (shim-word! (mut code) 0xA9BF7BFD)
+    (shim-word! (mut code) 0x910003FD)
+    (for [r 19 29]
+      (when (!= (& changed (<< (: 1 u64) (cast u64 r))) 0) (push! (mut saved) (cast u32 r))))
+    (for [i 0 (/ (+ (len saved) 1) 2)]
+      (let [first (get saved (* i 2))
+            second (if (< (+ (* i 2) 1) (len saved)) (get saved (+ (* i 2) 1)) (: 31 u32))]
+        ; stp first, second, [sp, #-16]!
+        (shim-word! (mut code) (| (: 0xA9BF03E0 u32) (<< second 10) first))))
+    (when (> slots 0)
+      ; sub sp, sp, #area
+      (shim-word! (mut code) (| (: 0xD10003FF u32) (<< (cast u32 area) 10)))
+      (for [i 0 slots]
+        ; str x<i>, [sp, #8*i]
+        (shim-word! (mut code) (| (: 0xF90003E0 u32) (<< (cast u32 i) 10) (cast u32 i))))
+      (for [i 0 n]
+        ; ldr x<pinned i>, [sp, #8*i]
+        (shim-word! (mut code)
+                    (| (: 0xF94003E0 u32)
+                       (<< (cast u32 i) 10)
+                       (cast u32 (get (.argflags f) (+ (cast i64 (.opb x)) i))))))
+      (when indirect
+        (shim-word! (mut code) (| (: 0xF94003E0 u32) (<< (cast u32 n) 10) (cast u32 scratch))))
+      ; add sp, sp, #area
+      (shim-word! (mut code) (| (: 0x910003FF u32) (<< (cast u32 area) 10))))
+    (if indirect
+        ; blr scratch
+        (shim-word! (mut code) (| (: 0xD63F0000 u32) (<< (cast u32 scratch) 5)))
+        (do
+          (when (!= (% (cast i64 (.next x)) 4) 0)
+            (fail name "inline :shim machine code is not a whole number of AArch64 instructions"))
+          (for [k (cast i64 (.block x)) (+ (cast i64 (.block x)) (cast i64 (.next x)))]
+            (push! (mut code) (get (.bytes f) k)))))
+    (when (and (!= result 255) (!= result 0))
+      ; mov x0, x<result>
+      (shim-word! (mut code) (| (: 0xAA0003E0 u32) (<< (cast u32 result) 16))))
+    (let [(mut i) (- (/ (+ (len saved) 1) 2) 1)]
+      (while (>= i 0)
+        (let [first (get saved (* i 2))
+              second (if (< (+ (* i 2) 1) (len saved)) (get saved (+ (* i 2) 1)) (: 31 u32))]
+          ; ldp first, second, [sp], #16
+          (shim-word! (mut code) (| (: 0xA8C103E0 u32) (<< second 10) first)))
+        (set! i (- i 1))))
+    (shim-word! (mut code) 0xA8C17BFD)
+    (shim-word! (mut code) 0xD65F03C0)
+    (free! (mut saved))
+    code))
+
+;;; The thunk symbol for the SHIMCALL X of F, defined in TA on first use. With
+;;; a module's table (SHIMS) one thunk is shared by every equal call; without
+;;; one the call gets its own. CREATE false requires the thunk to exist: after
+;;; module preparation no local definition may be added.
+(defn shim-thunk! [(ta (ptr asm/Asm))
+                   (shims (ptr (HashMap (slice u8) u32)))
+                   (f (ptr cir/Func))
+                   (x (ptr cir/Value))
+                   (create bool)
+                   (a (dyn Allocator))] (-> u32)
+  (let [(mut key) (shim-key f x a)
+        known
+          (if (= (p/cast u64 shims) 0)
+              (None [u32])
+              (get (load shims) (slice key)))]
+    (match known
+      (Some [symbol] (do (free! (mut key)) symbol))
+      (None []
+            (do
+              (unless create
+                (fail (.name f) "a :shim call appeared after module preparation without its thunk"))
+              (let [(mut code) (shim-code f x a)
+                    offset (asm/sect-append! ta asm/SEC-TEXT (.data code) (len code) 4)
+                    symbol (asm/sym-add-def! ta
+                                             (sconcat (malloc-allocator)
+                                                      "coil.stogir.shim."
+                                                      (i64->str a offset))
+                                             asm/SEC-TEXT
+                                             offset
+                                             (len code)
+                                             (cast u8 asm/BIND-LOCAL))]
+                (when (!= (p/cast u64 shims) 0)
+                  (set! shims (slice key) symbol))
+                (free! (mut code))
+                (free! (mut key))
+                symbol))))))
+
+;;; The call itself: an ordinary C call of the thunk with the arguments in
+;;; order and, when a symbol is called, its address last.
+(defn lower-shim-call! [(s (ptr Adapter)) (x (ptr cir/Value))] (-> i32)
+  (let [f (.f s)
+        thunk (shim-thunk! (.ta s) (.shims s) f x (= (p/cast u64 (.shims s)) 0) (.a s))
+        (mut args) (ArrayList::new [i32] (.a s))
+        (mut types) (ArrayList::new [u8] (.a s))
+        rt (type-id s (.ty x))]
+    (for [i 0 (cast i64 (.nops x))]
+      (push! (mut args) (operand s x (cast u32 i)))
+      (push! (mut types) 5))
+    (when (>= (.imm x) 0)
+      (push! (mut args) (convert! s 36 5 (symbol! s (cast u32 (.imm x)))))
+      (push! (mut types) 5))
+    (match (calls/create-grouped 9 (cast u8 rt) (slice types) [] (.a s))
+      (Err [message] (fail (.name f) message))
+      (Ok [proto]
+          (let [r
+                  (require s
+                           (calls/emit! (mut (.g s))
+                                        proto
+                                        (.control s)
+                                        (symbol! s thunk)
+                                        (slice args)
+                                        (.a s)))]
+            (set! (.control s) r)
+            r)))))
 
 (defn lower-call! [(s (ptr Adapter)) (id u32) (x (ptr cir/Value))] (-> i32)
   (let [(mut args) (ArrayList::new [i32] (.a s))
@@ -1170,6 +1359,7 @@
         ty (type-id s (.ty x))
         native-op (basic-op op)]
     (cond (or (= op cir/OP-CALL) (= op cir/OP-TAILCALL)) (lower-call! s id x)
+          (= op cir/OP-SHIMCALL) (lower-shim-call! s x)
           (wide-context? s x) (wide-instruction! s id x)
           (and (or (= op cir/OP-ROTL)
                    (= op cir/OP-ROTR)
@@ -1332,9 +1522,6 @@
               (convert! s 36 5 r))
           ; The CIR operations with no Stogir lowering. Each stops the build
           ; with its own reason; none is approximated.
-          (= op cir/OP-SHIMCALL)
-            (fail (.name (.f s))
-                  "a call under a :shim (register-pinned) convention is not implemented (CIR SHIMCALL): Stogir calls use the C register assignment and clobber set only")
           (= op cir/OP-MACHINE)
             (fail (.name (.f s))
                   "inline machine-code bytes inside a function body are not implemented (CIR MACHINE)")
@@ -1893,7 +2080,9 @@
    (native-target (ptr asm/Asm))
    (native-cache (ArrayList NativeCache))
    (native-by-symbol (ArrayList i64))
-   (native-certified i64)])
+   (native-certified i64)
+   ; :shim thunks defined so far, by convention key (shim-thunk!).
+   (shims (HashMap (slice u8) u32))])
 
 (defn module-create [(a (dyn Allocator)) (trace bool)] (-> Module)
   (Module
@@ -1933,7 +2122,8 @@
     :native-target (p/cast (ptr asm/Asm) 0)
     :native-cache (ArrayList::new [NativeCache] a)
     :native-by-symbol (ArrayList::new [i64] a)
-    :native-certified 0))
+    :native-certified 0
+    :shims (HashMap::new [(slice u8) u32] a (keyops))))
 
 (defn adapt! [(s (ptr Adapter))
               (f (ptr cir/Func))
@@ -2225,6 +2415,14 @@
     (while (<= (len (.outlined module)) (cast i64 symbol))
       (push! (mut (.outlined module)) false))
     (set! (mut (.outlined module)) (cast i64 symbol) true))
+  ; Every :shim thunk is defined now: no local definition may appear once the
+  ; emission plan has indexed the module's symbols.
+  (when (.has-calls f)
+    (for [j 0 (len (.insts f))]
+      (let [x (cir/val f (get (.insts f) j))]
+        (when (= (cast i64 (.op x)) cir/OP-SHIMCALL)
+          (shim-thunk! ta (p/cast (ptr (HashMap (slice u8) u32)) (mut (.shims module)))
+                       f x true (.a module))))))
   (when (> (.growth (.inline module)) 0)
     (for [j 0 (len (.insts f))]
       (let [x (cir/val f (get (.insts f) j))
@@ -2241,6 +2439,7 @@
             keep (.a module)
             (mut state) (zeroed Adapter)
             s (cast (ptr Adapter) (mut state))]
+        (set! (.shims s) (p/cast (ptr (HashMap (slice u8) u32)) (mut (.shims module))))
         (adapt! s f ta (p/cast (ptr (ArrayList MTextData)) 0) a)
         ; The template's adapted graph is consumed by optimization. Only an
         ; optimized graph of at most budget+1 cells is registered; an adapted
@@ -3139,6 +3338,7 @@
             s (cast (ptr Adapter) (mut state))
             (mut owned) (zeroed Definition)
             definition (cast (ptr Definition) (mut owned))]
+        (set! (.shims s) (p/cast (ptr (HashMap (slice u8) u32)) (mut (.shims module))))
         (adapt! s f ta (p/cast (ptr (ArrayList MTextData)) 0) a)
         (annotate-call-effects! module (mut (.g s)) a)
         (when (> level 1) (prepare-inline-caller! s))
@@ -3459,6 +3659,8 @@
               (set! optimized (and (.clean definition) (> optimization 1)))
               (set! prepared true))))
         (unless prepared
+          (when (!= (p/cast i64 module) 0)
+            (set! (.shims s) (p/cast (ptr (HashMap (slice u8) u32)) (mut (.shims module)))))
           (adapt! s f ta text-data a)
           (when (!= (p/cast i64 module) 0)
             (annotate-call-effects! module (mut (.g s)) a))
