@@ -69,6 +69,10 @@ with tempfile.TemporaryDirectory(prefix='stogir-readonly-') as temporary:
     listing = subprocess.run(['llvm-objdump', '-d', '--no-show-raw-insn', str(obj)],
                              capture_output=True, text=True, check=True).stdout
     found = functions(listing)
+    # The comparison must still be a call: one expanded inline reads its
+    # operands in the loop and would say nothing about calls.
+    assert any(mnemonic == 'bl' for _, mnemonic, _ in found[f'_{MODULE}.count-equal']), \
+        'count-equal no longer calls memcmp'
     clean = loop_memory_reads(found[f'_{MODULE}.count-equal'])
     assert not clean, f'the bound is still read inside the memcmp-only loop: {clean}'
     for name in ('count-equal-spending', 'count-equal-namesake'):

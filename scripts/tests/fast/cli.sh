@@ -1329,6 +1329,12 @@ EOF
       "$COIL" run "$ROOT/tests/backend/stogir-readonly-library-calls.coil" --backend stogir -O3 --no-debug --debug-checks
     expect_rc 0 "real memcmp calls are read-only to Stogir, a Coil namesake is not" \
       python3 "$ROOT/scripts/tests/stogir-readonly-library-calls.py" "$COIL"
+    expect_rc 0 "a returned aggregate piece used on one path only is computed on every path (Stogir O3)" \
+      "$COIL" run "$ROOT/tests/backend/stogir-return-piece-placement.coil" --backend stogir -O3 --no-debug
+    expect_rc 0 "a returned aggregate piece used by a debug check only (Stogir O1, debug checks)" \
+      "$COIL" run "$ROOT/tests/backend/stogir-return-piece-placement.coil" --backend stogir -O1 --no-debug --debug-checks
+    expect_rc 0 "random conditional call crossings keep their values (Stogir O3)" \
+      "$COIL" run "$ROOT/tests/backend/stogir-frame-split.coil" --backend stogir -O3 --no-debug
     expect_rc 0 "native Mach-O data-in-code serialization and JIT loader" \
       "$COIL" run "$ROOT/src/compiler/selftest/jit_selftest.coil" --backend llvm
   fi
