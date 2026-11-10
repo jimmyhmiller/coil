@@ -14,7 +14,7 @@
 (import "stogir.a64.code" :as code)
 (import "coil.alloc" :use [Allocator])
 (import "coil.arraylist" :use [ArrayList])
-(import "coil.result" :use [Result Ok Err Some None])
+(import "coil.result" :use [Result Ok Err Option Some None])
 
 (defn logical-word [(tile select/Tile) (operation i32) (rd i32) (rn i32)]
   (-> (Result u32 (slice u8)))
@@ -70,9 +70,11 @@
           (and (not (or (= (.rule tile) 4) (= (.rule tile) 5)))
                (not (source-register? (.rule tile) rm))))
       (Err "invalid arithmetic physical register")
-      (if (and (>= (.rule tile) 38) (<= (.rule tile) 40) (= (.immediate tile) 0))
+      (if (or (= (.rule tile) 56)
+              (and (>= (.rule tile) 38) (<= (.rule tile) 40) (= (.immediate tile) 0)))
       ; A zero-count shift (selection also turns a multiply by one into LSL #0)
       ; is the source itself. A W result still zero-extends, as LSL W #0 would.
+      ; Rule 56 is the same X-form move of an already extended source.
       (if (and (.wide tile) (= rd rn))
           (Ok 0)
           (match (encode/logical-register (.wide tile) 1 rd 31 rn)
@@ -270,10 +272,26 @@
     (match (arithmetic! (mut output) tile rd rn rm)
       (Err [message] (set! error message))
       (Ok [_] 0))
-    (word! (mut output)
-           (mut error)
-           (encode/extend false (types/signed? ty) bits rd rd))
+    (unless (masked-within? tile ty bits)
+      (word! (mut output)
+             (mut error)
+             (encode/extend false (types/signed? ty) bits rd rd)))
     (if (= error "") (Ok (cast i32 (- (len output) start))) (Err error))))
+
+;;; A W-form AND with a logical immediate leaves a result no greater than the
+;;; immediate. When that mask lies within the value bits of the narrow type
+;;; (below the sign bit of a signed one), the result is already its own zero-
+;;; and sign-extension and needs no normalizing. The mask is decoded from the
+;;; tile's N:immr:imms fields: a 32-bit element is a rotated run of ones.
+(defn masked-within? [(tile select/Tile) (ty i32) (bits i32)] (-> bool)
+  (let [fields (.immediate tile)
+        imms (& fields 63)
+        rotation (& (>> fields 6) 63)]
+    (and (= (.rule tile) 42) (not (.wide tile)) (= (.right tile) 0)
+         (< fields 4096) (< imms 32) (< rotation 32) (>= bits 8) (< bits 32)
+         (let [run (- (<< (: 1 u64) (+ imms 1)) 1)
+               mask (& (| (>> run rotation) (<< run (- 32 rotation))) 0xFFFFFFFF)]
+           (< mask (<< (: 1 u64) (cast u64 (if (types/signed? ty) (- bits 1) bits))))))))
 
 ;;; MADD/MSUB: rd = addend +/- multiplicand * multiplier. Matching admits at
 ;;; most two sources that need a scratch register; a third is a hard error.
@@ -321,6 +339,41 @@
       (multiply-accumulate! (mut output) graph parts tile rd position)
       (operands-selected-with-locations! (mut output) graph parts tile opcode rd position)))
 
+;;; A byte or halfword shift by a literal count is one bitfield move. The
+;;; general narrow sequence normalizes the source, reduces the count modulo the
+;;; width, shifts and normalizes the result to the type; with a literal count
+;;; K (already reduced) that is, for width B:
+;;;   SHL: the low B-K source bits moved up by K, extended to the type
+;;;        (UBFIZ/SBFIZ #K, #B-K);
+;;;   SHR: the field [K, B) zero-extended, nonnegative in every type (UBFX);
+;;;   SAR of a signed type: the field [K, B) sign-extended (SBFX);
+;;;   K = 0: the source extended to the type.
+;;; SAR of an unsigned type has no single form. Returns the instruction, or
+;;; None when the tile is not such a shift.
+(defn narrow-literal-shift [(graph graph/Graph) (tile select/Tile) (opcode i32)
+                            (ty i32) (bits i32) (rd i32) (rn i32)]
+  (-> (Option (Result u32 (slice u8))))
+  (if (or (< opcode 49) (> opcode 51) (!= (.rule tile) (- opcode 40))
+          (>= (.right tile) 0) (not (or (= bits 8) (= bits 16))) (= ty 1))
+      (None)
+      (match (graph/lookup graph (.right tile))
+        (None [] (None))
+        (Some [literal]
+          (if (not (and (symbols/numeric? literal)
+                        (types/integer? (cast i32 (node/type-id literal)))))
+              (None)
+              (let [count (cast i32 (& (node/constant-bits literal) (cast u64 (- bits 1))))
+                    signed? (types/signed? ty)]
+                (cond (= count 0)
+                        (Some (encode/extend false signed? bits rd rn))
+                      (= opcode 49)
+                        (Some (encode/word-bitfield signed? (- 32 count) (- (- bits count) 1) rd rn))
+                      (= opcode 50)
+                        (Some (encode/word-bitfield false count (- bits 1) rd rn))
+                      signed?
+                        (Some (encode/word-bitfield true count (- bits 1) rd rn))
+                      :else (None))))))))
+
 (defn operands-selected-with-locations! [(output (mut code/Buffer))
                                 (graph graph/Graph)
                                 (parts locations/View)
@@ -332,7 +385,24 @@
     (None [] (Err "selected source missing"))
     (Some [source]
           (let [ty (cast i32 (node/type-id source))
-                bits (* 8 (types/scalar-size ty 8))]
+                bits (* 8 (types/scalar-size ty 8))
+                literal-shift
+                  (match (narrow-literal-shift graph tile opcode ty bits 0 0)
+                    (Some [_] true)
+                    (None [] false))]
+            (if literal-shift
+            (match (operand-register-with-locations! (mut output) graph parts (.left tile)
+                                                     position false 16)
+              (Err [message] (Err message))
+              (Ok [left]
+                (match (narrow-literal-shift graph tile opcode ty bits rd left)
+                  (None [] (Err "narrow literal shift lost its form"))
+                  (Some [instruction]
+                    (match instruction
+                      (Err [message] (Err message))
+                      (Ok [word]
+                        (bytes/append32! (mut (.text output)) word)
+                        (Ok 4)))))))
             ; A literal zero source of a full-width register form reads XZR
             ; instead of being materialized into a scratch register.
             (match (if (and (>= bits 32) (zero-register-rule? (.rule tile))
@@ -363,7 +433,7 @@
                                                                    17))
                     (Err [message] (Err message))
                     (Ok [right]
-                        (if (< bits 32)
+                        (if (and (< bits 32) (!= (.rule tile) 56))
                             (narrow! (mut (.text output))
                                      tile
                                      opcode
@@ -376,7 +446,7 @@
                                          tile
                                          rd
                                          left
-                                         right))))))))))
+                                         right)))))))))))
 
 ;;; Allocation reserves x16/x17 for materialization, narrow normalization and
 ;;; cycle resolution. Compose bytes and pending references atomically.

@@ -16,6 +16,7 @@
 (import "stogir.a64.memory" :as memory)
 (import "stogir.a64.tail-plan" :as tail-plan)
 (import "stogir.a64.static-stack" :as static-stack)
+(import "stogir.stack" :as stack)
 (import "stogir.a64.word-constant" :as word-constant)
 (import "stogir.a64.result-projections" :as result-projections)
 (import "coil.alloc" :use [Allocator])
@@ -88,6 +89,86 @@
        (= (.right tile) 0) (> (.left tile) 0)
        (conditional/movable-condition? graph reference)))
 
+;;; Whether LOAD reads a frame object, directly or at a constant offset. Such a
+;;; load may be the projection of a call result, which supplies the whole
+;;; loaded word from a register; its access form is never changed.
+(defn frame-load? [(graph g/Graph) (load i32)] (-> bool)
+  (let [address (address/base-view graph (.op2 (get (.instructions graph) (cast i64 load))))]
+    (and (> address 0)
+         (let [node (get (.instructions graph) (cast i64 address))
+               base (if (and (= (n/opcode node) 26) (> (.op1 node) 0))
+                        (address/base-view graph (.op1 node))
+                        address)]
+           (or (stack/frame-object? node)
+               (and (> base 0)
+                    (stack/frame-object? (get (.instructions graph) (cast i64 base)))))))))
+
+;;; EXTENSION (SEXT/ZEXT to an integer) is the only reader of a 32-bit TRUNC
+;;; in its own block, and that TRUNC the only reader of a 64-bit integer LOAD
+;;; whose access form may change.
+(defn word-view-load? [(graph g/Graph) (counts (ArrayList i64)) (protected (ArrayList bool))
+                       (omitted (ArrayList bool)) (blocks (ArrayList i32)) (extension i32)]
+  (-> bool)
+  (let [node (get (.instructions graph) (cast i64 extension))
+        view (.op1 node)]
+    (and (> view 0)
+         (types/integer? (cast i32 (n/type-id node))) (!= (n/type-id node) 1)
+         (= (get blocks (cast i64 extension)) (get blocks (cast i64 view)))
+         (let [truncation (get (.instructions graph) (cast i64 view))
+               load (.op1 truncation)]
+           (and (= (n/opcode truncation) 35)
+                (or (= (n/type-id truncation) 4) (= (n/type-id truncation) 10))
+                (= (get counts (cast i64 view)) 1)
+                (not (get protected (cast i64 view)))
+                (not (get omitted (cast i64 view)))
+                (> load 0)
+                (let [source (get (.instructions graph) (cast i64 load))]
+                  (and (= (n/opcode source) 91)
+                       (or (= (n/type-id source) 5) (= (n/type-id source) 11))
+                       (= (get counts (cast i64 load)) 2)
+                       (not (get protected (cast i64 load)))
+                       (not (get omitted (cast i64 load)))
+                       (not (frame-load? graph load)))))))))
+
+;;; The signed LOAD that REFERENCE reads as a zero extension, or zero.
+;;; REFERENCE is ZEXT of the LOAD, or AND(SEXT(LOAD), mask) whose mask is
+;;; exactly the loaded width and whose SEXT has no other reader. The AND and
+;;; its SEXT have one type, so the mask literal is of the extended width.
+(defn zero-view-load [(graph g/Graph) (counts (ArrayList i64)) (protected (ArrayList bool))
+                      (omitted (ArrayList bool)) (reference i32)] (-> i32)
+  (let [node (get (.instructions graph) (cast i64 reference))
+        opcode (n/opcode node)
+        through (.op1 node)]
+    (if (or (get omitted (cast i64 reference)) (<= through 0)
+            (not (types/integer? (cast i32 (n/type-id node)))) (= (n/type-id node) 1))
+        0
+        (let [inner (get (.instructions graph) (cast i64 through))
+              load (if (= opcode 47) (.op1 inner) through)]
+          (if (or (<= load 0)
+                  (and (= opcode 47)
+                       (or (!= (n/opcode inner) 33)
+                           (!= (n/type-id inner) (n/type-id node))
+                           (!= (get counts (cast i64 through)) 1)
+                           (get protected (cast i64 through))
+                           (get omitted (cast i64 through))))
+                  (and (!= opcode 47) (!= opcode 34)))
+              0
+              (let [source (get (.instructions graph) (cast i64 load))
+                    ty (n/type-id source)
+                    width (types/scalar-size (cast i32 ty) 8)]
+                (if (and (= (n/opcode source) 91)
+                         (or (= ty 8) (= ty 9) (= ty 10))
+                         (not (get protected (cast i64 load)))
+                         (not (get omitted (cast i64 load)))
+                         (not (frame-load? graph load))
+                         (or (!= opcode 47)
+                             (match (select/numeric-bits graph (.op2 node))
+                               (None [] false)
+                               (Some [mask]
+                                     (= mask (- (<< (: 1 u64) (cast u64 (* width 8))) 1))))))
+                    load
+                    0)))))))
+
 ;;; For EQ/NE(ZEXT(Boolean integer comparison), 0), the inner comparison;
 ;;; otherwise zero. Floating predicates are excluded: scalar-tile? selects
 ;;; integer comparisons only, and their inversion would need unordered codes.
@@ -152,6 +233,8 @@
         (mut narrow-users) (ArrayList::new [i32] a)
         (mut narrow-switches) (ArrayList::new [i32] a)
         (mut wide-switches) (ArrayList::new [i32] a)
+        (mut load-views) (ArrayList::new [i32] a)
+        (mut count-shifts) (ArrayList::new [i32] a)
         (mut exact-decrements) (ArrayList::new [i32] a)
         (mut block) (: 0 i32)
         (mut error) ""]
@@ -209,6 +292,13 @@
                                          (cast i64 (.op1 node))))
                           79)))
           (set! has-tail true))
+        ; Conversions that may decide the access form of the LOAD they read:
+        ; ZEXT or TRUNC of a LOAD, and AND of a sign-extended value.
+        (when (and fuse (> (.op1 node) 0)
+                   (or (= (n/opcode node) 34) (= (n/opcode node) 35) (= (n/opcode node) 47))
+                   (= (n/opcode (get (.instructions graph) (cast i64 (.op1 node))))
+                      (if (= (n/opcode node) 47) 33 91)))
+          (push! (mut load-views) reference))
         ; A SWITCH on a word extension can dispatch on the source word when
         ; every case literal is itself such an extension.
         (when (and fuse (>= (n/opcode node) 109) (<= (n/opcode node) 117))
@@ -247,6 +337,11 @@
                                      :left (.left tile) :right 0
                                      :immediate (.immediate tile))
                         tile))
+              ; A variable word shift can read its count through conversions.
+              (when (and fuse (>= (.rule tile) 9) (<= (.rule tile) 11)
+                         (>= (types/scalar-size (cast i32 (n/type-id node)) 8) 4)
+                         (> (select/count-view-source graph (.right tile)) 0))
+                (push! (mut count-shifts) reference))
               ; Only a 64-bit comparison of an extension can be narrowed.
               (when (and fuse (.wide tile) (>= (.rule tile) 20) (<= (.rule tile) 33)
                          (or (select/word-extension? graph (.left tile))
@@ -447,6 +542,103 @@
                               (set! (mut omitted) index true)
                               (set! (mut counts) (cast i64 (.left tile))
                                     (+ (get counts (cast i64 (.left tile))) 1))))))))))) (set! for-index-2 (+ for-index-2 1)))))
+    ; A variable shift reads its count from the source of each conversion
+    ; that has no other reader; the retired conversions release their inputs.
+    (when (= error "")
+      (for [i 0 (len count-shifts)]
+        (let [reference (get count-shifts i)
+              index (cast i64 reference)
+              tile (get tiles index)
+              (mut count) (.right tile)
+              (mut depth) 0
+              (mut walking) (not (get omitted index))]
+          (while (and walking (< depth 4))
+            (let [source (select/count-view-source graph count)]
+              ; Past the first conversion the shift's own moved edge is the
+              ; second one; the other belongs to the conversion just passed.
+              (if (and (> source 0)
+                       (= (get counts (cast i64 count)) (if (= depth 0) 1 2))
+                       (not (get protected (cast i64 count)))
+                       (not (get omitted (cast i64 count))))
+                  (do
+                    ; The shift's edge moves to the source. Each conversion
+                    ; keeps its own input edge until retirement cascades.
+                    (set! (mut counts) (cast i64 count)
+                          (- (get counts (cast i64 count)) 1))
+                    (set! (mut counts) (cast i64 source)
+                          (+ (get counts (cast i64 source)) 1))
+                    (when (= depth 0) (push! (mut retired) count))
+                    (set! count source))
+                  (set! walking false)))
+            (set! depth (+ depth 1)))
+          (if (= count (.right tile))
+              (set! (mut count-shifts) i 0)
+              (set! (mut tiles) index
+                    (select/Tile :rule (.rule tile) :wide (.wide tile) :left (.left tile)
+                                 :right count :immediate (.immediate tile)))))))
+    ; Access forms of integer LOADs, chosen by the conversions that read them.
+    ;   A LOAD whose only reader is a TRUNC to a byte or halfword accesses
+    ;   just those low bytes (little-endian), zero-extended; the TRUNC is its
+    ;   register. A sole SEXT of that TRUNC later makes the access
+    ;   sign-extending instead. A word TRUNC of a 64-bit LOAD is already a
+    ;   free view (and the wide access can pair), so that LOAD is narrowed
+    ;   only for a sole extension of the view, below.
+    ;   A signed LOAD read only by ZEXT, or by AND(SEXT, all bits of the
+    ;   loaded width), is accessed zero-extending; each reader is its register.
+    ; The LOAD keeps its place, address and type. Its control successor holds
+    ; the one edge that is not a data reader.
+    (when (and (= error "") (> (len load-views) 0))
+      (let [(mut zero-views) (ArrayList::new [i32] a)]
+        (for [i 0 (len load-views)]
+          (let [reference (get load-views i)
+                index (cast i64 reference)
+                node (get (.instructions graph) index)
+                opcode (n/opcode node)]
+            (unless (get omitted index)
+              (cond (= opcode 35)
+                      (let [load (get (.instructions graph) (cast i64 (.op1 node)))
+                            width (types/scalar-size (cast i32 (n/type-id node)) 8)]
+                        (when (and (select/narrowable-load-type? (n/type-id load))
+                                   (select/narrow-view-type? (n/type-id node))
+                                   (< width (types/scalar-size (cast i32 (n/type-id load)) 8))
+                                   (< width 4)
+                                   (= (get counts (cast i64 (.op1 node))) 2)
+                                   (not (get protected (cast i64 (.op1 node))))
+                                   (not (get omitted (cast i64 (.op1 node))))
+                                   (not (frame-load? graph (.op1 node))))
+                          (set! (mut tiles) (cast i64 (.op1 node))
+                                (select/Tile :rule 57 :wide false :left 0 :right 0
+                                             :immediate (cast u64 width)))
+                          (set! (mut tiles) index (select/extended-copy (.op1 node)))
+                          (set! (mut extractions) index (.op1 node))))
+                    :else
+                      (let [load (zero-view-load graph counts protected omitted reference)]
+                        (when (> load 0)
+                          (when (= (len zero-views) 0)
+                            (extend-zeroed! (mut zero-views) (len (.instructions graph))))
+                          (set! (mut zero-views) (cast i64 load)
+                                (+ (get zero-views (cast i64 load)) 1))))))))
+        (for reference load-views
+          (when (> (len zero-views) 0)
+            (let [index (cast i64 reference)
+                  node (get (.instructions graph) index)
+                  load (zero-view-load graph counts protected omitted reference)
+                  slot (cast i64 load)]
+              (when (and (> load 0)
+                         (= (get counts slot) (+ (cast i64 (get zero-views slot)) 1)))
+                (set! (mut tiles) slot
+                      (select/Tile :rule 57 :wide false :left 0 :right 0
+                                   :immediate
+                                     (cast u64 (types/scalar-size
+                                                 (cast i32 (n/type-id (get (.instructions graph) slot)))
+                                                 8))))
+                ; AND takes over the edge of the extension it reads through.
+                (when (= (n/opcode node) 47)
+                  (set! (mut omitted) (cast i64 (.op1 node)) true)
+                  (set! (mut counts) (cast i64 (.op1 node)) 0))
+                (set! (mut tiles) index (select/extended-copy load))
+                (set! (mut extractions) index load)))))
+        (free! (mut zero-views))))
     ; TRUNC(SHR/SAR) extracts a field; SHL(SHR/SAR) with matching counts
     ; clears low bits with one AND; SEXT/ZEXT of a word TRUNC view extends the
     ; low word of the view's source. Each selects a single machine input.
@@ -460,7 +652,15 @@
         (when (or (= opcode 35) (= opcode 49)
                   (and (or (= opcode 33) (= opcode 34))
                        (not (get omitted (cast i64 reference)))))
-          (match (cond (= opcode 35) (select/extraction graph reference)
+          (match (cond (= opcode 35)
+                         ; The low word of a 64-bit shift by zero is the
+                         ; shifted value's own register, as any word TRUNC.
+                         (match (select/extraction graph reference)
+                           (None [] (None))
+                           (Some [field]
+                             (if (and (.wide field) (= (.immediate field) 32))
+                                 (Some (select/extended-copy (.left field)))
+                                 (Some field))))
                        (= opcode 49) (select/shift-mask graph reference)
                        :else
                          ; Only for the last reader of the TRUNC: reading
@@ -471,12 +671,57 @@
                                      (get protected (cast i64 view)))
                                    (None)
                                  (> (get extractions (cast i64 view)) 0)
-                                   (if (and (= opcode 34)
-                                            (= (.rule (get tiles (cast i64 view))) 48)
-                                            (= (n/opcode (get (.instructions graph) (cast i64 view)))
-                                               35))
-                                       (Some (get tiles (cast i64 view)))
-                                       (None))
+                                   (cond (!= (n/opcode (get (.instructions graph) (cast i64 view))) 35)
+                                           (None)
+                                         (and (= opcode 34)
+                                              (= (.rule (get tiles (cast i64 view))) 48))
+                                           (Some (get tiles (cast i64 view)))
+                                         ; The view of a narrowed LOAD: its
+                                         ; register is the zero extension, or,
+                                         ; for this sole reader, the sign
+                                         ; extension from the view's width.
+                                         (= (.rule (get tiles (cast i64 view))) 56)
+                                           (let [load (get extractions (cast i64 view))
+                                                 form (select/load-form (get tiles (cast i64 load)))]
+                                             (cond (or (not (types/integer?
+                                                              (cast i32 (n/type-id (get (.instructions graph)
+                                                                                        (cast i64 reference))))))
+                                                       (= (n/type-id (get (.instructions graph)
+                                                                          (cast i64 reference))) 1)
+                                                       (!= (get blocks (cast i64 reference))
+                                                           (get blocks (cast i64 view))))
+                                                     (None)
+                                                   ; Not a LOAD: the word view
+                                                   ; of a 64-bit value shifted
+                                                   ; by zero. Extend its low
+                                                   ; word from that value.
+                                                   (= form 0)
+                                                     (Some (if (= opcode 34)
+                                                               (select/Tile :rule 48 :wide true :left load
+                                                                            :right 0 :immediate 32)
+                                                               (select/Tile :rule 53 :wide true :left load
+                                                                            :right 0 :immediate 0)))
+                                                   (= opcode 34)
+                                                     (if (= (& form 256) 0)
+                                                         (Some (select/extended-copy load))
+                                                         (None))
+                                                   :else
+                                                     (do
+                                                       (set! (mut tiles) (cast i64 load)
+                                                             (select/Tile :rule 57 :wide false
+                                                                          :left 0 :right 0
+                                                                          :immediate (cast u64 (| form 256))))
+                                                       (Some (select/extended-copy load)))))
+                                         :else (None))
+                                 ; The sole extension of a word view of a
+                                 ; 64-bit LOAD nothing else reads: the LOAD
+                                 ; accesses the word in the extended form.
+                                 (word-view-load? graph counts protected omitted blocks reference)
+                                   (let [load (.op1 (get (.instructions graph) (cast i64 view)))]
+                                     (set! (mut tiles) (cast i64 load)
+                                           (select/Tile :rule 57 :wide false :left 0 :right 0
+                                                        :immediate (if (= opcode 33) 260 4)))
+                                     (Some (select/extended-copy load)))
                                  :else (select/word-view-extension graph reference))))
             (None [] 0)
             (Some [tile]
@@ -504,7 +749,9 @@
           (when (and (>= opcode 91) (<= opcode 94))
             (match (memory/size graph reference)
               (Err [message] (set! error message))
-              (Ok [width]
+              (Ok [natural]
+                (let [form (select/load-form (get tiles (cast i64 reference)))
+                      width (if (= form 0) natural (& form 255))]
                   (match (address/select graph (.op2 node) width)
                     (None []
                       (match (address/select-indexed graph (.op2 node) width)
@@ -542,7 +789,7 @@
                             (let [base (cast i64 (.base chosen))]
                               (set! (mut counts) base (+ (get counts base) 1)))
                             (when (= (get counts index) 0)
-                              (push! (mut retired) (.op2 node))))))))))) (set! for-index-4 (+ for-index-4 1)))))
+                              (push! (mut retired) (.op2 node)))))))))))) (set! for-index-4 (+ for-index-4 1)))))
     ; Independent target extension: absorb a same-block constant word shift
     ; into ADD/SUB before liveness. Keep shared/rooted producer definitions.
     (when (and fuse (= error ""))
@@ -629,8 +876,9 @@
                                      8))
                               (or (= (n/opcode node) 28) (= (n/opcode node) 49)
                                   (= (n/opcode node) 50) (= (n/opcode node) 51)))
-                         ; A TRUNC whose extensions all read its source.
-                         (and (= (n/opcode node) 35)
+                         ; A TRUNC whose extensions all read its source, and
+                         ; conversions a shift count was read through.
+                         (and (>= (n/opcode node) 33) (<= (n/opcode node) 35)
                               (types/integer? (cast i32 (n/type-id node))))))
             (set! (mut omitted) index true)
             ; Fused unary and shifted ADD/SUB tiles already replaced their
@@ -677,8 +925,19 @@
             (for reference (.returns tails)
               (set! (mut omitted) (cast i64 reference) true)))))
     (free! (mut counts))
+    ; The register of a LOAD with a selected access form is not the loaded
+    ; word, so no later rule may supply that value from elsewhere.
+    (for reference load-views
+      (let [node (get (.instructions graph) (cast i64 reference))
+            load (if (= (n/opcode node) 47)
+                     (.op1 (get (.instructions graph) (cast i64 (.op1 node))))
+                     (.op1 node))]
+        (when (and (> load 0) (= (.rule (get tiles (cast i64 load))) 57))
+          (set! (mut protected) (cast i64 load) true))))
+    (free! (mut load-views))
     (if (!= error "")
         (do
+          (free! (mut count-shifts))
           (free! (mut blocks))
           (free! (mut protected))
           (free! (mut word-views))
@@ -739,6 +998,14 @@
                   (push! (mut (.inputs operands)) (select/multiplier tile))
                   (set! (mut (.ranges operands)) (cast i64 reference)
                         (machine/Range :offset offset :count 3)))))) (set! for-index-8 (+ for-index-8 1))))
+          ; A shift whose count is read through conversions uses their source.
+          (for reference count-shifts
+            (when (and (> reference 0)
+                       (not (get (.omitted operands) (cast i64 reference))))
+              (let [range (get (.ranges operands) (cast i64 reference))]
+                (set! (mut (.inputs operands)) (+ (.offset range) 1)
+                      (.right (get tiles (cast i64 reference)))))))
+          (free! (mut count-shifts))
           ; A narrowed comparison, or the branch that consumed it, was given
           ; the comparison's graph operands. Read each retired extension
           ; through its source, as the selected tile does.
