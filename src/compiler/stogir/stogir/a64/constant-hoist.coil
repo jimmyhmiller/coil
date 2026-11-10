@@ -13,7 +13,9 @@
 (import "stogir.pipeline" :as pipeline)
 (import "stogir.allocation" :as allocation)
 (import "stogir.matched-uses" :as machine)
+(import "stogir.nonnegative" :as nonnegative)
 (import "stogir.a64.select" :as select)
+(import "stogir.a64.reciprocal" :as reciprocal)
 (import "stogir.a64.address" :as address)
 (import "coil.alloc" :use [Allocator])
 (import "coil.arraylist" :use [ArrayList])
@@ -21,11 +23,21 @@
 
 ;;; graph is the caller's graph when nodes is empty, otherwise an owned
 ;;; instruction overlay of it. nodes are the appended COPY definitions.
-(defstruct Hoisted [(graph g/Graph) (nodes (ArrayList i32))])
+;;; reciprocals holds pairs: a DIV/MOD by a literal, then the definition of
+;;; the reciprocal its selected tile multiplies by. That link is a machine
+;;; operand only (matching binds it); the graph keeps the division by its
+;;; literal. constants is set when the overlay owns its constant pool, a copy
+;;; of the caller's followed by the reciprocals.
+(defstruct Hoisted [(graph g/Graph) (nodes (ArrayList i32)) (reciprocals (ArrayList i32))
+                    (constants bool)])
 
 (defn release! [(hoisted (mut Hoisted))] (-> void)
+  (when (.constants hoisted)
+    (free! (mut (.constants (.graph hoisted))))
+    (free! (mut (.constant-spans (.graph hoisted)))))
   (when (> (len (.nodes hoisted)) 0)
     (g/release-overlay! (mut (.graph hoisted))))
+  (free! (mut (.reciprocals hoisted)))
   (free! (mut (.nodes hoisted))))
 
 ;;; A nonzero 32/64-bit integer or address literal. Zero reads WZR/XZR or is a
@@ -293,6 +305,80 @@
           (push! (mut literals) literal))))
     found))
 
+;;; The reciprocal of the DIV/MOD by a literal at reference in block, when its
+;;; tile is a reciprocal multiplication: the tile matching will select (the
+;;; non-negative form of a signed division whose dividend is proven so).
+(defn reciprocal-of [(graph g/Graph) (prepared pipeline/Prepared) (block i32) (reference i32)]
+  (-> (Option u64))
+  (let [node (get (.instructions graph) (cast i64 reference))
+        opcode (n/opcode node)]
+    (if (or (not (or (= opcode 29) (= opcode 30)))
+            (not (types/integer? (cast i32 (n/type-id node))))
+            (<= (.op1 node) 0) (>= (.op2 node) 0))
+        (None)
+        (match (select/select graph reference)
+          (Err [_] (None))
+          (Ok [tile]
+            (if (not (reciprocal/rule? (.rule tile)))
+                (None)
+                (reciprocal/magic
+                  (if (and (or (= (.rule tile) 60) (= (.rule tile) 62))
+                           (nonnegative/proven? graph (.idom prepared) block (.left tile)))
+                      (select/reciprocal-nonnegative tile)
+                      tile))))))))
+
+;;; The definition in block target of the reciprocal BITS of a WIDE or word
+;;; division. The literal is appended to the overlay's own constant pool, once
+;;; per value. Zero reports reference-space exhaustion.
+(defn reciprocal-definition! [(work (mut g/Graph)) (source g/Graph) (bits u64) (wide bool)
+                              (target i32) (nodes (mut (ArrayList i32)))
+                              (blocks (mut (ArrayList i32))) (literals (mut (ArrayList i32)))
+                              (owned (mut bool)) (allocator (dyn Allocator))] (-> i32)
+  (let [type (if wide (: 5 u8) (: 4 u8))
+        fresh (= (len nodes) 0)
+        (mut literal) (: 0 i32)
+        (mut found) (: 0 i32)]
+    (when fresh
+      (set! work (g/instruction-overlay source allocator)))
+    (unless owned
+      (let [(mut constants) (ArrayList::new [n/Node] allocator)
+            (mut spans) (ArrayList::new [i32] allocator)]
+        (extend! (mut constants) (.data (.constants source)) (len (.constants source)))
+        (extend! (mut spans) (.data (.constant-spans source)) (len (.constant-spans source)))
+        (set! (.constants work) constants)
+        (set! (.constant-spans work) spans)
+        (set! owned true)))
+    (for [i (len (.constants source)) (len (.constants work))]
+      (let [constant (get (.constants work) i)]
+        (when (and (= (n/opcode constant) type) (= (n/type-id constant) type)
+                   (= (n/constant-bits constant) bits))
+          (set! literal (cast i32 (- -1 i))))))
+    (when (= literal 0)
+      (match (g/append-constant! (mut work) (n/constant type type 0 bits))
+        (None [] 0)
+        (Some [created] (set! literal created))))
+    (when (!= literal 0)
+      (for [k 0 (len nodes)]
+        (when (and (= (get literals k) literal) (= (get blocks k) target))
+          (set! found (get nodes k))))
+      (when (= found 0)
+        (match (g/append-inputs! (mut work) 68 type [literal (: 1 i32)])
+          (None [] 0)
+          (Some [created]
+            (set! found created)
+            (push! (mut nodes) created)
+            (push! (mut blocks) target)
+            (push! (mut literals) literal)))))
+    (when (and (= found 0) fresh)
+      ; Nothing was appended: hand the caller's graph back.
+      (when owned
+        (free! (mut (.constants work)))
+        (free! (mut (.constant-spans work)))
+        (set! owned false))
+      (g/release-overlay! (mut work))
+      (set! work source))
+    found))
+
 ;;; prepared describes graph and is updated in place to describe the result.
 ;;; One COPY serves every use of a literal that shares a preheader. stores
 ;;; admits STORE values; the caller clears it when selected return values name
@@ -308,6 +394,8 @@
                            :calling (ArrayList::new [bool] allocator)
                            :unknown false)
         (mut scanned) false
+        (mut reciprocals) (ArrayList::new [i32] allocator)
+        (mut owned) false
         (mut error) ""]
     (let [items-103 (.starts (.blocks prepared)) (mut for-index-103) (: 0 i64)] (while (< for-index-103 (len items-103)) (let [block (get items-103 for-index-103)]
       (let [range (get (.ranges (.schedule prepared)) (cast i64 block))
@@ -315,8 +403,10 @@
         (when (> (get (.depths prepared) (cast i64 block)) 0)
           (for [i (.offset range) (+ (.offset range) (.count range))]
             (let [reference (get (.nodes (.schedule prepared)) i)
-                  mask (operands graph prepared reference stores)]
-              (when (!= mask 0)
+                  mask (operands graph prepared reference stores)
+                  magic (reciprocal-of graph prepared block reference)
+                  magic? (match magic (Some [_] true) (None [] false))]
+              (when (or (!= mask 0) magic?)
                 (when (< target 0)
                   ; The loop scan runs once, for the first candidate only.
                   (unless scanned
@@ -335,7 +425,21 @@
                                                     (mut blocks) (mut literals) allocator)]
                         (if (= definition 0)
                             (set! error "constant hoisting exhausted graph references")
-                            (g/write-input-word! (mut work) reference slot definition)))))))))))) (set! for-index-103 (+ for-index-103 1))))
+                            (g/write-input-word! (mut work) reference slot definition)))))
+                  (match magic
+                    (None [] 0)
+                    (Some [bits]
+                      (when (= error "")
+                        (let [node (get (.instructions graph) (cast i64 reference))
+                              wide (= (types/scalar-size (cast i32 (n/type-id node)) 8) 8)
+                              definition (reciprocal-definition! (mut work) graph bits wide target
+                                                                 (mut nodes) (mut blocks)
+                                                                 (mut literals) (mut owned)
+                                                                 allocator)]
+                          (if (= definition 0)
+                              (set! error "constant hoisting exhausted graph references")
+                              (do (push! (mut reciprocals) reference)
+                                  (push! (mut reciprocals) definition)))))))))))))) (set! for-index-103 (+ for-index-103 1))))
     (when (and (= error "") (> (len nodes) 0))
       (match (pipeline/schedule-appended! (mut prepared) work (slice nodes) (slice blocks)
                                           allocator)
@@ -344,7 +448,8 @@
     (release-loops! (mut facts))
     (free! (mut blocks))
     (free! (mut literals))
-    (let [(mut result) (Hoisted :graph work :nodes nodes)]
+    (let [(mut result) (Hoisted :graph work :nodes nodes :reciprocals reciprocals
+                                :constants owned)]
       (if (= error "")
           (Ok result)
           (do (release! (mut result)) (Err error))))))
