@@ -91,7 +91,13 @@
    (borrowed bool)
    ; The module's :shim thunks by convention key (shim-thunk!), or null when
    ; the function is compiled outside a module.
-   (shims (ptr (HashMap (slice u8) u32)))])
+   (shims (ptr (HashMap (slice u8) u32)))
+   ; Expansion only reads the callee registry (expand-module!): the registry
+   ; is closed and other threads may be reading it.
+   (readonly bool)
+   ; Which version of each definition a finalization worker reads (visible),
+   ; or null: the module's own.
+   (view (ptr View))])
 
 (defn require [(s (ptr Adapter)) (result (Result i32 (slice u8)))] (-> i32)
   (match result (Ok [r] r) (Err [message] (fail (.name (.f s)) message))))
@@ -2348,7 +2354,61 @@
    ; Cells a clone of the finalized template reserves (inlining/base-clone-cells).
    (cells i64)
    ; Finalized without the call and sparse exemptions (see template-policy).
-   (deferred bool)])
+   (deferred bool)
+   ; The registry snapshot of this version built by a finalization worker,
+   ; until the module adopts it and callee-handle names it; else null.
+   (snapshot inlining/Snapshot)])
+
+;;; Parallel finalization (module-finish!, "Parallel emission" in
+;;; src/compiler/stogir/README.md). Once the registry's specialization cache
+;;; is closed, finalizing a definition reads the registry and other
+;;; definitions and writes only its own result, so the definitions from
+;;; position `first` of the finalization order on are finalized by workers.
+;;;
+;;; The serial loop finalizes in `order`, so a definition reads the
+;;; definitions before it in that order as finalized and the ones after it as
+;;; they were before finalization. Workers keep exactly that: the module's own
+;;; list is not written while they run (it holds every definition before
+;;; finalization, and the finalized ones before `first`); a worker writes its
+;;; result to `finished` and reads another definition's entry there by
+;;; position (visible). A definition is started when the definitions it
+;;; calls that precede it have finished, whatever else is still running: it
+;;; cannot come to read any other unfinished one, because a clone only brings
+;;; calls of definitions that precede the cloned one. The results are
+;;; installed in the module, and their snapshots adopted by the registry, in
+;;; finalization order after the workers have stopped. Each result is a
+;;; function of the versions read, so the module is the serial loop's.
+;;;
+;;; `pending`, `ready`, `remaining` and `done` are guarded by `mutex`; a
+;;; worker's entry of `finished` and `budgets` is written before `done` is
+;;; set under it and read only by workers started after that.
+(defstruct Finishing
+  [(module (ptr Module))
+   (order (ArrayList i64))
+   ; Position of each definition in `order`.
+   (position (ArrayList i64))
+   (first i64)
+   (finished (ArrayList Definition))
+   (done (ArrayList bool))
+   ; Borrowed snapshot of a definition as it is before finalization, for the
+   ; ones called from an earlier position that have no registry handle.
+   (before (ArrayList inlining/Snapshot))
+   (budgets (ArrayList i32))
+   (mutex Mutex) (work Condition)
+   ; Per definition: calls of unfinished earlier definitions; its callers
+   ; waiting on it, chained through `next`.
+   (pending (ArrayList i32)) (heads (ArrayList i64)) (next (ArrayList i64))
+   (callers (ArrayList i64))
+   (ready (ArrayList i64)) (remaining i64)
+   (workers (ArrayList FinishWorker)) (threads (ArrayList Thread))])
+
+;;; One finalizing thread. Everything it keeps (graphs, snapshots) comes from
+;;; its own arena, which the module owns afterwards.
+(defstruct FinishWorker [(finishing (ptr Finishing)) (keep (ptr scratch/ScratchArena))])
+
+;;; A worker finalizing definition `index`, at `position`, into `own`.
+(defstruct View
+  [(finishing (ptr Finishing)) (index i64) (position i64) (own (ptr Definition))])
 
 ;;; A non-template caller owns its final graph in a stable arena until emitted.
 ;;; Registry snapshots remain frozen; these bodies are never registered callees.
@@ -2419,7 +2479,10 @@
    (native-by-symbol (ArrayList i64))
    (native-certified i64)
    ; :shim thunks defined so far, by convention key (shim-thunk!).
-   (shims (HashMap (slice u8) u32))])
+   (shims (HashMap (slice u8) u32))
+   ; Arenas of the finalization workers: they own the graphs and registry
+   ; snapshots of the definitions finalized there (Finishing).
+   (finish-arenas (ArrayList (ptr scratch/ScratchArena)))])
 
 (defn module-create [(a (dyn Allocator)) (trace bool)] (-> Module)
   (module-create-with a trace (settings-read)))
@@ -2465,7 +2528,8 @@
     :native-cache (ArrayList::new [NativeCache] a)
     :native-by-symbol (ArrayList::new [i64] a)
     :native-certified 0
-    :shims (HashMap::new [(slice u8) u32] a (keyops))))
+    :shims (HashMap::new [(slice u8) u32] a (keyops))
+    :finish-arenas (ArrayList::new [(ptr scratch/ScratchArena)] a)))
 
 ;;; adapt-as! for a function whose own symbol is not known: a call to itself
 ;;; is then a call like any other.
@@ -2534,6 +2598,7 @@
                        (a (dyn Allocator))] (-> void)
   ; A new owned graph version must acquire its own immutable proof.
   (set! (.callee-handle definition) 0)
+  (set! (.snapshot definition) (inlining/Snapshot :state (p/cast (ptr u8) 0)))
   (set! (.effects definition) (groups/no-effects))
   (set! (.graph definition) (graph/duplicate source a))
   (set! (.roots definition) (ArrayList::new [i32] a))
@@ -3053,6 +3118,37 @@
           (set! kept (+ kept 1)))))
     (while (> (len (.exits s)) kept) (pop! (mut (.exits s))))))
 
+;;; The definition at INDEX as the serial finalization loop would read it
+;;; here: the module's own, or for a finalization worker the version its
+;;; position sees (Finishing). Reading one that has not finished is a broken
+;;; scheduling invariant, never a wait.
+(defn visible [(module (ptr Module)) (view (ptr View)) (index i64)] (-> (ptr Definition))
+  (if (= (p/cast u64 view) 0)
+      (elem (mut (.definitions module)) index)
+      (let [finishing (.finishing view)
+            position (get (.position finishing) index)]
+        (cond (= index (.index view)) (.own view)
+              (or (> position (.position view)) (< position (.first finishing)))
+                (elem (mut (.definitions module)) index)
+              (get (.done finishing) index) (elem (mut (.finished finishing)) index)
+              :else (fail (.name (.source (.own view)))
+                          "finalization read a definition that has not finished")))))
+
+;;; The registry's view of DEFINITION (the one visible at INDEX) for the
+;;; read-only expansion: its handle, or the snapshot a worker built for it.
+(defn frozen-site [(s (ptr Adapter)) (index i64) (definition (ptr Definition)) (reference i32)]
+  (-> inlining/FrozenSite)
+  (cond (!= (.callee-handle definition) 0)
+          (inlining/FrozenSite :reference reference :callee (.callee-handle definition)
+                               :snapshot (inlining/Snapshot :state (p/cast (ptr u8) 0)))
+        (!= (p/cast u64 (.state (.snapshot definition))) 0)
+          (inlining/FrozenSite :reference reference :callee 0 :snapshot (.snapshot definition))
+        (and (!= (p/cast u64 (.view s)) 0)
+             (!= (p/cast u64 (.state (get (.before (.finishing (.view s))) index))) 0))
+          (inlining/FrozenSite :reference reference :callee 0
+                               :snapshot (get (.before (.finishing (.view s))) index))
+        :else (fail (.name (.source definition)) "definition has no registry snapshot")))
+
 ;;; Whether cloning DEFINITION at every direct call of it in the module adds
 ;;; at most the growth setting, by its current cell count.
 (defn sparse-definition? [(module (ptr Module)) (definition Definition)] (-> bool)
@@ -3099,6 +3195,11 @@
   (free! (mut (.native-cache module))) (free! (mut (.native-by-symbol module)))
   (private/context-release! (mut (.native-context module)))
   (inlining/registry-release! (mut (.callees module)))
+  ; After the registry: it has adopted snapshots stored in these arenas.
+  (for [i 0 (len (.finish-arenas module))]
+    (close! (get (.finish-arenas module) i))
+    (destroy (malloc-allocator) (get (.finish-arenas module) i)))
+  (free! (mut (.finish-arenas module)))
   (for [i 0 (len (.bodies module))]
     (release-emission-body! module (.symbol (.definition (at (.bodies module) i))))))
 
@@ -3167,9 +3268,12 @@
       (let [a (.a s)
             source-cells (if (.trace module) (len (.instructions (.g s))) (: 0 i64))
             (mut sites) (ArrayList::new [inlining/RegisteredSite] a)
+            (mut frozen-sites) (ArrayList::new [inlining/FrozenSite] a)
             (mut trace-sites) (ArrayList::new [inlining/Site] a)
             (mut changes) (: 0 i32)
             (mut r) 1]
+        (when (and (.readonly s) (.trace module))
+          (fail (.name (.f s)) "read-only expansion cannot trace"))
         ; Only instruction starts are nodes; variadic payload cells are skipped.
         (while (< r (len (.instructions (.g s))))
           (let [call (get (.instructions (.g s)) r)
@@ -3186,20 +3290,18 @@
                           (Some [name]
                                 (let [index (definition-index s module name)]
                                   (when (and (>= index 0)
-                                             (!= (p/cast u64 (.source (get (.definitions module) index)))
+                                             (!= (p/cast u64 (.source (visible module (.view s) index)))
                                                  (p/cast u64 (.f s)))
-                                             (or (not (.recursive (get (.definitions module) index)))
+                                             (or (not (.recursive (visible module (.view s) index)))
                                                  (and final (single-call? (.g s)))))
-                                    (let [definition
-                                            (elem (mut (.definitions module))
-                                                  index)
-                                          handle
-                                            (register-definition! module
-                                                                  definition)]
-                                      (push! (mut sites)
-                                             (inlining/RegisteredSite
-                                               :reference (cast i32 r)
-                                               :callee handle))
+                                    (let [definition (visible module (.view s) index)]
+                                      (if (.readonly s)
+                                          (push! (mut frozen-sites)
+                                                 (frozen-site s index definition (cast i32 r)))
+                                          (push! (mut sites)
+                                                 (inlining/RegisteredSite
+                                                   :reference (cast i32 r)
+                                                   :callee (register-definition! module definition))))
                                       (when (.trace module)
                                         (push! (mut trace-sites)
                                                (inlining/Site
@@ -3249,17 +3351,22 @@
                         (.caller-private proof)
                         (.private-result proof)
                         (.result-kind proof)))))
-        (when (> (len sites) 0)
-          (match (inlining/optimize-registered-specialized-policy (.callees module)
-                   (.g s) (.start s) (slice (.exits s)) (slice sites)
-                   (inlining/with-budget (cond (not final)
-                                                 (template-policy (.policy (.inline module)) deferred
-                                                                  (.wrap (.inline module)))
-                                               deferred
-                                                 (forwarder-policy (.policy (.inline module)))
-                                               :else (.policy (.inline module)))
-                                         budget)
-                   (.proof s) a)
+        (when (> (+ (len sites) (len frozen-sites)) 0)
+          (match (let [policy (inlining/with-budget
+                                (cond (not final)
+                                        (template-policy (.policy (.inline module)) deferred
+                                                         (.wrap (.inline module)))
+                                      deferred
+                                        (forwarder-policy (.policy (.inline module)))
+                                      :else (.policy (.inline module)))
+                                budget)]
+                   (if (.readonly s)
+                       (inlining/optimize-frozen-specialized-policy (.callees module)
+                         (.g s) (.start s) (slice (.exits s)) (slice frozen-sites) policy
+                         (.proof s) a)
+                       (inlining/optimize-registered-specialized-policy (.callees module)
+                         (.g s) (.start s) (slice (.exits s)) (slice sites) policy
+                         (.proof s) a)))
             (Err [message] (fail (.name (.f s)) message))
             (Ok [outcome]
                 (do
@@ -3307,6 +3414,7 @@
                               (inlining/specialization-count (.callees module))
                               final))))))
         (free! (mut trace-sites))
+        (free! (mut frozen-sites))
         (free! (mut sites))
         changes)))
 
@@ -3359,11 +3467,12 @@
 ;;; callee's parameter ordinals), else -1. Only bodies of this module have
 ;;; records: an import, an indirect call or a function of another unit never
 ;;; acquires one.
-(defn effects-target [(module (ptr Module)) (source graph/Graph) (reference i32)]
+(defn effects-target [(module (ptr Module)) (view (ptr View)) (source graph/Graph)
+                      (reference i32)]
   (-> i64)
   (let [call (get (.instructions source) (cast i64 reference))
         index (called-definition module source (.op2 call))]
-    (if (or (< index 0) (not (.present (.effects (get (.definitions module) index))))) -1
+    (if (or (< index 0) (not (.present (.effects (visible module view index))))) -1
         (match (calls/signature source (.op2 call) (node/type-id call)
                    (- (get (.arities source) (cast i64 reference)) 2))
           (Err [_] -1)
@@ -3372,7 +3481,7 @@
                 (match (strings/lookup (.strings source) (.id signature))
                   (None [] -1)
                   (Some [bytes]
-                        (let [target (.graph (get (.definitions module) index))]
+                        (let [target (.graph (visible module view index))]
                           (if (.present (groups/effects bytes)) -1
                               (match (strings/lookup (.strings target) (.function-prototype target))
                                 (None [] -1)
@@ -3382,14 +3491,14 @@
 ;;; Caller owns this graph version exclusively. Only the prototype's effect
 ;;; record changes; instruction references, observations, result roles and ABI
 ;;; pieces are stable.
-(defn annotate-call-effects! [(module (ptr Module)) (source (mut graph/Graph))
-                              (a (dyn Allocator))] (-> i32)
+(defn annotate-call-effects! [(module (ptr Module)) (view (ptr View))
+                              (source (mut graph/Graph)) (a (dyn Allocator))] (-> i32)
   (let [(mut bytes) (ArrayList::new [u8] a) (mut r) (: 1 i64) (mut changes) (: 0 i32)]
     (while (< r (len (.instructions source)))
       (let [call (get (.instructions source) r)
             count (get (.arities source) r)]
         (when (= (node/opcode call) 79)
-          (let [index (effects-target module source (cast i32 r))]
+          (let [index (effects-target module view source (cast i32 r))]
             (when (>= index 0)
               (match (calls/signature source (.op2 call) (node/type-id call) (- count 2))
                 (Err [e] (fail "call effects" e))
@@ -3398,7 +3507,7 @@
                     (None [] (fail "call effects" "prototype disappeared"))
                     (Some [original]
                       (when (groups/with-effects! (mut bytes) original
-                                                  (.effects (get (.definitions module) index)))
+                                                  (.effects (visible module view index)))
                         (let [id (match (strings/intern! (mut (.strings source)) (slice bytes))
                                    (None [] (fail "call effects" "prototype space exhausted"))
                                    (Some [id] id))
@@ -3424,23 +3533,29 @@
 ;;; records can enable memory optimization here (native-effects/enables?) the
 ;;; template is optimized once more, so that its clones, its own emission and
 ;;; its summary all see the result.
-(defn finish-definition-effects! [(module (ptr Module)) (definition (ptr Definition))]
+;;;
+;;; A is what owns the definition: the module's allocator, or for a
+;;; finalization worker (VIEW) its own arena. A worker also leaves the
+;;; registry alone and builds this version's snapshot instead.
+(defn finish-definition-effects! [(module (ptr Module)) (view (ptr View))
+                                  (definition (ptr Definition)) (a (dyn Allocator))]
   (-> void)
   (let [(mut r) (: 1 i64) (mut needed) false source (.graph definition)]
     (while (and (not needed) (< r (len (.instructions source))))
       (let [call (get (.instructions source) r) count (get (.arities source) r)]
         (when (and (= (node/opcode call) 79)
-                   (>= (effects-target module source (cast i32 r)) 0))
+                   (>= (effects-target module view source (cast i32 r)) 0))
           (set! needed true))
         (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
     (when needed
       (let [proven (and (.effects module) (!= (.proof definition) 0)
                         (= (rewrite/content-hash source 8) (.proof definition)))
-            (mut owned) (graph/duplicate source (.a module))
-            changes (annotate-call-effects! module (mut owned) (.a module))
+            (mut owned) (graph/duplicate source a)
+            changes (annotate-call-effects! module view (mut owned) a)
             again (and (.effects module) (native-effects/enables? owned))]
         (set! (.graph definition) owned)
         (set! (.callee-handle definition) 0)
+        (set! (.snapshot definition) (inlining/Snapshot :state (p/cast (ptr u8) 0)))
         (when (.effects module)
           (set! (.proof definition) (if proven (rewrite/content-hash owned 8) 0)))
         (when again
@@ -3454,18 +3569,23 @@
                   (let [(mut optimized) optimized]
                     (own-definition! definition (.graph optimized) (slice (.roots optimized))
                                      (slice (.import-names definition))
-                                     (slice (.import-ids definition)) (.a module))
+                                     (slice (.import-ids definition)) a)
                     (set! (.clean definition) true)
                     (set! (.proof definition) (.proof optimized))
                     (queue/release! (mut (.iteration optimized))))))
             (close! work)))
         (when (.trace module)
           (eprintln "stogir effect-calls {}: {} again {}" (.name (.source definition)) changes again))))
-    (register-definition! module definition)
+    (when (= (p/cast u64 view) 0) (register-definition! module definition))
     ; The summary borrows this exact registered graph version. Its scratch
     ; must not accumulate in the module arena.
     (let [work (p/alloc-stack scratch/ScratchArena)]
       (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 4096)
+      (when (and (!= (p/cast u64 view) 0) (= (.callee-handle definition) 0))
+        (match (inlining/snapshot-create (definition-callee module (load definition))
+                                         (.proof definition) 8 a (allocator work))
+          (Err [message] (fail (.name (.source definition)) message))
+          (Ok [snapshot] (set! (.snapshot definition) snapshot))))
       (set! (.effects definition)
             (cond (.effects module)
                     (native-effects/summarize (.graph definition) (allocator work))
@@ -3567,64 +3687,317 @@
     (free! (mut heads))
     order))
 
+;;; Finalize DEFINITION: expand its direct calls until nothing changes, then
+;;; its effect records and summary. BUDGET is its growth allowance, charged
+;;; here. Serially (VIEW null) DEFINITION is the module's own entry, KEEP the
+;;; module's allocator, and the registry is filled as callees are met. For a
+;;; finalization worker DEFINITION is its private copy, KEEP its arena, and
+;;; every other definition is read through VIEW and the closed registry;
+;;; nothing the module owns is written, released or reallocated, since other
+;;; workers read it: the graph is borrowed and the lists are copies.
+(defn finalize-definition! [(module (ptr Module)) (view (ptr View))
+                            (definition (ptr Definition)) (budget (ptr i32))
+                            (keep (dyn Allocator))] (-> void)
+  (let [temporary (p/alloc-stack scratch/ScratchArena)
+        worker (!= (p/cast u64 view) 0)
+        (mut changed) true]
+    (while changed
+      (set! changed false)
+      (scratch/ScratchArena::init-with-capacity temporary
+                                                (malloc-allocator)
+                                                65536)
+      (let [before (len (.instructions (.graph definition)))
+            (mut state) (zeroed Adapter)
+            s (cast (ptr Adapter) (mut state))]
+        (set! (.a s) (allocator temporary))
+        (set! (.f s) (.source definition))
+        (set! (.g s) (.graph definition))
+        (set! (.start s) (.entry definition))
+        (set! (.proof s) (.proof definition))
+        (if worker
+            (do
+              (set! (.view s) view)
+              (set! (.readonly s) true)
+              (set! (.borrowed s) true)
+              (set! (.exits s) (ArrayList::new [i32] (.a s)))
+              (set! (.import-names s) (ArrayList::new [(slice u8)] (.a s)))
+              (set! (.import-ids s) (ArrayList::new [u32] (.a s)))
+              (for [i 0 (len (.observed definition))]
+                (push! (mut (.exits s)) (get (.observed definition) i)))
+              (for [i 0 (len (.import-ids definition))]
+                (push! (mut (.import-names s)) (get (.import-names definition) i))
+                (push! (mut (.import-ids s)) (get (.import-ids definition) i))))
+            (do
+              (set! (.exits s) (.observed definition))
+              (set! (.import-names s) (.import-names definition))
+              (set! (.import-ids s) (.import-ids definition))))
+        (when (> (expand-module! s module (load budget) false (.deferred definition)) 0)
+          ; Charge reserved clone cells before cleanup; optimization never
+          ; replenishes this definition's budget.
+          ; Uncharged small-callee growth can exceed the remainder.
+          (let [left (- (load budget)
+                        (cast i32 (- (len (.instructions (.g s))) before)))]
+            (store! budget (if (< left 0) 0 left)))
+          (let [cleaned (finish-private-template! s)]
+            (own-definition! definition
+                             (.g s)
+                             (slice (.exits s))
+                             (slice (.import-names s))
+                             (slice (.import-ids s))
+                             keep)
+            (set! (.clean definition) cleaned)
+            (set! (.proof definition) (.proof s)))
+          (set! changed true)))
+      (close! temporary))
+    (finish-definition-effects! module view definition keep)))
+
+;;; ---- Finalization on worker threads (see Finishing) ----
+
+(defn mutex-lock! [(mutex (ptr Mutex))] (-> void)
+  (match (Mutex::lock! mutex)
+    (Ok [_] 0) (Err [_] (fail "worker threads" "mutex lock failed"))))
+
+(defn mutex-unlock! [(mutex (ptr Mutex))] (-> void)
+  (match (Mutex::unlock! mutex)
+    (Ok [_] 0) (Err [_] (fail "worker threads" "mutex unlock failed"))))
+
+;;; Finalize definition INDEX on the calling worker and publish the result.
+(defn finishing-run! [(worker (ptr FinishWorker)) (index i64)] (-> void)
+  (let [finishing (.finishing worker)
+        module (.module finishing)
+        (mut own) (get (.definitions module) index)
+        (mut budget) (get (.budgets finishing) index)
+        (mut view) (View :finishing finishing :index index
+                         :position (get (.position finishing) index)
+                         :own (cast (ptr Definition) (mut own)))]
+    (finalize-definition! module (cast (ptr View) (mut view)) (cast (ptr Definition) (mut own))
+                          (cast (ptr i32) (mut budget)) (allocator (.keep worker)))
+    (set! (mut (.finished finishing)) index own)
+    (set! (mut (.budgets finishing)) index budget)))
+
+;;; Take ready definitions until none is left unfinished. A definition that
+;;; finishes releases the callers that waited only for it.
+(defn finishing-worker [(argument (ptr i8))] (-> (ptr i8))
+  (let [worker (p/cast (ptr FinishWorker) argument)
+        finishing (.finishing worker)
+        mutex (field finishing mutex)]
+    (mutex-lock! mutex)
+    (loop
+      (while (and (= (len (.ready finishing)) 0) (> (.remaining finishing) 0))
+        (match (Condition::wait! (field finishing work) mutex)
+          (Ok [_] 0) (Err [_] (fail "finalization" "condition wait failed"))))
+      (if (= (len (.ready finishing)) 0)
+          (break)
+          (let [index (match (pop! (mut (.ready finishing)))
+                        (Some [index] index)
+                        (None [] (fail "finalization" "ready list emptied under its mutex")))]
+            (mutex-unlock! mutex)
+            (finishing-run! worker index)
+            (mutex-lock! mutex)
+            (set! (mut (.done finishing)) index true)
+            (set! (.remaining finishing) (- (.remaining finishing) 1))
+            (let [(mut edge) (get (.heads finishing) index)
+                  (mut released) (: 0 i64)]
+              (while (>= edge 0)
+                (let [caller (get (.callers finishing) edge)
+                      left (- (get (.pending finishing) caller) 1)]
+                  (set! (mut (.pending finishing)) caller left)
+                  (when (= left 0)
+                    (push! (mut (.ready finishing)) caller)
+                    (set! released (+ released 1))))
+                (set! edge (get (.next finishing) edge)))
+              ; This thread takes one itself; the rest need another each.
+              (when (or (> released 1) (= (.remaining finishing) 0))
+                (match (Condition::notify-all! (field finishing work))
+                  (Ok [_] 0) (Err [_] (fail "finalization" "condition notify failed"))))))))
+    (mutex-unlock! mutex)
+    (p/cast (ptr i8) 0)))
+
+;;; Finalize the definitions from position FIRST of ORDER on with THREADS
+;;; threads, this one included, and install the results. The registry must
+;;; be closed. BUDGETS is updated as the serial loop updates it.
+(defn finish-parallel! [(module (ptr Module)) (order (ArrayList i64)) (first i64)
+                        (budgets (mut (ArrayList i32))) (threads i64)] (-> void)
+  (unless (inlining/registry-closed? (.callees module))
+    (fail "finalization" "parallel finalization needs a closed registry"))
+  (when (or (.trace module) (< threads 2))
+    (fail "finalization" "parallel finalization needs threads and no tracing"))
+  (let [m (malloc-allocator)
+        count (len (.definitions module))
+        null (inlining/Snapshot :state (p/cast (ptr u8) 0))
+        schedule-span (tr/span-begin "backend.stogir.finalize.schedule")
+        finishing (box! m Finishing (zeroed Finishing))
+        ; Scratch of this thread's preparation; the borrowed snapshots live
+        ; here until the workers have stopped.
+        work (p/alloc-stack scratch/ScratchArena)]
+    (scratch/ScratchArena::init-with-capacity work m 65536)
+    (set! (.module finishing) module)
+    (set! (.order finishing) order)
+    (set! (.first finishing) first)
+    (set! (.position finishing) (ArrayList::new [i64] m))
+    (set! (.finished finishing) (ArrayList::new [Definition] m))
+    (set! (.done finishing) (ArrayList::new [bool] m))
+    (set! (.before finishing) (ArrayList::new [inlining/Snapshot] m))
+    (set! (.budgets finishing) (ArrayList::new [i32] m))
+    (set! (.pending finishing) (ArrayList::new [i32] m))
+    (set! (.heads finishing) (ArrayList::new [i64] m))
+    (set! (.next finishing) (ArrayList::new [i64] m))
+    (set! (.callers finishing) (ArrayList::new [i64] m))
+    (set! (.ready finishing) (ArrayList::new [i64] m))
+    (set! (.workers finishing) (ArrayList::new [FinishWorker] m))
+    (set! (.threads finishing) (ArrayList::new [Thread] m))
+    (reserve! (mut (.position finishing)) count)
+    (reserve! (mut (.finished finishing)) count)
+    (reserve! (mut (.done finishing)) count)
+    (reserve! (mut (.before finishing)) count)
+    (reserve! (mut (.budgets finishing)) count)
+    (reserve! (mut (.pending finishing)) count)
+    (reserve! (mut (.heads finishing)) count)
+    (for [i 0 count]
+      (push! (mut (.position finishing)) -1)
+      (push! (mut (.finished finishing)) (zeroed Definition))
+      (push! (mut (.done finishing)) false)
+      (push! (mut (.before finishing)) null)
+      (push! (mut (.budgets finishing)) (get budgets i))
+      (push! (mut (.pending finishing)) 0)
+      (push! (mut (.heads finishing)) -1))
+    (for [i 0 count]
+      (set! (mut (.position finishing)) (get order i) i))
+    ; Answers the workers would otherwise compute at every site.
+    (match (inlining/registry-settle! (mut (.callees module)) (allocator work))
+      (Err [message] (fail "finalization" message)) (Ok [_] 0))
+    ; What each definition waits for, and the versions before finalization
+    ; that an earlier position reads without a registry handle.
+    (for [at first count]
+      (let [index (get order at)
+            source (.graph (get (.definitions module) index))
+            (mut r) 1]
+        (while (< r (len (.instructions source)))
+          (let [call (get (.instructions source) r)
+                arity (get (.arities source) r)]
+            (when (= (node/opcode call) 79)
+              (let [callee (called-definition module source (.op2 call))]
+                (when (and (>= callee 0) (!= callee index))
+                  (let [position (get (.position finishing) callee)]
+                    (cond (and (>= position first) (< position at))
+                            (do (push! (mut (.callers finishing)) index)
+                                (push! (mut (.next finishing)) (get (.heads finishing) callee))
+                                (set! (mut (.heads finishing)) callee
+                                      (- (len (.callers finishing)) 1))
+                                (set! (mut (.pending finishing)) index
+                                      (+ (get (.pending finishing) index) 1)))
+                          (and (> position at)
+                               (= (.callee-handle (get (.definitions module) callee)) 0)
+                               (= (p/cast u64 (.state (get (.before finishing) callee))) 0))
+                            (let [target (get (.definitions module) callee)]
+                              (match (inlining/snapshot-borrow (definition-callee module target)
+                                                               (.proof target) 8
+                                                               (allocator work) (allocator work))
+                                (Err [message] (fail (.name (.source target)) message))
+                                (Ok [snapshot]
+                                    (set! (mut (.before finishing)) callee snapshot))))
+                          :else 0)))))
+            (set! r (+ r (/ (+ (cast i64 arity) 4) 4)))))))
+    (set! (.remaining finishing) (- count first))
+    ; Popped from the end: lower positions first.
+    (let [(mut at) count]
+      (while (> at first)
+        (set! at (- at 1))
+        (when (= (get (.pending finishing) (get order at)) 0)
+          (push! (mut (.ready finishing)) (get order at)))))
+    ; No push may move the ready list while workers hold the mutex briefly.
+    (reserve! (mut (.ready finishing)) count)
+    (match (Mutex::init (field finishing mutex))
+      (Ok [_] 0) (Err [_] (fail "finalization" "mutex creation failed")))
+    (match (Condition::init (field finishing work))
+      (Ok [_] 0) (Err [_] (fail "finalization" "condition creation failed")))
+    ; Worker records and thread handles must not move once threads run.
+    (for [i 0 threads]
+      (let [keep (box! m scratch/ScratchArena (zeroed scratch/ScratchArena))]
+        (scratch/ScratchArena::init-with-capacity keep m 1048576)
+        (push! (mut (.finish-arenas module)) keep)
+        (push! (mut (.workers finishing)) (FinishWorker :finishing finishing :keep keep))
+        (push! (mut (.threads finishing)) (zeroed Thread))))
+    (tr/span-end schedule-span)
+    (let [(mut started) (: 0 i64) (mut refused) false
+          span (tr/span-begin "backend.stogir.finalize.workers")]
+      ; This thread is the last worker; a refused thread only leaves fewer.
+      (while (and (not refused) (< started (- threads 1)))
+        (if (= (Thread::spawn-configured (elem (mut (.threads finishing)) started)
+                                         (fnptr-of finishing-worker)
+                                         (p/cast (ptr i8) (elem (mut (.workers finishing)) started))
+                                         (ThreadConfig::new (worker-stack-size) -1))
+               (: 0 i32))
+            (set! started (+ started 1))
+            (set! refused true)))
+      (finishing-worker (p/cast (ptr i8) (elem (mut (.workers finishing)) (- threads 1))))
+      (for [i 0 started]
+        (unless (= (Thread::join (elem (mut (.threads finishing)) i)) (: 0 i32))
+          (fail "finalization" "thread join failed")))
+      (tr/span-end span))
+    (match (Condition::destroy! (field finishing work))
+      (Ok [_] 0) (Err [_] (fail "finalization" "condition release failed")))
+    (match (Mutex::destroy! (field finishing mutex))
+      (Ok [_] 0) (Err [_] (fail "finalization" "mutex release failed")))
+    ; Install in finalization order; the registry adopts each new snapshot.
+    (for [at first count]
+      (let [index (get order at)
+            definition (elem (mut (.definitions module)) index)]
+        (unless (get (.done finishing) index)
+          (fail (.name (.source definition)) "definition was not finalized"))
+        (store! definition (get (.finished finishing) index))
+        (set! (mut budgets) index (get (.budgets finishing) index))
+        (when (= (.callee-handle definition) 0)
+          (match (inlining/registry-adopt! (mut (.callees module)) (.snapshot definition))
+            (Err [message] (fail (.name (.source definition)) message))
+            (Ok [handle]
+                (set! (.callee-handle definition) handle)
+                (set! (.snapshot definition) null))))))
+    (close! work)
+    (free! (mut (.position finishing))) (free! (mut (.finished finishing)))
+    (free! (mut (.done finishing))) (free! (mut (.before finishing)))
+    (free! (mut (.budgets finishing))) (free! (mut (.pending finishing)))
+    (free! (mut (.heads finishing))) (free! (mut (.next finishing)))
+    (free! (mut (.callers finishing))) (free! (mut (.ready finishing)))
+    (free! (mut (.workers finishing))) (free! (mut (.threads finishing)))
+    (destroy m finishing)))
+
 ;;; Finalize each actual direct-call DAG callee before its callers. A caller's
 ;;; bounded local revisits can expose nested calls or private storage promotion,
 ;;; but transitive callee graphs already have their final immutable contents.
 ;;; The same 512-cell growth accounting applies; recursive closures stay Never.
-(defn module-finish! [(module (ptr Module))] (-> void)
+;;;
+;;; With THREADS above one (and no tracing) the loop runs here only until the
+;;; registry's specialization cache is closed; the remaining definitions are
+;;; finalized by worker threads (finish-parallel!), with the same result. A
+;;; module whose cache never closes is finalized here entirely.
+(defn module-finish! [(module (ptr Module)) (threads i64)] (-> void)
   (let [a (.a module)
         count (len (.definitions module))
+        order-span (tr/span-begin "backend.stogir.finalize.order")
         (mut order) (mark-acyclic-definitions! module)
         (mut budgets) (ArrayList::new [i32] a)
-        temporary (p/alloc-stack scratch/ScratchArena)]
+        parallel (and (> threads 1) (not (.trace module)))
+        (mut at) (: 0 i64)]
     (for [i 0 count]
       (push! (mut budgets) (.budget (.policy (.inline module))))
       (set! (.deferred (elem (mut (.definitions module)) i))
             (or (< (.scope (.inline module)) 2)
                 (<= (inlining/base-clone-cells (.graph (get (.definitions module) i)))
                     (cast i64 (.keep (.inline module)))))))
-    (for index order
-      (when (.trace module)
-        (eprintln "stogir finalize-order {}: {}"
-                  (.name (.source (get (.definitions module) index)))
-                  index))
-      (let [(mut changed) true]
-        (while changed
-          (set! changed false)
-          (scratch/ScratchArena::init-with-capacity temporary
-                                                    (malloc-allocator)
-                                                    65536)
-          (let [definition (elem (mut (.definitions module)) index)
-                before (len (.instructions (.graph definition)))
-                (mut state) (zeroed Adapter)
-                s (cast (ptr Adapter) (mut state))]
-            (set! (.a s) (allocator temporary))
-            (set! (.f s) (.source definition))
-            (set! (.g s) (.graph definition))
-            (set! (.start s) (.entry definition))
-            (set! (.exits s) (.observed definition))
-            (set! (.import-names s) (.import-names definition))
-            (set! (.import-ids s) (.import-ids definition))
-            (set! (.proof s) (.proof definition))
-            (when (> (expand-module! s module (get budgets index) false (.deferred definition)) 0)
-              ; Charge reserved clone cells before cleanup; optimization never
-              ; replenishes this definition's budget.
-              ; Uncharged small-callee growth can exceed the remainder.
-              (let [left (- (get budgets index)
-                            (cast i32 (- (len (.instructions (.g s))) before)))]
-                (set! (mut budgets) index (if (< left 0) 0 left)))
-              (let [cleaned (finish-private-template! s)]
-                (own-definition! definition
-                                 (.g s)
-                                 (slice (.exits s))
-                                 (slice (.import-names s))
-                                 (slice (.import-ids s))
-                                 a)
-                (set! (.clean definition) cleaned)
-                (set! (.proof definition) (.proof s)))
-              (set! changed true)))
-          (close! temporary)))
-      (finish-definition-effects! module (elem (mut (.definitions module)) index)))
+    (tr/span-end order-span)
+    (while (and (< at count)
+                (not (and parallel (inlining/registry-closed? (.callees module)))))
+      (let [index (get order at)]
+        (when (.trace module)
+          (eprintln "stogir finalize-order {}: {}"
+                    (.name (.source (get (.definitions module) index)))
+                    index))
+        (finalize-definition! module (p/cast (ptr View) 0)
+                              (elem (mut (.definitions module)) index)
+                              (elem (mut budgets) index) a))
+      (set! at (+ at 1)))
+    (when (< at count) (finish-parallel! module order at (mut budgets) threads))
     (set! (.frozen module) true)
     (when (.trace module)
       (for [i 0 count]
@@ -3816,7 +4189,7 @@
             definition (cast (ptr Definition) (mut owned))]
         (set! (.shims s) (p/cast (ptr (HashMap (slice u8) u32)) (mut (.shims module))))
         (adapt-as! s f ta (cast i64 symbol) (p/cast (ptr (ArrayList MTextData)) 0) a)
-        (annotate-call-effects! module (mut (.g s)) a)
+        (annotate-call-effects! module (p/cast (ptr View) 0) (mut (.g s)) a)
         (when (> level 1) (prepare-inline-caller! s))
         (let [changes (expand-module! s module (.budget (.policy (.inline module))) true
                                       (body-deferred? module symbol))]
@@ -4175,7 +4548,7 @@
             (set! (.shims s) (p/cast (ptr (HashMap (slice u8) u32)) (mut (.shims module)))))
           (adapt-as! s f ta (cast i64 symbol) text-data a)
           (when (!= (p/cast i64 module) 0)
-            (annotate-call-effects! module (mut (.g s)) a))
+            (annotate-call-effects! module (p/cast (ptr View) 0) (mut (.g s)) a))
           (when (and (!= (p/cast i64 module) 0) (> optimization 1))
             (prepare-inline-caller! s)
             (set! optimized true))

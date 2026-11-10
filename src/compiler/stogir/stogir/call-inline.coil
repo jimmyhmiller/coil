@@ -4,7 +4,7 @@
 (module stogir.call-inline)
 (import "stogir.fill" :as fill)
 
-(export compatible? Callee Site SiteProof inspect-verified-site optimize optimize-sites optimize-sites-if-changed Registry RegisteredSite specialization-count optimize-registered-specialized-if-changed optimize-registered-specialized-proven optimize-registered-specialized-policy optimize-registered-prioritized-policy optimize-sites-policy optimize-sites-policy-if-changed Policy default-policy with-budget with-every-call with-keep-cells base-clone-cells registry-create registry-release! register! register-proven! prioritize-registered-sites optimize-registered-prioritized-if-changed optimize-registered-if-changed)
+(export compatible? Callee Site SiteProof inspect-verified-site optimize optimize-sites optimize-sites-if-changed Registry RegisteredSite specialization-count optimize-registered-specialized-if-changed optimize-registered-specialized-proven optimize-registered-specialized-policy optimize-registered-prioritized-policy optimize-sites-policy optimize-sites-policy-if-changed Policy default-policy with-budget with-every-call with-keep-cells base-clone-cells registry-create registry-release! register! register-proven! prioritize-registered-sites optimize-registered-prioritized-if-changed optimize-registered-if-changed registry-closed? registry-settle! Snapshot snapshot-create snapshot-borrow registry-adopt! FrozenSite optimize-frozen-specialized-policy)
 
 (import "stogir.graph" :as g)
 (import "stogir.cfg" :as cfg)
@@ -2359,3 +2359,277 @@
                       (free! (mut resolved)) (free! (mut costs))
                       (free! (mut closed)) (free! (mut closed-contexts))
                       result))))))))))
+
+;;; ---- Reading a closed registry from several threads ----
+;;;
+;;; The specialization cache admits a fixed number of creation attempts. Once
+;;; they are spent the registry is closed: context selection can only pick an
+;;; existing context, so an expansion reads the registry and, through the
+;;; entries above, writes nothing but the closed-control memo of a callee or
+;;; context. optimize-frozen-specialized-policy is that expansion without the
+;;; memo write. It therefore never writes the registry, and any number of
+;;; threads may run it at once, as long as nothing registers or adopts
+;;; meanwhile. Its result is the one optimize-registered-specialized-policy
+;;; gives for the same sites.
+
+;;; Whether no further specialization context can be created.
+(defn registry-closed? [(registry Registry)] (-> bool)
+  (and (!= (p/cast u64 (.state registry)) 0)
+       (>= (.context-attempts (p/cast (ptr RegistryState) (.state registry))) 128)))
+
+;;; Answer the closed-control question of every inlineable callee and of every
+;;; context that has not been asked yet, so that the read-only entry finds the
+;;; answer instead of computing it at each site. The answers are the ones the
+;;; lazy memo would hold. SCRATCH serves the analysis only.
+(defn registry-settle! [(registry (mut Registry)) (scratch (dyn Allocator))]
+  (-> (Result i64 (slice u8)))
+  (if (= (p/cast u64 (.state registry)) 0)
+      (Err "inline registry is released")
+      (let [state (p/cast (ptr RegistryState) (.state registry))
+            (mut settled) (: 0 i64)]
+        (for [i 0 (len (.callees state))]
+          (let [callee (elem (mut (.callees state)) i)]
+            (when (and (= (.closed callee) 0) (not (.never callee)))
+              (set! (.closed callee)
+                    (if (closed-control? (.graph callee) (slice (.observed callee)) scratch) 1 2))
+              (set! settled (+ settled 1)))))
+        (for [i 0 (len (.contexts state))]
+          (let [context (elem (mut (.contexts state)) i)]
+            (when (= (.closed context) 0)
+              (set! (.closed context)
+                    (if (closed-control? (.graph (.body (.value context)))
+                                         (slice (.roots (.body (.value context)))) scratch)
+                        1 2))
+              (set! settled (+ settled 1)))))
+        (Ok settled))))
+
+;;; A validated immutable callee that is not in a registry (yet). An owned
+;;; snapshot holds copies of everything, allocated from its own allocator, and
+;;; registry-adopt! can enter it into a registry without copying; a borrowed
+;;; one reads the provider's graph, name and roots, which must not change
+;;; while it is used, and cannot be adopted. Building one touches no registry,
+;;; so threads can build snapshots concurrently, each from its own allocators.
+(defstruct Snapshot [(state (ptr u8))])
+
+(defstruct SnapshotState [(callee FrozenCallee) (owned bool) (adopted bool) (pointer-bytes i32)])
+
+(defn snapshot-error [(target Callee) (proof u128) (pointer-bytes i32) (scratch (dyn Allocator))]
+  (-> (slice u8))
+  (let [source (.graph target)
+        (mut error) ""]
+    (unless (and (!= proof 0) (= (rewrite/content-hash source pointer-bytes) proof))
+      (match (rewrite/validate source pointer-bytes scratch)
+        (Err [message] (set! error message))
+        (Ok [_] 0)))
+    (when (and (= error "")
+               (not (and (cloneable? (.instructions source))
+                         (cloneable? (.arities source))
+                         (cloneable? (.constants source))
+                         (cloneable? (.constant-spans source))
+                         (cloneable? (.bytes (.strings source)))
+                         (cloneable? (.entries (.strings source))))))
+      (set! error "invalid inline snapshot storage"))
+    (for [i 0 (len (.roots target))]
+      (let [root (get (.roots target) i)]
+        (when (or (<= root 0) (not (g/contains? source root)))
+          (set! error "invalid inline callee root"))))
+    (for [i 0 (len (.observed target))]
+      (let [root (get (.observed target) i)]
+        (when (or (<= root 0) (not (g/contains? source root)))
+          (set! error "invalid inline observed root"))))
+    (for [i 0 (len (.roots target))]
+      (let [root (get (.roots target) i)
+            (mut found) false]
+        (for [j 0 (len (.observed target))]
+          (when (= root (get (.observed target) j)) (set! found true)))
+        (unless found (set! error "inline return is not observed"))))
+    error))
+
+(defn snapshot-build [(target Callee) (proof u128) (pointer-bytes i32) (owned bool)
+                      (keep (dyn Allocator)) (scratch (dyn Allocator))]
+  (-> (Result Snapshot (slice u8)))
+  (let [error (snapshot-error target proof pointer-bytes scratch)]
+    (if (!= error "")
+        (Err error)
+        (let [source (.graph target)
+              (mut name) (ArrayList::new [u8] keep)
+              (mut roots) (ArrayList::new [i32] keep)
+              (mut observed) (ArrayList::new [i32] keep)]
+          (reserve! (mut name) (len (.name target)))
+          (for [i 0 (len (.name target))] (push! (mut name) (get (.name target) i)))
+          (for [i 0 (len (.roots target))] (push! (mut roots) (get (.roots target) i)))
+          (for [i 0 (len (.observed target))] (push! (mut observed) (get (.observed target) i)))
+          (let [graph (if owned (freeze-graph source keep) source)
+                closed (if (.never target) (: 0 i32)
+                           (if (closed-control? graph (slice observed) scratch) (: 1 i32) 2))]
+            (Ok (Snapshot
+                  :state
+                    (p/cast (ptr u8)
+                            (alloc/box! keep SnapshotState
+                                        (SnapshotState
+                                          :callee (FrozenCallee
+                                                    :name name :graph graph :entry (.entry target)
+                                                    :roots roots :observed observed
+                                                    :never (.never target) :always (.always target)
+                                                    :sparse (.sparse target)
+                                                    :base-cells (base-clone-cells source)
+                                                    :closed closed)
+                                          :owned owned :adopted false
+                                          :pointer-bytes pointer-bytes))))))))))
+
+;;; An owned snapshot of TARGET, checked as register-proven! checks it (PROOF
+;;; as there). Everything that lasts is allocated from KEEP, which must live
+;;; as long as the snapshot and any registry that adopts it.
+(defn snapshot-create [(target Callee) (proof u128) (pointer-bytes i32)
+                       (keep (dyn Allocator)) (scratch (dyn Allocator))]
+  (-> (Result Snapshot (slice u8)))
+  (snapshot-build target proof pointer-bytes true keep scratch))
+
+;;; A borrowed snapshot of TARGET: the same checks, no copy of the graph.
+(defn snapshot-borrow [(target Callee) (proof u128) (pointer-bytes i32)
+                       (keep (dyn Allocator)) (scratch (dyn Allocator))]
+  (-> (Result Snapshot (slice u8)))
+  (snapshot-build target proof pointer-bytes false keep scratch))
+
+;;; Enter an owned snapshot into REGISTRY and return its handle. Nothing is
+;;; copied or validated again: the registry takes the snapshot's storage, which
+;;; stays allocated from the snapshot's allocator and is released with the
+;;; registry. A snapshot is adopted at most once.
+(defn registry-adopt! [(registry (mut Registry)) (snapshot Snapshot)]
+  (-> (Result i64 (slice u8)))
+  (cond (= (p/cast u64 (.state registry)) 0) (Err "inline registry is released")
+        (= (p/cast u64 (.state snapshot)) 0) (Err "missing inline snapshot")
+        :else
+          (let [state (p/cast (ptr RegistryState) (.state registry))
+                held (p/cast (ptr SnapshotState) (.state snapshot))]
+            (cond (not (.owned held)) (Err "borrowed inline snapshot cannot be adopted")
+                  (.adopted held) (Err "inline snapshot is already adopted")
+                  (!= (.pointer-bytes held) (.pointer-bytes state))
+                    (Err "inline snapshot has another pointer width")
+                  :else
+                    (do (set! (.adopted held) true)
+                        (push! (mut (.callees state)) (.callee held))
+                        (Ok (len (.callees state))))))))
+
+;;; A call site whose callee is a registry handle (CALLEE above zero) or else
+;;; a snapshot outside the registry.
+(defstruct FrozenSite [(reference i32) (callee i64) (snapshot Snapshot)])
+
+(defn frozen-target [(state (ptr RegistryState)) (site FrozenSite)]
+  (-> (Result (ptr FrozenCallee) (slice u8)))
+  (cond (> (.callee site) (len (.callees state))) (Err "invalid registered inline callee")
+        (> (.callee site) 0) (Ok (elem (mut (.callees state)) (- (.callee site) 1)))
+        (or (< (.callee site) 0) (= (p/cast u64 (.state (.snapshot site))) 0))
+          (Err "invalid registered inline callee")
+        (!= (.pointer-bytes (p/cast (ptr SnapshotState) (.state (.snapshot site))))
+            (.pointer-bytes state))
+          (Err "inline snapshot has another pointer width")
+        :else (Ok (cast (ptr FrozenCallee)
+                        (mut (.callee (p/cast (ptr SnapshotState) (.state (.snapshot site)))))))))
+
+(defn frozen-callee [(target (ptr FrozenCallee))] (-> Callee)
+  (Callee :name (slice (.name target)) :graph (.graph target) :entry (.entry target)
+          :roots (slice (.roots target)) :observed (slice (.observed target))
+          :never (.never target) :always (.always target) :sparse (.sparse target)))
+
+;;; optimize-registered-verified over frozen sites, the memo left as it is.
+(defn optimize-frozen-verified [(state (ptr RegistryState)) (source g/Graph)
+                                (roots (slice i32)) (sites (slice FrozenSite))
+                                (policy Policy) (entry i32) (caller-verified bool)
+                                (a (dyn Allocator))]
+  (-> (Result (Option rewrite/Rewritten) (slice u8)))
+  (let [(mut resolved) (ArrayList::new [Site] a)
+        (mut costs) (ArrayList::new [i64] a)
+        (mut closed) (ArrayList::new [i32] a)
+        (mut error) ""]
+    (for [i 0 (len sites)]
+      (match (frozen-target state (get sites i))
+        (Err [message] (set! error message))
+        (Ok [target]
+          (when (> entry 0) (push! (mut costs) (.base-cells target)))
+          (push! (mut closed) (.closed target))
+          (push! (mut resolved)
+                 (Site :reference (.reference (get sites i)) :target (frozen-callee target))))))
+    (let [result
+            (if (!= error "")
+                (Err error)
+                (optimize-sites-core source roots (slice resolved) (.pointer-bytes state) policy
+                                     true (slice costs) entry caller-verified (mut closed) a))]
+      (free! (mut resolved)) (free! (mut costs)) (free! (mut closed))
+      result)))
+
+;;; optimize-registered-specialized-policy for a closed registry, reading it
+;;; only (see above). A site names a registry handle or a snapshot; a snapshot
+;;; has no contexts, as a callee registered after the registry closed has none.
+;;; An open registry is an error: its cache could still change.
+(defn optimize-frozen-specialized-policy [(registry Registry) (source g/Graph)
+                (entry i32) (roots (slice i32)) (sites (slice FrozenSite))
+                (policy Policy) (proof u128) (a (dyn Allocator))]
+  (-> (Result (Option rewrite/Rewritten) (slice u8)))
+  (cond
+    (= (p/cast u64 (.state registry)) 0) (Err "inline registry is released")
+    (not (registry-closed? registry)) (Err "inline registry is still open")
+    (<= entry 0) (Err "invalid priority entry")
+    :else
+      (let [state (p/cast (ptr RegistryState) (.state registry))
+            budget (.budget policy)
+            verified (and (!= proof 0)
+                          (= (rewrite/content-hash source (.pointer-bytes state)) proof))]
+        (if (or (<= budget 0) (> budget 16384))
+            (optimize-frozen-verified state source roots sites policy entry verified a)
+            (match (optimize-frozen-verified state source roots sites (with-budget policy 0)
+                                             entry verified a)
+              (Err [message] (Err message))
+              (Ok [validated]
+                (match validated
+                  (Some [owned]
+                    (let [(mut owned) owned]
+                      (rewrite/release! (mut owned))
+                      (Err "zero-budget inline validation changed graph")))
+                  (None []
+                    (let [(mut resolved) (ArrayList::new [Site] a)
+                          (mut costs) (ArrayList::new [i64] a) (mut error) ""
+                          (mut closed) (ArrayList::new [i32] a)
+                          (mut shared) (: (None) (Option uses/Uses))]
+                      (for [i 0 (len sites)]
+                        (when (= error "")
+                          (let [site (get sites i)]
+                            ; A closed registry: this selects and never creates.
+                            (match (if (> (.callee site) 0)
+                                       (context-for! state source roots (.reference site)
+                                                     (.callee site) (mut shared) a)
+                                       (Ok [i64 (slice u8)] 0))
+                              (Err [message] (set! error message))
+                              (Ok [context]
+                                (match (frozen-target state site)
+                                  (Err [message] (set! error message))
+                                  (Ok [original]
+                                    (if (= context 0)
+                                        (do (push! (mut resolved)
+                                                   (Site :reference (.reference site)
+                                                         :target (frozen-callee original)))
+                                            (push! (mut closed) (.closed original))
+                                            (push! (mut costs) (.base-cells original)))
+                                        (let [cached (elem (mut (.contexts state)) (- context 1))]
+                                          (push! (mut resolved)
+                                                 (Site :reference (.reference site)
+                                                       :target
+                                                         (Callee :name (slice (.name original))
+                                                                 :graph (.graph (.body (.value cached)))
+                                                                 :entry (.entry original)
+                                                                 :roots (slice (.returns cached))
+                                                                 :observed (slice (.roots (.body (.value cached))))
+                                                                 :never (.never original)
+                                                                 :always (.always original)
+                                                                 :sparse (.sparse original))))
+                                          (push! (mut closed) (.closed cached))
+                                          (push! (mut costs) (.cost cached)))))))))))
+                      (let [result
+                              (if (!= error "") (Err error)
+                                  (optimize-sites-sharing-uses source roots (slice resolved)
+                                                               (.pointer-bytes state) policy true
+                                                               (slice costs) entry true (mut shared)
+                                                               (mut closed) a))]
+                        (release-shared-uses! (mut shared))
+                        (free! (mut resolved)) (free! (mut costs)) (free! (mut closed))
+                        result))))))))))
