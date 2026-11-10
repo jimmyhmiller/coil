@@ -379,13 +379,15 @@ November 10, 2026. At `-O3` the adapter (`src/compiler/backend/codegen_stogir.co
 
 | Stage | Where it runs | Why |
 |---|---|---|
-| Copy forwarding over the module (`copies/forward-module!`) | serial | Coil-side whole-module pass |
+| Lowering checked functions to CIR (`tl-func-lower!`) | **workers**; the commit of each function serial, in reachability order | see "Coil-side stages on workers" below |
+| Copy forwarding over the module (`copies/forward-module!`) | per-function steps on **workers**, three serial joins | see below |
 | Template preparation (`module-prepare!`): adapt CIR to a graph | serial, submission order | adaptation binds import symbols in the assembler; their numbering is part of the object |
 | Template preparation: SCCP and return canonicalization (`prepare-optimize!`) | **workers** | reads and writes one function's own graph, allocates from that function's arena |
 | Template preparation: enter the definition and its bindings into the module (`prepare-commit!`) | serial, submission order | writes the module's lists, bindings and arena |
 | Finalization (`module-finish!`): inline expansion in callee-before-caller order, effect summaries, registry snapshots | serial | each template reads the finalized bodies of its callees and registers itself in the shared callee registry |
 | Emission planning (`stogir-emission-plan`, `prepare-emission-body!`): reachability, adaptation and final expansion of non-template callers | serial | discovery order decides which bodies are adapted and in what order (assembler symbols), and final expansion reads and fills the registry's bounded specialization cache |
-| Native leaf cache (`precompile-native-leaf!`, `seal-native!`) | serial | publishes into the assembler and the private native context |
+| Native leaf cache: the image of each candidate (`native-leaf-image`) | **workers** | reads one frozen definition and module settings; its context is made from those settings, not the module's native context |
+| Native leaf cache: retain, register, merge, confirm (`native-leaf-publish!`), `seal-native!` | serial, function order | publishes into the assembler and the private native context |
 | Emission: image of each live function from its frozen definition (`native-image`) | **workers** | reads one frozen graph, the sealed native context and module settings; allocates from the function's arena |
 | Emission: merge each image into the assembler (`merge!`), machine-code bodies, shim trampolines, body release | serial, submission order | everything that fixes an offset or a symbol index |
 
@@ -458,6 +460,35 @@ Generation wall time on the merged base (`coil build --timings`, minimum of two 
 | LLVM, 8 partitions | 5.66 | 13.31 | 39.9 |
 
 So generation is 1.63x faster than LLVM's in wall time today, against a target of 5x.
+
+### Coil-side stages on workers (November 10, 2026, `front`)
+
+Three stages inside the generation span are not library code: lowering the checked program to CIR, copy forwarding over CIR, and the native leaf cache's driver. They run their per-function work on workers under the same rule as the stages above: workers write nothing shared, and everything that fixes a number or an offset happens on the backend thread in the serial order. `COIL_NATIVE_STAGES=1` prints one line per stage (`native-stage`, name, elapsed, process CPU, the backend thread's own CPU, in microseconds); the same stages are `--timings` spans (`backend.native.*`, `backend.stogir.*`).
+
+Lowering (`codegen_tpde.coil`, "parallel lowering"). Serial lowering depends on order in two ways only: a function creates module symbols as it meets them (interned strings, static cells, runtime imports, linker addresses, method tables, with their data and relocations), and mirrors module symbols into the assembler's symbol table as it first names them. On a worker both are taken out of lowering. The worker's `Tl` is `virtual`: a module symbol it would create is an event in the function's log, named in the CIR by a stand-in, and a tpde symbol is a number local to the function. Its view of the module (`lower-view!`) shares what is read and never written while functions are lowered (program, layouts, signatures, statics) and has private lookup memos, a private allocator and no object at all. The backend thread commits functions in `reach-pending` order, the serial lowering order (`tl-func-commit!`): it replays the log, mirrors the function's symbols in the order lowering first asked for them (interleaved with the events exactly as lowering made them), records what each local symbol became, and reaches the functions the finished CIR refers to in the order `tl-reach-cir!` would. So module symbols, assembler symbols, data offsets and the reachability order are the serial ones. The CIR's local symbol numbers are rewritten later, by whichever thread next works on the function (the first step of copy forwarding, `lower-renumber!`).
+
+Which functions to lower is found by the workers: the functions a finished CIR refers to are exactly those its commit will reach, so the worker queues them at once (and a method table's methods, which the commit reaches through the table's relocations). The backend thread queues what only a commit can find and lowers a function itself when nobody has started it by its turn. Nothing is lowered that serial lowering would not lower. Each lowering thread lowers into one reused `cir/Func` and copies the finished function out at its size (`cir/copy-finished!`); the serial collecting path does the same, which is where most of the serial saving below comes from.
+
+A failure on a worker (`cga-fail` through `cga-failure-hook-cell`) is recorded in the function's item together with the events lowered before it, and that worker thread ends. The backend thread reports it at the function's turn after replaying those events, so the failure the user sees is the first in lowering order, and a failure that serial lowering would have met earlier inside the same function (a duplicate static storage symbol, which only the module can detect) is still the one reported. `scripts/tests/stogir-parallel-emission.py` checks both, and the identity of a module whose functions make every kind of event.
+
+Lowering stays on the backend thread at levels one and two (no collected module), under `COIL_TPDE_STATS`, `COIL_TPDE_PROFILE_LOWER`, while `COIL_CODEGEN_TIMINGS` measures the inlining done during lowering, and when a second crew would start in one process.
+
+Copy forwarding (`cir_copies.coil`). The pass is whole-module only through the argument summaries. It is three phases of per-function steps, each closed by a serial join: local summaries, then two rounds of forwarding with the summaries of the last join followed by the function's new local summary. A step reads and writes its own function and reads the last join's summaries, so a phase's steps run on workers in weighted chunks (`stogir-forward-copies!`), with snapshot fusion after the last step of a function. Two things are answered without recomputing, on the serial path too: a function the last forwarding left unchanged keeps its local summary, and the second round skips a function the first left unchanged when no direct callee's facts changed at the join in between (it would repeat a computation that found nothing). A join solves the summaries by pushing each weakened fact to the arguments that flow into it, over reverse edges built at the join, instead of sweeping every argument until nothing changes (eleven sweeps on the compiler workload); the solution is the same greatest fixpoint.
+
+Native leaf cache (`precompile-native-leaves!`). The image of a candidate is a function of its frozen definition and the module's settings, so images are made on workers up to `lead` ahead; retaining the image, registering it in the native context, merging it into the assembler and confirming the publication happen on the backend thread in function order. Whether a function is a candidate is asked when it is handed out and again at its turn, and a difference is a hard error.
+
+Measurements (the compiler workload R, `coil build --backend stogir -O3 --no-debug --timings` with `COIL_NATIVE_STAGES=1`; milliseconds; the machine carried a load average of 20 to 45 from unrelated jobs during this work, so the elapsed figures at more than one worker are upper bounds and the backend thread's own CPU is the reliable part):
+
+| Stage | before, serial | serial now | 8 workers, elapsed | 8 workers, backend thread's own CPU |
+|---|---|---|---|---|
+| module setup (`backend.native.setup`) | 12.5 | 10.8 | 10.8 | 10.8 |
+| lowering (`backend.native.lower`) | 227 | 184 | 42 | 22 |
+| copy forwarding (`backend.stogir.copies`) | 324 | 255 | 49 | 8 |
+| native leaf cache (`backend.stogir.leaf-cache`) | 137 | 137 | 28 | 11 |
+| close, merge, object encoding and write | 12 | 12 | 12 | 12 |
+| these stages together | 713 | 599 | 142 | 64 |
+
+The stage records account for the whole span: the sum of the records differs from `backend.tpde-object` by about 1 ms, so there is no time between stages, in arena teardown or in the object write beyond what the table shows. The serial path's generator instructions fell from 156.9B to 155.7B. What remains serial in these stages is the last column: the commit of each lowered function (about 0.7 microseconds each: its events, 4.7 symbols and 5.7 references on average), the three summary joins, publishing each leaf, module setup (signature and symbol registration in `native_module.coil`, shared with TPDE) and writing the object.
 
 ### Worker scaling and generator work, measured (November 10, 2026, `cpu`)
 
