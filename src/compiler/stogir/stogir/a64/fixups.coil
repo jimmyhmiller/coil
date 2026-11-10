@@ -9,8 +9,9 @@
 
 (defstruct Branch [(offset i64) (label i32) (condition i32) (link bool)])
 
-;;; condition=-1 selects B/BL; 0..15 selects B.cond and 64..191 CBZ/CBNZ
-;;; (encode/register-condition). Labels contain
+;;; condition=-1 selects B/BL; 0..15 selects B.cond, 64..191 CBZ/CBNZ
+;;; (encode/register-condition) and 256..4351 TBZ/TBNZ (encode/bit-condition).
+;;; Labels contain
 ;;; section-relative byte offsets, with -1 meaning unbound.
 ;;; Validate every patch before mutation, so failure leaves output unchanged.
 (defn apply! [(output (mut (ArrayList u8)))
@@ -91,7 +92,8 @@
                                      (.base record)))))
           (Ok (cast i32 (len records)))))))
 
-;;; A direct B.cond has a smaller reach than B. Expand only distant predicates
+;;; A direct B.cond or CBZ/CBNZ has a smaller reach than B, and TBZ/TBNZ a
+;;; smaller one still (encode/predicate-reach?). Expand only distant predicates
 ;;; into inverse B.cond +8 / B target. The common near case allocates nothing.
 ;;; Far expansion is transactional: the original buffer and all offset metadata
 ;;; survive any failure unchanged. Final application can safely be repeated.
@@ -134,7 +136,7 @@
             (if (or (< target 0) (> target size) (!= (% target 4) 0))
                 (set! error "invalid branch layout target")
                 (when (and (>= (.condition branch) 0)
-                           (or (< delta -1048576) (> delta 1048572)))
+                           (not (e/predicate-reach? (.condition branch) delta)))
                   (if (and (> (.condition branch) 13) (< (.condition branch) 16))
                       (set! error
                             "cannot relax an unconditional condition code")
@@ -296,7 +298,7 @@
               delta (- target offset)]
           (when (and (not (get expanded index))
                      (>= (.condition branch) 0)
-                     (or (< delta -1048576) (> delta 1048572)))
+                     (not (e/predicate-reach? (.condition branch) delta)))
             (if (and (> (.condition branch) 13) (< (.condition branch) 16))
                 (set! error "cannot relax an unconditional condition code")
                 (do
@@ -446,6 +448,133 @@
     (free! (mut blocked))
     (free! (mut entered))
     pairs))
+;;; An NZCV value under which B.cond `condition` (0..13) is taken.
+(defn satisfying-flags [(condition i32)] (-> u32)
+  (match condition
+    (0 4) (2 2) (4 8) (6 1) (8 2) (9 4) (11 8) (13 4) (_ 0)))
+
+;;; CMP/CMN Rn, Rm or CMP/CMN Rn, #imm5 as the conditional comparison that
+;;; performs it when `condition` holds and otherwise sets NZCV to `flags`;
+;;; zero when the word is not such a comparison. The register form must be
+;;; unshifted and the immediate unshifted and below 32; Rn = 31 (SP in the
+;;; immediate form) is declined in both.
+(defn conditional-compare-word [(word u32) (condition i32) (flags u32)] (-> u32)
+  (let [register (= (& word (: 0x3FE0FC1F u32)) (: 0x2B00001F u32))
+        immediate (and (= (& word (: 0x3FC0001F u32)) (: 0x3100001F u32))
+                       (< (& (>> word 10) (: 0xFFF u32)) 32))
+        rn (& (>> word 5) (: 31 u32))]
+    (if (or (not (or register immediate)) (= rn 31) (< condition 0) (> condition 13))
+        0
+        (| (: 0x3A400000 u32)
+           (& word (: 0xC0000000 u32))
+           (if immediate (: 0x00000800 u32) (: 0 u32))
+           (if immediate
+               (<< (& (>> word 10) (: 31 u32)) 16)
+               (& word (: 0x001F0000 u32)))
+           (<< (cast u32 condition) 12)
+           (<< rn 5)
+           flags))))
+
+;;; Two flag branches around one comparison,
+;;;     B.c1 T ; CMP a, b ; B.c2 T          (either condition reaches T)
+;;;     B.c1 S ; CMP a, b ; B.c2 T ; S:     (both conditions reach T)
+;;; become CCMP a, b, #flags, !c1 ; B.c2 T: when c1 holds the comparison is
+;;; skipped and flags are set so that c2 is taken (first form) or not taken
+;;; (second form). NZCV is dead at every branch target and after a branch that
+;;; is not taken only the flags of its own comparison are read, which are
+;;; unchanged on that path. Requires that no branch or table entry targets any
+;;; of the three words, no relocation or inline data on them, and no label
+;;; there with more than word alignment. The first branch
+;;; word becomes a NOP recorded in `removed` (so a chain merges again at the
+;;; kept second branch) and its record is deleted; labels on it move to the
+;;; comparison. Runs once every label is bound, before compaction.
+(defn merge-conditions! [(output (mut code/Buffer))
+                         (labels (mut (ArrayList i64)))
+                         (branches (mut (ArrayList Branch)))
+                         (relatives (ArrayList Relative))
+                         (alignment (ArrayList i32))
+                         (removed (mut (ArrayList i64)))] (-> i32)
+  (let [size (len (.text output))
+        allocator (.alc (.text output))
+        (mut merged) (ArrayList::new [i64] allocator)
+        (mut targeted) (ArrayList::new [bool] allocator)
+        (mut count) (: 0 i32)]
+    (for [i 0 (- (len branches) 1)]
+      (let [first (get branches i)
+            second (get branches (+ i 1))
+            at (.offset first)]
+        (when (and (>= (.condition first) 0) (<= (.condition first) 13)
+                   (>= (.condition second) 0) (<= (.condition second) 13)
+                   (= (.offset second) (+ at 8))
+                   (>= at 0) (<= (+ at 12) size)
+                   (>= (.label first) 0) (< (cast i64 (.label first)) (len labels))
+                   (>= (.label second) 0) (< (cast i64 (.label second)) (len labels)))
+          (let [near (get labels (cast i64 (.label first)))
+                far (get labels (cast i64 (.label second)))
+                either (and (>= near 0) (= near far))
+                both (and (not either) (= near (+ at 12)))
+                word (conditional-compare-word
+                       (read-word (.text output) (+ at 4))
+                       (^ (.condition first) 1)
+                       (satisfying-flags (if either
+                                             (.condition second)
+                                             (^ (.condition second) 1))))
+                (mut ok) (and (or either both) (!= word 0))]
+            (when ok
+              ; One pass over every target, the first time a pair qualifies.
+              (when (= (len targeted) 0)
+                (extend-zeroed! (mut targeted) (+ (/ size 4) 2))
+                (for branch branches
+                  (when (and (>= (.label branch) 0) (< (cast i64 (.label branch)) (len labels)))
+                    (let [target (get labels (cast i64 (.label branch)))]
+                      (when (and (>= target 0) (<= target size))
+                        (set! (mut targeted) (/ target 4) true)))))
+                (for relative relatives
+                  (when (and (>= (.label relative) 0)
+                             (< (cast i64 (.label relative)) (len labels)))
+                    (let [target (get labels (cast i64 (.label relative)))]
+                      (when (and (>= target 0) (<= target size))
+                        (set! (mut targeted) (/ target 4) true))))))
+              (when (or (get targeted (/ at 4))
+                        (get targeted (/ (+ at 4) 4))
+                        (get targeted (/ (+ at 8) 4)))
+                (set! ok false))
+              (for reference (.references output)
+                (when (and (>= (.offset reference) at) (< (.offset reference) (+ at 12)))
+                  (set! ok false)))
+              (for range (.text-data output)
+                (when (and (< (.offset range) (+ at 12))
+                           (> (+ (.offset range) (.length range)) at))
+                  (set! ok false)))
+              (for relative relatives
+                (when (and (>= (.offset relative) at) (< (.offset relative) (+ at 12)))
+                  (set! ok false)))
+              (for [k 0 (len labels)]
+                (let [label (get labels k)]
+                  (when (and (>= label at) (<= label (+ at 8))
+                             (< k (len alignment)) (> (get alignment k) 4))
+                    (set! ok false)))))
+            (when ok
+              (bytes/patch32! (mut (.text output)) at 0xD503201F)
+              (bytes/patch32! (mut (.text output)) (+ at 4) word)
+              (push! (mut removed) (/ at 4))
+              (push! (mut merged) i)
+              (for [k 0 (len labels)]
+                (when (= (get labels k) at) (set! (mut labels) k (+ at 4))))
+              (set! count (+ count 1)))))))
+    ; Delete the first-branch records, last first: the record swapped into a
+    ; freed slot comes from behind every index still to be deleted.
+    (let [(mut k) (len merged)]
+      (while (> k 0)
+        (set! k (- k 1))
+        (let [index (get merged k)
+              last (- (len branches) 1)]
+          (when (!= index last) (set! (mut branches) index (get branches last)))
+          (pop! (mut branches)))))
+    (free! (mut merged))
+    (free! (mut targeted))
+    count))
+
 ;;; Delete the pairing NOPs before relaxation, while every position is still a
 ;;; record: labels, branch sites, relative table words and bases, relocations
 ;;; and inline data move down by four bytes per earlier removed word. Removed
