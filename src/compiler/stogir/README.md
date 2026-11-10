@@ -224,7 +224,7 @@ Inline policy copied from coil-stogir feature/inline-policy (base 4589058): call
 
 Always policy copied from coil-stogir feature/inline-policy: Callee carries the source's :inline (Always); Policy honor-always (adapter setting always=1) inlines those templates at every site without charging the caller's budget. Off by default.
 
-Shrink-wrapping and leaf inlining copied from coil-stogir feature/inline-policy: Policy small-leaf (adapter small-leaf=1) limits the small-callee exemption to call-free callees; a64.shrink-wrap, selected by the emission Context (adapter COIL_STOGIR_SHRINK_WRAP=1, module emission only), builds the frame only on paths that leave the frameless entry region, and makes the allocator assign preserved registers late. Both are off by default.
+Shrink-wrapping and leaf inlining copied from coil-stogir feature/inline-policy: Policy small-leaf (adapter small-leaf=1) limits the small-callee exemption to call-free callees; a64.shrink-wrap, selected by the emission Context (adapter COIL_STOGIR_SHRINK_WRAP=1, module emission only), builds the frame only on paths that leave the frameless entry region. Leaf inlining is off by default. Shrink-wrapping is on by default since feature/idiom-frame (COIL_STOGIR_SHRINK_WRAP=0 turns it off); its second allocation with preserved registers assigned late is the separate opt-in COIL_STOGIR_SHRINK_RETRY=1.
 
 November 8 allocation-region research: optional deterministic allocation input/output snapshots, selected through COIL_TPDE_STATS and COIL_STOGIR_GRAPH. Library files vendored unchanged from coil-stogir research/allocation-regions; replay equality validation pending.
 
