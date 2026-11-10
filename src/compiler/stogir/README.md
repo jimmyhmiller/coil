@@ -366,3 +366,16 @@ Each worker item has its own `ScratchArena` over the process allocator. In emiss
 
 Option. `COIL_STOGIR_THREADS=N` (1 to 64; anything else is a hard error) sets the number of workers; 1 is the serial path, with no thread started. Unset, it is the online processors, at most eight. `COIL_TPDE_SERIAL` (set to anything) always selects the serial path, as it does for TPDE. While `COIL_CODEGEN_TIMINGS` is on and `COIL_STOGIR_THREADS` is unset the path is also serial, because those records are summed as serial CPU time (`docs/benchmarks/idioms/tools/mkhost-env.sh` sets `COIL_TPDE_SERIAL=1` and keeps its meaning). With both `COIL_CODEGEN_TIMINGS` and an explicit `COIL_STOGIR_THREADS` above one, the parallel stages each contribute one record of elapsed time, so the sum is the wall-clock time of generation. Levels one and two do not build a module and keep the two-stage lowering/compiling pipeline shared with TPDE.
 
+Measurements (November 10, 2026; the compiler workload, `coil build src/compiler/main.coil --backend stogir -O3 --no-debug` and `emit-obj` of the same, run by the LLVM-built candidate; minimum of three on a machine shared with other jobs, load average 11 to 26, so absolute seconds are high and only the ratios are meaningful):
+
+| Workers | whole build, wall s | whole build, CPU s (user+sys) | generation records, wall s |
+|---|---|---|---|
+| 1 (serial path) | 15.22 | 15.27 | 7.00 |
+| 2 | 12.62 | 15.13 | 4.60 |
+| 4 | 11.73 | 15.23 | 3.79 |
+| 8 (default here) | 11.44 | 15.98 | 3.53 |
+| LLVM backend, same machine state | 14.41 | 44.2 | — |
+
+Serial generation by stage, from one instrumented run (seconds): copy forwarding 0.35, template preparation 1.01 (about 0.4 of it adaptation), finalization 1.38, emission planning 0.59, native leaf cache 0.14, emission 3.38. With eight workers what is left is about 2.9 s of serial stages plus the parallel ones at about 0.6 s, so generation is 2.0x faster and the build 1.33x. The serial path costs what it did: 156.45B generator instructions against 156.51B before (`COIL_TPDE_SERIAL=1`, minimum of three). The object of the compiler workload is the same file at 1, 2, 4, 8 and the default number of workers (five runs each), in the stage-two and stage-three self builds, and under ThreadSanitizer (`--sanitize=thread` build of the compiler, eight workers, no report; a deliberately unsynchronized counter in the worker is reported). `scripts/tests/stogir-parallel-emission.py` checks identity and the settings on a generated 400-function module.
+
+What stays serial, and what moving it would take. Finalization and emission planning both expand call sites through `inlining/Registry`, which registers snapshots and fills a bounded specialization cache as it goes; running templates of one call-graph level concurrently needs an expansion entry that only reads the registry, with registration and cache insertion done afterwards in a fixed order, and planning additionally discovers which bodies exist as it goes. Adaptation creates import symbols in the assembler; recording the names and binding them at the commit would let it move to the workers. None of that is done here.
