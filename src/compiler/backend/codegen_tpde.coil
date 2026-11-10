@@ -59,7 +59,10 @@
          r-x86-64-64 r-x86-64-32 r-x86-64-pc32 r-x86-64-plt32 r-x86-64-gotpcrel
          r-x86-64-rex-gotpcrelx sht-progbits shf-alloc shf-write shf-execinstr])
 (import "coil.atomic" :as atomic)
-(import "coil.thread" :use [Thread ThreadConfig])
+(import "coil.thread" :as os-thread :use [Thread ThreadConfig])
+(import "coil.sync" :use [Mutex Condition])
+(import "coil.scratch" :as scratch)
+(import "coil.compiler.ffi" :use [worker-stack-size])
 (import "coil.cc" :as cc)
 (import "coil.time" :use [monotonic-now])
 (import "coil.compiler.codegen_stogir" :as stogir)
@@ -141,6 +144,36 @@
 ;;; function's generation are empty, so starting a function clears nothing.
 (defstruct AllocSlot [(key u64) (escaped bool) (gen u32)])
 
+;;; What lowering a function does to the module besides making its CIR: each
+;;; kind makes (or finds) one module symbol. A context lowering on behalf of
+;;; the backend thread (`virtual`, see "parallel lowering") records these
+;;; instead of performing them; the backend thread performs them at the
+;;; function's turn, in the recorded order (tl-replay-event!).
+(const EVENT-STRING 0)  ; an interned string: text, flag = NUL-terminated
+
+(const EVENT-RUNTIME 1)  ; a runtime function: text = its symbol name
+
+(const EVENT-STATIC 2)  ; a static cell: size, align, ty, init; text when `named`
+
+(const EVENT-LINKER 3)  ; a linker-defined address: text = the symbol
+
+(const EVENT-VTABLE 4)  ; a trait object's method table: methods
+
+(defstruct LowerEvent
+  [(kind i64)
+   (text (slice u8))
+   (flag bool)
+   (named bool)
+   (size i64)
+   (align i64)
+   (ty Type)
+   (init (ptr Expr))
+   (methods (ptr (ArrayList (slice u8))))])
+
+;;; The bytes of a scalar def this unit wrote with a relocation-free
+;;; initializer (static-literal-bits); `known` is false when it has none.
+(defstruct StaticLiteral [(known bool) (bits u64)])
+
 (defstruct Tl
   [(g (ptr Cga))
    (a (dyn Allocator))
@@ -195,6 +228,33 @@
    (stogir bool)  ; independent stogir selector over the same native CIR
    (stogir-module (ptr stogir/Module))
    (stogir-level i32)  ; immutable policy shared by lowering/compilation jobs
+   ; ---- a context lowering on a worker's behalf ("parallel lowering"). It
+   ; reads the module and writes nothing of it: `g` is a private view
+   ; (lower-view!), a module symbol it would create is an event, and a tpde
+   ; symbol is a function-local number.
+   (virtual bool)
+   ; module symbols below this exist already; `symbol-base + k` stands for the
+   ; symbol event k of the function at hand will make
+   (symbol-base i64)
+   (events (ArrayList LowerEvent))
+   ; per local tpde symbol, in the order lowering first asked for them: the
+   ; module symbol (or event stand-in) it mirrors, and how many events had
+   ; been recorded by then
+   (symbols (ArrayList i64))
+   ; the CIR values whose `imm` is a local tpde symbol
+   (symbol-values (ArrayList u32))
+   ; the functions the finished CIR refers to, in tl-reach-cir!'s order
+   (references (ArrayList i64))
+   ; g-leaf-inline-cost by signature index (GSig.inline_cost is the backend
+   ; thread's memo)
+   (inline-costs (ArrayList i64))
+   ; static-literal-bits of every def, made before the workers start
+   (static-literals (ptr (ArrayList StaticLiteral)))
+   ; ---- the backend thread's, for committing a function a worker lowered:
+   ; the module symbol each of its events made, and every function's
+   ; signature by function index (null for a declaration)
+   (replayed (ArrayList i64))
+   (func-sigs (ArrayList (ptr GSig)))
    (x64 bool)  ; x86-64 (System V) rather than arm64 (AAPCS64)
    (elf bool)  ; the object becomes ELF (tl-elf-object), not Mach-O
    ; ---- debug info (`dbg`), see "debug info" below. The lowering side owns
@@ -588,8 +648,17 @@
     (for _ (range (len (.sym-map tl)) (+ m 1))
       (push! (mut (.sym-map tl)) (none32))))
   (let [have (get (.sym-map tl) m)]
-    (if (!= have (none32))
-        have
+    (cond
+      (!= have (none32)) have
+      ; a function-local number; the backend thread mirrors the symbols in
+      ; this order when it commits the function (tl-func-commit!)
+      (.virtual tl)
+        (let [t (u32-of (/ (len (.symbols tl)) 2))]
+          (push! (mut (.symbols tl)) m)
+          (push! (mut (.symbols tl)) (len (.events tl)))
+          (set! (mut (.sym-map tl)) m t)
+          t)
+      :else
         (let [ms (al-at [MSym] (field (field (.g tl) obj) syms) m)
               binding
                 (cond (not (.ext ms)) (: 0 u8)
@@ -604,6 +673,129 @@
             (push! (mut (.tsym-mobj tl)) -1))
           (set! (mut (.tsym-mobj tl)) (i64-of t) m)
           t))))
+
+; ---- module symbols lowering makes ----
+; Each has one definition here, called directly when the backend thread
+; lowers, and from tl-replay-event! for a function a worker lowered.
+
+;;; A static cell (`alloc-static`), named or anonymous, with its link-time
+;;; initializer written.
+(defn module-static! [(g (ptr Cga))
+                      (symbol (Option (slice u8)))
+                      (size i64)
+                      (align i64)
+                      (t (ptr Type))
+                      (init (ptr Expr))] (-> i64)
+  (let [sym
+          (match symbol
+            (Some [name] (g-public-zero-global! g name size align))
+            (None [] (g-zero-global! g size align)))
+        ms (al-at [MSym] (field (field g obj) syms) sym)]
+    (when (!= (primitive/cast i64 init) 0)
+      (g-static-write! g t init (.sect ms) (.off ms))
+      0)
+    sym))
+
+(defn module-linker-symbol! [(g (ptr Cga)) (symbol (slice u8))] (-> i64)
+  (mobj-add-sym! (mut (.obj g)) (g-mangle g symbol) 0 0 true))
+
+;;; A trait object's method table in the data section: one relocated pointer
+;;; per method.
+(defn module-vtable! [(g (ptr Cga)) (methods (ptr (ArrayList (slice u8))))] (-> i64)
+  (let [a (.a g)
+        buf (mobj-sect-buf (mut (.obj g)) (.datasec g))]
+    (b-align! (mut buf) 8)
+    (let [vtoff (len (load buf))
+          nm (sconcat a "l_vtable." (i64->str a (.nglob g)))]
+      (set! (.nglob g) (+ (.nglob g) 1))
+      (for i (range 0 (len (load methods)))
+        (let [mnm (get (load methods) i)
+              msi (g-sig-idx g mnm)]
+          (when (< msi 0) (tl-fail (sconcat a "make-dyn: unknown method " mnm)))
+          (mobj-add-reloc! (mut (.obj g))
+                           (.datasec g)
+                           (len (load buf))
+                           (.symidx (al-at [GSig] (field g sigs) msi))
+                           (reloc-unsigned)
+                           false
+                           3)
+          (b-u64! (mut buf) 0)))
+      (mobj-add-sym! (mut (.obj g)) nm (.datasec g) vtoff false))))
+
+(defn tl-event [(kind i64)] (-> LowerEvent)
+  (let [(mut event) (zeroed LowerEvent)]
+    (set! (.kind event) kind)
+    (set! (.ty event) (TVoid))
+    event))
+
+;;; Record EVENT; the result stands for the module symbol it will make.
+(defn tl-event! [(tl (ptr Tl)) (event LowerEvent)] (-> i64)
+  (push! (mut (.events tl)) event)
+  (+ (.symbol-base tl) (- (len (.events tl)) 1)))
+
+;;; Perform a recorded event on the module; the symbol it made.
+(defn tl-replay-event! [(tl (ptr Tl)) (event (ptr LowerEvent))] (-> i64)
+  (let [g (.g tl)
+        kind (.kind event)]
+    (cond (= kind EVENT-STRING) (g-intern-str! g (.text event) (.flag event))
+          (= kind EVENT-RUNTIME) (g-runtime-sym! g (.text event))
+          (= kind EVENT-STATIC)
+            (module-static! g
+                            (if (.named event) (Some (.text event)) (None))
+                            (.size event)
+                            (.align event)
+                            (field event ty)
+                            (.init event))
+          (= kind EVENT-LINKER) (module-linker-symbol! g (.text event))
+          (= kind EVENT-VTABLE) (module-vtable! g (.methods event))
+          :else (tl-fail "native lowering: unknown module event"))))
+
+(defn tl-string-symbol [(tl (ptr Tl)) (sv (slice u8)) (nul bool)] (-> i64)
+  (if (.virtual tl)
+      (let [(mut event) (tl-event EVENT-STRING)]
+        (set! (.text event) sv)
+        (set! (.flag event) nul)
+        (tl-event! tl event))
+      (g-intern-str! (.g tl) sv nul)))
+
+(defn tl-runtime-symbol [(tl (ptr Tl)) (name (slice u8))] (-> i64)
+  (if (.virtual tl)
+      (let [(mut event) (tl-event EVENT-RUNTIME)]
+        (set! (.text event) name)
+        (tl-event! tl event))
+      (g-runtime-sym! (.g tl) name)))
+
+(defn tl-static-symbol [(tl (ptr Tl))
+                        (symbol (Option (slice u8)))
+                        (size i64)
+                        (align i64)
+                        (t Type)
+                        (init (ptr Expr))] (-> i64)
+  (if (.virtual tl)
+      (let [(mut event) (tl-event EVENT-STATIC)]
+        (match symbol
+          (Some [name] (set! (.named event) true) (set! (.text event) name))
+          (None [] 0))
+        (set! (.size event) size)
+        (set! (.align event) align)
+        (set! (.ty event) t)
+        (set! (.init event) init)
+        (tl-event! tl event))
+      (let [(mut tp) t] (module-static! (.g tl) symbol size align (mut tp) init))))
+
+(defn tl-linker-symbol [(tl (ptr Tl)) (symbol (slice u8))] (-> i64)
+  (if (.virtual tl)
+      (let [(mut event) (tl-event EVENT-LINKER)]
+        (set! (.text event) symbol)
+        (tl-event! tl event))
+      (module-linker-symbol! (.g tl) symbol)))
+
+(defn tl-vtable-symbol [(tl (ptr Tl)) (methods (ptr (ArrayList (slice u8))))] (-> i64)
+  (if (.virtual tl)
+      (let [(mut event) (tl-event EVENT-VTABLE)]
+        (set! (.methods event) methods)
+        (tl-event! tl event))
+      (module-vtable! (.g tl) methods)))
 
 ;;; The System V classification, in native_module's
 ;;; AbiInfo: class 0 integer scalar, 1 float scalar, 2 one eightbyte, 3 two,
@@ -1670,13 +1862,13 @@
                   (TFloat 64)))
     (EBool [b] (tv-s (iconst tl (if b 1 0)) (TBool)))
     (EStr [sv]
-          (let [sym (g-intern-str! (.g tl) sv true)
+          (let [sym (tl-string-symbol tl sv true)
                 s (new-slot-bytes tl 16 8)]
             (store-n tl s 0 (sym-val tl sym) 8)
             (store-n tl s 8 (iconst tl (len sv)) 8)
             (tv-p s (TSlice (box-ty tl (TInt 8 false))))))
     (ECStr [sv]
-           (let [sym (g-intern-str! (.g tl) sv true)]
+           (let [sym (tl-string-symbol tl sv true)]
              (tv-s (sym-val tl sym) (TPtr (box-ty tl (TInt 8 true))))))
     (EVar [name]
           (match (lookup tl name)
@@ -1814,6 +2006,30 @@
 ;;; scalar def whose relocation-free initializer this unit wrote yields those
 ;;; bytes, exactly as the LLVM backend folds its constant global. The value is
 ;;; extended into its CIR container as load-mem! would extend the loaded bytes.
+;;; The bytes static-literal folds for def SI, read from the module's data.
+(defn static-literal-width [(ty Type)] (-> i64)
+  (match ty
+    (TInt [bits _] (if (and (>= bits 8) (<= bits 64) (= (% bits 8) 0))
+                       (/ bits 8) 0))
+    (TFloat [bits] (if (or (= bits 32) (= bits 64)) (/ bits 8) 0))
+    (TBool [] 1)
+    (_ 0)))
+
+(defn static-literal-bits [(g (ptr Cga)) (si i64)] (-> StaticLiteral)
+  (let [st (al-at [GStatic] (field g statics) si)
+        ms (al-at [MSym] (field (field g obj) syms) (.symidx st))
+        width (static-literal-width (.ty st))]
+    (if (or (not (.literal st)) (= width 0) (<= (.sect ms) 0))
+        (StaticLiteral :known false :bits (: 0 u64))
+        (let [buf (mobj-sect-buf (mut (.obj g)) (.sect ms))]
+          (if (or (< (.off ms) 0) (> (+ (.off ms) width) (len (load buf))))
+              (StaticLiteral :known false :bits (: 0 u64))
+              (let [(mut bits) (: 0 u64)]
+                (for k (range 0 width)
+                  (set! bits (| bits (<< (cast u64 (get (load buf) (+ (.off ms) k)))
+                                         (cast u64 (* k 8))))))
+                (StaticLiteral :known true :bits bits)))))))
+
 (defn static-literal [(tl (ptr Tl)) (inner (ptr Expr))] (-> (Option TV))
   (match (.kind inner)
     (EStaticRef [name]
@@ -1821,34 +2037,27 @@
         (if (< si 0)
             (None)
             (let [st (al-at [GStatic] (field (.g tl) statics) si)
-                  ms (al-at [MSym] (field (field (.g tl) obj) syms) (.symidx st))
                   ty (.ty st)
-                  width (match ty
-                          (TInt [bits _] (if (and (>= bits 8) (<= bits 64) (= (% bits 8) 0))
-                                             (/ bits 8) 0))
-                          (TFloat [bits] (if (or (= bits 32) (= bits 64)) (/ bits 8) 0))
-                          (TBool [] 1)
-                          (_ 0))]
-              (if (or (not (.literal st)) (= width 0) (<= (.sect ms) 0))
+                  width (static-literal-width ty)
+                  ; a def's literal bytes are written before any function is
+                  ; lowered and never afterwards
+                  literal (if (.virtual tl)
+                              (get (load (.static-literals tl)) si)
+                              (static-literal-bits (.g tl) si))]
+              (if (not (.known literal))
                   (None)
-                  (let [buf (mobj-sect-buf (mut (.obj (.g tl))) (.sect ms))]
-                    (if (or (< (.off ms) 0) (> (+ (.off ms) width) (len (load buf))))
+                  (let [bits (.bits literal)
+                        (mut tt) ty
+                        signed (match ty (TInt [_ sg] sg) (_ false))
+                        top (<< (: 1 u64) (cast u64 (- (* width 8) 1)))
+                        container (if (and signed (< width 8) (!= (& bits top) 0))
+                                      (| bits (<< (: 0xFFFFFFFFFFFFFFFF u64)
+                                                  (cast u64 (* width 8))))
+                                      bits)]
+                    (if (and (match ty (TBool [] true) (_ false)) (> bits 1))
                         (None)
-                        (let [(mut bits) (: 0 u64)
-                              (mut tt) ty]
-                          (for k (range 0 width)
-                            (set! bits (| bits (<< (cast u64 (get (load buf) (+ (.off ms) k)))
-                                                   (cast u64 (* k 8))))))
-                          (let [signed (match ty (TInt [_ sg] sg) (_ false))
-                                top (<< (: 1 u64) (cast u64 (- (* width 8) 1)))
-                                container (if (and signed (< width 8) (!= (& bits top) 0))
-                                              (| bits (<< (: 0xFFFFFFFFFFFFFFFF u64)
-                                                          (cast u64 (* width 8))))
-                                              bits)]
-                            (if (and (match ty (TBool [] true) (_ false)) (> bits 1))
-                                (None)
-                                (Some (tv-s (cir/const! (.f tl) (tl-cty (mut tt)) container (: 0 u64))
-                                            ty))))))))))))
+                        (Some (tv-s (cir/const! (.f tl) (tl-cty (mut tt)) container (: 0 u64))
+                                    ty)))))))))
     (_ (None))))
 
 ;;; A volatile access is lowered like an ordinary one and then marked
@@ -1989,22 +2198,13 @@
                                      cir/T-I64)]
               (tv-s p (TPtr (box-ty tl t))))
           :else
-            (let [g (.g tl)
-                  sym
-                    (match symbol
-                      (Some [name]
-                            (g-public-zero-global! g
-                                                   name
-                                                   (tsize tl (mut tp))
-                                                   (talign tl (mut tp))))
-                      (None []
-                            (g-zero-global! g
-                                            (tsize tl (mut tp))
-                                            (talign tl (mut tp)))))
-                  ms (al-at [MSym] (field (field g obj) syms) sym)]
-              (when (!= (primitive/cast i64 init) 0)
-                (g-static-write! g (mut tp) init (.sect ms) (.off ms))
-                0)
+            (let [sym
+                    (tl-static-symbol tl
+                                      symbol
+                                      (tsize tl (mut tp))
+                                      (talign tl (mut tp))
+                                      t
+                                      init)]
               (tv-s (sym-val tl sym) (TPtr (box-ty tl t)))))))
 
 ;;; A call to a one-argument runtime function returning type `rty`.
@@ -2017,7 +2217,7 @@
                        (a0 u32)
                        (a1 u32)
                        (rty i64)] (-> u32)
-  (let [sym (tl-sym tl (g-runtime-sym! (.g tl) name))
+  (let [sym (tl-sym tl (tl-runtime-symbol tl name))
         _ (clear! (mut (.rt-args tl)))
         _ (clear! (mut (.rt-flags tl)))
         _ (clear! (mut (.rt-rts tl)))]
@@ -2052,10 +2252,10 @@
               ; frem: libm fmod(f)
               (let [sym
                       (tl-sym tl
-                              (g-runtime-sym! (.g tl)
-                                              (if (= ct cir/T-F32)
-                                                  "_fmodf"
-                                                  "_fmod")))
+                              (tl-runtime-symbol tl
+                                                 (if (= ct cir/T-F32)
+                                                     "_fmodf"
+                                                     "_fmod")))
                     (mut args) (ArrayList::new [u32] (.a tl))
                     (mut flags) (ArrayList::new [u32] (.a tl))
                     (mut rts) (ArrayList::new [u8] (.a tl))]
@@ -3112,12 +3312,7 @@
               (cir/op0! (.f tl) cir/OP-FENCE cir/T-VOID 0 0)
               (tv-s (iconst tl 0) (i64t))))
     (ILinkerAddress [symbol]
-                    (let [sym
-                            (mobj-add-sym! (mut (.obj (.g tl)))
-                                           (g-mangle (.g tl) symbol)
-                                           0
-                                           0
-                                           true)]
+                    (let [sym (tl-linker-symbol tl symbol)]
                       (tv-s (sym-val tl sym) result)))
     (_ (tl-fail "codegen: machine-code outside a machine-code function (checker bug)"))))
 
@@ -3128,31 +3323,12 @@
                    (_vt (slice u8))
                    (methods (ptr (ArrayList (slice u8))))
                    (inner (ptr Expr))] (-> TV)
-  (let [g (.g tl)
-        a (.a tl)
-        buf (mobj-sect-buf (mut (.obj g)) (.datasec g))]
-    (b-align! (mut buf) 8)
-    (let [vtoff (len (load buf))
-          nm (sconcat a "l_vtable." (i64->str a (.nglob g)))]
-      (set! (.nglob g) (+ (.nglob g) 1))
-      (for i (range 0 (len (load methods)))
-        (let [mnm (get (load methods) i)
-              msi (g-sig-idx g mnm)]
-          (when (< msi 0) (tl-fail (sconcat a "make-dyn: unknown method " mnm)))
-          (mobj-add-reloc! (mut (.obj g))
-                           (.datasec g)
-                           (len (load buf))
-                           (.symidx (al-at [GSig] (field g sigs) msi))
-                           (reloc-unsigned)
-                           false
-                           3)
-          (b-u64! (mut buf) 0)))
-      (let [vtsym (mobj-add-sym! (mut (.obj g)) nm (.datasec g) vtoff false)
-            iv (scalar tl (tl-expr tl inner))
-            s (new-slot-bytes tl 16 8)]
-        (store-n tl s 0 iv 8)
-        (store-n tl s 8 (sym-val tl vtsym) 8)
-        (tv-p s (TStruct ds))))))
+  (let [vtsym (tl-vtable-symbol tl methods)
+        iv (scalar tl (tl-expr tl inner))
+        s (new-slot-bytes tl 16 8)]
+    (store-n tl s 0 iv 8)
+    (store-n tl s 8 (sym-val tl vtsym) 8)
+    (tv-p s (TStruct ds))))
 
 (defn tl-dyn-dispatch [(tl (ptr Tl)) (dc (ptr DynCall))] (-> TV)
   (let [a (.a tl)
@@ -3679,11 +3855,24 @@
             (= (.name fd) (.selfname tl))
             (tl-inline-active? tl (.name fd)))
         false
-        (do
-          (when (= (.inline_cost sig) 0)
-            (set! (.inline_cost sig) (g-leaf-inline-cost fd)))
-          (and (> (.inline_cost sig) 0)
-               (<= (.inline_cost sig) (.inline-budget tl)))))))
+        (let [cost (tl-inline-cost tl sig)]
+          (and (> cost 0) (<= cost (.inline-budget tl)))))))
+
+;;; g-leaf-inline-cost of SIG's function, computed once: in the signature for
+;;; the backend thread, in the context's own table for one lowering on a
+;;; worker's behalf, which must not write the shared signature.
+(defn tl-inline-cost [(tl (ptr Tl)) (sig (ptr GSig))] (-> i64)
+  (if (.virtual tl)
+      (let [index (/ (- (primitive/cast i64 sig)
+                        (primitive/cast i64 (.data (.sigs (.g tl)))))
+                     (primitive/sizeof GSig))]
+        (when (= (get (.inline-costs tl) index) 0)
+          (set! (mut (.inline-costs tl)) index (g-leaf-inline-cost (load (field sig func)))))
+        (get (.inline-costs tl) index))
+      (do
+        (when (= (.inline_cost sig) 0)
+          (set! (.inline_cost sig) (g-leaf-inline-cost (load (field sig func)))))
+        (.inline_cost sig))))
 
 ;;; Capture each aggregate argument before evaluating the next argument.
 ;;; Copies have value semantics, and their additional lowering work belongs to
@@ -3711,7 +3900,7 @@
           (if (and (.measure-inline tl) (= (.inline-depth tl) 0))
               (tr/codegen-start)
               0)]
-    (set! (.inline-budget tl) (- (.inline-budget tl) (.inline_cost sig)))
+    (set! (.inline-budget tl) (- (.inline-budget tl) (tl-inline-cost tl sig)))
     (push! (mut (.inline-functions tl)) (.name fd))
     (for i (range 0 (len (load ps)))
       (bind! tl (.name (elem ps i)) (get (load tvs) i)))
@@ -3912,6 +4101,31 @@
               (tl-fail "native reachability: CIR symbol was not mirrored"))
             (tl-reach-symbol! tl (get (.tsym-mobj tl) (.imm x)))))))))
 
+;;; tl-reach-cir! for a context lowering on a worker's behalf: the functions
+;;; the finished CIR refers to, in the order tl-reach-cir! would reach them,
+;;; and every value that names a (function-local) tpde symbol.
+(defn tl-collect-references! [(tl (ptr Tl))] (-> void)
+  (let [fp (.f tl)]
+    (for i (range 0 (len (.values fp)))
+      (let [x (cir/val fp (cast u32 i))
+            op (cast i64 (.op x))
+            symbol (= op cir/OP-SYM)
+            call (and (or (= op cir/OP-CALL)
+                          (= op cir/OP-TAILCALL)
+                          (= op cir/OP-SHIMCALL))
+                      (>= (.imm x) 0))]
+        (when (or symbol call)
+          (when (>= (* (.imm x) 2) (len (.symbols tl)))
+            (tl-fail "native lowering: CIR symbol was not recorded"))
+          (push! (mut (.symbol-values tl)) (cast u32 i))
+          (when (and (.reach-enabled tl)
+                     (or (and symbol (> (get (.scratch-uses fp) i) 0))
+                         (and call (= (& (.flags x) (: 8 u8)) 0))))
+            (let [m (get (.symbols tl) (* (.imm x) 2))]
+              (when (< m (len (.reach-by-symbol tl)))
+                (let [index (get (.reach-by-symbol tl) m)]
+                  (when (>= index 0) (push! (mut (.references tl)) index)))))))))))
+
 (defn tl-reach-setup! [(tl (ptr Tl))] (-> void)
   (let [g (.g tl)
         fs (.funcs (.program g))]
@@ -3919,15 +4133,17 @@
     (for [i 0 (len (load fs))] (push! (mut (.reach-seen tl)) false))
     (for [i 0 (len (load fs))]
       (let [fd (elem fs i)]
+        (push! (mut (.func-sigs tl)) (primitive/cast (ptr GSig) 0))
         (unless (.declared fd)
           (let [sig (tl-sig tl fd)]
+            (set! (mut (.func-sigs tl)) i sig)
             (set! (mut (.reach-by-symbol tl)) (.symidx sig) i)
             (when (.shim sig)
               (set! (mut (.reach-by-symbol tl)) (.implsym sig) i))))))
     (for [i 0 (len (load fs))]
       (let [fd (elem fs i)]
         (unless (.declared fd)
-          (let [sig (tl-sig tl fd)
+          (let [sig (get (.func-sigs tl) i)
                 sym (get (.syms (.obj g)) (.symidx sig))]
             (when (or (not (.reach-enabled tl)) (.ext sym))
               (tl-reach-symbol! tl (.symidx sig)))))))
@@ -3969,7 +4185,7 @@
         (when (and (.stogir tl) (not (.dbg tl))) (copies/forward-copies! fp))
         (cir/fuse-snapshots! fp))
       (tr/codegen-end (if (.stogir tl) "stogir" "tpde") "ir-codegen" started))
-    (tl-reach-cir! tl)
+    (if (.virtual tl) (tl-collect-references! tl) (tl-reach-cir! tl))
     (when stats
       (set! (.t-lower tl) (+ (.t-lower tl) (- (ticks) t1)))
       (set! (.stat-funcs tl) (+ (.stat-funcs tl) 1))
@@ -4013,7 +4229,10 @@
    (dtrack (ArrayList u32))
    (dlocs (ArrayList u64))
    ; 1 from submission until the compiling side is done with it
-   (state i64)])
+   (state i64)
+   ; a function a crew lowered ("parallel lowering"), until its CIR is
+   ; renumbered; null otherwise
+   (lowered (ptr LowerItem))])
 
 ;;; The encoding stage, after a function compiled: its variables' frame
 ;;; offsets and scope ranges from what compiling recorded, its line rows, and
@@ -4149,7 +4368,9 @@
    (dbg bool)
    (dthreaded bool)
    (dtail i64)
-   (dthread Thread)])
+   (dthread Thread)
+   ; Stogir -O3: the workers lowering functions, or null ("parallel lowering")
+   (crew (ptr LowerCrew))])
 
 (extern cgtpde.sched-yield :as "sched_yield" [] (-> i32))
 
@@ -4214,7 +4435,11 @@
         ; Debug arrays remain ring-owned: collection is only used without DWARF.
         (push! (mut (.pending p)) (load j))
         (when (= (.kind j) JOB-COMPILE)
-          (set! (.fp j) (box! (.a (.tl p)) cir/Func (cir/Func::new)))))
+          ; the slot's function is lowered into again; the module keeps a
+          ; copy at its size
+          (let [kept (box! (.a (.tl p)) cir/Func (zeroed cir/Func))]
+            (cir/copy-finished! kept (.fp j))
+            (set! (.fp (elem (mut (.pending p)) (- (len (.pending p)) 1))) kept))))
       (if (.threaded p)
           (atomic/store (field j state) 1)
           (do
@@ -4257,7 +4482,8 @@
              :dallocas (ArrayList::new [i64] (malloc-allocator))
              :dtrack (ArrayList::new [u32] (malloc-allocator))
              :dlocs (ArrayList::new [u64] (malloc-allocator))
-             :state 0)))
+             :state 0
+             :lowered (primitive/cast (ptr LowerItem) 0))))
   (when (and threaded (not (.collect p)))
     (tasm/share! (.ta tl))
     ; the encoding thread first: the compiling one reads `dthreaded` from its
@@ -4285,6 +4511,598 @@
         (atomic/store (field j state) 0)
         (set! (.dthreaded p) false)))
     0))
+
+; ---- parallel lowering ----
+; For a collected module (Stogir -O3) lowering runs on worker threads, and
+; this, the backend thread, only commits: at each function's turn in the
+; reachability order it performs what the function's lowering did to the
+; module and to the assembler's symbol table. The object is the one serial
+; lowering makes, for any number of workers and any scheduling, because:
+;
+; - Lowering a function reads the checked program, the layouts and the
+;   signatures, none of which change while functions are lowered, and its
+;   result does not depend on what was lowered before it. The two things
+;   that did depend on order are taken out of it. A module symbol the
+;   function creates (an interned string, a static cell, a runtime import, a
+;   linker address, a method table) becomes an event in the function's log,
+;   named in its CIR by a stand-in. A tpde symbol becomes a number local to
+;   the function. See Tl.virtual.
+; - The commit (tl-func-commit!) replays the log in order, mirrors the
+;   function's symbols into the assembler in the order lowering first asked
+;   for them, rewrites the CIR's symbol numbers, and reaches the functions
+;   the CIR refers to in the order tl-reach-cir! would. Commits happen in
+;   the order of `reach-pending`, which is the serial lowering order, so
+;   every module symbol, tpde symbol, data offset and the reachability order
+;   itself come out as they do serially.
+; - Workers write nothing shared. Each has its own Tl, its own view of the
+;   module (lower-view!: private lookup memos, an allocator of its own, no
+;   object) and its own arena; a function's CIR, log and lists belong to the
+;   worker until it stores LOWER-DONE and to the backend thread afterwards.
+;
+; Which functions to lower is found by the workers themselves: the functions
+; a finished CIR refers to are exactly those its commit will reach, so the
+; worker queues them at once (and a method table's methods, which the commit
+; reaches through the table's relocations). Anything only the commit can find
+; (roots, functions referenced from data it writes) the backend thread queues,
+; and a function nobody has started when its turn comes it lowers itself.
+; Nothing is lowered that serial lowering would not lower.
+;
+; A failure (cga-fail) on a worker is recorded in the function's item and the
+; worker thread ends; the backend thread reports it at that function's turn,
+; after replaying the events lowering recorded before it failed, so the first
+; failure in lowering order is the one reported, as serially.
+
+(const LOWER-NONE 0)
+
+(const LOWER-QUEUED 1)
+
+(const LOWER-RUNNING 2)
+
+(const LOWER-DONE 3)
+
+;;; How many queued functions a worker takes at once.
+(const LOWER-BATCH 8)
+
+;;; One function's lowering: the lowering thread's from the RUNNING state to
+;;; LOWER-DONE, the backend thread's afterwards (uninitialized before).
+(defstruct LowerItem
+  [(func cir/Func)
+   (events (ArrayList LowerEvent))
+   ; as Tl.symbols; the commit replaces each module symbol by its tpde symbol
+   (symbols (ArrayList i64))
+   (symbol-values (ArrayList u32))
+   (references (ArrayList i64))
+   (failed bool)
+   (message (slice u8))])
+
+;;; A thread that lowers: a worker, or (the last entry of the crew's list) the
+;;; backend thread when it lowers a function nobody has started. `live` is
+;;; guarded by the crew's mutex: a worker that has not failed, or the backend
+;;; thread while it lowers.
+(defstruct LowerThread
+  [(crew (ptr LowerCrew))
+   (thread Thread)
+   (id i64)
+   (worker bool)
+   (live bool)
+   (arena scratch/ScratchArena)
+   (view Cga)
+   (tl Tl)
+   ; every function is lowered into this one and copied out at its size
+   (scratch cir/Func)
+   ; the functions taken from the queue, the one being lowered, and the
+   ; functions lowering found to queue
+   (batch (ArrayList i64))
+   (position i64)
+   (requests (ArrayList i64))])
+
+;;; `queue`, `head`, `closed`, `waiting` and `alive` are guarded by `mutex`.
+;;; `threads` and `items` are complete before the first worker starts and do
+;;; not move. `awaited` (the function the backend thread waits for, or -1) is
+;;; atomic.
+(defstruct LowerCrew
+  [(tl (ptr Tl))
+   (funcs (ptr (ArrayList Func)))
+   (items (ArrayList LowerItem))
+   ; per function, LOWER-NONE to LOWER-DONE: read and written atomically, and
+   ; the steps NONE -> QUEUED -> RUNNING made under the mutex
+   (states (ArrayList i64))
+   (queue (ArrayList i64))
+   (head i64)
+   (mutex Mutex)
+   (work Condition)
+   (done Condition)
+   (closed bool)
+   (waiting i64)
+   (alive i64)
+   (awaited i64)
+   (threads (ArrayList LowerThread))
+   (started i64)
+   (released bool)
+   (static-literals (ArrayList StaticLiteral))])
+
+(extern cgtpde.thread-exit :as "pthread_exit" [(ptr i8)] (-> never))
+
+;;; The crew lowering now, for the failure hook; one at a time per process.
+(defn lower-crew-cell [] (-> (ptr (ptr LowerCrew)))
+  (primitive/alloc-static (ptr LowerCrew)))
+
+(defn crew-lock! [(crew (ptr LowerCrew))] (-> void)
+  (match (Mutex::lock! (field crew mutex))
+    (Ok [_] 0) (Err [_] (tl-fail "parallel lowering: mutex lock failed"))))
+
+(defn crew-unlock! [(crew (ptr LowerCrew))] (-> void)
+  (match (Mutex::unlock! (field crew mutex))
+    (Ok [_] 0) (Err [_] (tl-fail "parallel lowering: mutex unlock failed"))))
+
+(defn crew-wait! [(crew (ptr LowerCrew)) (condition (ptr Condition))] (-> void)
+  (match (Condition::wait! condition (field crew mutex))
+    (Ok [_] 0) (Err [_] (tl-fail "parallel lowering: condition wait failed"))))
+
+(defn crew-notify-all! [(condition (ptr Condition))] (-> void)
+  (match (Condition::notify-all! condition)
+    (Ok [_] 0) (Err [_] (tl-fail "parallel lowering: condition notify failed"))))
+
+;;; A private view of module G for one lowering thread: what lowering reads
+;;; of it is shared and unchanging; the lookup memos, which a lookup writes,
+;;; are the thread's own, allocation is from A, and there is no object, since
+;;; everything lowering does to the object is an event.
+(defn lower-view! [(view (ptr Cga)) (g (ptr Cga)) (a (dyn Allocator))] (-> void)
+  (store! view (load g))
+  (set! (.a view) a)
+  (set! (.sig_memo view) (name-memo-new a))
+  (let [layouts (field view layouts)]
+    (set! (.a layouts) a)
+    (set! (.struct_memo layouts) (name-memo-new a))
+    (set! (.sum_memo layouts) (name-memo-new a))
+    (set! (.field_memo layouts) (name-memo-new a))
+    (set! (.variant_memo layouts) (name-memo-new a)))
+  (set! (.obj view) (zeroed MObj))
+  0)
+
+;;; The lowering state of a context that lowers on behalf of MAIN.
+(defn lower-context! [(w (ptr Tl))
+                      (view (ptr Cga))
+                      (main (ptr Tl))
+                      (crew (ptr LowerCrew))
+                      (a (dyn Allocator))] (-> void)
+  (store! w (zeroed Tl))
+  (set! (.g w) view)
+  (set! (.a w) a)
+  (set! (.virtual w) true)
+  (set! (.symbol-base w) (len (.reach-by-symbol main)))
+  (set! (.static-literals w) (field crew static-literals))
+  (set! (.stogir w) (.stogir main))
+  (set! (.stogir-level w) (.stogir-level main))
+  (set! (.x64 w) (.x64 main))
+  (set! (.elf w) (.elf main))
+  (set! (.reach-enabled w) (.reach-enabled main))
+  ; read only once lowering starts: the list's storage is shared
+  (set! (.reach-by-symbol w) (.reach-by-symbol main))
+  (set! (.reach-pending w) (ArrayList::new [i64] a))
+  (set! (.reach-seen w) (ArrayList::new [bool] a))
+  (set! (.stogir-text-data w) (ArrayList::new [MTextData] a))
+  (set! (.inline-functions w) (ArrayList::new [(slice u8)] a))
+  (set! (.dw-vars w) (ArrayList::new [DwVar] a))
+  (set! (.dw-var-extra w) (ArrayList::new [i64] a))
+  (set! (.dw-var-val w) (ArrayList::new [u32] a))
+  (set! (.dw-track w) (ArrayList::new [u32] a))
+  (set! (.dbg-shadow w) (ArrayList::new [u32] a))
+  (set! (.dbg-ty-keys w) (ArrayList::new [u64] a))
+  (set! (.dbg-vslots w) (ArrayList::new [i64] a))
+  (set! (.dbg-ty-vals w) (ArrayList::new [i64] a))
+  (set! (.dw-evs w) (ArrayList::new [DwLineEv] a))
+  (set! (.inst-off w) (ArrayList::new [i64] a))
+  (set! (.env w) (ArrayList::new [TBind] a))
+  (set! (.loops w) (ArrayList::new [TLoop] a))
+  (set! (.allocs w) (ArrayList::new [AllocSlot] a))
+  (set! (.alloc-gen w) (: 1 u32))
+  (set! (.sym-map w) (ArrayList::new [u32] a))
+  (set! (.tsym-mobj w) (ArrayList::new [i64] a))
+  (set! (.defined w) (ArrayList::new [i64] a))
+  (set! (.call-args w) (ArrayList::new [u32] a))
+  (set! (.penv w) (ArrayList::new [PBind] a))
+  (set! (.abi-cache w) (ArrayList::new [AbiInfo] a))
+  (set! (.abi-known w) (ArrayList::new [bool] a))
+  (set! (.call-flags w) (ArrayList::new [u32] a))
+  (set! (.call-rts w) (ArrayList::new [u8] a))
+  (set! (.rt-args w) (ArrayList::new [u32] a))
+  (set! (.rt-flags w) (ArrayList::new [u32] a))
+  (set! (.rt-rts w) (ArrayList::new [u8] a))
+  (set! (.events w) (ArrayList::new [LowerEvent] a))
+  (set! (.symbols w) (ArrayList::new [i64] a))
+  (set! (.symbol-values w) (ArrayList::new [u32] a))
+  (set! (.references w) (ArrayList::new [i64] a))
+  (set! (.replayed w) (ArrayList::new [i64] a))
+  (set! (.func-sigs w) (ArrayList::new [(ptr GSig)] a))
+  (set! (.inline-costs w) (ArrayList::new [i64] a))
+  (extend-zeroed! (mut (.inline-costs w)) (len (.sigs view)))
+  0)
+
+;;; Whether function INDEX is lowered to CIR at all (a machine-code function
+;;; is its bytes, written by the backend thread).
+(defn lower-lowered? [(crew (ptr LowerCrew)) (index i64)] (-> bool)
+  (match (func-machine-code (al-at [Func] (.funcs crew) index))
+    (Some [_] false)
+    (None [] true)))
+
+;;; Queue the functions in REQUESTS that nobody has asked for yet. The caller
+;;; holds the mutex.
+(defn lower-queue-locked! [(crew (ptr LowerCrew)) (requests (ptr (ArrayList i64)))] (-> void)
+  (let [(mut added) false]
+    (for [k 0 (len (load requests))]
+      (let [index (get (load requests) k)
+            state (elem (mut (.states crew)) index)]
+        (when (and (= (atomic/read state) LOWER-NONE) (lower-lowered? crew index))
+          (atomic/store state LOWER-QUEUED)
+          (push! (mut (.queue crew)) index)
+          (set! added true))))
+    (when (and added (> (.waiting crew) 0)) (crew-notify-all! (field crew work)))))
+
+;;; Lower function INDEX on THREAD's context into its item. The item is this
+;;; thread's from the RUNNING state the caller put it in until the caller
+;;; stores LOWER-DONE.
+(defn lower-item! [(thread (ptr LowerThread)) (index i64)] (-> void)
+  (let [crew (.crew thread)
+        tl (field thread tl)
+        item (elem (mut (.items crew)) index)
+        fd (al-at [Func] (.funcs crew) index)]
+    (set! (.failed item) false)
+    (set! (.f tl) (field thread scratch))
+    (tl-sig tl fd)
+    (tl-func-lower! tl fd)
+    (cir/copy-finished! (field item func) (field thread scratch))
+    ; a method table's methods are reached through its relocations
+    (when (.reach-enabled tl)
+      (for [k 0 (len (.references tl))]
+        (push! (mut (.requests thread)) (get (.references tl) k)))
+      (for [k 0 (len (.events tl))]
+        (let [event (elem (mut (.events tl)) k)]
+          (when (= (.kind event) EVENT-VTABLE)
+            (for [m 0 (len (load (.methods event)))]
+              (let [si (g-sig-idx (.g tl) (get (load (.methods event)) m))]
+                (when (>= si 0)
+                  (let [target
+                          (get (.reach-by-symbol tl)
+                               (.symidx (al-at [GSig] (field (.g tl) sigs) si)))]
+                    (when (>= target 0) (push! (mut (.requests thread)) target))))))))))
+    (lower-hand-over! tl item)))
+
+;;; Give the context's results for the function at hand to ITEM and make the
+;;; context ready for the next function.
+(defn lower-hand-over! [(tl (ptr Tl)) (item (ptr LowerItem))] (-> void)
+  (let [a (.a tl)]
+    (for [k 0 (/ (len (.symbols tl)) 2)]
+      (set! (mut (.sym-map tl)) (get (.symbols tl) (* k 2)) (none32)))
+    (set! (.events item) (.events tl))
+    (set! (.symbols item) (.symbols tl))
+    (set! (.symbol-values item) (.symbol-values tl))
+    (set! (.references item) (.references tl))
+    (set! (.events tl) (ArrayList::new [LowerEvent] a))
+    (set! (.symbols tl) (ArrayList::new [i64] a))
+    (set! (.symbol-values tl) (ArrayList::new [u32] a))
+    (set! (.references tl) (ArrayList::new [i64] a))))
+
+;;; Function INDEX is lowered (or failed): wake the backend thread if it is
+;;; waiting for it. The store and the read of `awaited` are both sequentially
+;;; consistent, as are lower-await!'s store of `awaited` and read of the
+;;; state, so one of the two sees the other.
+(defn lower-finish-item! [(crew (ptr LowerCrew)) (index i64)] (-> void)
+  (atomic/store (elem (mut (.states crew)) index) LOWER-DONE)
+  (when (= (atomic/read (field crew awaited)) index)
+    (crew-lock! crew)
+    (crew-notify-all! (field crew done))
+    (crew-unlock! crew)))
+
+(defn lower-worker [(argument (ptr i8))] (-> (ptr i8))
+  (let [thread (primitive/cast (ptr LowerThread) argument)
+        crew (.crew thread)]
+    (crew-lock! crew)
+    (set! (.id thread) (os-thread/current-id))
+    (loop
+      (lower-queue-locked! crew (cast (ptr (ArrayList i64)) (mut (.requests thread))))
+      (clear! (mut (.requests thread)))
+      (clear! (mut (.batch thread)))
+      ; entries the backend thread took for itself are no longer QUEUED
+      (loop
+        (while (and (< (.head crew) (len (.queue crew)))
+                    (!= (atomic/read (elem (mut (.states crew))
+                                           (get (.queue crew) (.head crew))))
+                        LOWER-QUEUED))
+          (set! (.head crew) (+ (.head crew) 1)))
+        (if (or (< (.head crew) (len (.queue crew))) (.closed crew))
+            (break)
+            (do
+              (set! (.waiting crew) (+ (.waiting crew) 1))
+              (crew-wait! crew (field crew work))
+              (set! (.waiting crew) (- (.waiting crew) 1)))))
+      (if (>= (.head crew) (len (.queue crew)))
+          (break)
+          (let [available (- (len (.queue crew)) (.head crew))
+                share (/ available (* 2 (if (> (.alive crew) 0) (.alive crew) 1)))
+                take (cond (< share 1) 1 (> share LOWER-BATCH) LOWER-BATCH :else share)]
+            (while (and (< (len (.batch thread)) take) (< (.head crew) (len (.queue crew))))
+              (let [index (get (.queue crew) (.head crew))
+                    state (elem (mut (.states crew)) index)]
+                (set! (.head crew) (+ (.head crew) 1))
+                (when (= (atomic/read state) LOWER-QUEUED)
+                  (atomic/store state LOWER-RUNNING)
+                  (push! (mut (.batch thread)) index))))
+            (crew-unlock! crew)
+            (for [k 0 (len (.batch thread))]
+              (set! (.position thread) k)
+              (lower-item! thread (get (.batch thread) k))
+              (lower-finish-item! crew (get (.batch thread) k)))
+            (crew-lock! crew))))
+    (crew-unlock! crew)
+    (primitive/cast (ptr i8) 0)))
+
+;;; The failure hook (cga-failure-hook-cell) while a crew lowers. On a worker:
+;;; record the failure in the function's item with the events lowered so far,
+;;; give the rest of the batch back, and end the thread. On the backend thread
+;;; lowering a function itself (which is then the next to commit, so this is
+;;; the first failure in order): replay those events, as lowering serially
+;;; would have performed them before failing, and return to let the failure
+;;; proceed. On any other thread, or the backend thread otherwise: return.
+(defn lower-failure [(bytes (ptr u8)) (length i64)] (-> i64)
+  (let [crew (atomic/read-ptr (lower-crew-cell))]
+    (when (!= (primitive/cast usize crew) 0)
+      (let [me (os-thread/current-id)
+            (mut found) -1]
+        (crew-lock! crew)
+        (for [k 0 (len (.threads crew))]
+          (let [thread (elem (mut (.threads crew)) k)]
+            (when (and (.live thread) (= (.id thread) me))
+              (set! (.live thread) false)
+              (set! found k))))
+        (crew-unlock! crew)
+        (when (>= found 0)
+          (let [thread (elem (mut (.threads crew)) found)
+                context (field thread tl)]
+            (if (.worker thread)
+                (let [index (get (.batch thread) (.position thread))
+                      item (elem (mut (.items crew)) index)
+                      (mut copy) (ArrayList::new [u8] (malloc-allocator))]
+                  (for [k 0 length] (push! (mut copy) (load (primitive/index bytes k))))
+                  (set! (.message item) (slice copy))
+                  (set! (.failed item) true)
+                  (set! (.events item) (.events context))
+                  (crew-lock! crew)
+                  (for [k (+ (.position thread) 1) (len (.batch thread))]
+                    (let [later (get (.batch thread) k)]
+                      (atomic/store (elem (mut (.states crew)) later) LOWER-QUEUED)
+                      (push! (mut (.queue crew)) later)))
+                  (set! (.alive crew) (- (.alive crew) 1))
+                  (when (> (.waiting crew) 0) (crew-notify-all! (field crew work)))
+                  (crew-unlock! crew)
+                  (lower-finish-item! crew index)
+                  (cgtpde.thread-exit (primitive/cast (ptr i8) 0)))
+                (let [main (.tl crew)
+                      events (field context events)]
+                  (set! (.selfname (.g main)) (.selfname context))
+                  (set! (.nstatic (.g main)) 0)
+                  (for [k 0 (len (load events))]
+                    (tl-replay-event! main (elem events k)))))))))
+    0))
+
+;;; Start a crew of THREADS workers lowering TL's reachable functions, or null
+;;; when lowering is to run on this thread: no worker could be started, or
+;;; another crew is at work in this process.
+(defn lower-crew-start [(tl (ptr Tl)) (threads i64)] (-> (ptr LowerCrew))
+  (let [crew (box! (malloc-allocator) LowerCrew (zeroed LowerCrew))
+        g (.g tl)
+        funcs (.funcs (.program g))
+        null (primitive/cast (ptr LowerCrew) 0)]
+    (if (!= (primitive/cast usize (atomic/cas-ptr (lower-crew-cell) null crew)) 0)
+        (do (destroy (malloc-allocator) crew) null)
+        (do
+          (set! (.tl crew) tl)
+          (set! (.funcs crew) funcs)
+          (set! (.awaited crew) -1)
+          ; an item is written first by the thread that lowers its function
+          (set! (.items crew) (ArrayList::new [LowerItem] (malloc-allocator)))
+          (reserve! (mut (.items crew)) (len (load funcs)))
+          (set! (.len (.items crew)) (len (load funcs)))
+          (set! (.states crew) (ArrayList::new [i64] (malloc-allocator)))
+          (extend-zeroed! (mut (.states crew)) (len (load funcs)))
+          (set! (.queue crew) (ArrayList::new [i64] (malloc-allocator)))
+          (set! (.static-literals crew) (ArrayList::new [StaticLiteral] (malloc-allocator)))
+          (for [si 0 (len (.statics g))]
+            (push! (mut (.static-literals crew)) (static-literal-bits g si)))
+          (match (Mutex::init (field crew mutex))
+            (Ok [_] 0) (Err [_] (tl-fail "parallel lowering: mutex creation failed")))
+          (match (Condition::init (field crew work))
+            (Ok [_] 0) (Err [_] (tl-fail "parallel lowering: condition creation failed")))
+          (match (Condition::init (field crew done))
+            (Ok [_] 0) (Err [_] (tl-fail "parallel lowering: condition creation failed")))
+          ; Thread records must not move once a thread runs on one; the last
+          ; is the backend thread's own.
+          (set! (.threads crew) (ArrayList::new [LowerThread] (malloc-allocator)))
+          (extend-zeroed! (mut (.threads crew)) (+ threads 1))
+          (for [k 0 (+ threads 1)]
+            (let [thread (elem (mut (.threads crew)) k)]
+              (set! (.crew thread) crew)
+              (set! (.worker thread) (< k threads))
+              (scratch/ScratchArena::init-with-capacity (field thread arena)
+                                                        (malloc-allocator)
+                                                        1048576)
+              (store! (field thread scratch) (cir/Func::new))
+              (let [a (allocator (field thread arena))]
+                (lower-view! (field thread view) g a)
+                (lower-context! (field thread tl) (field thread view) tl crew a)
+                (set! (.batch thread) (ArrayList::new [i64] a))
+                (set! (.requests thread) (ArrayList::new [i64] a)))))
+          (set! (.id (elem (mut (.threads crew)) threads)) (os-thread/current-id))
+          (store! (cga-failure-hook-cell) (primitive/cast (ptr i8) (fnptr-of lower-failure)))
+          (let [(mut refused) false]
+            (while (and (not refused) (< (.started crew) threads))
+              (let [thread (elem (mut (.threads crew)) (.started crew))]
+                (set! (.live thread) true)
+                (if (= (Thread::spawn-configured (field thread thread)
+                                                 (fnptr-of lower-worker)
+                                                 (primitive/cast (ptr i8) thread)
+                                                 (ThreadConfig::new (worker-stack-size) -1))
+                       (: 0 i32))
+                    (set! (.started crew) (+ (.started crew) 1))
+                    (do (set! (.live thread) false) (set! refused true))))))
+          (crew-lock! crew)
+          (set! (.alive crew) (.started crew))
+          (crew-unlock! crew)
+          (if (> (.started crew) 0)
+              crew
+              (do (lower-crew-finish! crew) (lower-crew-free! crew) null))))))
+
+;;; Queue the functions of TL's reach-pending from position FROM on that
+;;; nobody has asked for.
+(defn lower-request-pending! [(crew (ptr LowerCrew)) (from i64)] (-> void)
+  (let [tl (.tl crew)
+        own (elem (mut (.threads crew)) (- (len (.threads crew)) 1))]
+    (clear! (mut (.requests own)))
+    (for [k from (len (.reach-pending tl))]
+      (let [index (get (.reach-pending tl) k)]
+        (when (= (atomic/read (elem (mut (.states crew)) index)) LOWER-NONE)
+          (push! (mut (.requests own)) index))))
+    (when (> (len (.requests own)) 0)
+      (crew-lock! crew)
+      (lower-queue-locked! crew (cast (ptr (ArrayList i64)) (mut (.requests own))))
+      (crew-unlock! crew)
+      (clear! (mut (.requests own))))))
+
+;;; Block until function INDEX is lowered; if no thread has started it, lower
+;;; it here.
+(defn lower-await! [(crew (ptr LowerCrew)) (index i64)] (-> void)
+  (let [state (elem (mut (.states crew)) index)]
+    (when (!= (atomic/read state) LOWER-DONE)
+      (crew-lock! crew)
+      (if (!= (atomic/read state) LOWER-RUNNING)
+          (let [own (elem (mut (.threads crew)) (- (len (.threads crew)) 1))]
+            (if (= (atomic/read state) LOWER-DONE)
+                (crew-unlock! crew)
+                (do
+                  (atomic/store state LOWER-RUNNING)
+                  (set! (.live own) true)
+                  (crew-unlock! crew)
+                  (clear! (mut (.requests own)))
+                  (lower-item! own index)
+                  (atomic/store state LOWER-DONE)
+                  (crew-lock! crew)
+                  (set! (.live own) false)
+                  (lower-queue-locked! crew (cast (ptr (ArrayList i64)) (mut (.requests own))))
+                  (crew-unlock! crew)
+                  (clear! (mut (.requests own))))))
+          (do
+            (atomic/store (field crew awaited) index)
+            (while (!= (atomic/read state) LOWER-DONE)
+              (crew-wait! crew (field crew done)))
+            (atomic/store (field crew awaited) -1)
+            (crew-unlock! crew))))))
+
+;;; Every function is committed: join the workers and release what lowering
+;;; allocated besides the functions' CIR (which the items keep until
+;;; lower-crew-free!).
+(defn lower-crew-finish! [(crew (ptr LowerCrew))] (-> void)
+  (crew-lock! crew)
+  (set! (.closed crew) true)
+  (crew-notify-all! (field crew work))
+  (crew-unlock! crew)
+  (for [k 0 (.started crew)]
+    (unless (= (Thread::join (field (elem (mut (.threads crew)) k) thread)) (: 0 i32))
+      (tl-fail "parallel lowering: thread join failed")))
+  (store! (cga-failure-hook-cell) (primitive/cast (ptr i8) 0))
+  (atomic/store-ptr (lower-crew-cell) (primitive/cast (ptr LowerCrew) 0))
+  (match (Condition::destroy! (field crew work))
+    (Ok [_] 0) (Err [_] (tl-fail "parallel lowering: condition release failed")))
+  (match (Condition::destroy! (field crew done))
+    (Ok [_] 0) (Err [_] (tl-fail "parallel lowering: condition release failed")))
+  (match (Mutex::destroy! (field crew mutex))
+    (Ok [_] 0) (Err [_] (tl-fail "parallel lowering: mutex release failed")))
+  (for [k 0 (len (.threads crew))]
+    (cir/func-free! (field (elem (mut (.threads crew)) k) scratch)))
+  (free! (mut (.queue crew)))
+  (free! (mut (.static-literals crew))))
+
+;;; Release the lowering threads' arenas, which hold each function's symbol
+;;; list until its CIR is renumbered (lower-renumber!).
+(defn lower-crew-release! [(crew (ptr LowerCrew))] (-> void)
+  (unless (.released crew)
+    (set! (.released crew) true)
+    (for [k 0 (len (.threads crew))]
+      (close! (field (elem (mut (.threads crew)) k) arena)))
+    (free! (mut (.threads crew)))))
+
+;;; Give the CIR of a committed function its tpde symbols: lowering numbered
+;;; them locally and the commit recorded what each became. It touches the
+;;; function's own CIR only, so it runs on whichever thread next works on the
+;;; function (the first step of copy forwarding).
+(defn lower-renumber! [(item (ptr LowerItem))] (-> void)
+  (let [fp (field item func)]
+    (for [k 0 (len (.symbol-values item))]
+      (let [x (cir/val fp (get (.symbol-values item) k))]
+        (set! (.imm x) (get (.symbols item) (* (.imm x) 2)))))))
+
+(defn lower-crew-free! [(crew (ptr LowerCrew))] (-> void)
+  (lower-crew-release! crew)
+  (free! (mut (.items crew)))
+  (free! (mut (.states crew)))
+  (destroy (malloc-allocator) crew))
+
+;;; tl-func! for a function a crew lowered: everything tl-func! and lowering
+;;; do to the module, the assembler and reachability, in the same order, then
+;;; the job.
+(defn tl-func-commit! [(tl (ptr Tl))
+                       (p (ptr Pipe))
+                       (index i64)
+                       (fd (ptr Func))
+                       (item (ptr LowerItem))] (-> void)
+  (compiler-work! "emit" (.name fd))
+  (let [g (.g tl)
+        known (get (.func-sigs tl) index)
+        sig (if (= (primitive/cast usize known) 0) (tl-sig tl fd) known)
+        msym (if (.shim sig) (.implsym sig) (.symidx sig))
+        tsym (tl-sym tl msym)
+        fp (field item func)
+        base (len (.reach-by-symbol tl))]
+    (set! (.selfname g) (.name fd))
+    (set! (.nstatic g) 0)
+    ; events and symbol mirrors interleaved as lowering made them: a symbol
+    ; is mirrored as the module had it at that point
+    (clear! (mut (.replayed tl)))
+    (for [k 0 (/ (len (.symbols item)) 2)]
+      (let [m (get (.symbols item) (* k 2))
+            before (get (.symbols item) (+ (* k 2) 1))]
+        (while (< (len (.replayed tl)) before)
+          (push! (mut (.replayed tl))
+                 (tl-replay-event! tl (elem (mut (.events item)) (len (.replayed tl))))))
+        ; kept for lower-renumber!
+        (set! (mut (.symbols item))
+              (* k 2)
+              (i64-of (tl-sym tl (if (< m base) m (get (.replayed tl) (- m base))))))))
+    (while (< (len (.replayed tl)) (len (.events item)))
+      (push! (mut (.replayed tl))
+             (tl-replay-event! tl (elem (mut (.events item)) (len (.replayed tl))))))
+    (when (.failed item) (tl-fail (.message item)))
+    (for [k 0 (len (.references item))]
+      (let [index (get (.references item) k)]
+        (unless (get (.reach-seen tl) index)
+          (set! (mut (.reach-seen tl)) index true)
+          (push! (mut (.reach-pending tl)) index))))
+    (push! (mut (.defined tl)) msym)
+    (push! (mut (.defined tl)) (i64-of tsym))
+    ; the ring's first slot lends the job its (unused) debug lists
+    (let [(mut job) (load (pipe-slot p 0))]
+      (set! (.kind job) JOB-COMPILE)
+      (set! (.fd job) fd)
+      (set! (.fp job) fp)
+      (set! (.sig job) sig)
+      (set! (.tsym job) tsym)
+      (set! (.tramp job) (none32))
+      (set! (.lowered job) item)
+      (when (.shim sig)
+        (let [tramp (tl-sym tl (.symidx sig))]
+          (set! (.tramp job) tramp)
+          (push! (mut (.defined tl)) (.symidx sig))
+          (push! (mut (.defined tl)) (i64-of tramp))))
+      (push! (mut (.pending p)) job))))
 
 ;;; Post-inline target reachability. Host images retain every requested name.
 ;;; Unprepared bodies remain roots and contribute their original CIR edges.
@@ -4417,19 +5235,34 @@
 
 ;;; A run of consecutive functions for one phase of module copy forwarding.
 (defstruct CopyChunk
-  [(forward (ptr copies/ModuleForward)) (phase i64) (begin i64) (end i64)])
+  [(forward (ptr copies/ModuleForward))
+   (lowered (slice (ptr LowerItem)))
+   (phase i64)
+   (begin i64)
+   (end i64)])
 
-;;; A worker's part of copies/forward-module!: the steps of one chunk, and
-;;; after the last phase's step of a function its snapshot fusion, which
-;;; nothing in copy forwarding reads. Each step touches its own function only.
+;;; Step PHASE of copy forwarding for function I, on any thread: before the
+;;; first, the renumbering a function lowered by a crew still needs; after the
+;;; last, its snapshot fusion, which nothing in copy forwarding reads.
+(defn copy-step! [(forward (ptr copies/ModuleForward))
+                  (scratch (ptr copies/State))
+                  (lowered (slice (ptr LowerItem)))
+                  (phase i64)
+                  (i i64)] (-> void)
+  (when (= phase 0)
+    (let [item (get lowered i)]
+      (when (!= (primitive/cast usize item) 0) (lower-renumber! item))))
+  (copies/module-forward-step! forward scratch phase i)
+  (when (= phase (- copies/MODULE-FORWARD-PHASES 1))
+    (cir/fuse-snapshots! (get (.funcs forward) i))))
+
+;;; A worker's part of copies/forward-module!: the steps of one chunk. Each
+;;; step touches its own function only.
 (defn copy-chunk-task [(argument (ptr i8))] (-> (ptr i8))
   (let [chunk (primitive/cast (ptr CopyChunk) argument)
-        forward (.forward chunk)
-        last (= (.phase chunk) (- copies/MODULE-FORWARD-PHASES 1))
         (mut scratch) (copies/module-forward-scratch)]
     (for [i (.begin chunk) (.end chunk)]
-      (copies/module-forward-step! forward (mut scratch) (.phase chunk) i)
-      (when last (cir/fuse-snapshots! (get (.funcs forward) i))))
+      (copy-step! (.forward chunk) (mut scratch) (.lowered chunk) (.phase chunk) i))
     (copies/module-forward-scratch-free! (mut scratch))
     (primitive/cast (ptr i8) 0)))
 
@@ -4438,8 +5271,10 @@
 ;;; steps of each phase run on workers, in chunks of about equal size; the
 ;;; joins between phases run here. A step's result depends on its function
 ;;; and the last join alone, so the functions come out the same as serially.
-(defn stogir-forward-copies! [(tl (ptr Tl)) (funcs (slice (ptr cir/Func))) (syms (slice u32))]
-  (-> void)
+(defn stogir-forward-copies! [(tl (ptr Tl))
+                              (funcs (slice (ptr cir/Func)))
+                              (syms (slice u32))
+                              (lowered (slice (ptr LowerItem)))] (-> void)
   (let [threads (if (and (tl-threads?) (not (.stats tl))) (stogir/generation-threads) 1)
         phases copies/MODULE-FORWARD-PHASES
         (mut state) (copies/module-forward-new funcs syms)
@@ -4455,7 +5290,9 @@
           (for [i 0 (len funcs)]
             (set! weight (+ weight 16 (len (.values (get funcs i)))))
             (when (or (>= weight target) (= i (- (len funcs) 1)))
-              (push! (mut chunks) (CopyChunk :forward forward :phase 0 :begin begin :end (+ i 1)))
+              (push! (mut chunks)
+                     (CopyChunk :forward forward :lowered lowered :phase 0
+                                :begin begin :end (+ i 1)))
               (set! begin (+ i 1))
               (set! weight 0))))))
     (let [per (len chunks)
@@ -4470,7 +5307,7 @@
           (for [c 0 per]
             (let [chunk (get chunks c)]
               (push! (mut chunks)
-                     (CopyChunk :forward forward :phase phase
+                     (CopyChunk :forward forward :lowered lowered :phase phase
                                 :begin (.begin chunk) :end (.end chunk)))))))
       (for [phase 0 phases]
         (when ok
@@ -4486,16 +5323,14 @@
                     (tl-fail "copy forwarding: task index differs from its chunk")))
                 (for [c 0 per] (stogir/pool-await! pool (+ (* phase per) c))))
               (let [(mut scratch) (copies/module-forward-scratch)]
-                (for [i 0 (len funcs)]
-                  (copies/module-forward-step! forward (mut scratch) phase i))
+                (for [i 0 (len funcs)] (copy-step! forward (mut scratch) lowered phase i))
                 (copies/module-forward-scratch-free! (mut scratch))))
           (stage-end xs))
           (let [xj (stage-begin "backend.stogir.copies.join")]
           (set! ok (copies/module-forward-join! forward phase))
           (stage-end xj))))
       (when parallel (stogir/pool-finish! pool))
-      (unless ok (tl-fail "copy forwarding weakened a callee argument summary"))
-      (unless parallel (for [i 0 (len funcs)] (cir/fuse-snapshots! (get funcs i)))))
+      (unless ok (tl-fail "copy forwarding weakened a callee argument summary")))
     (copies/module-forward-free! forward)
     (free! (mut chunks))))
 
@@ -4507,13 +5342,18 @@
           started (tr/codegen-start)
           copies-stage (stage-begin "backend.stogir.copies")]
       (let [(mut funcs) (ArrayList::new [(ptr cir/Func)] (malloc-allocator))
-            (mut syms) (ArrayList::new [u32] (malloc-allocator))]
+            (mut syms) (ArrayList::new [u32] (malloc-allocator))
+            (mut lowered) (ArrayList::new [(ptr LowerItem)] (malloc-allocator))]
         (for [i 0 (len (.pending p))]
           (let [j (elem (mut (.pending p)) i)]
             (when (= (.kind j) JOB-COMPILE)
               (push! (mut funcs) (.fp j))
-              (push! (mut syms) (.tsym j)))))
-        (stogir-forward-copies! tl (slice funcs) (slice syms))
+              (push! (mut syms) (.tsym j))
+              (push! (mut lowered) (.lowered j))
+              (set! (.lowered j) (primitive/cast (ptr LowerItem) 0)))))
+        (stogir-forward-copies! tl (slice funcs) (slice syms) (slice lowered))
+        (when (!= (primitive/cast usize (.crew p)) 0) (lower-crew-release! (.crew p)))
+        (free! (mut lowered))
         (free! (mut funcs))
         (free! (mut syms)))
       (stage-end copies-stage)
@@ -5080,6 +5920,8 @@
     (set! (.rt-args tl) (ArrayList::new [u32] a))
     (set! (.rt-flags tl) (ArrayList::new [u32] a))
     (set! (.rt-rts tl) (ArrayList::new [u8] a))
+    (set! (.replayed tl) (ArrayList::new [i64] a))
+    (set! (.func-sigs tl) (ArrayList::new [(ptr GSig)] a))
     (let [tlp (cast (ptr Tl) (mut tl))
           (mut pipe) (zeroed Pipe)
           pp (cast (ptr Pipe) (mut pipe))
@@ -5096,16 +5938,43 @@
                            0)))
       (let [names?
               (!= (primitive/cast i64 (cgtpde.getenv c"COIL_TPDE_NAMES")) 0)]
-        (let [(mut cursor) 0]
+        (let [(mut cursor) 0
+              ; Stogir -O3 lowers on worker threads when more than one
+              ; generation thread is configured ("parallel lowering"). The
+              ; measuring and profiling modes lower here, as before.
+              threads
+                (if (and (.collect pp)
+                         (tl-threads?)
+                         (not (.stats tlp))
+                         (not (.measure-inline tlp))
+                         (= (.prof-lower-repeat tlp) 0))
+                    (stogir/generation-threads)
+                    1)
+              crew
+                (if (> threads 1)
+                    (lower-crew-start tlp threads)
+                    (primitive/cast (ptr LowerCrew) 0))
+              parallel (!= (primitive/cast usize crew) 0)]
+          (set! (.crew pp) crew)
+          (when parallel (lower-request-pending! crew 0))
           (while (< cursor (len (.reach-pending tlp)))
             (let [i (get (.reach-pending tlp) cursor)
-                  fd (al-at [Func] fs i)]
+                  fd (al-at [Func] fs i)
+                  reached (len (.reach-pending tlp))]
               (when names? (eprintln "native[{}] {}" i (.name fd)))
               (match (func-machine-code fd)
                 (Some [code] (tl-machine-code-func! tlp pp fd code))
-                (None [] (tl-func! tlp pp fd)))
-              (tl-reach-data! tlp))
-            (set! cursor (+ cursor 1))))
+                (None []
+                      (if parallel
+                          (do
+                            (lower-await! crew i)
+                            (tl-func-commit! tlp pp i fd (elem (mut (.items crew)) i)))
+                          (tl-func! tlp pp fd))))
+              (tl-reach-data! tlp)
+              ; what only this commit could find, for the workers
+              (when parallel (lower-request-pending! crew reached)))
+            (set! cursor (+ cursor 1)))
+          (when parallel (lower-crew-finish! crew)))
         (stage-end lower-stage)
         (pipe-finish! pp))
       (tr/span-end span)
@@ -5147,6 +6016,7 @@
 ;;; static. (Lists in the build's allocator go with it; a REPL builds many
 ;;; times in one process, so nothing here may outlive the build.)
 (defn tl-free! [(tl (ptr Tl)) (p (ptr Pipe))] (-> void)
+  (when (!= (primitive/cast usize (.crew p)) 0) (lower-crew-free! (.crew p)))
   (tasm/asm-free! (.ta tl))
   (free! (mut (.stogir-text-data tl)))
   (free! (mut (.reach-pending tl)))
