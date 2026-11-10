@@ -1,0 +1,213 @@
+;;; Integer DIV/MOD by a literal that is not a power of two, as the high half
+;;; of a multiplication by a fixed-point reciprocal (Granlund and Montgomery;
+;;; the recipes follow Hacker's Delight chapter 10). This is an independent
+;;; target extension: pinned upstream emits a machine divide.
+;;;
+;;; Tile rules (the immediate holds the divisor's bits in the type's width):
+;;;   59/60 = unsigned/signed DIV, 61/62 = unsigned/signed MOD,
+;;;   63/64 = signed DIV/MOD of a dividend proven non-negative by a positive
+;;;           divisor, computed as the unsigned form of a dividend with a clear
+;;;           top bit (no sign correction, never the wide-reciprocal fix-up).
+;;; The quotient is built in x16 with x17 as the second temporary, so the
+;;; dividend must be in neither; a dividend that emission put in a scratch is
+;;; first moved to the result register. The remainder is dividend - q * d by
+;;; one MSUB. NZCV is preserved.
+(module stogir.a64.reciprocal)
+(import "stogir.a64.select" :as select)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.a64.constants" :as constants)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+;;; Signed: q = high(n * magic), plus n when d > 0 and magic < 0, minus n when
+;;; d < 0 and magic > 0, shifted right arithmetically, plus its own sign bit.
+(defstruct Signed [(magic u64) (shift i32)])
+
+;;; Unsigned: q = high((n >> pre) * magic); when add, the true reciprocal has
+;;; one bit more than the width and q = (((n - q) >> 1) + q); then q >> post.
+(defstruct Unsigned [(magic u64) (pre i32) (post i32) (add bool)])
+
+(defn mask-of [(width i32)] (-> u64)
+  (if (= width 64) (: 0xFFFFFFFFFFFFFFFF u64) (- (<< (: 1 u64) (cast u64 width)) 1)))
+
+;;; DIVISOR is the bit pattern of a signed WIDTH-bit value other than 0, 1, -1.
+(defn signed-recipe [(divisor u64) (width i32)] (-> Signed)
+  (let [mask (mask-of width)
+        minimum (<< (: 1 u64) (cast u64 (- width 1)))
+        d (& divisor mask)
+        negative? (!= (& d minimum) 0)
+        ad (if negative? (& (- 0 d) mask) d)
+        t (& (+ minimum (if negative? (: 1 u64) 0)) mask)
+        anc (& (- (- t 1) (% t ad)) mask)
+        (mut p) (- width 1)
+        (mut q1) (/ minimum anc)
+        (mut r1) (- minimum (* (/ minimum anc) anc))
+        (mut q2) (/ minimum ad)
+        (mut r2) (- minimum (* (/ minimum ad) ad))
+        (mut more) true]
+    (while more
+      (set! p (+ p 1))
+      (set! q1 (& (<< q1 1) mask))
+      (set! r1 (& (<< r1 1) mask))
+      (when (>= r1 anc)
+        (set! q1 (& (+ q1 1) mask))
+        (set! r1 (& (- r1 anc) mask)))
+      (set! q2 (& (<< q2 1) mask))
+      (set! r2 (& (<< r2 1) mask))
+      (when (>= r2 ad)
+        (set! q2 (& (+ q2 1) mask))
+        (set! r2 (& (- r2 ad) mask)))
+      (let [delta (& (- ad r2) mask)]
+        (set! more (or (< q1 delta) (and (= q1 delta) (= r1 0))))))
+    (let [magic (& (+ q2 1) mask)]
+      (Signed :magic (if negative? (& (- 0 magic) mask) magic) :shift (- p width)))))
+
+;;; DIVISOR is an unsigned WIDTH-bit value of at least 2. LEADING-ZEROS top
+;;; bits of every dividend are known clear. An even divisor that would need
+;;; the fix-up instead shifts the dividend right first; the odd part then
+;;; divides a dividend with more known clear bits, which never needs it.
+(defn unsigned-recipe [(divisor u64) (width i32) (leading-zeros i32)] (-> Unsigned)
+  (let [mask (mask-of width)
+        minimum (<< (: 1 u64) (cast u64 (- width 1)))
+        maximum (- minimum 1)
+        d (& divisor mask)
+        ones (>> mask (cast u64 leading-zeros))
+        nc (& (- ones (% (& (- (+ ones 1) d) mask) d)) mask)
+        (mut p) (- width 1)
+        (mut add) false
+        (mut q1) (/ minimum nc)
+        (mut r1) (- minimum (* (/ minimum nc) nc))
+        (mut q2) (/ maximum d)
+        (mut r2) (- maximum (* (/ maximum d) d))
+        (mut more) true]
+    (while more
+      (set! p (+ p 1))
+      (if (>= r1 (& (- nc r1) mask))
+          (do (set! q1 (& (+ (<< q1 1) 1) mask))
+              (set! r1 (& (- (<< r1 1) nc) mask)))
+          (do (set! q1 (& (<< q1 1) mask))
+              (set! r1 (& (<< r1 1) mask))))
+      (if (>= (& (+ r2 1) mask) (& (- d r2) mask))
+          (do (when (>= q2 maximum) (set! add true))
+              (set! q2 (& (+ (<< q2 1) 1) mask))
+              (set! r2 (& (- (+ (<< r2 1) 1) d) mask)))
+          (do (when (>= q2 minimum) (set! add true))
+              (set! q2 (& (<< q2 1) mask))
+              (set! r2 (& (+ (<< r2 1) 1) mask))))
+      (let [delta (& (- (- d 1) r2) mask)]
+        (set! more (and (< p (* 2 width))
+                        (or (< q1 delta) (and (= q1 delta) (= r1 0)))))))
+    (if (and add (= (& d 1) 0))
+        (let [(mut odd) d (mut pre) (: 0 i32)]
+          (while (= (& odd 1) 0)
+            (set! odd (>> odd 1))
+            (set! pre (+ pre 1)))
+          (let [inner (unsigned-recipe odd width (+ leading-zeros pre))]
+            (Unsigned :magic (.magic inner) :pre pre :post (.post inner) :add (.add inner))))
+        (Unsigned :magic (& (+ q2 1) mask) :pre 0
+                  :post (if add (- (- p width) 1) (- p width)) :add add))))
+
+(defn rule? [(rule i32)] (-> bool)
+  (and (>= rule 59) (<= rule 64)))
+
+(defn remainder? [(rule i32)] (-> bool)
+  (or (= rule 61) (= rule 62) (= rule 64)))
+
+(defn word! [(output (mut (ArrayList u8)))
+             (error (mut (slice u8)))
+             (instruction (Result u32 (slice u8)))] (-> void)
+  (when (= error "")
+    (match instruction
+      (Err [message] (set! error message))
+      (Ok [word] (bytes/append32! (mut output) word)))))
+
+(defn constant! [(output (mut (ArrayList u8)))
+                 (error (mut (slice u8)))
+                 (wide bool)
+                 (rd i32)
+                 (bits u64)] (-> void)
+  (when (= error "")
+    (match (constants/emit! (mut output) wide rd bits)
+      (Err [message] (set! error message))
+      (Ok [_] 0))))
+
+;;; High half of n * x16 into x16. The 32-bit form multiplies the two words
+;;; into the full 64-bit product and shifts its high word down, arithmetically
+;;; for a signed product so that the W register holds the signed high word.
+(defn high! [(output (mut (ArrayList u8)))
+             (error (mut (slice u8)))
+             (wide bool)
+             (signed? bool)
+             (n i32)] (-> void)
+  (if wide
+      (word! (mut output) (mut error) (encode/multiply-high signed? 16 n 16))
+      (do
+        (word! (mut output) (mut error) (encode/multiply-long signed? 16 n 16))
+        (word! (mut output) (mut error)
+               (encode/shift-immediate true (if signed? 2 1) 16 16 32)))))
+
+(defn emit! [(output (mut (ArrayList u8)))
+             (tile select/Tile)
+             (rd i32)
+             (rn i32)] (-> (Result i32 (slice u8)))
+  (let [wide (.wide tile)
+        width (if wide (: 64 i32) (: 32 i32))
+        rule (.rule tile)
+        d (.immediate tile)
+        scratch-source? (or (= rn 16) (= rn 17))
+        n (if scratch-source? rd rn)
+        start (len output)
+        (mut error) ""]
+    (if (or (not (rule? rule))
+            (< rd 0) (> rd 30) (< rn 0) (> rn 30)
+            (= n 16) (= n 17)
+            (< d 2) (!= (& d (mask-of width)) d))
+        (Err "reciprocal division lacks a dividend register outside the scratch pair")
+        (do
+          (when scratch-source?
+            (word! (mut output) (mut error) (encode/logical-register wide 1 rd 31 rn)))
+          (if (or (= rule 60) (= rule 62))
+              (let [recipe (signed-recipe d width)
+                    minimum (<< (: 1 u64) (cast u64 (- width 1)))
+                    negative-divisor? (!= (& d minimum) 0)
+                    negative-magic? (!= (& (.magic recipe) minimum) 0)]
+                ; The W-form constant is the magic word; SMULL sign-extends it.
+                (constant! (mut output) (mut error) wide 16 (.magic recipe))
+                (high! (mut output) (mut error) wide true n)
+                (when (and (not negative-divisor?) negative-magic?)
+                  (word! (mut output) (mut error) (encode/add-sub wide false false 16 16 n)))
+                (when (and negative-divisor? (not negative-magic?))
+                  (word! (mut output) (mut error) (encode/add-sub wide true false 16 16 n)))
+                (when (> (.shift recipe) 0)
+                  (word! (mut output) (mut error)
+                         (encode/shift-immediate wide 2 16 16 (.shift recipe))))
+                (word! (mut output) (mut error)
+                       (encode/add-sub-shifted wide false
+                                               (if (remainder? rule) (: 16 i32) rd)
+                                               16 16 1 (- width 1))))
+              (let [recipe (unsigned-recipe d width (if (>= rule 63) (: 1 i32) 0))]
+                (when (and (.add recipe) (> (.pre recipe) 0))
+                  (set! error "reciprocal division recipe needs both a pre-shift and a fix-up"))
+                (when (> (.pre recipe) 0)
+                  (word! (mut output) (mut error)
+                         (encode/shift-immediate wide 1 17 n (.pre recipe))))
+                (constant! (mut output) (mut error) wide 16 (.magic recipe))
+                (high! (mut output) (mut error) wide false
+                       (if (> (.pre recipe) 0) (: 17 i32) n))
+                (when (.add recipe)
+                  (word! (mut output) (mut error) (encode/add-sub wide true false 17 n 16))
+                  (word! (mut output) (mut error)
+                         (encode/add-sub-shifted wide false 16 16 17 1 1)))
+                (if (remainder? rule)
+                    (when (> (.post recipe) 0)
+                      (word! (mut output) (mut error)
+                             (encode/shift-immediate wide 1 16 16 (.post recipe))))
+                    (word! (mut output) (mut error)
+                           (if (> (.post recipe) 0)
+                               (encode/shift-immediate wide 1 rd 16 (.post recipe))
+                               (encode/logical-register wide 1 rd 31 16))))))
+          (when (remainder? rule)
+            (constant! (mut output) (mut error) wide 17 d)
+            (word! (mut output) (mut error) (encode/multiply-subtract wide rd 16 17 n)))
+          (if (= error "") (Ok (cast i32 (- (len output) start))) (Err error))))))
