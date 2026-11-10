@@ -6,7 +6,9 @@ LLVM backend links through the cc driver. Both must record what the driver
 records: `sdk` is the version of the SDK linked against (the system picks,
 among other things, its allocator by it) and `minos` is the deployment target
 the link names, else MACOSX_DEPLOYMENT_TARGET, else the SDK's version. The
-objects themselves carry one build version whatever the backend.
+objects themselves carry one build version whatever the backend. With an
+SDK newer than the running system the driver records the system's version as
+minos, and the direct link must too.
 """
 from pathlib import Path
 import json
@@ -75,6 +77,25 @@ with tempfile.TemporaryDirectory(prefix='native-link-versions-') as temporary:
     env = {backend: link(source, temporary / f'env-{backend}', backend, MACOSX_DEPLOYMENT_TARGET='13.1')
            for backend in BACKENDS}
     assert set(env.values()) == {('1', '13.1', sdk)}, env
+
+    # An SDK newer than the running system: the driver falls back to the
+    # system's version for minos, and so must the direct link. The copy shares
+    # the real SDK's contents and only claims a later version.
+    later = temporary / 'later' / 'MacOSX.sdk'
+    later.mkdir(parents=True)
+    for entry in Path(sdk_path).iterdir():
+        if entry.name not in ('SDKSettings.json', 'SDKSettings.plist'):
+            (later / entry.name).symlink_to(entry)
+    settings = json.loads((Path(sdk_path) / 'SDKSettings.json').read_text())
+    settings['Version'] = '99.0'
+    (later / 'SDKSettings.json').write_text(json.dumps(settings))
+    plist = subprocess.run(['plutil', '-convert', 'xml1', '-o', str(later / 'SDKSettings.plist'),
+                            str(later / 'SDKSettings.json')], capture_output=True, text=True)
+    assert plist.returncode == 0, plist.stderr
+    newer = {backend: link(source, temporary / f'newer-{backend}', backend, SDKROOT=str(later))
+             for backend in BACKENDS}
+    assert len(set(newer.values())) == 1, f'an SDK newer than the system: {newer}'
+    assert newer['stogir'][2] == '99.0' and newer['stogir'][1] != '99.0', newer
 
     named = {backend: link(source, temporary / f'named-{backend}', backend,
                            '--target', 'arm64-apple-macosx14.0.0', MACOSX_DEPLOYMENT_TARGET='13.1')
