@@ -289,4 +289,23 @@ November 10, 2026 — adapter defaults (no library change; `stogir.a64.private-l
 - The inline policy with `COIL_STOGIR_INLINE` unset is `hoist=1,always=1,forward=1,self=1,calls=128` (about 3% fewer host cycles for about 1.5% more generation on the compiler itself). A set `COIL_STOGIR_INLINE` replaces the default entirely: keys it does not name are off or zero with the fixed 512-cell budget and template bound. `COIL_STOGIR_INLINE=budget=512` (or the empty value) is therefore the previous default, a policy with no exemption.
 - Shrink wrapping, frame splitting and nested-loop rotation were already on (`COIL_STOGIR_SHRINK_WRAP=0`, `COIL_STOGIR_FRAME_SPLIT=0`). The research options (`CALL_HOLES`, `ROTATE`, `BRANCH_FACTS`, `INDUCTION`, `RECOLOR`, `REGIONAL`, `GLOBAL_LOADS`, `IF_CONVERT`, `HOIST_LOADS`, `STRENGTH`, `SHRINK_RETRY`) stay off unless set to 1.
 
+November 10, 2026 (later) — the default inline policy is now `hoist=1,always=1,forward=1,self=1,calls=128,wrap=256,small=80,small-scope=loop,small-leaf=1`. Library `call-inline` gains three policy fields, all off in `default-policy`: `keep-cells` (adapter key `wrap=N`: a template whose clone is at most N cells expands no callee whose clone is larger than N; its callers clone the small body and decide that call themselves, and the template's own emitted body takes the call in one more expansion with the budget it has left), `small-callers` (`small-caller=N`: under `small-scope=loop` the small exemption applies at every site of a caller of at most N cells) and `small-charged` (`small-charge=1`: a site the small exemption takes is charged while the budget lasts). Two output-preserving savings: a site whose callee is known to clone more cells than its allowance skips the eligibility walk, and the leaf test runs only for callees that fit the small exemption (`host.o` is byte-identical at the previous default and at the two small-leaf settings measured below).
+
+Why: at the previous default, adding `small=80,small-scope=any,small-leaf=1` removed 0.39B executed calls for +3.6% generator instructions. Of the 5,206 call instructions it removed from the linked compiler, 57% never execute on the workload and 252 (4.8%) carry 90% of the removed calls. A third of the benefit was not the exemption at all: uncharged leaves made `seg-flatten!` too large for `seg-force` to absorb, which left `seg-force`, and with it `sx-items` and `code-node-parts`, small enough for their callers to clone (135M calls). `wrap` states that directly: a small template does not absorb a large callee. The remaining benefit sits in loops, and comes from the loop sites not being charged (charging them while the budget lasts gives nearly all of it back).
+
+Exact counts on the fixed workload (generator: block counts of the compiler built by a fixed counting compiler; host: block counts of the emitted compiler emitting the seed object, which every host reproduced):
+
+| Policy (after `hoist=1,always=1,forward=1,self=1,calls=128`) | Generator instructions | Host instructions | Direct calls | Loads | Stores |
+|---|---|---|---|---|---|
+| nothing more (previous default) | 161.56B | 150.3B | 2.08B | 38.84B | 10.13B |
+| `wrap=256` | 161.21B (−0.22%) | 149.7B | 1.98B | 38.18B | 9.87B |
+| `wrap=200,small=80,small-scope=loop,small-leaf=1,small-charge=1` | 161.56B (0.0%) | 149.1B | 1.90B | 38.12B | 9.82B |
+| `wrap=256,small=40,small-scope=loop,small-leaf=1` | 162.22B (+0.40%) | 148.7B | 1.83B | 37.94B | 9.71B |
+| `wrap=256,small=80,small-scope=loop,small-leaf=1` (new default) | 163.07B (+0.93%) | 148.2B | 1.78B | 37.80B | 9.56B |
+| `small=80,small-scope=loop,small-leaf=1` | 163.75B (+1.35%) | 148.2B | 1.79B | 37.79B | 9.56B |
+| `wrap=200,small=80,small-scope=any,small-leaf=1` | 166.12B (+2.8%) | 147.6B | 1.70B | 37.72B | 9.55B |
+| `small=80,small-scope=any,small-leaf=1` | 167.40B (+3.6%) | 147.5B | 1.69B | 37.62B | 9.47B |
+
+Measured and rejected: `budget=768` with `wrap=256` (+4.6% generation, more host instructions), `template=128` (more calls), `small-caller=80|200` (no change in the host for +0.2 to +0.5% generation), a non-leaf loop exemption (+2.8% generation, more host instructions), and an earlier form of `wrap` that bounded the template's total size instead of the callee's (small helpers stopped merging: 0.6B more calls).
+
 Older entries above that call these options "off by default" describe the state when they were written. Unit keys (`unit-key-header` in the driver) record the compiler binary, target, level and backend but no `COIL_STOGIR_` setting: a new compiler never reuses an old compiler's unit, but one compiler run under two settings reuses the unit built under the first.
