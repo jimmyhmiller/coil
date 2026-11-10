@@ -89,11 +89,13 @@ def events_program():
     """Functions whose lowering makes module symbols and data: string
     literals (some shared between functions), static cells with and without
     an initializer, method tables of trait objects, function pointers,
-    runtime imports, and reads of a constant def. Their numbering and the
+    runtime imports (some under names lowering composes), and reads of a
+    constant def. Their numbering and the
     data's layout follow lowering order, and which functions exist at all
     follows what earlier ones refer to (a method reached only through a
     method table, a function reached only through a pointer)."""
     lines = ['(module parallel.events)', '(import "coil.primitive" :as primitive)',
+             '(import "coil.math" :as math)',
              '(deftrait Shape [Self] (area [(self (ptr Self))] (-> i64)))',
              '(def scale (: 7 i64))']
     for i in range(24):
@@ -117,7 +119,8 @@ def events_program():
                     f'    (+ (call-ptr target x) (len "text {i % 17}")))')
         elif kind == 4:
             body = (f'(let [y (cast f64 (+ x {i}))]\n'
-                    f'    (+ (cast i64 (primitive/frem y 7.5)) (g{i // 2} x)))')
+                    f'    (+ (cast i64 (primitive/frem y 7.5)) (cast i64 (math/log2 (math/log (+ y 3.0))))\n'
+                    f'       (g{i // 2} x)))')
         elif kind == 5:
             body = (f'(let [cell (primitive/alloc-static i64 {i})]\n'
                     f'    (+ (load cell) (* scale (g{i - 5} x))))')
