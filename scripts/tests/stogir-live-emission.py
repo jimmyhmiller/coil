@@ -19,55 +19,12 @@ def run(*args):
     return result.stdout
 
 
-with tempfile.TemporaryDirectory(prefix='stogir-emission-') as temporary:
-    directory = Path(temporary)
-    obj = directory / 'program.o'
-    run(COMPILER, 'emit-obj', ROOT / 'tests/cli/stogir-live-emission.coil',
-        '--backend', 'stogir', '-O3', '--no-debug', '-o', obj)
-    traced = directory / 'traced.o'
-    result = subprocess.run([str(COMPILER), 'emit-obj', str(ROOT / 'tests/cli/stogir-live-emission.coil'),
-                             '--backend', 'stogir', '-O3', '--no-debug', '-o', str(traced)],
-                            cwd=ROOT, env=dict(ENV, COIL_TPDE_STATS='1'),
-                            capture_output=True, text=True, timeout=120)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert obj.read_bytes() == traced.read_bytes(), 'effect tracing changes object bytes'
-    assert 'stogir nonwriting-body tests.cli.stogir-live-emission.readonly-leaf: true' in result.stderr
-    assert 'stogir nonwriting-body tests.cli.stogir-live-emission.writing-leaf: false' in result.stderr
-    assert 'stogir nonwriting-body tests.cli.stogir-live-emission.readonly-pair-result: true' in result.stderr
-    # The native prepass publishes once, and the ordinary job reuses each body.
-    native_lines = [line for line in result.stderr.splitlines()
-                    if line.startswith('stogir native-leaf ')]
-    assert native_lines, 'private module prepass did not run'
-    cached_names = [line.split(': certified', 1)[0].removeprefix('stogir native-leaf ')
-                    for line in native_lines]
-    assert len(cached_names) == len(set(cached_names)), 'native body compiled twice'
-    reused_names = [line.removeprefix('stogir reuse-native ')
-                    for line in result.stderr.splitlines()
-                    if line.startswith('stogir reuse-native ')]
-    assert sorted(cached_names) == sorted(reused_names), 'cache/job identity mismatch'
-    assert any(': certifiedtrue ' in line for line in native_lines), 'no certified leaf exercised'
-    assembly = run('llvm-objdump', '-dr', obj)
-    assert any('ARM64_RELOC_BRANCH26' in line and
-               '_tests.cli.stogir-live-emission.readonly-leaf' in line
-               for line in assembly.splitlines()), 'no residual read-only call exercised'
-    assert any('ARM64_RELOC_BRANCH26' in line and
-               '_tests.cli.stogir-live-emission.pair-result' in line
-               for line in assembly.splitlines()), 'no residual aggregate call exercised'
-    assert any('ARM64_RELOC_BRANCH26' in line and
-               '_tests.cli.stogir-live-emission.readonly-pair-result' in line
-               for line in assembly.splitlines()), 'no residual readonly aggregate call exercised'
-    symbols = run('nm', obj)
-    assert symbols.strip(), 'nm returned no symbol table'
-    for helper in ['leaf', 'wrapper', 'make-callback']:
-        assert f'_tests.cli.stogir-live-emission.{helper}' not in symbols, helper
-    for retained in ['_tests.cli.stogir-live-emission.readonly-leaf',
-                     '_stogir_retained_entry',
-                     '_tests.cli.stogir-live-emission.address-only',
-                     '_tests.cli.stogir-live-emission.returned-callback',
-                     '_tests.cli.stogir-live-emission.recursive']:
-        assert retained in symbols, retained
-    driver = directory / 'alias.c'
-    driver.write_text('''#include <stdint.h>
+SOURCE = ROOT / 'tests/cli/stogir-live-emission.coil'
+PREFIX = '_tests.cli.stogir-live-emission.'
+# The policy that charges every clone to the caller's budget, so the fanout
+# callers keep most of their calls whatever the default policy inlines.
+CHARGED = {'COIL_STOGIR_INLINE': 'budget=512'}
+DRIVER = """#include <stdint.h>
 #include <stdlib.h>
 struct NativePair { uint64_t first, second; };
 extern struct NativePair stogir_register_pair(uint64_t, uint64_t);
@@ -81,10 +38,83 @@ __attribute__((constructor)) static void check_exported_alias(void) {
         if (result.first != values[i] || result.second != values[j]) abort();
     }
 }
-''')
-    executable = directory / 'program'
+"""
+
+
+def emit(directory, name, settings):
+    """Emit, link and run the program under SETTINGS; return the direct call
+    targets and the defined symbols of its object."""
+    environment = dict(ENV, **settings)
+    obj = directory / f'{name}.o'
+    traced = directory / f'{name}-traced.o'
+    command = [str(COMPILER), 'emit-obj', str(SOURCE),
+               '--backend', 'stogir', '-O3', '--no-debug', '-o']
+    plain = subprocess.run(command + [str(obj)], cwd=ROOT, env=environment,
+                           capture_output=True, text=True, timeout=120)
+    assert plain.returncode == 0, plain.stdout + plain.stderr
+    result = subprocess.run(command + [str(traced)], cwd=ROOT,
+                            env=dict(environment, COIL_TPDE_STATS='1'),
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert obj.read_bytes() == traced.read_bytes(), 'effect tracing changes object bytes'
+    # The effect proof comes from each body, under every inline policy.
+    assert f'stogir nonwriting-body {PREFIX[1:]}readonly-leaf: true' in result.stderr
+    assert f'stogir nonwriting-body {PREFIX[1:]}writing-leaf: false' in result.stderr
+    assert f'stogir nonwriting-body {PREFIX[1:]}readonly-pair-result: true' in result.stderr
+    # The native prepass publishes once, and the ordinary job reuses each body.
+    native_lines = [line for line in result.stderr.splitlines()
+                    if line.startswith('stogir native-leaf ')]
+    assert native_lines, 'private module prepass did not run'
+    cached_names = [line.split(': certified', 1)[0].removeprefix('stogir native-leaf ')
+                    for line in native_lines]
+    assert len(cached_names) == len(set(cached_names)), 'native body compiled twice'
+    reused_names = [line.removeprefix('stogir reuse-native ')
+                    for line in result.stderr.splitlines()
+                    if line.startswith('stogir reuse-native ')]
+    assert sorted(cached_names) == sorted(reused_names), 'cache/job identity mismatch'
+    assert any(': certifiedtrue ' in line for line in native_lines), 'no certified leaf exercised'
+    targets = {line.split()[-1] for line in run('llvm-objdump', '-dr', obj).splitlines()
+               if 'ARM64_RELOC_BRANCH26' in line}
+    listing = run('nm', obj)
+    assert listing.strip(), 'nm returned no symbol table'
+    defined = {fields[-1] for fields in map(str.split, listing.splitlines())
+               if len(fields) == 3 and fields[1] != 'U'}
+    # An :inline (Never) callee is called under every policy.
+    assert PREFIX + 'pair-result' in targets, 'no residual aggregate call exercised'
+    # Helpers every policy inlines everywhere are not emitted.
+    for helper in ['leaf', 'wrapper', 'make-callback']:
+        assert PREFIX + helper not in defined, helper
+    # Roots that no direct call reaches: native data, an address that arrives
+    # through an inlined helper, an export alias, and a recursive function.
+    for retained in [PREFIX + 'address-only', PREFIX + 'returned-callback',
+                     '_stogir_retained_entry', PREFIX + 'recursive']:
+        assert retained in defined, retained
+    # A helper with no other root is emitted exactly when a call to it
+    # survived inlining, whichever calls the policy in force left.
+    for helper in ['readonly-leaf', 'readonly-pair-result', 'writing-leaf']:
+        assert (PREFIX + helper in defined) == (PREFIX + helper in targets), \
+            f'{name}: {helper} emitted {PREFIX + helper in defined}, ' \
+            f'called {PREFIX + helper in targets}'
+    driver = directory / 'alias.c'
+    driver.write_text(DRIVER)
+    executable = directory / name
     run('cc', obj, driver, '-lm', '-o', executable)
     assert run(executable) == 'post-inline emission: 0 failures\n'
+    return targets, defined
+
+
+with tempfile.TemporaryDirectory(prefix='stogir-emission-') as temporary:
+    directory = Path(temporary)
+    # The default policy: whatever it inlines, emission follows the final graphs.
+    emit(directory, 'default', {})
+    # Charged clones exhaust the fanout callers' budgets, so calls to callees
+    # proven read-only from their bodies remain and their targets are emitted.
+    targets, defined = emit(directory, 'charged', CHARGED)
+    assert PREFIX + 'readonly-leaf' in targets, 'no residual read-only call exercised'
+    assert PREFIX + 'readonly-pair-result' in targets, \
+        'no residual readonly aggregate call exercised'
+    assert PREFIX + 'readonly-leaf' in defined
+    assert PREFIX + 'readonly-pair-result' in defined
     library = directory / 'library.coil'
     library.write_text('(module emission.unit)\n'
                        '(defn first [(x i64)] (-> i64) (+ x 7))\n'
