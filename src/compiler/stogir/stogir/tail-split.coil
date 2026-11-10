@@ -1,0 +1,355 @@
+;;; A call in tail position that reaches its RETURN through a join.
+;;;
+;;; Return canonicalization and inline expansion leave one RETURN reading a PHI
+;;; at a MERGE of every returning path. A path that ends in a CALL whose result
+;;; is that PHI's input is a call in tail position, but the late CALL/RETURN
+;;; recognition (a64/tail-plan, after ir_emit.c:ir_try_tailcall) only sees a
+;;; RETURN that directly follows its CALL. This gives each such path its own
+;;; RETURN again:
+;;;
+;;;   c = CALL ...; e = END(c); m = MERGE(.., e, ..); p = PHI(m, .., c, ..);
+;;;   RETURN(m, p)
+;;; becomes
+;;;   c = CALL ...; RETURN(c, c)        and m, p lose that input.
+;;;
+;;; The MERGE's block must hold nothing but that PHI and the RETURN, so no
+;;; effect and no other value separates the call from the return. When one
+;;; path remains (the last one, when every path ends in such a call), the join
+;;; disappears and the RETURN moves onto that path.
+;;;
+;;; Inline expansion nests such joins: the expanded callee's own return join
+;;; holds only its PHI and an END into the caller's. A path through inner
+;;; joins of that shape is split the same way; an inner join left with one
+;;; path gives that path to its parent, and one left with none disappears.
+;;; Whether the call then really becomes a jump stays tail-plan's decision; a
+;;; path it declines merely has its own copy of the return.
+;;;
+;;; An independent extension; not an upstream ir pass.
+(module stogir.tail-split)
+(export Split run release!)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.uses" :as uses)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+(defstruct Split [(graph g/Graph) (roots (ArrayList i32))])
+
+(defn release! [(value (mut Split))] (-> void)
+  (g/release! (mut (.graph value)))
+  (free! (mut (.roots value))))
+
+(defn opcode [(graph g/Graph) (reference i32)] (-> i32)
+  (if (and (> reference 0) (g/contains? graph reference))
+      (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference))))
+      -1))
+
+(defn input [(graph g/Graph) (reference i32) (index i32)] (-> i32)
+  (match (g/operand graph reference index) (Some [value] value) (None [] 0)))
+
+(defn root? [(roots (slice i32)) (reference i32)] (-> bool)
+  (let [(mut found) false (mut i) 0]
+    (while (and (not found) (< i (len roots)))
+      (when (= (get roots i) reference) (set! found true))
+      (set! i (+ i 1)))
+    found))
+
+;;; Inner joins followed below a RETURN's own.
+(const DEPTH 8)
+
+;;; The PHI of MERGE that VALUE is, with one input per MERGE input; else zero.
+(defn phi-of [(graph g/Graph) (merge i32) (value i32)] (-> i32)
+  (if (and (= (opcode graph value) 67)
+           (= (input graph value 1) merge)
+           (= (get (.arities graph) (cast i64 value))
+              (+ (get (.arities graph) (cast i64 merge)) 1)))
+      value
+      0))
+
+;;; The MERGE that RETURN directly follows and returns a PHI of (or nothing,
+;;; for a void RETURN), or zero.
+(defn join-of [(graph g/Graph) (returning i32)] (-> i32)
+  (let [node (get (.instructions graph) (cast i64 returning))
+        merge (.op1 node)]
+    (if (and (= (n/opcode node) 120) (= (opcode graph merge) 112))
+        (if (= (n/type-id node) 0)
+            (if (= (.op2 node) 0) merge 0)
+            (if (> (phi-of graph merge (.op2 node)) 0) merge 0))
+        0)))
+
+;;; Whether a join of result type TY (zero: void) may have a call in tail
+;;; position on some path, from the graph alone. PHI is zero for a void join.
+(defn promising? [(graph g/Graph) (merge i32) (phi i32) (ty u8) (depth i32)] (-> bool)
+  (let [count (cast i32 (get (.arities graph) (cast i64 merge)))
+        (mut found) false
+        (mut i) (: 1 i32)]
+    (while (and (not found) (<= i count))
+      (let [end (input graph merge i)
+            control (if (= (opcode graph end) 114) (input graph end 1) 0)
+            value (if (> phi 0) (input graph phi (+ i 1)) 0)]
+        (cond (= (opcode graph control) 79)
+                (when (or (= ty 0) (= value control)) (set! found true))
+              (and (= (opcode graph control) 112) (< depth DEPTH))
+                (let [inner (if (= ty 0) 0 (phi-of graph control value))]
+                  (when (and (or (= ty 0) (> inner 0))
+                             (promising? graph control inner ty (+ depth 1)))
+                    (set! found true)))
+              :else 0))
+      (set! i (+ i 1)))
+    found))
+
+(defn candidate? [(graph g/Graph) (returning i32)] (-> bool)
+  (let [merge (if (and (> returning 0) (g/contains? graph returning)) (join-of graph returning) 0)]
+    (and (> merge 0)
+         (let [node (get (.instructions graph) (cast i64 returning))]
+           (promising? graph merge (if (= (n/type-id node) 0) 0 (.op2 node))
+                       (n/type-id node) 0)))))
+
+(defn used [(edges uses/Uses) (reference i32)] (-> i64)
+  (.count (get (.ranges edges) (cast i64 reference))))
+
+;;; Input INDEX of MERGE is an END directly after a CALL whose result is the
+;;; join's value on that path.
+(defn tail-edge? [(graph g/Graph) (edges uses/Uses) (roots (slice i32)) (merge i32) (phi i32)
+                  (ty u8) (index i32)]
+  (-> bool)
+  (let [end (input graph merge index)
+        call (if (= (opcode graph end) 114) (input graph end 1) 0)]
+    (and (= (opcode graph call) 79)
+         (= (used edges end) 1)
+         (not (root? roots call))
+         (not (root? roots end))
+         (or (= ty 0)
+             (and (= (input graph phi (+ index 1)) call)
+                  (= (n/type-id (get (.instructions graph) (cast i64 call))) ty))))))
+
+;;; Input INDEX of MERGE is an END directly after an inner MERGE whose block is
+;;; exactly the PHI that the join reads on that path (none for a void join)
+;;; and that END. Returns the inner PHI through INNER.
+(defn inner-edge? [(graph g/Graph) (edges uses/Uses) (roots (slice i32)) (merge i32) (phi i32)
+                   (ty u8) (index i32) (inner (mut i32))]
+  (-> bool)
+  (let [end (input graph merge index)
+        below (if (= (opcode graph end) 114) (input graph end 1) 0)
+        value (if (> phi 0) (input graph phi (+ index 1)) 0)
+        own (if (and (= (opcode graph below) 112) (!= ty 0)) (phi-of graph below value) 0)]
+    (set! inner own)
+    (and (= (opcode graph below) 112)
+         (= (used edges end) 1)
+         (not (root? roots end))
+         (not (root? roots below))
+         (if (= ty 0)
+             (= (used edges below) 1)
+             (and (> own 0)
+                  (not (root? roots own))
+                  (= (used edges own) 1)
+                  (= (used edges below) 2))))))
+
+(defstruct Count [(tails i64) (plain i64)])
+
+;;; Paths of the join that end in a call in tail position, and all others. An
+;;; inner join without such a path counts as one plain path.
+(defn survey [(graph g/Graph) (edges uses/Uses) (roots (slice i32)) (merge i32) (phi i32) (ty u8)
+              (depth i32)]
+  (-> Count)
+  (let [(mut result) (Count :tails 0 :plain 0)]
+    (for [i 1 (+ (cast i64 (get (.arities graph) (cast i64 merge))) 1)]
+      (let [(mut inner) (: 0 i32)]
+        (cond (tail-edge? graph edges roots merge phi ty (cast i32 i))
+                (set! (.tails result) (+ (.tails result) 1))
+              (and (< depth DEPTH)
+                   (inner-edge? graph edges roots merge phi ty (cast i32 i) (mut inner)))
+                (let [below (survey graph edges roots (input graph (input graph merge (cast i32 i)) 1)
+                                    inner ty (+ depth 1))]
+                  (if (= (.tails below) 0)
+                      (set! (.plain result) (+ (.plain result) 1))
+                      (do
+                        (set! (.tails result) (+ (.tails result) (.tails below)))
+                        (set! (.plain result) (+ (.plain result) (.plain below))))))
+              :else (set! (.plain result) (+ (.plain result) 1)))))
+    result))
+
+;;; The block of MERGE is exactly the PHI that RETURN reads (when it reads
+;;; one) and RETURN.
+(defn isolated? [(graph g/Graph) (edges uses/Uses) (roots (slice i32)) (returning i32) (merge i32)]
+  (-> bool)
+  (let [node (get (.instructions graph) (cast i64 returning))
+        phi (if (= (n/type-id node) 0) 0 (.op2 node))
+        users (get (.ranges edges) (cast i64 merge))
+        (mut ok) (and (not (root? roots merge)) (or (= phi 0) (not (root? roots phi))))]
+    (for [i (.offset users) (+ (.offset users) (.count users))]
+      (let [user (.user (get (.edges edges) i))]
+        (unless (or (= user returning) (and (> phi 0) (= user phi))) (set! ok false))))
+    (unless (= (.count users) (if (> phi 0) 2 1)) (set! ok false))
+    (when (and ok (> phi 0))
+      (let [readers (get (.ranges edges) (cast i64 phi))]
+        (unless (and (= (.count readers) 1)
+                     (= (.user (get (.edges edges) (.offset readers))) returning))
+          (set! ok false))))
+    ok))
+
+;;; Whether MERGE still has exactly the inputs ENDS. A path's END identifies
+;;; its value too: a reduced inner join hands on a different END.
+(defn same-inputs? [(graph g/Graph) (merge i32) (ends (slice i32))] (-> bool)
+  (let [(mut same) (= (len ends) (cast i64 (get (.arities graph) (cast i64 merge))))]
+    (when same
+      (for [i 0 (len ends)]
+        (unless (= (get ends i) (input graph merge (cast i32 (+ i 1)))) (set! same false))))
+    same))
+
+;;; One RETURN's split in progress. total/seen count the tail paths; when no
+;;; plain path exists (keep), the last tail path stays for the RETURN itself.
+;;; link is the terminal-chain link the next RETURN takes (see split!).
+(defstruct Work
+  [(ty u8) (total i64) (seen i64) (keep bool) (linked bool) (link i32) (changed i32)
+   (error (slice u8))])
+
+;;; Split the paths of the join MERGE/PHI in GRAPH, reading the unchanged
+;;; SOURCE (which EDGES indexes). The paths that remain are appended to ENDS
+;;; and VALUES, at most one per input: a plain or kept path as it was, or what
+;;; an inner join was reduced to. The MERGE and PHI themselves are left for the
+;;; caller, which knows what follows them.
+(defn reduce! [(graph (mut g/Graph)) (source g/Graph) (edges uses/Uses) (original (slice i32))
+               (roots (mut (ArrayList i32))) (work (mut Work)) (merge i32) (phi i32) (depth i32)
+               (ends (mut (ArrayList i32))) (values (mut (ArrayList i32))) (a (dyn Allocator))]
+  (-> void)
+  (for [i 1 (+ (cast i64 (get (.arities source) (cast i64 merge))) 1)]
+    (let [end (input source merge (cast i32 i))
+          value (if (> phi 0) (input source phi (cast i32 (+ i 1))) 0)
+          (mut inner) (: 0 i32)]
+      (cond (tail-edge? source edges original merge phi (.ty work) (cast i32 i))
+              (do
+                (set! (.seen work) (+ (.seen work) 1))
+                (if (and (.keep work) (= (.seen work) (.total work)))
+                    (do (push! (mut ends) end) (push! (mut values) value))
+                    (if (g/rewrite-inputs! (mut graph) end 120 (.ty work)
+                                           [(input source end 1) value
+                                            (if (.linked work) (.link work) 0)])
+                        (do
+                          (when (.linked work) (set! (.link work) end))
+                          (push! (mut roots) end)
+                          (set! (.changed work) (+ (.changed work) 1)))
+                        (set! (.error work) "tail split could not rewrite an END"))))
+            (and (< depth DEPTH)
+                 (inner-edge? source edges original merge phi (.ty work) (cast i32 i) (mut inner))
+                 (> (.tails (survey source edges original (input source end 1) inner (.ty work)
+                                    (+ depth 1)))
+                    0))
+              (let [below (input source end 1)
+                    (mut sub-ends) (ArrayList::new [i32] a)
+                    (mut sub-values) (ArrayList::new [i32] a)]
+                (push! (mut sub-values) below)
+                (reduce! (mut graph) source edges original (mut roots) (mut work) below inner
+                         (+ depth 1) (mut sub-ends) (mut sub-values) a)
+                (cond (same-inputs? source below (slice sub-ends))
+                        ; Every path stayed as it was (the kept one was its
+                        ; only tail path).
+                        (do (push! (mut ends) end) (push! (mut values) value))
+                      (>= (len sub-ends) 2)
+                        (do
+                          (unless (and (g/rewrite-inputs! (mut graph) below 112 0 (slice sub-ends))
+                                       (or (= inner 0)
+                                           (g/rewrite-inputs! (mut graph) inner 67 (.ty work)
+                                                              (slice sub-values))))
+                            (set! (.error work) "tail split could not shrink an inner join"))
+                          (push! (mut ends) end)
+                          (push! (mut values) value))
+                      :else
+                        (do
+                          (unless (and (g/make-nop! (mut graph) end)
+                                       (g/make-nop! (mut graph) below)
+                                       (or (= inner 0) (g/make-nop! (mut graph) inner)))
+                            (set! (.error work) "tail split could not dissolve an inner join"))
+                          (when (= (len sub-ends) 1)
+                            (push! (mut ends) (get sub-ends 0))
+                            (push! (mut values) (get sub-values 1)))))
+                (free! (mut sub-ends))
+                (free! (mut sub-values)))
+            :else (do (push! (mut ends) end) (push! (mut values) value))))))
+
+;;; Split RETURNING in the working GRAPH. New RETURNs are appended to ROOTS;
+;;; RETURNING keeps its reference (and so its root and whatever links to it).
+;;; LINKED: RETURNING belongs to a terminal chain, which the new RETURNs join
+;;; just before it.
+(defn split! [(graph (mut g/Graph)) (source g/Graph) (edges uses/Uses) (original (slice i32))
+              (roots (mut (ArrayList i32))) (returning i32) (merge i32) (linked bool)
+              (a (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions source) (cast i64 returning))
+        ty (n/type-id node)
+        phi (if (= ty 0) 0 (.op2 node))
+        count (survey source edges original merge phi ty 0)
+        (mut work) (Work :ty ty :total (.tails count) :seen 0 :keep (= (.plain count) 0)
+                         :linked linked :link (.op3 node) :changed 0 :error "")
+        (mut ends) (ArrayList::new [i32] a)
+        (mut values) (ArrayList::new [i32] a)]
+    (push! (mut values) merge)
+    (when (> (.tails count) (if (.keep work) 1 0))
+      (reduce! (mut graph) source edges original (mut roots) (mut work) merge phi 0
+               (mut ends) (mut values) a)
+      (when (= (.error work) "")
+        (cond (= (len ends) 0)
+                (set! (.error work) "tail split left no path for the original RETURN")
+              (= (len ends) 1)
+                ; The join is gone: RETURNING moves onto the one remaining path.
+                (let [end (get ends 0)
+                      control (input graph end 1)]
+                  (unless (and (g/rewrite-inputs! (mut graph) returning 120 ty
+                                                  [control (get values 1) (.link work)])
+                               (g/make-nop! (mut graph) end)
+                               (g/make-nop! (mut graph) merge)
+                               (or (= phi 0) (g/make-nop! (mut graph) phi)))
+                    (set! (.error work) "tail split could not dissolve the join")))
+              :else
+                (unless (and (g/rewrite-inputs! (mut graph) merge 112 0 (slice ends))
+                             (or (= phi 0)
+                                 (g/rewrite-inputs! (mut graph) phi 67 ty (slice values)))
+                             (g/set-operand! (mut graph) returning 3 (.link work)))
+                  (set! (.error work) "tail split could not shrink the join")))))
+    (free! (mut ends))
+    (free! (mut values))
+    (if (= (.error work) "") (Ok (.changed work)) (Err (.error work)))))
+
+;;; None when SOURCE has no such path (the usual case, decided from ROOTS
+;;; alone: every RETURN is a root). Otherwise an owned copy with those paths
+;;; split and the roots that observe it. SOURCE is never modified. Constants
+;;; and strings keep their references, so code generated from the copy can be
+;;; finished against SOURCE.
+(defn run [(source g/Graph) (roots (slice i32)) (a (dyn Allocator))]
+  (-> (Result (Option Split) (slice u8)))
+  (let [(mut any) false (mut r) 0]
+    (while (and (not any) (< r (len roots)))
+      (when (candidate? source (get roots r)) (set! any true))
+      (set! r (+ r 1)))
+    (if (not any)
+        (Ok (None))
+        (let [(mut edges) (uses/build source a)
+              (mut graph) (g/duplicate source a)
+              (mut observed) (ArrayList::new [i32] a)
+              (mut done) (ArrayList::new [i32] a)
+              (mut error) ""
+              (mut changed) (: 0 i32)]
+          (for [i 0 (len roots)] (push! (mut observed) (get roots i)))
+          (for [i 0 (len roots)]
+            (let [returning (get roots i)]
+              ; Each RETURN has its own join; a root listed twice is split once.
+              (when (and (= error "") (candidate? source returning)
+                         (not (root? (slice done) returning)))
+                (push! (mut done) returning)
+                (let [merge (join-of source returning)]
+                  (when (isolated? source edges roots returning merge)
+                    (match (split! (mut graph) source edges roots (mut observed) returning merge
+                                   (or (!= (.op3 (get (.instructions source) (cast i64 returning))) 0)
+                                       (> (used edges returning) 0))
+                                   a)
+                      (Err [message] (set! error message))
+                      (Ok [count] (set! changed (+ changed count)))))))))
+          (free! (mut done))
+          (uses/release! (mut edges))
+          (if (and (= error "") (> changed 0))
+              (Ok (Some (Split :graph graph :roots observed)))
+              (do
+                (g/release! (mut graph))
+                (free! (mut observed))
+                (if (= error "") (Ok (None)) (Err error))))))))
