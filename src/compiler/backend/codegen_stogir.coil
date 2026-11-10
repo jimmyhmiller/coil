@@ -73,7 +73,10 @@
    (branches (ArrayList i32))
    (exits (ArrayList i32))
    (import-names (ArrayList (slice u8)))
-   (import-ids (ArrayList u32))])
+   (import-ids (ArrayList u32))
+   ; g belongs to a frozen definition: an expansion replaces it without
+   ; releasing it, and then owns its result as usual.
+   (borrowed bool)])
 
 (defn require [(s (ptr Adapter)) (result (Result i32 (slice u8)))] (-> i32)
   (match result (Ok [r] r) (Err [message] (fail (.name (.f s)) message))))
@@ -1684,6 +1687,9 @@
   [(inlineable bool)
    ; The source is :inline (Always); the policy decides whether that is honored.
    (always bool)
+   ; Not inlineable, but its only call cycle is its calls of itself. Those
+   ; stay calls in every clone, so it expands only where expand-module! says.
+   (recursive bool)
    ; The graph is sccp/optimize-memory output for its observed roots and has
    ; not changed since, so emission may skip the image's entry SCCP.
    (clean bool)
@@ -1700,7 +1706,13 @@
    (import-names (ArrayList (slice u8)))
    (import-ids (ArrayList u32))
    ; Content proof of graph (see Adapter), or zero.
-   (proof u128)])
+   (proof u128)
+   ; Growth budget left when the template was finalized.
+   (left i32)
+   ; Cells a clone of the finalized template reserves (inlining/base-clone-cells).
+   (cells i64)
+   ; Finalized without the call and sparse exemptions (see template-policy).
+   (deferred bool)])
 
 ;;; A non-template caller owns its final graph in a stable arena until emitted.
 ;;; Registry snapshots remain frozen; these bodies are never registered callees.
@@ -1752,6 +1764,10 @@
    (bodies (ArrayList EmissionBody))
    (body-by-symbol (ArrayList i64))
    (by-symbol (ArrayList i64))
+   ; Symbols of the functions declared :inline (Never).
+   (outlined (ArrayList bool))
+   ; Direct call instructions per target symbol over every submitted function.
+   (call-sites (ArrayList i32))
    (bindings (HashMap (slice u8) u32))
    (native-context private/Context)
    (native-publication private/Publication)
@@ -1788,6 +1804,8 @@
     :bodies (ArrayList::new [EmissionBody] a)
     :body-by-symbol (ArrayList::new [i64] a)
     :by-symbol (ArrayList::new [i64] a)
+    :outlined (ArrayList::new [bool] a)
+    :call-sites (ArrayList::new [i32] a)
     :bindings (HashMap::new [(slice u8) u32] a (keyops-borrowed))
     :native-context (private/no-context)
     :native-publication (private/no-publication)
@@ -1889,12 +1907,29 @@
 ;;; always=0|1 (:inline (Always) templates inline at every site, uncharged),
 ;;; small-leaf=0|1 (the small exemption applies only to callees without calls),
 ;;; hoist=0|1 (inlined callees' frame objects join the caller's static frame
-;;; instead of a dynamic stack scope).
+;;; instead of a dynamic stack scope), calls=N (sites cloning at most N cells
+;;; are not charged even when the callee contains calls, of any shape),
+;;; forward=0|1 (a caller whose only call is the site takes a callee with calls
+;;; of any shape, charged), self=0|1 (a function whose only recursion is calling
+;;; itself is a template for callers whose only call is that one), sparse=N
+;;; with growth=G (as calls=N, for a callee whose cells times its direct call
+;;; instructions in the module is at most G), exempt=never|bodies|all (the
+;;; calls and sparse exemptions apply in :inline (Never) functions, which are
+;;; emitted once and cloned nowhere; in every function that is not a template;
+;;; or in templates as well),
+;;; keep=N (under exempt=all a template of at most N cells still goes without
+;;; them, so what its callers clone stays as small as before), final=0|1 (such
+;;; a template gets them in its own emitted body, expanded once more).
 ;;; Any other key or value is a hard error. Object caches do not key on it.
-(defstruct InlineSettings [(policy inlining/Policy) (template i32)])
+(defstruct InlineSettings [(policy inlining/Policy) (template i32) (self bool) (growth i32)
+                           (keep i32)
+                           ; Where the calls and sparse exemptions apply: 0 in :inline (Never)
+                           ; functions, 1 in every function that is not a template, 2 everywhere.
+                           (scope i32) (final bool)])
 
 (defn inline-defaults [] (-> InlineSettings)
-  (InlineSettings :policy (inlining/default-policy (inline-budget)) :template (inline-budget)))
+  (InlineSettings :policy (inlining/default-policy (inline-budget)) :template (inline-budget)
+                  :self false :growth 0 :keep 0 :scope 0 :final false))
 
 (defn inline-setting-int [(key (slice u8)) (value (slice u8))] (-> i32)
   (match (str/parse-int value)
@@ -1959,6 +1994,9 @@
         (let [(mut budget) (inline-budget) (mut template) (inline-budget)
               (mut small) (: 0 i32) (mut anywhere) false
               (mut indirect) false (mut pair) false (mut always) false (mut leaf) false (mut hoist) false
+              (mut calls) (: 0 i32) (mut forward) false (mut self) false
+              (mut sparse) (: 0 i32) (mut growth) (: 0 i32) (mut keep) (: 0 i32)
+              (mut scope) (: 0 i32) (mut final) false
               (mut items) (str/split a (str/from-cstr raw) ",")]
           (for item items
             (unless (= item "")
@@ -1977,6 +2015,23 @@
                         (= key "always") (set! always (inline-setting-flag key value))
                         (= key "small-leaf") (set! leaf (inline-setting-flag key value))
                         (= key "hoist") (set! hoist (inline-setting-flag key value))
+                        (= key "calls") (set! calls (inline-setting-int key value))
+                        (= key "forward") (set! forward (inline-setting-flag key value))
+                        (= key "self") (set! self (inline-setting-flag key value))
+                        (= key "keep") (set! keep (inline-setting-int key value))
+                        (= key "final") (set! final (inline-setting-flag key value))
+                        (= key "exempt")
+                          (set! scope (cond (= value "all") 2
+                                            (= value "bodies") 1
+                                            (= value "never") 0
+                                            :else (tl-inline-fail key value)))
+                        (= key "sparse") (set! sparse (inline-setting-int key value))
+                        (= key "growth")
+                          (set! growth (match (str/parse-int value)
+                                         (None [] (tl-inline-fail key value))
+                                         (Some [n] (if (or (< n 0) (> n 1048576))
+                                                       (tl-inline-fail key value)
+                                                       (cast i32 n)))))
                         :else (tl-inline-fail key value)))
                 (free! (mut parts)))))
           (free! (mut items))
@@ -1984,8 +2039,11 @@
             :policy (inlining/Policy :budget budget :small-cells small :small-anywhere anywhere
                                      :small-leaf leaf
                                      :indirect-calls indirect :pair-result-calls pair
-                                     :honor-always always :hoist-frames hoist)
-            :template template)))))
+                                     :honor-always always :hoist-frames hoist
+                                     :call-cells calls :sparse-cells sparse
+                                     :forwarders forward)
+            :template template :self self :growth growth :keep keep
+            :scope scope :final final)))))
 
 (defn module-prepare! [(module (ptr Module))
                        (f (ptr cir/Func))
@@ -1993,6 +2051,19 @@
                        (symbol u32)
                        (never bool)
                        (always bool)] (-> void)
+  (when never
+    (while (<= (len (.outlined module)) (cast i64 symbol))
+      (push! (mut (.outlined module)) false))
+    (set! (mut (.outlined module)) (cast i64 symbol) true))
+  (when (> (.growth (.inline module)) 0)
+    (for [j 0 (len (.insts f))]
+      (let [x (cir/val f (get (.insts f) j))
+            op (cast i64 (.op x))]
+        (when (and (or (= op cir/OP-CALL) (= op cir/OP-TAILCALL)) (>= (.imm x) 0))
+          (while (<= (len (.call-sites module)) (.imm x))
+            (push! (mut (.call-sites module)) 0))
+          (set! (mut (.call-sites module)) (.imm x)
+                (+ (get (.call-sites module) (.imm x)) 1))))))
   (when (and (not never) (<= (len (.insts f)) (cast i64 (.template (.inline module)))))
     (let [work (p/alloc-stack scratch/ScratchArena)]
       (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
@@ -2137,15 +2208,27 @@
           (set! kept (+ kept 1)))))
     (while (> (len (.exits s)) kept) (pop! (mut (.exits s))))))
 
-(defn definition-callee [(definition Definition)] (-> inlining/Callee)
+;;; Whether cloning DEFINITION at every direct call of it in the module adds
+;;; at most the growth setting, by its current cell count.
+(defn sparse-definition? [(module (ptr Module)) (definition Definition)] (-> bool)
+  (let [growth (cast i64 (.growth (.inline module)))
+        symbol (cast i64 (.symbol definition))
+        sites (if (< symbol (len (.call-sites module)))
+                  (cast i64 (get (.call-sites module) symbol))
+                  (: 0 i64))]
+    (and (> growth 0)
+         (<= (* sites (len (.instructions (.graph definition)))) growth))))
+
+(defn definition-callee [(module (ptr Module)) (definition Definition)] (-> inlining/Callee)
   (inlining/Callee
     :name (.name definition)
     :graph (.graph definition)
     :entry (.entry definition)
     :roots (slice (.roots definition))
     :observed (slice (.inline-controls definition))
-    :never (not (.inlineable definition))
-    :always (.always definition)))
+    :never (not (or (.inlineable definition) (.recursive definition)))
+    :always (.always definition)
+    :sparse (sparse-definition? module definition)))
 
 ;;; Preparation is serial. Each version owns a distinct registry snapshot;
 ;;; source mutation can never stale an earlier proof. Emission only reads the
@@ -2157,7 +2240,7 @@
       (fail (.name (.source definition))
             "unregistered frozen stogir definition"))
     (match (inlining/register-proven! (mut (.callees module))
-                                      (definition-callee (load definition))
+                                      (definition-callee module (load definition))
                                       (.proof definition))
       (Err [message] (fail (.name (.source definition)) message))
       (Ok [handle] (set! (.callee-handle definition) handle))))
@@ -2174,7 +2257,57 @@
   (for [i 0 (len (.bodies module))]
     (release-emission-body! module (.symbol (.definition (at (.bodies module) i))))))
 
-(defn expand-module! [(s (ptr Adapter)) (module (ptr Module)) (budget i32)]
+;;; Whether GRAPH contains exactly one CALL and no TAILCALL.
+(defn single-call? [(g graph/Graph)] (-> bool)
+  (let [(mut calls) (: 0 i64) (mut r) (: 1 i64)]
+    (while (and (< calls 2) (< r (len (.instructions g))))
+      (let [opcode (node/opcode (get (.instructions g) r))]
+        (cond (= opcode 79) (set! calls (+ calls 1))
+              (= opcode 80) (set! calls 2)
+              :else 0)
+        (set! r (+ r (/ (+ (cast i64 (get (.arities g) r)) 4) 4)))))
+    (= calls 1)))
+
+;;; The expansion policy for a template being finalized. Forwarders are decided
+;;; on emitted bodies only. A DEFERRED template (every template unless
+;;; exempt=all, then one of at most the keep setting in cells) also goes
+;;; without the call and sparse exemptions: a small template
+;;; is what its callers clone, and a callee absorbed there both grows every
+;;; such clone and can make the template clonable where it was not (measured
+;;; on the compiler itself: reserve! absorbed reallocate, push! then absorbed
+;;; reserve! and stayed a call at 230M more executed sites). Under the final
+;;; setting its emitted body gets them instead (prepare-template-body!).
+;;; POLICY without the call and sparse exemptions, forwarders kept.
+(defn forwarder-policy [(policy inlining/Policy)] (-> inlining/Policy)
+  (inlining/Policy :budget (.budget policy) :small-cells (.small-cells policy)
+                   :small-anywhere (.small-anywhere policy) :small-leaf (.small-leaf policy)
+                   :indirect-calls (.indirect-calls policy)
+                   :pair-result-calls (.pair-result-calls policy)
+                   :honor-always (.honor-always policy) :hoist-frames (.hoist-frames policy)
+                   :call-cells 0 :sparse-cells 0 :forwarders (.forwarders policy)))
+
+(defn template-policy [(policy inlining/Policy) (deferred bool)] (-> inlining/Policy)
+  (inlining/Policy :budget (.budget policy) :small-cells (.small-cells policy)
+                   :small-anywhere (.small-anywhere policy) :small-leaf (.small-leaf policy)
+                   :indirect-calls (.indirect-calls policy)
+                   :pair-result-calls (.pair-result-calls policy)
+                   :honor-always (.honor-always policy) :hoist-frames (.hoist-frames policy)
+                   :call-cells (if deferred 0 (.call-cells policy))
+                   :sparse-cells (if deferred 0 (.sparse-cells policy))
+                   :forwarders false))
+
+;;; Submit the direct calls of registered definitions for expansion. FINAL says
+;;; the graph is a body about to be emitted, expanded this once, rather than a
+;;; template being finalized; DEFERRED withholds the call and sparse exemptions
+;;; (template-policy) in either case. A call of the function being expanded is never a
+;;; site. A recursive template is a site only in a FINAL caller whose one call
+;;; it is: the clone carries calls of the template itself, so the caller
+;;; becomes the function without its entry call, and those calls are never
+;;; expanded again. Elsewhere a clone would only peel one level of the
+;;; recursion (measured on the compiler itself: +1.6% generation for no fewer
+;;; executed instructions).
+(defn expand-module! [(s (ptr Adapter)) (module (ptr Module)) (budget i32) (final bool)
+                      (deferred bool)]
   (-> i32)
   (if (= (p/cast i64 module) 0)
       0
@@ -2199,7 +2332,11 @@
                           (None [] 0)
                           (Some [name]
                                 (let [index (definition-index s module name)]
-                                  (when (>= index 0)
+                                  (when (and (>= index 0)
+                                             (!= (p/cast u64 (.source (get (.definitions module) index)))
+                                                 (p/cast u64 (.f s)))
+                                             (or (not (.recursive (get (.definitions module) index)))
+                                                 (and final (single-call? (.g s)))))
                                     (let [definition
                                             (elem (mut (.definitions module))
                                                   index)
@@ -2215,7 +2352,7 @@
                                                (inlining/Site
                                                  :reference (cast i32 r)
                                                  :target
-                                                   (definition-callee (load definition))))))))))))))
+                                                   (definition-callee module (load definition))))))))))))))
             (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
         (when (.trace module)
           (for [i 0 (len sites)]
@@ -2262,7 +2399,13 @@
         (when (> (len sites) 0)
           (match (inlining/optimize-registered-specialized-policy (.callees module)
                    (.g s) (.start s) (slice (.exits s)) (slice sites)
-                   (inlining/with-budget (.policy (.inline module)) budget) (.proof s) a)
+                   (inlining/with-budget (cond (not final)
+                                                 (template-policy (.policy (.inline module)) deferred)
+                                               deferred
+                                                 (forwarder-policy (.policy (.inline module)))
+                                               :else (.policy (.inline module)))
+                                         budget)
+                   (.proof s) a)
             (Err [message] (fail (.name (.f s)) message))
             (Ok [outcome]
                 (do
@@ -2271,7 +2414,8 @@
                     (Some [expanded]
                           (let [(mut expanded) expanded]
                             (set! changes (.changes expanded))
-                            (graph/release! (mut (.g s)))
+                            (unless (.borrowed s) (graph/release! (mut (.g s))))
+                            (set! (.borrowed s) false)
                             (free! (mut (.exits s)))
                             (set! (.g s) (.graph expanded))
                             (set! (.exits s) (.roots expanded))
@@ -2280,13 +2424,34 @@
                             (bind-cloned-imports! s module)
                             (queue/release! (mut (.iteration expanded))))))
                   (when (.trace module)
-                    (eprintln "stogir expand {}: {} sites, {} changes, {} reserved, {} remaining, {} contexts"
+                    (for site trace-sites
+                      (let [target (.target site)
+                            callee (.graph target)
+                            (mut label) (.name target)
+                            (mut calls) (: 0 i64)
+                            (mut cursor) (: 1 i64)]
+                        (for definition (.definitions module)
+                          (when (= (.name definition) (.name target))
+                            (set! label (.name (.source definition)))))
+                        (while (< cursor (len (.instructions callee)))
+                          (when (= (node/opcode (get (.instructions callee) cursor)) 79)
+                            (set! calls (+ calls 1)))
+                          (set! cursor (+ cursor (/ (+ (cast i64 (get (.arities callee) cursor)) 4) 4))))
+                        (eprintln "stogir inline-site {} -> {}: {}, {} cells, {} calls, never {}, always {}"
+                                  (.name (.f s)) label
+                                  (if (= (node/opcode (get (.instructions (.g s))
+                                                           (cast i64 (.reference site)))) 79)
+                                      "kept" "inlined")
+                                  (len (.instructions callee)) calls
+                                  (.never target) (.always target))))
+                    (eprintln "stogir expand {}: {} sites, {} changes, {} reserved, {} remaining, {} contexts, final {}"
                               (.name (.f s))
                               (len sites)
                               changes
                               (- (len (.instructions (.g s))) source-cells)
                               (- (cast i64 budget) (- (len (.instructions (.g s))) source-cells))
-                              (inlining/specialization-count (.callees module))))))))
+                              (inlining/specialization-count (.callees module))
+                              final))))))
         (free! (mut trace-sites))
         (free! (mut sites))
         changes)))
@@ -2420,6 +2585,9 @@
 ;;; closure is acyclic can be cloned. Kahn elimination is linear in actual CALL
 ;;; edges, not function-address imports. Cycle members and their callers remain
 ;;; callable, and can themselves absorb acyclic helpers, but are not templates.
+;;; Under the self setting a definition left only with calls of itself is
+;;; marked recursive: a template for forwarders (see expand-module!), while
+;;; its callers stay outside the acyclic order as before.
 (defn mark-acyclic-definitions! [(module (ptr Module))] (-> (ArrayList i64))
   (let [a (.a module)
         count (len (.definitions module))
@@ -2427,11 +2595,15 @@
         (mut next) (ArrayList::new [i64] a)
         (mut callers) (ArrayList::new [i64] a)
         (mut pending) (ArrayList::new [i64] a)
+        ; Calls of the definition itself, a subset of its pending calls.
+        (mut own) (ArrayList::new [i64] a)
         (mut leaves) (queue/create count a)
         (mut order) (ArrayList::new [i64] a)]
     (for [i 0 count]
       (push! (mut heads) -1)
       (push! (mut pending) 0)
+      (push! (mut own) 0)
+      (set! (.recursive (elem (mut (.definitions module)) i)) false)
       (set! (.inlineable (elem (mut (.definitions module)) i)) false))
     (for [i 0 count]
       (let [source (.graph (get (.definitions module) i))
@@ -2441,6 +2613,7 @@
                 arity (get (.arities source) r)]
             (when (= (node/opcode call) 79)
               (let [callee (called-definition module source (.op2 call))]
+                (when (= callee i) (set! (mut own) i (+ (get own i) 1)))
                 (when (>= callee 0)
                   (push! (mut callers) i)
                   (push! (mut next) (get heads callee))
@@ -2449,6 +2622,10 @@
             (set! r (+ r (/ (+ (cast i64 arity) 4) 4)))))))
     (for [i 0 count]
       (when (= (get pending i) 0) (queue/add! (mut leaves) i)))
+    (when (.self (.inline module))
+      (for [i 0 count]
+        (when (and (> (get own i) 0) (= (get pending i) (get own i)))
+          (set! (.recursive (elem (mut (.definitions module)) i)) true))))
     (let [(mut index) (queue/pop! (mut leaves))]
       (while (>= index 0)
         (set! (.inlineable (elem (mut (.definitions module)) index)) true)
@@ -2458,12 +2635,20 @@
             (let [caller (get callers edge)
                   remaining (- (get pending caller) 1)]
               (set! (mut pending) caller remaining)
+              (when (and (.self (.inline module)) (> remaining 0)
+                         (= remaining (get own caller)))
+                (set! (.recursive (elem (mut (.definitions module)) caller)) true))
               (when (= remaining 0) (queue/add! (mut leaves) caller)))
             (set! edge (get next edge))))
         (set! index (queue/pop! (mut leaves)))))
     ; Cycle closures are not templates, but can absorb finalized acyclic helpers.
+    ; Recursive templates come first: a later caller may be their forwarder.
     (for [i 0 count]
-      (unless (.inlineable (get (.definitions module) i)) (push! (mut order) i)))
+      (when (.recursive (get (.definitions module) i)) (push! (mut order) i)))
+    (for [i 0 count]
+      (unless (or (.inlineable (get (.definitions module) i))
+                  (.recursive (get (.definitions module) i)))
+        (push! (mut order) i)))
     (when (.trace module)
       (for definition (.definitions module)
         (eprintln "stogir inline-policy {}: acyclic {}"
@@ -2471,6 +2656,7 @@
                   (.inlineable definition))))
     (queue/release! (mut leaves))
     (free! (mut pending))
+    (free! (mut own))
     (free! (mut callers))
     (free! (mut next))
     (free! (mut heads))
@@ -2486,7 +2672,12 @@
         (mut order) (mark-acyclic-definitions! module)
         (mut budgets) (ArrayList::new [i32] a)
         temporary (p/alloc-stack scratch/ScratchArena)]
-    (for [i 0 count] (push! (mut budgets) (.budget (.policy (.inline module)))))
+    (for [i 0 count]
+      (push! (mut budgets) (.budget (.policy (.inline module))))
+      (set! (.deferred (elem (mut (.definitions module)) i))
+            (or (< (.scope (.inline module)) 2)
+                (<= (inlining/base-clone-cells (.graph (get (.definitions module) i)))
+                    (cast i64 (.keep (.inline module)))))))
     (for index order
       (when (.trace module)
         (eprintln "stogir finalize-order {}: {}"
@@ -2510,7 +2701,7 @@
             (set! (.import-names s) (.import-names definition))
             (set! (.import-ids s) (.import-ids definition))
             (set! (.proof s) (.proof definition))
-            (when (> (expand-module! s module (get budgets index)) 0)
+            (when (> (expand-module! s module (get budgets index) false (.deferred definition)) 0)
               ; Charge reserved clone cells before cleanup; optimization never
               ; replenishes this definition's budget.
               ; Uncharged small-callee growth can exceed the remainder.
@@ -2565,6 +2756,10 @@
                         op
                         (get histogram op))))
           (free! (mut histogram)))))
+    (for [i 0 count]
+      (set! (.left (elem (mut (.definitions module)) i)) (get budgets i))
+      (set! (.cells (elem (mut (.definitions module)) i))
+            (inlining/base-clone-cells (.graph (get (.definitions module) i)))))
     (free! (mut budgets))
     (free! (mut order))))
 
@@ -2578,18 +2773,109 @@
               index -1))
         -1)))
 
+;;; The body prepared for F, when there is one.
+(defn emission-body [(module (ptr Module)) (f (ptr cir/Func)) (symbol u32)]
+  (-> (ptr Definition))
+  (let [id (cast i64 symbol)]
+    (if (and (< id (len (.body-by-symbol module)))
+             (> (get (.body-by-symbol module) id) 0))
+        (let [body (elem (mut (.bodies module)) (- (get (.body-by-symbol module) id) 1))]
+          (if (= (p/cast u64 (.source (.definition body))) (p/cast u64 f))
+              (cast (ptr Definition) (mut (.definition body)))
+              (p/cast (ptr Definition) 0)))
+        (p/cast (ptr Definition) 0))))
+
+;;; The graph codegen emits for F: its prepared body (a non-template caller, or
+;;; a template the final expansion changed), else its finalized template.
 (defn emission-definition [(module (ptr Module)) (f (ptr cir/Func)) (symbol u32)]
   (-> (ptr Definition))
-  (let [index (prepared-index module f symbol) id (cast i64 symbol)]
-    (if (>= index 0)
-        (elem (mut (.definitions module)) index)
-        (if (and (< id (len (.body-by-symbol module)))
-                 (> (get (.body-by-symbol module) id) 0))
-            (let [body (elem (mut (.bodies module)) (- (get (.body-by-symbol module) id) 1))]
-              (if (= (p/cast u64 (.source (.definition body))) (p/cast u64 f))
-                  (cast (ptr Definition) (mut (.definition body)))
-                  (p/cast (ptr Definition) 0)))
-            (p/cast (ptr Definition) 0)))))
+  (let [body (emission-body module f symbol)
+        index (prepared-index module f symbol)]
+    (cond (!= (p/cast i64 body) 0) body
+          (>= index 0) (elem (mut (.definitions module)) index)
+          :else (p/cast (ptr Definition) 0))))
+
+;;; Whether the body of the non-template function SYMBOL goes without the call
+;;; and sparse exemptions: under exempt=never, unless it is :inline (Never).
+(defn body-deferred? [(module (ptr Module)) (symbol u32)] (-> bool)
+  (and (= (.scope (.inline module)) 0)
+       (not (and (< (cast i64 symbol) (len (.outlined module)))
+                 (get (.outlined module) (cast i64 symbol))))))
+
+;;; Whether POLICY has exemptions that apply only to emitted bodies.
+(defn final-exemptions? [(policy inlining/Policy)] (-> bool)
+  (or (> (.call-cells policy) 0) (> (.sparse-cells policy) 0) (.forwarders policy)))
+
+;;; Whether the finalized template at INDEX has a direct call that the final
+;;; exemptions could expand: any callee template when the call is the only one
+;;; (a forwarder) or, for a deferred template, one whose clone fits its
+;;; exemption size. Everything else was decided when the template was finalized.
+(defn final-candidate? [(module (ptr Module)) (index i64)] (-> bool)
+  (let [policy (.policy (.inline module))
+        source (.graph (get (.definitions module) index))
+        forwarder (and (.forwarders policy) (single-call? source))
+        deferred (.deferred (get (.definitions module) index))
+        (mut found) false
+        (mut r) (: 1 i64)]
+    (while (and (not found) (< r (len (.instructions source))))
+      (let [call (get (.instructions source) r)]
+        (when (= (node/opcode call) 79)
+          (let [callee (called-definition module source (.op2 call))]
+            (when (and (>= callee 0) (!= callee index))
+              (let [target (get (.definitions module) callee)
+                    limit (cast i64 (if (and (> (.sparse-cells policy) (.call-cells policy))
+                                             (sparse-definition? module target))
+                                        (.sparse-cells policy)
+                                        (.call-cells policy)))]
+                (when (or (and forwarder (or (.inlineable target) (.recursive target)))
+                          (and deferred (.final (.inline module))
+                               (.inlineable target) (<= (.cells target) limit)))
+                  (set! found true))))))
+        (set! r (+ r (/ (+ (cast i64 (get (.arities source) r)) 4) 4)))))
+    found))
+
+;;; Expand a finalized template once more under the full policy for emission.
+;;; The template and its registry snapshot stay as callers cloned them; a
+;;; changed graph becomes this function's emission body. The budget is what
+;;; finalization left, at least one cell so that exemptions still apply.
+(defn prepare-template-body! [(module (ptr Module)) (index i64) (symbol u32)] (-> void)
+  (let [work (p/alloc-stack scratch/ScratchArena)]
+    (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
+    (let [a (allocator work)
+          template (elem (mut (.definitions module)) index)
+          (mut state) (zeroed Adapter)
+          s (cast (ptr Adapter) (mut state))]
+      (set! (.a s) a)
+      (set! (.f s) (.source template))
+      (set! (.g s) (.graph template))
+      (set! (.borrowed s) true)
+      (set! (.start s) (.entry template))
+      (set! (.proof s) (.proof template))
+      (set! (.exits s) (ArrayList::new [i32] a))
+      (set! (.import-names s) (ArrayList::new [(slice u8)] a))
+      (set! (.import-ids s) (ArrayList::new [u32] a))
+      (for [i 0 (len (.observed template))]
+        (push! (mut (.exits s)) (get (.observed template) i)))
+      (for [i 0 (len (.import-ids template))]
+        (push! (mut (.import-names s)) (get (.import-names template) i))
+        (push! (mut (.import-ids s)) (get (.import-ids template) i)))
+      (when (> (expand-module! s module (if (> (.left template) 1) (.left template) 1) true
+                               (not (.final (.inline module)))) 0)
+        (let [keep (box! (.a module) scratch/ScratchArena (zeroed scratch/ScratchArena))
+              (mut owned) (zeroed Definition)
+              definition (cast (ptr Definition) (mut owned))]
+          (scratch/ScratchArena::init-with-capacity keep (malloc-allocator) 4096)
+          (set! (.clean definition) false) (set! (.proof definition) 0)
+          (set! (.inlineable definition) false) (set! (.symbol definition) symbol)
+          (set! (.entry definition) (.start s)) (set! (.name definition) (.name (.source template)))
+          (set! (.source definition) (.source template))
+          (own-definition! definition (.g s) (slice (.exits s))
+                           (slice (.import-names s)) (slice (.import-ids s)) (allocator keep))
+          (push! (mut (.bodies module)) (EmissionBody :definition owned :arena keep))
+          (while (<= (len (.body-by-symbol module)) (cast i64 symbol))
+            (push! (mut (.body-by-symbol module)) 0))
+          (set! (mut (.body-by-symbol module)) (cast i64 symbol) (len (.bodies module))))))
+    (close! work)))
 
 ;;; Serial planning moves the old raw-caller preparation before reachability.
 ;;; Only its finalized graph and bindings enter the retained arena. Adaptation,
@@ -2597,6 +2883,11 @@
 ;;; snapshot after use. Callee eligibility and the checked clone cap are unchanged.
 (defn prepare-emission-body! [(module (ptr Module)) (f (ptr cir/Func))
                               (ta (ptr asm/Asm)) (symbol u32) (level i32)] (-> void)
+  (when (and (= (p/cast i64 (emission-body module f symbol)) 0)
+             (>= (prepared-index module f symbol) 0)
+             (final-exemptions? (.policy (.inline module)))
+             (final-candidate? module (prepared-index module f symbol)))
+    (prepare-template-body! module (prepared-index module f symbol) symbol))
   (when (= (p/cast i64 (emission-definition module f symbol)) 0)
     (unless (.frozen module) (fail (.name f) "emission preparation before registry freeze"))
     (let [work (p/alloc-stack scratch/ScratchArena)
@@ -2610,7 +2901,8 @@
         (adapt! s f ta (p/cast (ptr (ArrayList MTextData)) 0) a)
         (annotate-nonwriting-calls! module (mut (.g s)) a)
         (when (> level 1) (prepare-inline-caller! s))
-        (let [changes (expand-module! s module (.budget (.policy (.inline module))))]
+        (let [changes (expand-module! s module (.budget (.policy (.inline module))) true
+                                      (body-deferred? module symbol))]
           (set! (.clean definition) (and (> level 1) (= changes 0)))
           (set! (.proof definition) (if (and (> level 1) (= changes 0)) (.proof s) 0)))
         (set! (.inlineable definition) false) (set! (.symbol definition) symbol)
@@ -2934,7 +3226,8 @@
             (set! optimized true))
           ; Inline expansion invalidates the SCCP fixpoint; zero changes keep it.
           (when (> (expand-module! s module (if (= (p/cast i64 module) 0) (inline-budget)
-                                                (.budget (.policy (.inline module))))) 0)
+                                                (.budget (.policy (.inline module)))) true
+                                   (and (!= (p/cast i64 module) 0) (body-deferred? module symbol))) 0)
             (set! optimized false))))
       (when (and (!= (p/cast u64 module) 0) (.trace module)) (trace-graph! s))
       (match (cond (and (!= (p/cast usize module) 0) (> (.native-certified module) 0) optimized)
