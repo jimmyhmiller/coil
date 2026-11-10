@@ -71,6 +71,12 @@ def program(specialized):
                          f'  (let [n (+ (cast i128 x) {i + 2}) q (/ n (cast i128 (+ d {i + 3})))]\n'
                          f'    (+ (cast i64 q) (c{i % CYCLE} 2))))')
             extra.append(f'(w{i} {i + 100} {i})')
+        # The same for template candidates, which workers adapt during
+        # template preparation, with another routine (unsigned remainder).
+        for i in range(WIDE):
+            lines.append(f'(defn v{i} [(x i64) (d i64)] (-> i64)\n'
+                         f'  (cast i64 (% (+ (cast u128 x) {i + 5}) (cast u128 (+ d {i + 7})))))')
+            extra.append(f'(v{i} {i + 50} {i})')
     lines.append('(defn main [] (-> i64)\n  (let [(mut total) (: 0 i64)]\n'
                  + ''.join(f'    (set! total (+ total (f{i} {i % 11})))\n'
                            for i in range(FUNCTIONS))
@@ -101,7 +107,8 @@ with tempfile.TemporaryDirectory(prefix='stogir-parallel-') as temporary:
     generated.write_text(program(False))
     closing = directory / 'closing.coil'
     closing.write_text(program(True))
-    for source in [generated, closing, ROOT / 'tests/cli/stogir-live-emission.coil']:
+    for source in [generated, closing, ROOT / 'tests/cli/stogir-live-emission.coil',
+                   ROOT / 'tests/backend/stogir-shim-calls.coil']:
         serial = directory / 'serial.o'
         emit(source, serial, {'COIL_TPDE_SERIAL': '1'})
         expected = serial.read_bytes()
@@ -150,10 +157,11 @@ with tempfile.TemporaryDirectory(prefix='stogir-parallel-') as temporary:
                  if line.startswith('coil-trace count stogir.plan.wave ')]
         assert (len(waves) > 1 and sum(waves) > 100) if expected_workers else not waves, \
             f'{setting}: planning waves {waves}'
-        repeated = sum(1 for line in trace.splitlines()
-                       if line.startswith('coil-trace count stogir.plan.repeated '))
-        assert repeated > 0 if expected_workers else repeated == 0, \
-            f'{setting}: {repeated} bodies prepared again'
+        for stage in ['plan', 'prepare']:
+            repeated = sum(1 for line in trace.splitlines()
+                           if line.startswith(f'coil-trace count stogir.{stage}.repeated '))
+            assert repeated > 0 if expected_workers else repeated == 0, \
+                f'{setting}: {stage} repeated {repeated} functions'
     for invalid in ['0', '65', '-2', 'many', '']:
         message = emit(generated, directory / 'invalid.o', {'COIL_STOGIR_THREADS': invalid},
                        expect=1)

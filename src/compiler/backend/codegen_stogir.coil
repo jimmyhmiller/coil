@@ -102,7 +102,11 @@
    ; no symbol yet sets `unbound`, and the adaptation is then void and must be
    ; repeated where the symbol may be created.
    (lookup-only bool)
-   (unbound bool)])
+   (unbound bool)
+   ; Held around every read of the assembler and of the module's thunk table
+   ; while another thread may be adding symbols or thunks (parallel template
+   ; preparation), or null.
+   (guard (ptr Mutex))])
 
 (defn require [(s (ptr Adapter)) (result (Result i32 (slice u8)))] (-> i32)
   (match result (Ok [r] r) (Err [message] (fail (.name (.f s)) message))))
@@ -183,6 +187,17 @@
 (defn import-name [(a (dyn Allocator)) (symbol u32)] (-> (slice u8))
   (sconcat a "_coil_stogir_import_" (i64->str a (cast i64 symbol))))
 
+;;; Assembler symbol SYMBOL, which exists. Its record never moves or changes
+;;; while functions are adapted; finding it reads the assembler's symbol
+;;; table, which another thread may be extending (Adapter guard).
+(defn symbol-at [(s (ptr Adapter)) (symbol u32)] (-> (ptr asm/Symbol))
+  (if (= (p/cast u64 (.guard s)) 0)
+      (asm/sym-at (.ta s) symbol)
+      (do (mutex-lock! (.guard s))
+          (let [target (asm/sym-at (.ta s) symbol)]
+            (mutex-unlock! (.guard s))
+            target))))
+
 ;;; The assembler symbol of the runtime routine NAME, created on first use
 ;;; (asm/runtime-sym!). An adaptation that may only read the assembler
 ;;; (lookup-only) finds an existing symbol the same way; for a missing one it
@@ -190,12 +205,15 @@
 ;;; used.
 (defn runtime-symbol! [(s (ptr Adapter)) (name (slice u8))] (-> u32)
   (if (.lookup-only s)
-      (let [ta (.ta s) (mut found) (: -1 i64)]
+      (let [ta (.ta s) (mut found) (: -1 i64) (mut symbol) (: 0 u32)]
+        (when (!= (p/cast u64 (.guard s)) 0) (mutex-lock! (.guard s)))
         (for [i 0 (len (.rt-names ta))]
-          (when (and (< found 0) (= (get (.rt-names ta) i) name)) (set! found i)))
-        (if (< found 0)
-            (do (set! (.unbound s) true) (: 0 u32))
-            (get (.rt-syms ta) found)))
+          (when (and (< found 0) (= (get (.rt-names ta) i) name))
+            (set! found i)
+            (set! symbol (get (.rt-syms ta) i))))
+        (when (!= (p/cast u64 (.guard s)) 0) (mutex-unlock! (.guard s)))
+        (when (< found 0) (set! (.unbound s) true))
+        symbol)
       (asm/runtime-sym! (.ta s) name)))
 
 (defn symbol! [(s (ptr Adapter)) (id u32)] (-> i32)
@@ -439,7 +457,7 @@
 ;;; section, so a Coil function called `memcmp`, or one exported as the C symbol
 ;;; `memcmp`, never matches.
 (defn pure-runtime-call? [(s (ptr Adapter)) (symbol u32) (arguments i64)] (-> bool)
-  (let [target (asm/sym-at (.ta s) symbol)
+  (let [target (symbol-at s symbol)
         name (.name target)]
     (and (= (.sect target) -1)
          (= (.binding target) 1)
@@ -454,7 +472,7 @@
 ;;; declaration lets the backend compare a short known count inline.
 (defn runtime-compare-call? [(s (ptr Adapter)) (symbol u32) (result i32) (types (slice u8))]
   (-> bool)
-  (let [target (asm/sym-at (.ta s) symbol)
+  (let [target (symbol-at s symbol)
         name (.name target)]
     (and (= (.sect target) -1)
          (= (.binding target) 1)
@@ -619,11 +637,27 @@
                 (free! (mut key))
                 symbol))))))
 
+;;; The thunk of the SHIMCALL X of the function being adapted (shim-thunk!).
+;;; An adaptation that may only read the assembler (lookup-only) takes an
+;;; existing thunk of the module's table; a missing one makes it void
+;;; (unbound), as a missing runtime symbol does (runtime-symbol!).
+(defn shim-symbol! [(s (ptr Adapter)) (x (ptr cir/Value))] (-> u32)
+  (if (and (.lookup-only s) (!= (p/cast u64 (.shims s)) 0))
+      (let [(mut key) (shim-key (.f s) x (.a s))]
+        (when (!= (p/cast u64 (.guard s)) 0) (mutex-lock! (.guard s)))
+        (let [known (get (load (.shims s)) (slice key))]
+          (when (!= (p/cast u64 (.guard s)) 0) (mutex-unlock! (.guard s)))
+          (free! (mut key))
+          (match known
+            (Some [symbol] symbol)
+            (None [] (do (set! (.unbound s) true) (: 0 u32))))))
+      (shim-thunk! (.ta s) (.shims s) (.f s) x (= (p/cast u64 (.shims s)) 0) (.a s))))
+
 ;;; The call itself: an ordinary C call of the thunk with the arguments in
 ;;; order and, when a symbol is called, its address last.
 (defn lower-shim-call! [(s (ptr Adapter)) (x (ptr cir/Value))] (-> i32)
   (let [f (.f s)
-        thunk (shim-thunk! (.ta s) (.shims s) f x (= (p/cast u64 (.shims s)) 0) (.a s))
+        thunk (shim-symbol! s x)
         (mut args) (ArrayList::new [i32] (.a s))
         (mut types) (ArrayList::new [u8] (.a s))
         rt (type-id s (.ty x))]
@@ -2928,7 +2962,7 @@
 ;;; the submitting thread in submission order) and, under a growth setting,
 ;;; its direct call sites.
 (defn prepare-note! [(module (ptr Module)) (f (ptr cir/Func)) (ta (ptr asm/Asm))
-                     (symbol u32) (never bool)]
+                     (symbol u32) (never bool) (guard (ptr Mutex))]
   (-> void)
   (when never
     (while (<= (len (.outlined module)) (cast i64 symbol))
@@ -2940,8 +2974,11 @@
     (for [j 0 (len (.insts f))]
       (let [x (cir/val f (get (.insts f) j))]
         (when (= (cast i64 (.op x)) cir/OP-SHIMCALL)
+          ; Adapting workers read the assembler and this table under GUARD.
+          (when (!= (p/cast u64 guard) 0) (mutex-lock! guard))
           (shim-thunk! ta (p/cast (ptr (HashMap (slice u8) u32)) (mut (.shims module)))
-                       f x true (.a module))))))
+                       f x true (.a module))
+          (when (!= (p/cast u64 guard) 0) (mutex-unlock! guard))))))
   (when (> (.growth (.inline module)) 0)
     (for [j 0 (len (.insts f))]
       (let [x (cir/val f (get (.insts f) j))
@@ -2960,14 +2997,13 @@
 ;;; Only an optimized graph of at most budget+1 cells is registered; an adapted
 ;;; graph over 1.5x the budget is not optimized just to be discarded (on the
 ;;; compiler itself no such graph shrinks enough to register): it is released
-;;; here and the result is false. This is the only step of template
-;;; preparation that touches the assembler (it binds import symbols and
-;;; defines SHIMCALL thunks), so it runs on the submitting thread in
-;;; submission order.
+;;; here and the result is false. Adaptation reads the assembler (the names
+;;; of called symbols, the module's SHIMCALL thunks) and creates the symbol
+;;; of a runtime routine on its first use. A worker adapts with S set to
+;;; lookup-only and guarded: it then creates nothing, and S is unbound (the
+;;; result is void, whatever is returned) when a symbol it needs is missing.
 (defn prepare-adapt! [(module (ptr Module)) (s (ptr Adapter)) (f (ptr cir/Func))
                       (ta (ptr asm/Asm)) (symbol u32) (a (dyn Allocator))] (-> bool)
-  ; SHIMCALL thunks are defined in the assembler as adaptation meets them:
-  ; another reason this step stays on the submitting thread.
   (set! (.shims s) (p/cast (ptr (HashMap (slice u8) u32)) (mut (.shims module))))
   (adapt-as! s f ta (cast i64 symbol) (p/cast (ptr (ArrayList MTextData)) 0) a)
   (if (> (* 2 (len (.instructions (.g s)))) (* 3 (cast i64 (.template (.inline module)))))
@@ -3073,18 +3109,30 @@
                        (symbol u32)
                        (never bool)
                        (always bool)] (-> void)
-  (prepare-note! module f ta symbol never)
+  (prepare-note! module f ta symbol never (p/cast (ptr Mutex) 0))
   (when (template-candidate? module f never)
-    (let [work (p/alloc-stack scratch/ScratchArena)]
-      (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
-      (let [a (allocator work)
-            (mut state) (zeroed Adapter)
-            s (cast (ptr Adapter) (mut state))]
-        (when (prepare-adapt! module s f ta symbol a)
-          (match (prepare-optimize! s a)
-            (Err [message] (fail (.name f) message))
-            (Ok [prepared] (prepare-commit! module s f symbol always prepared)))))
-      (close! work))))
+    (prepare-template! module f ta symbol always (p/cast (ptr Mutex) 0))))
+
+;;; Adapt, optimize and commit the template candidate F on this thread.
+;;; GUARD (or null) is held while F is adapted: adaptation may add symbols to
+;;; the assembler that other threads are reading under it.
+(defn prepare-template! [(module (ptr Module)) (f (ptr cir/Func)) (ta (ptr asm/Asm))
+                         (symbol u32) (always bool) (guard (ptr Mutex))] (-> void)
+  (let [work (p/alloc-stack scratch/ScratchArena)]
+    (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
+    (let [a (allocator work)
+          (mut state) (zeroed Adapter)
+          s (cast (ptr Adapter) (mut state))
+          adapted
+            (do (when (!= (p/cast u64 guard) 0) (mutex-lock! guard))
+                (let [adapted (prepare-adapt! module s f ta symbol a)]
+                  (when (!= (p/cast u64 guard) 0) (mutex-unlock! guard))
+                  adapted))]
+      (when adapted
+        (match (prepare-optimize! s a)
+          (Err [message] (fail (.name f) message))
+          (Ok [prepared] (prepare-commit! module s f symbol always prepared)))))
+    (close! work)))
 
 (defn definition-index [(s (ptr Adapter))
                         (module (ptr Module))
@@ -4815,25 +4863,62 @@
 
 ;;; ---- Parallel template preparation ----
 
-;;; One template candidate between its adaptation and its commit. The arena
-;;; holds the adapted graph and everything optimization allocates.
+;;; module-prepare! with adaptation and optimization on workers.
+;;;
+;;; What the serial loop does to shared state for one function, in order:
+;;; prepare-note! (module lists; the assembler, for a new SHIMCALL thunk),
+;;; adaptation (the assembler, when a runtime routine gets its symbol on first
+;;; use) and the commit (module lists and bindings). The numbers of those
+;;; symbols are in the adapted graphs and in the object, so they are created
+;;; in that order here too: every submitted function is an item, and the
+;;; submitting thread commits items in submission order, `lead` behind the
+;;; submissions. A commit notes its function, then takes the worker's result.
+;;;
+;;; A worker adapts with the assembler read-only: it looks symbols and thunks
+;;; up and creates none. A symbol it finds was created by the commit of an
+;;; earlier function (or before preparation), so it exists with that number
+;;; when the serial loop adapts this function, and the graph is the serial
+;;; one. A symbol or thunk it does not find makes its result void: the commit
+;;; adapts the function again on the submitting thread, where the symbol is
+;;; created at the function's place in the order. Which functions are void
+;;; can depend on timing; what is committed cannot.
+;;;
+;;; `guard` serializes the workers' reads of the assembler and the thunk
+;;; table against the submitting thread's additions to them.
+
+;;; One submitted function. `task` is its pool task when it is a template
+;;; candidate, else -1. The arena, opened by the worker, holds the adapted
+;;; graph and everything optimization allocates until the commit.
 (defstruct PreparationItem
-  [(source (ptr cir/Func)) (symbol u32) (always bool)
+  [(preparation (ptr Preparation)) (source (ptr cir/Func)) (symbol u32)
+   (never bool) (always bool) (task i64)
    (arena scratch/ScratchArena) (state Adapter)
+   ; Adaptation needed a symbol that did not exist yet.
+   (void bool)
+   ; The adapted graph is too large for a template (prepare-adapt!).
+   (skipped bool)
    (failed bool) (message (slice u8)) (prepared PreparedTemplate)])
 
-;;; module-prepare! with prepare-optimize! on workers. `items` holds the
-;;; candidates submitted and not yet committed, oldest at `committed`.
 (defstruct Preparation
-  [(module (ptr Module)) (ta (ptr asm/Asm)) (pool (ptr Pool))
+  [(module (ptr Module)) (ta (ptr asm/Asm)) (pool (ptr Pool)) (guard Mutex)
    (items (ArrayList (ptr PreparationItem))) (committed i64) (lead i64)])
 
 (defn preparation-task [(argument (ptr i8))] (-> (ptr i8))
-  (let [item (p/cast (ptr PreparationItem) argument)]
-    (match (prepare-optimize! (cast (ptr Adapter) (mut (.state item)))
-                              (allocator (field item arena)))
-      (Err [message] (set! (.failed item) true) (set! (.message item) message))
-      (Ok [prepared] (set! (.prepared item) prepared)))
+  (let [item (p/cast (ptr PreparationItem) argument)
+        preparation (.preparation item)
+        work (field item arena)
+        s (cast (ptr Adapter) (mut (.state item)))]
+    (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
+    (set! (.lookup-only s) true)
+    (set! (.guard s) (field preparation guard))
+    (let [fits (prepare-adapt! (.module preparation) s (.source item) (.ta preparation)
+                               (.symbol item) (allocator work))]
+      (cond (.unbound s) (set! (.void item) true)
+            (not fits) (set! (.skipped item) true)
+            :else
+              (match (prepare-optimize! s (allocator work))
+                (Err [message] (set! (.failed item) true) (set! (.message item) message))
+                (Ok [prepared] (set! (.prepared item) prepared)))))
     (p/cast (ptr i8) 0)))
 
 ;;; Start parallel preparation of at most CAPACITY functions, or null when no
@@ -4848,57 +4933,64 @@
         (let [preparation (box! (malloc-allocator) Preparation (zeroed Preparation))]
           (set! (.module preparation) module) (set! (.ta preparation) ta)
           (set! (.pool preparation) pool) (set! (.lead preparation) (generation-lead threads))
+          (match (Mutex::init (field preparation guard))
+            (Ok [_] 0) (Err [_] (fail "preparation" "mutex creation failed")))
           (set! (.items preparation)
                 (ArrayList::new [(ptr PreparationItem)] (malloc-allocator)))
           preparation))))
 
-;;; Take back the oldest submitted candidate and enter it into the module:
-;;; module-prepare!'s commit, in submission order. A failed optimization is
-;;; reported here.
+;;; Commit the oldest submitted function: module-prepare!'s effects on the
+;;; module and the assembler for it, in submission order. A failed
+;;; optimization is reported here.
 (defn preparation-commit! [(preparation (ptr Preparation))] (-> void)
   (let [index (.committed preparation)
-        item (get (.items preparation) index)]
-    (pool-await! (.pool preparation) index)
-    (when (.failed item) (fail (.name (.source item)) (.message item)))
-    (prepare-commit! (.module preparation) (cast (ptr Adapter) (mut (.state item)))
-                     (.source item) (.symbol item) (.always item) (.prepared item))
-    (close! (field item arena))
+        item (get (.items preparation) index)
+        module (.module preparation)]
+    (prepare-note! module (.source item) (.ta preparation) (.symbol item) (.never item)
+                   (field preparation guard))
+    (when (>= (.task item) 0)
+      (pool-await! (.pool preparation) (.task item))
+      (when (.failed item) (fail (.name (.source item)) (.message item)))
+      (cond (.void item)
+              (do (tr/count "stogir.prepare.repeated" 1)
+                  (close! (field item arena))
+                  (prepare-template! module (.source item) (.ta preparation) (.symbol item)
+                                     (.always item) (field preparation guard)))
+            (.skipped item) (close! (field item arena))
+            :else
+              (do (prepare-commit! module (cast (ptr Adapter) (mut (.state item)))
+                                   (.source item) (.symbol item) (.always item) (.prepared item))
+                  (close! (field item arena)))))
     (destroy (malloc-allocator) item)
     (set! (.committed preparation) (+ index 1))))
 
-;;; module-prepare! for F, with its optimization on a worker. F is adapted
-;;; here, on the submitting thread, so import symbols are bound in the serial
-;;; order. Its commit follows once `lead` later candidates have been
-;;; submitted (or at preparation-finish!): a point fixed by submission
-;;; counts, not by when workers finish. Neither adaptation nor optimization
-;;; reads what a commit writes, so the module is the one module-prepare!
-;;; builds.
+;;; module-prepare! for F, adapted and optimized by a worker when it is a
+;;; template candidate. Its commit follows once `lead` later functions have
+;;; been submitted (or at preparation-finish!): a point fixed by submission
+;;; counts, not by when workers finish.
 (defn preparation-submit! [(preparation (ptr Preparation)) (f (ptr cir/Func)) (symbol u32)
                            (never bool) (always bool)] (-> void)
-  (let [module (.module preparation)]
-    (prepare-note! module f (.ta preparation) symbol never)
-    (when (template-candidate? module f never)
-      (let [item (box! (malloc-allocator) PreparationItem (zeroed PreparationItem))
-            work (field item arena)]
-        (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
-        (set! (.source item) f) (set! (.symbol item) symbol) (set! (.always item) always)
-        (if (prepare-adapt! module (cast (ptr Adapter) (mut (.state item))) f
-                            (.ta preparation) symbol (allocator work))
-            (do
-              (push! (mut (.items preparation)) item)
-              (unless (= (pool-submit! (.pool preparation) (p/cast (ptr i8) item))
-                         (- (len (.items preparation)) 1))
-                (fail (.name f) "preparation task index differs from its item"))
-              (while (> (- (len (.items preparation)) (.committed preparation))
-                        (.lead preparation))
-                (preparation-commit! preparation)))
-            (do (close! work) (destroy (malloc-allocator) item)))))))
+  (let [module (.module preparation)
+        item (box! (malloc-allocator) PreparationItem (zeroed PreparationItem))]
+    (set! (.preparation item) preparation)
+    (set! (.source item) f) (set! (.symbol item) symbol)
+    (set! (.never item) never) (set! (.always item) always)
+    (set! (.task item)
+          (if (template-candidate? module f never)
+              (pool-submit! (.pool preparation) (p/cast (ptr i8) item))
+              -1))
+    (push! (mut (.items preparation)) item)
+    (while (> (- (len (.items preparation)) (.committed preparation))
+              (.lead preparation))
+      (preparation-commit! preparation))))
 
-;;; Commit every remaining candidate, join the workers and release PREPARATION.
+;;; Commit every remaining function, join the workers and release PREPARATION.
 (defn preparation-finish! [(preparation (ptr Preparation))] (-> void)
   (while (< (.committed preparation) (len (.items preparation)))
     (preparation-commit! preparation))
   (pool-finish! (.pool preparation))
+  (match (Mutex::destroy! (field preparation guard))
+    (Ok [_] 0) (Err [_] (fail "preparation" "mutex release failed")))
   (free! (mut (.items preparation)))
   (destroy (malloc-allocator) preparation))
 
