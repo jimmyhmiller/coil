@@ -5,9 +5,11 @@
 (import "stogir.graph" :as g)
 (import "stogir.cfg" :as cfg)
 (import "stogir.a64.phi-coalesce" :as phi)
+(import "stogir.a64.convert" :as convert)
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
 (import "stogir.interval" :as interval)
+(import "stogir.live-ranges" :as ranges)
 (import "stogir.constraints" :as c)
 (import "stogir.interval-queue" :as queue)
 (import "coil.hashmap" :use [HashMap])
@@ -19,20 +21,21 @@
 (import "coil.alloc" :use [Allocator])
 (import "coil.result" :use [Some None])
 
-;;; A 64-to-32-bit integer TRUNC is also a register view: it is emitted as a
+;;; PROTO only names its address operand's prototype (emitted as an identity
+;;; copy). A 64-to-32-bit integer TRUNC is also a register view: it is emitted as a
 ;;; plain move, and consumers of 32-bit values read only the low word (ZEXT
 ;;; knowledge never treats such a TRUNC as zero-extended).
 (defn reusable? [(graph g/Graph) (reference i32)] (-> bool)
   (let [node (get (.instructions graph) (cast i64 reference))
         opcode (n/opcode node)
         ty (cast i32 (n/type-id node))]
-    (and (or (= opcode 68) (= opcode 36) (= opcode 35))
+    (and (or (= opcode 68) (= opcode 36) (= opcode 35) (= opcode 40))
          (> (.op1 node) 0)
          (types/valid-scalar? ty)
          (> (types/size ty 8) 0)
          ; BOOL-producing conversions canonicalize nonzero bytes, so they
          ; cannot share a still-live source even at the same storage width.
-         (or (= opcode 68) (!= ty 1))
+         (or (= opcode 68) (= opcode 40) (!= ty 1))
          (<= (types/size ty 8) 8)
          (match (g/lookup graph (.op1 node))
            (None [] false)
@@ -139,9 +142,103 @@
                                             (cast i64 (.op1 node))))
                               2)))))
 
-;;; Parts are unsplit and unassigned, before physical reservations. A child
-;;; joins its source group only when its full lifetime is already covered and
-;;; coincident fixed constraints agree. In a valid forward data schedule each
+;;; Graph reference to part index, built on the first candidate.
+(defn index-parts! [(indices (mut (ArrayList i32))) (parts (ArrayList allocation/Part))
+                    (graph g/Graph)] (-> void)
+  (when (= (len indices) 0)
+    (fill/append! (mut indices) (len (.instructions graph)) -1)
+    (for [i 0 (len parts)]
+      (let [part (at parts i)]
+        (when (> (.parent part) 0)
+          (set! (mut indices) (cast i64 (.parent part)) (cast i32 i)))))))
+
+;;; A widening view (convert/widening-view?) shares its source's lifetime: the
+;;; source's definition already leaves the whole widened value in its register,
+;;; so the pair is one value of the wide type from that definition on. The wide
+;;; member owns the group, so every move and spill of it has the wide type's
+;;; size and keeps those bits; the source's other consumers read its low part.
+;;; The source must be an unshared, non-Phi singleton (its definition needs a
+;;; register, never a narrow memory home) whose coincident fixed uses agree.
+;;; Returns whether joined.
+(defn widen! [(parents (mut (ArrayList i32)))
+              (groups (HashMap i32 bool))
+              (parts (mut (ArrayList allocation/Part)))
+              (indices (ArrayList i32))
+              (heads (ArrayList i32))
+              (graph g/Graph)
+              (reference i32)
+              (a (dyn Allocator))] (-> bool)
+  (let [input (.op1 (get (.instructions graph) (cast i64 reference)))
+        source (get indices (cast i64 input))
+        target (get indices (cast i64 reference))]
+    (if (or (< source 0) (< target 0)
+            (= (n/opcode (get (.instructions graph) (cast i64 input))) 67)
+            (and (> (len parents) 0)
+                 (or (!= (get parents (cast i64 input)) input)
+                     (!= (get parents (cast i64 reference)) reference)))
+            (phi/group? groups input)
+            (phi/group? groups reference)
+            (and (> (len heads) 0)
+                 (or (!= (get heads (cast i64 source)) source)
+                     (!= (get heads (cast i64 target)) target))))
+        false
+        (let [s (at parts (cast i64 source))
+              t (at parts (cast i64 target))
+              alone (and (= (.allowed s) (.allowed t))
+                         (> (len (.ranges s)) 0)
+                         (> (len (.ranges t)) 0)
+                         (phi/compatible? (.uses s) (.uses t)))]
+          (if (not alone)
+              false
+              (let [ranges (phi/union-ranges (.ranges s) (.ranges t) a)
+                    uses (phi/union-uses (.uses s) (.uses t) a)
+                    owner (elem (mut parts) (cast i64 target))
+                    member (elem (mut parts) (cast i64 source))]
+                (free! (mut (.ranges owner)))
+                (free! (mut (.uses owner)))
+                (set! (.ranges owner) ranges)
+                (set! (.uses owner) uses)
+                (clear! (mut (.ranges member)))
+                (clear! (mut (.uses member)))
+                (when (= (len parents) 0)
+                  (reserve! (mut parents) (len (.instructions graph)))
+                  (for [r 0 (len (.instructions graph))]
+                    (push! (mut parents) (cast i32 r))))
+                (set! (mut parents) (cast i64 input) reference)
+                true))))))
+
+;;; A same-size view that is itself a member of a Phi group hands the group its
+;;; source: the source (an unshared, non-Phi singleton) joins as one more
+;;; non-overlapping member, exactly as a Phi input does, so the view's
+;;; definition has nothing to copy. Returns whether joined.
+(defn absorb! [(parents (mut (ArrayList i32)))
+               (parts (mut (ArrayList allocation/Part)))
+               (indices (ArrayList i32))
+               (heads (ArrayList i32))
+               (graph g/Graph)
+               (reference i32)
+               (a (dyn Allocator))] (-> bool)
+  (let [node (get (.instructions graph) (cast i64 reference))
+        input (.op1 node)
+        owner (phi/root parents reference)
+        source (get indices (cast i64 input))
+        target (get indices (cast i64 owner))]
+    (and (!= (n/opcode node) 35)
+         (>= source 0) (>= target 0) (!= source target)
+         (> (len parents) 0)
+         (= (get parents (cast i64 input)) input)
+         (!= (n/opcode (get (.instructions graph) (cast i64 input))) 67)
+         (or (= (len heads) 0) (= (get heads (cast i64 source)) source))
+         (if (phi/join! (mut parts) target source a)
+             (do (set! (mut parents) (cast i64 input) owner) true)
+             false))))
+
+;;; Parts are unsplit and unassigned, before physical reservations. A view has
+;;; its source's bits and neither is redefined while the other lives (a Phi
+;;; source is excluded by entry-conflict?), so a child joins its source group
+;;; whenever coincident fixed constraints agree. The group's lifetime becomes
+;;; the union: a source that dies at the view hands its register on, and one
+;;; that outlives it is not duplicated. In a valid forward data schedule each
 ;;; encountered COPY definition is a singleton; do not merge an existing group
 ;;; as a child. Original ranges/uses remain intact until all decisions finish.
 ;;; The empty result means no aliases and no change to indexed lookup.
@@ -150,6 +247,7 @@
                (parts (mut (ArrayList allocation/Part)))
             (graph g/Graph)
             (scheduled schedule/Schedule)
+            (originals (slice ranges/Value))
             (a (dyn Allocator))] (-> void)
   (let [(mut indices) (ArrayList::new [i32] a)
         (mut heads) (ArrayList::new [i32] a)
@@ -160,29 +258,51 @@
     ; One schedule walk. Index only on a reusable node, fixed uses only on a
     ; contained candidate, and group storage only after a successful proof.
     (for reference (.nodes scheduled)
+     (do
+      (when (convert/widening-view? graph reference)
+        (index-parts! (mut indices) parts graph)
+        (when (and (widen! (mut parents) groups (mut parts) indices heads graph reference a)
+                   fixed-ready)
+          ; The owner's fixed uses now include its source's definition.
+          (for use (.uses (at parts (cast i64 (get indices (cast i64 reference)))))
+            (when (= (.kind use) 2)
+              (set! (mut fixed) (fixed-key reference (.position use)) (.register use))))))
       (when (reusable? graph reference)
-        (when (= (len indices) 0)
-          (fill/append! (mut indices) (len (.instructions graph)) -1)
-          (for [i 0 (len parts)]
-            (let [part (at parts i)]
-              (when (> (.parent part) 0)
-                (set! (mut indices) (cast i64 (.parent part)) (cast i32 i))))))
+        (index-parts! (mut indices) parts graph)
         (let [input (.op1 (get (.instructions graph) (cast i64 reference)))
               source (if (= (len parents) 0) input (canonical parents input))
               parent (get indices (cast i64 source))
-              child (get indices (cast i64 reference))]
+              child (get indices (cast i64 reference))
+              grouped (phi/group? groups source)]
+          (when (and (!= source reference) (>= child 0) (not grouped)
+                     (phi/group? groups (phi/root parents reference))
+                     (absorb! (mut parents) (mut parts) indices heads graph reference a)
+                     fixed-ready)
+            (let [owner (phi/root parents reference)]
+              (for use (.uses (at parts (cast i64 (get indices (cast i64 owner)))))
+                (when (= (.kind use) 2)
+                  (set! (mut fixed) (fixed-key owner (.position use)) (.register use))))))
           (when (and (!= source reference)
                      (>= parent 0)
                      (>= child 0)
-                     (not (phi/group? groups source))
+                     ; A Phi group holds other values once this source dies:
+                     ; only a view inside the source's own lifetime may join.
+                     (or (not grouped)
+                         (and (< (cast i64 input) (len originals))
+                              (inside? (.ranges (get originals (cast i64 input)))
+                                       (.ranges (at parts (cast i64 child))))
+                              (not (entry-conflict? graph scheduled input
+                                                    (.ranges (at parts (cast i64 child)))))))
                      (not (phi/group? groups (phi/root parents reference)))
                      (or (= (len heads) 0)
                          (= (get heads (cast i64 child)) child)))
             (let [p (at parts (cast i64 parent))
                   v (at parts (cast i64 child))
+                  contained (inside? (.ranges p) (.ranges v))
                   (mut compatible)
                     (and (= (.allowed p) (.allowed v))
-                         (inside? (.ranges p) (.ranges v))
+                         (> (len (.ranges p)) 0)
+                         (> (len (.ranges v)) 0)
                          (not (entry-conflict? graph
                                                scheduled
                                                source
@@ -220,12 +340,19 @@
                     (set! (mut fixed)
                           (fixed-key source (.position use))
                           (.register use))))
+                ; A view outliving its source extends the shared lifetime at
+                ; once, so later views of the group are tested against it.
+                (unless contained
+                  (let [joined (phi/union-ranges (.ranges p) (.ranges v) a)
+                        owner (elem (mut parts) (cast i64 parent))]
+                    (free! (mut (.ranges owner)))
+                    (set! (.ranges owner) joined)))
                 (set! (mut links)
                       (cast i64 child)
                       (get heads (cast i64 parent)))
                 (set! (mut heads) (cast i64 parent) child)
                 (set! (mut heads) (cast i64 child) -1)
-                (set! (mut parents) (cast i64 reference) source)))))))
+                (set! (mut parents) (cast i64 reference) source))))))))
     (when (> (len heads) 0)
       (fill/append! (mut cursors) (len parts) 0)
       (for [i 0 (len parts)]
@@ -246,18 +373,21 @@
             (a (dyn Allocator))] (-> (ArrayList i32))
   (let [(mut parents) (ArrayList::new [i32] a)
         (mut groups) (HashMap::new-scalar [i32 bool] a)]
-    (extend! (mut parents) groups (mut parts) graph scheduled a)
+    (extend! (mut parents) groups (mut parts) graph scheduled [] a)
     (free! (mut groups))
     parents))
 
 ;;; Prepared CFG/depths belong to the same immutable graph/schedule epoch.
+;;; originals[r] is value r's own lifetime before any joining (empty when
+;;; unknown: views of Phi-group members then stay separate).
 (defn run-prepared! [(parts (mut (ArrayList allocation/Part)))
                      (graph g/Graph) (scheduled schedule/Schedule)
                      (blocks cfg/Blocks) (depths (ArrayList i32))
+                     (originals (slice ranges/Value))
                      (a (dyn Allocator))] (-> (ArrayList i32))
   (let [(mut parents) (ArrayList::new [i32] a)
         (mut groups) (phi/run! (mut parts) (mut parents) graph scheduled blocks depths a)]
-    (extend! (mut parents) groups (mut parts) graph scheduled a)
+    (extend! (mut parents) groups (mut parts) graph scheduled originals a)
     (free! (mut groups))
     parents))
 
