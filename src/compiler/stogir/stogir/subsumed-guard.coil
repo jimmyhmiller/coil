@@ -1,0 +1,207 @@
+;;; A range guard in front of a literal bit-set membership test,
+;;;     IF (n ? C)  then  IF ((M & (1 << n)) != 0) ...
+;;; decides nothing when the second test alone answers the same for every
+;;; value n can hold: wherever the guard fails, bit n of M is clear, and the
+;;; two failing exits enter one MERGE carrying the same PHI inputs. The guard
+;;; then always takes the side of the bit test. n must lie in [0, width) so
+;;; that the shift is the plain bit n, which is what makes the test safe to
+;;; run where the guard used to stop.
+;;;
+;;; `candidates` reads the graph only (no use lists): the IFs whose shape and
+;;; values qualify. `confirm` checks the exits with exact use lists.
+(module stogir.subsumed-guard)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.symbols" :as symbols)
+(import "stogir.uses" :as uses)
+(import "stogir.branch-facts" :as facts)
+(import "stogir.equality-chain" :as chain)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+;;; guard: the IF to decide; pass: its projection that holds the bit test;
+;;; test: the bit-test IF; nonzero: the bit test's condition is NE (bit set).
+(defstruct Guard [(guard i32) (pass i32) (test i32) (nonzero bool)])
+
+(defn code [(graph g/Graph) (reference i32)] (-> i32)
+  (if (<= reference 0) 0
+      (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference))))))
+
+(defn literal [(graph g/Graph) (reference i32)] (-> (Option u64))
+  (if (>= reference 0)
+      (None)
+      (match (g/lookup graph reference)
+        (Some [value] (if (symbols/numeric? value) (Some (n/constant-bits value)) (None)))
+        (None [] (None)))))
+
+;;; The count n of SHL(1, n) whose type is `size` bytes wide, or zero.
+(defn unit-shift [(graph g/Graph) (reference i32) (size i32)] (-> i32)
+  (if (!= (code graph reference) 49)
+      0
+      (let [node (get (.instructions graph) (cast i64 reference))
+            ty (cast i32 (n/type-id node))]
+        (if (and (types/integer? ty) (= (types/size ty 8) size) (> (.op2 node) 0)
+                 (match (literal graph (.op1 node)) (Some [bits] (= bits 1)) (None [] false)))
+            (.op2 node)
+            0))))
+
+;;; The count of a one-bit operand of a `size`-byte AND and the width in bits
+;;; of the shift that places it: SHL(1, n) of the AND's own width, or for a
+;;; 32-bit AND also TRUNC(SHL64(1, n)), whose bit is clear from 32 up exactly
+;;; as bit n of the zero-extended 32-bit mask is. Count zero when neither.
+(defstruct Shifted [(count i32) (bits i32)])
+
+(defn shifted [(graph g/Graph) (reference i32) (size i32)] (-> Shifted)
+  (let [direct (unit-shift graph reference size)]
+    (if (> direct 0)
+        (Shifted :count direct :bits (* size 8))
+        (if (and (= size 4) (= (code graph reference) 35))
+            (let [node (get (.instructions graph) (cast i64 reference))]
+              (if (and (types/integer? (cast i32 (n/type-id node)))
+                       (= (types/size (cast i32 (n/type-id node)) 8) 4))
+                  (Shifted :count (unit-shift graph (.op1 node) 8) :bits 64)
+                  (Shifted :count 0 :bits 0)))
+            (Shifted :count 0 :bits 0)))))
+
+;;; The value a ZEXT or SEXT widens, else the reference itself. The widened
+;;; value equals it whenever it is not negative, which the caller's range
+;;; check of the result establishes.
+(defn unextended [(graph g/Graph) (reference i32)] (-> i32)
+  (let [opcode (code graph reference)]
+    (if (or (= opcode 33) (= opcode 34))
+        (let [inner (.op1 (get (.instructions graph) (cast i64 reference)))]
+          (if (and (> inner 0) (types/integer? (facts/type-of graph inner))) inner reference))
+        reference)))
+
+;;; Truth of (k OP c) for a count k in [0, 64) and the literal bits `c` of an
+;;; integer `width` bytes wide; opcode is 14..23.
+(defn holds? [(opcode i32) (k u64) (c u64) (width i32)] (-> bool)
+  (let [bits (cast u64 (* width 8))
+        low (if (= width 8) c (& c (- (<< (: 1 u64) bits) 1)))
+        signed (if (or (= width 8) (= (& (>> low (- bits 1)) 1) 0))
+                   (cast i64 low)
+                   (- (cast i64 low) (cast i64 (<< (: 1 u64) bits))))
+        sk (cast i64 k)]
+    (cond (= opcode 14) (= k low) (= opcode 15) (!= k low)
+          (= opcode 16) (< sk signed) (= opcode 17) (>= sk signed)
+          (= opcode 18) (<= sk signed) (= opcode 19) (> sk signed)
+          (= opcode 20) (< k low) (= opcode 21) (>= k low)
+          (= opcode 22) (<= k low) (= opcode 23) (> k low)
+          :else false)))
+
+;;; IF `test` on EQ/NE(AND(one bit, M), 0) with a literal M, in a 32- or
+;;; 64-bit integer type (see shifted). `count` is the shift count with a
+;;; widening removed, `bits` the width the shift reduces its count to; zero
+;;; count when the IF is not such a test.
+(defstruct BitTest [(count i32) (mask u64) (bits i32) (nonzero bool)])
+
+(defn bit-test [(graph g/Graph) (test i32)] (-> BitTest)
+  (let [none (BitTest :count 0 :mask 0 :bits 0 :nonzero false)
+        condition (.op2 (get (.instructions graph) (cast i64 test)))
+        opcode (code graph condition)]
+    (if (not (or (= opcode 14) (= opcode 15)))
+        none
+        (let [comparison (get (.instructions graph) (cast i64 condition))
+              ; A widening of the AND is zero exactly when the AND is.
+              masked (unextended graph (.op1 comparison))]
+          (if (or (!= (code graph masked) 47)
+                  (match (literal graph (.op2 comparison))
+                    (Some [bits] (!= bits 0))
+                    (None [] true)))
+              none
+              (let [node (get (.instructions graph) (cast i64 masked))
+                    ty (cast i32 (n/type-id node))
+                    size (if (types/integer? ty) (types/size ty 8) 0)
+                    first (shifted graph (.op1 node) size)
+                    second (shifted graph (.op2 node) size)
+                    place (if (> (.count first) 0) first second)
+                    other (if (> (.count first) 0) (.op2 node) (.op1 node))]
+                (if (or (<= (.count place) 0) (not (or (= size 4) (= size 8))))
+                    none
+                    (match (literal graph other)
+                      (None [] none)
+                      (Some [mask]
+                        (BitTest :count (unextended graph (.count place))
+                                 :mask (if (= size 8) mask (& mask 0xFFFFFFFF))
+                                 :bits (.bits place)
+                                 :nonzero (= opcode 15)))))))))))
+
+;;; The guard that the bit test `found` of IF `test` makes redundant, by
+;;; values alone; guard = 0 when there is none. `range` is the interval of
+;;; the count's signed value.
+(defn candidate [(graph g/Graph) (test i32) (found BitTest) (range facts/Range)] (-> Guard)
+  (let [none (Guard :guard 0 :pass 0 :test 0 :nonzero false)
+        pass (.op1 (get (.instructions graph) (cast i64 test)))
+        side (code graph pass)
+        guard (if (or (= side 107) (= side 108))
+                  (.op1 (get (.instructions graph) (cast i64 pass)))
+                  0)
+        condition (if (and (= (code graph guard) 116)
+                           (= (get (.arities graph) (cast i64 guard)) 2))
+                      (.op2 (get (.instructions graph) (cast i64 guard)))
+                      0)
+        opcode (code graph condition)]
+    (if (or (< opcode 14) (> opcode 23)
+            (not (.valid range)) (< (.low range) 0) (< (.high range) (.low range))
+            (>= (.high range) (cast i128 (.bits found))))
+        none
+        (let [comparison (get (.instructions graph) (cast i64 condition))
+              ty (facts/type-of graph (.op1 comparison))
+              width (if (types/integer? ty) (types/size ty 8) 0)]
+          (match (literal graph (facts/operand graph (.op2 comparison)))
+            (None [] none)
+            (Some [bound]
+              (if (or (!= (unextended graph (facts/operand graph (.op1 comparison)))
+                          (.count found))
+                      (< width 1) (> width 8)
+                      (!= ty (facts/type-of graph (.op2 comparison))))
+                  none
+                  (let [(mut redundant) true
+                        (mut k) (cast u64 (.low range))]
+                    (while (and redundant (<= k (cast u64 (.high range))))
+                      (let [holds (holds? opcode k bound width)]
+                        (when (and (!= holds (= side 107)) (!= (& (>> (.mask found) k) 1) 0))
+                          (set! redundant false)))
+                      (set! k (+ k 1)))
+                    (if redundant
+                        (Guard :guard guard :pass pass :test test :nonzero (.nonzero found))
+                        none)))))))))
+
+;;; The projection of IF `branch` with opcode `wanted` (107 or 108), or zero.
+(defn projection [(graph g/Graph) (edges uses/Uses) (branch i32) (wanted i32)] (-> i32)
+  (let [range (get (.ranges edges) (cast i64 branch))
+        (mut found) (: 0 i32)]
+    (for [i (.offset range) (+ (.offset range) (.count range))]
+      (let [edge (get (.edges edges) i)]
+        (when (and (= (.operand edge) 1) (= (code graph (.user edge)) wanted))
+          (set! found (.user edge)))))
+    found))
+
+;;; The guard's failing exit and the bit test's bit-clear exit enter one MERGE
+;;; through blocks that hold nothing, and every PHI there takes one value from
+;;; both; and the passing projection holds only the bit test.
+(defn confirmed? [(graph g/Graph) (edges uses/Uses) (found Guard)] (-> bool)
+  (let [fail (projection graph edges (.guard found)
+                         (if (= (code graph (.pass found)) 107) 108 107))
+        clear (projection graph edges (.test found) (if (.nonzero found) 108 107))]
+    (if (or (<= fail 0) (<= clear 0) (!= (chain/only-user edges (.pass found)) (.test found)))
+        false
+        (let [first (chain/joining-end graph edges fail)
+              second (chain/joining-end graph edges clear)
+              merge (if (> first 0) (chain/only-user edges first) 0)]
+          (cond (or (<= first 0) (<= second 0) (<= merge 0)) false
+                (= first second) true
+                (!= (chain/only-user edges second) merge) false
+                :else
+                  (let [slot (chain/position graph merge first)
+                        other (chain/position graph merge second)
+                        range (get (.ranges edges) (cast i64 merge))
+                        (mut same) (and (> slot 0) (> other 0))]
+                    (for [k (.offset range) (+ (.offset range) (.count range))]
+                      (let [user (.user (get (.edges edges) k))]
+                        (when (and (= (code graph user) 67)
+                                   (!= (chain/input graph user (+ slot 1))
+                                       (chain/input graph user (+ other 1))))
+                          (set! same false))))
+                    same))))))
