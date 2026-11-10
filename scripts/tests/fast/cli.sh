@@ -1325,6 +1325,10 @@ EOF
       "$COIL" run "$ROOT/tests/backend/stogir-emission-lifetime.coil" --backend llvm -O1 --no-debug --debug-checks --sanitize=address
     expect_rc 0 "hosted read-only C routines reach Stogir as PURE calls" \
       "$COIL" run "$ROOT/tests/backend/stogir-pure-runtime-calls.coil" --backend llvm -O1 --no-debug --debug-checks
+    expect_rc 0 "loops calling memcmp reload only what a store can change (Stogir O3)" \
+      "$COIL" run "$ROOT/tests/backend/stogir-readonly-library-calls.coil" --backend stogir -O3 --no-debug --debug-checks
+    expect_rc 0 "real memcmp calls are read-only to Stogir, a Coil namesake is not" \
+      python3 "$ROOT/scripts/tests/stogir-readonly-library-calls.py" "$COIL"
     expect_rc 0 "native Mach-O data-in-code serialization and JIT loader" \
       "$COIL" run "$ROOT/src/compiler/selftest/jit_selftest.coil" --backend llvm
   fi
