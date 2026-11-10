@@ -1321,6 +1321,14 @@ EOF
       "$COIL" run "$ROOT/tests/backend/static-literal-reads.coil" --backend tpde --no-debug --debug-checks
     expect_rc 0 "Stogir aggregate snapshots and zero-fill boundaries" \
       python3 "$ROOT/scripts/tests/stogir-runtime-bulk.py" "$COIL"
+    expect_rc 0 "a cached unit is keyed on the Stogir settings it was generated under" \
+      python3 "$ROOT/scripts/tests/stogir-unit-settings.py" "$COIL"
+    expect_rc 0 "every backend's program records the same platform, minos and sdk" \
+      python3 "$ROOT/scripts/tests/native-link-versions.py" "$COIL"
+    expect_rc 0 "volatile accesses reach Stogir machine code one for one" \
+      python3 "$ROOT/scripts/tests/stogir-volatile.py" "$COIL"
+    expect_rc 0 "Stogir -O1, -O2 and -O3 agree and -O0 is refused" \
+      python3 "$ROOT/scripts/tests/stogir-levels.py" "$COIL"
     expect_rc 0 "deferred Stogir graph ownership under ASAN" \
       "$COIL" run "$ROOT/tests/backend/stogir-emission-lifetime.coil" --backend llvm -O1 --no-debug --debug-checks --sanitize=address
     expect_rc 0 "hosted read-only C routines reach Stogir as PURE calls" \
