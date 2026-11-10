@@ -2176,12 +2176,10 @@
       :template template :self self :growth growth :keep keep :wrap wrap
       :scope scope :final final)))
 
-(defn module-prepare! [(module (ptr Module))
-                       (f (ptr cir/Func))
-                       (ta (ptr asm/Asm))
-                       (symbol u32)
-                       (never bool)
-                       (always bool)] (-> void)
+;;; What module-prepare! records about F before any template work: the
+;;; :inline (Never) mark and, under a growth setting, its direct call sites.
+(defn prepare-note! [(module (ptr Module)) (f (ptr cir/Func)) (symbol u32) (never bool)]
+  (-> void)
   (when never
     (while (<= (len (.outlined module)) (cast i64 symbol))
       (push! (mut (.outlined module)) false))
@@ -2194,97 +2192,136 @@
           (while (<= (len (.call-sites module)) (.imm x))
             (push! (mut (.call-sites module)) 0))
           (set! (mut (.call-sites module)) (.imm x)
-                (+ (get (.call-sites module) (.imm x)) 1))))))
-  (when (and (not never) (<= (len (.insts f)) (cast i64 (.template (.inline module)))))
+                (+ (get (.call-sites module) (.imm x)) 1)))))))
+
+;;; Whether F is small enough to be tried as an inline template.
+(defn template-candidate? [(module (ptr Module)) (f (ptr cir/Func)) (never bool)] (-> bool)
+  (and (not never) (<= (len (.insts f)) (cast i64 (.template (.inline module))))))
+
+;;; Adapt F into S. The template's adapted graph is consumed by optimization.
+;;; Only an optimized graph of at most budget+1 cells is registered; an adapted
+;;; graph over 1.5x the budget is not optimized just to be discarded (on the
+;;; compiler itself no such graph shrinks enough to register): it is released
+;;; here and the result is false. This is the only step of template
+;;; preparation that touches the assembler (it binds import symbols), so it
+;;; runs on the submitting thread in submission order.
+(defn prepare-adapt! [(module (ptr Module)) (s (ptr Adapter)) (f (ptr cir/Func))
+                      (ta (ptr asm/Asm)) (a (dyn Allocator))] (-> bool)
+  (adapt! s f ta (p/cast (ptr (ArrayList MTextData)) 0) a)
+  (if (> (* 2 (len (.instructions (.g s)))) (* 3 (cast i64 (.template (.inline module)))))
+      (do (graph/release! (mut (.g s))) false)
+      true))
+
+;;; An adapted template after optimization: its graph and observations, the
+;;; RETURN roots left in it, and whether return canonicalization edited the
+;;; optimizer's output.
+(defstruct PreparedTemplate
+  [(optimized rewrite/Rewritten) (returns i64) (canonicalized bool)])
+
+;;; Optimize the adapted graph of S and normalize a multi-return template.
+;;; Reads and writes only S's graph and allocates only from A: prepared
+;;; templates do not see each other, so workers run this concurrently.
+(defn prepare-optimize! [(s (ptr Adapter)) (a (dyn Allocator))]
+  (-> (Result PreparedTemplate (slice u8)))
+  (match (sccp/optimize-memory-owned! (.g s) 8 (slice (.exits s)) true a)
+    (Err [message] (Err message))
+    (Ok [optimized]
+        (let [(mut optimized) optimized
+              (mut returns) (: 0 i64)
+              (mut r) 1]
+          ; Keep every control root during optimization. The library then
+          ; proves control closure from every supplied observation.
+          (while (< r (len (.instructions (.graph optimized))))
+            (let [n (get (.instructions (.graph optimized)) r)
+                  count (get (.arities (.graph optimized)) r)]
+              (when (= (node/opcode n) 120) (set! returns (+ returns 1)))
+              (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+          ; Normalize only owned multi-return templates. Rebuild the
+          ; graph epoch before any immutable registry handle is issued.
+          (if (> returns 1)
+              (match (return-merge/canonicalize (.graph optimized) (.start s)
+                       (slice (.roots optimized)) 8 a)
+                (Err [message] (Err message))
+                (Ok [canonical]
+                  (graph/release! (mut (.graph optimized)))
+                  (free! (mut (.roots optimized)))
+                  (queue/release! (mut (.iteration optimized)))
+                  (set! (.graph optimized) (.graph canonical))
+                  (set! (.roots optimized) (.roots canonical))
+                  (set! (.iteration optimized)
+                        (queue/create (len (.instructions (.graph canonical))) a))
+                  (Ok (PreparedTemplate :optimized optimized :returns 1 :canonicalized true))))
+              (Ok (PreparedTemplate :optimized optimized :returns returns
+                                    :canonicalized false)))))))
+
+;;; Enter an optimized template into the module when it has one RETURN and
+;;; fits: its definition and symbol bindings, owned by the module allocator.
+;;; Runs on the submitting thread in submission order; releases the template.
+(defn prepare-commit! [(module (ptr Module)) (s (ptr Adapter)) (f (ptr cir/Func))
+                       (symbol u32) (always bool) (prepared PreparedTemplate)] (-> void)
+  (let [keep (.a module)
+        (mut optimized) (.optimized prepared)]
+    (when (.trace module)
+      (eprintln "stogir template {}: {} cells, {} returns"
+                (.name f)
+                (len (.instructions (.graph optimized)))
+                (.returns prepared)))
+    (when (and (= (.returns prepared) 1)
+               (<= (len (.instructions (.graph optimized)))
+                   (+ (cast i64 (.template (.inline module))) 1)))
+      (let [(mut owned) (zeroed Definition)
+            definition (cast (ptr Definition) (mut owned))]
+        (set! (.symbol definition) symbol)
+        (set! (.always definition) always)
+        (set! (.source definition) f)
+        (set! (.entry definition) (.start s))
+        (set! (.name definition)
+              (sconcat keep
+                       "_coil_stogir_import_"
+                       (i64->str keep (cast i64 symbol))))
+        (own-definition! definition
+                         (.graph optimized)
+                         (slice (.roots optimized))
+                         (slice (.import-names s))
+                         (slice (.import-ids s))
+                         keep)
+        ; Return canonicalization edits the SCCP output.
+        (set! (.clean definition) (not (.canonicalized prepared)))
+        (set! (.proof definition) (if (.canonicalized prepared) 0 (.proof optimized)))
+        (for [i 0 (len (.import-ids definition))]
+          (let [name (get (.import-names definition) i)
+                id (get (.import-ids definition) i)]
+            (match (get (.bindings module) name)
+              (Some [prior]
+                    (when (!= prior id)
+                      (fail (.name f)
+                            "conflicting module symbol binding")))
+              (None [] (set! (mut (.bindings module)) name id)))))
+        (while (<= (len (.by-symbol module)) (cast i64 symbol))
+          (push! (mut (.by-symbol module)) 0))
+        (push! (mut (.definitions module)) owned)
+        (set! (mut (.by-symbol module))
+              (cast i64 symbol)
+              (len (.definitions module)))))
+    (rewrite/release! (mut optimized))))
+
+(defn module-prepare! [(module (ptr Module))
+                       (f (ptr cir/Func))
+                       (ta (ptr asm/Asm))
+                       (symbol u32)
+                       (never bool)
+                       (always bool)] (-> void)
+  (prepare-note! module f symbol never)
+  (when (template-candidate? module f never)
     (let [work (p/alloc-stack scratch/ScratchArena)]
       (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
       (let [a (allocator work)
-            keep (.a module)
             (mut state) (zeroed Adapter)
             s (cast (ptr Adapter) (mut state))]
-        (adapt! s f ta (p/cast (ptr (ArrayList MTextData)) 0) a)
-        ; The template's adapted graph is consumed by optimization. Only an
-        ; optimized graph of at most budget+1 cells is registered; an adapted
-        ; graph over 1.5x the budget is not optimized just to be discarded
-        ; (on the compiler itself no such graph shrinks enough to register).
-        (if (> (* 2 (len (.instructions (.g s)))) (* 3 (cast i64 (.template (.inline module)))))
-          (graph/release! (mut (.g s)))
-        (match (sccp/optimize-memory-owned! (.g s) 8 (slice (.exits s)) true a)
-          (Err [message] (fail (.name f) message))
-          (Ok [optimized]
-              (let [(mut optimized) optimized
-                    (mut roots) (ArrayList::new [i32] a)
-                    (mut canonicalized) false
-                    (mut r) 1]
-                ; Keep every control root during optimization. The library then
-                ; proves control closure from every supplied observation.
-                (while (< r (len (.instructions (.graph optimized))))
-                  (let [n (get (.instructions (.graph optimized)) r)
-                        count (get (.arities (.graph optimized)) r)]
-                    (when (= (node/opcode n) 120)
-                      (push! (mut roots) (cast i32 r)))
-                    (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
-                ; Normalize only owned multi-return templates. Rebuild the
-                ; graph epoch before any immutable registry handle is issued.
-                (set! canonicalized (> (len roots) 1))
-                (when (> (len roots) 1)
-                  (match (return-merge/canonicalize (.graph optimized) (.start s)
-                           (slice (.roots optimized)) 8 a)
-                    (Err [message] (fail (.name f) message))
-                    (Ok [canonical]
-                      (graph/release! (mut (.graph optimized)))
-                      (free! (mut (.roots optimized)))
-                      (queue/release! (mut (.iteration optimized)))
-                      (set! (.graph optimized) (.graph canonical))
-                      (set! (.roots optimized) (.roots canonical))
-                      (set! (.iteration optimized)
-                            (queue/create (len (.instructions (.graph canonical))) a))
-                      (free! (mut roots))
-                      (set! roots (ArrayList::new [i32] a))
-                      (push! (mut roots) (.returned canonical)))))
-                (when (.trace module)
-                  (eprintln "stogir template {}: {} cells, {} returns"
-                            (.name f)
-                            (len (.instructions (.graph optimized)))
-                            (len roots)))
-                (when (and (= (len roots) 1)
-                           (<= (len (.instructions (.graph optimized)))
-                               (+ (cast i64 (.template (.inline module))) 1)))
-                  (let [(mut owned) (zeroed Definition)
-                        definition (cast (ptr Definition) (mut owned))]
-                    (set! (.symbol definition) symbol)
-                    (set! (.always definition) always)
-                    (set! (.source definition) f)
-                    (set! (.entry definition) (.start s))
-                    (set! (.name definition)
-                          (sconcat keep
-                                   "_coil_stogir_import_"
-                                   (i64->str keep (cast i64 symbol))))
-                    (own-definition! definition
-                                     (.graph optimized)
-                                     (slice (.roots optimized))
-                                     (slice (.import-names s))
-                                     (slice (.import-ids s))
-                                     keep)
-                    ; Return canonicalization edits the SCCP output.
-                    (set! (.clean definition) (not canonicalized))
-                    (set! (.proof definition) (if canonicalized 0 (.proof optimized)))
-                    (for [i 0 (len (.import-ids definition))]
-                      (let [name (get (.import-names definition) i)
-                            id (get (.import-ids definition) i)]
-                        (match (get (.bindings module) name)
-                          (Some [prior]
-                                (when (!= prior id)
-                                  (fail (.name f)
-                                        "conflicting module symbol binding")))
-                          (None [] (set! (mut (.bindings module)) name id)))))
-                    (while (<= (len (.by-symbol module)) (cast i64 symbol))
-                      (push! (mut (.by-symbol module)) 0))
-                    (push! (mut (.definitions module)) owned)
-                    (set! (mut (.by-symbol module))
-                          (cast i64 symbol)
-                          (len (.definitions module)))))
-                (rewrite/release! (mut optimized)))))))
+        (when (prepare-adapt! module s f ta a)
+          (match (prepare-optimize! s a)
+            (Err [message] (fail (.name f) message))
+            (Ok [prepared] (prepare-commit! module s f symbol always prepared)))))
       (close! work))))
 
 (defn definition-index [(s (ptr Adapter))
@@ -3483,64 +3520,158 @@
     (close! work)
     (tr/codegen-end "stogir" "ir-codegen" codegen-start))))
 
-;;; ---- Parallel emission ----
+;;; ---- Parallel generation ----
 ;;;
-;;; After module-finish!, emission planning and the native leaf cache, every
-;;; function still to be emitted has a frozen Definition (its finalized
-;;; template or its prepared emission body) and its image depends on nothing
-;;; else that changes: native-image reads that one graph, the sealed native
-;;; context and the module's settings. So the images are generated on worker
-;;; threads, one function per claim, and the submitting thread merges them
-;;; into the assembler in submission order, exactly where the serial loop
-;;; would have. The object is therefore the same bytes for any thread count
-;;; and any scheduling; nothing a worker decides depends on what another
-;;; worker has finished. See "Parallel emission" in src/compiler/stogir/README.md.
+;;; Two stages of module generation consist of per-function work that reads
+;;; and writes nothing but that function's own data: optimizing an adapted
+;;; template (prepare-optimize!) and generating a function's image from its
+;;; frozen definition (native-image). Those run on worker threads. Everything
+;;; that touches shared state (the assembler, the module's lists and arena,
+;;; the callee registry) stays on the submitting thread, which performs it
+;;; in submission order at points fixed by task indices alone. The object is
+;;; therefore the same bytes for any thread count and any scheduling, and
+;;; nothing a worker decides depends on what another worker has finished.
+;;; See "Parallel emission" in src/compiler/stogir/README.md.
 
-;;; One function awaiting its image. `done`, `failed`, `message` and `image`
-;;; are written by the worker that claimed the item and read by the merging
-;;; thread only after it has seen `done` under the emission mutex. The arena
-;;; is the worker's scratch for this function; it owns the image and is
-;;; closed by the merging thread once the image is in the assembler.
-(defstruct EmissionItem
-  [(source (ptr cir/Func)) (symbol u32) (definition (ptr Definition))
-   (done bool) (failed bool) (message (slice u8)) (image image/Image)
-   (arena scratch/ScratchArena)])
+;;; One unit of work for a worker and whether it has finished.
+(defstruct PoolTask [(argument (ptr i8)) (done bool)])
 
-;;; `next` (the next unclaimed item), `merged` (items already merged) and every
-;;; item's `done` are guarded by `mutex`; `progress` is notified when any of
-;;; them changes. Workers stay at most `window` items ahead of the merge so
-;;; that retained scratch arenas are bounded.
-(defstruct Emission
-  [(module (ptr Module)) (ta (ptr asm/Asm)) (level i32)
-   (items (ArrayList EmissionItem))
-   (window i64)
-   (mutex Mutex) (progress Condition)
-   (next i64) (merged i64)
+;;; Worker threads running `run` on submitted arguments, each exactly once.
+;;; `tasks` (reserved to `capacity` at creation, so that its storage never
+;;; moves), `next` (the next unclaimed task), `closed` and `awaited` (the
+;;; task the submitter is blocked on, or -1) are guarded by `mutex`. Workers
+;;; wait on `work` for a task or the close; the one submitting thread waits
+;;; on `finished` for its awaited task. A task's argument is handed to the
+;;; worker and back to the submitter under that mutex, so the two never use
+;;; it at the same time.
+(defstruct Pool
+  [(run (fnptr (cc/C) [(ptr i8)] (ptr i8)))
+   (tasks (ArrayList PoolTask)) (capacity i64)
+   (mutex Mutex) (work Condition) (finished Condition)
+   (next i64) (closed bool) (awaited i64)
    (threads (ArrayList Thread)) (started i64)])
 
-(defn emission-lock! [(e (ptr Emission))] (-> void)
-  (match (Mutex::lock! (field e mutex))
-    (Ok [_] 0) (Err [_] (fail "emission" "mutex lock failed"))))
+(defn pool-lock! [(pool (ptr Pool))] (-> void)
+  (match (Mutex::lock! (field pool mutex))
+    (Ok [_] 0) (Err [_] (fail "worker pool" "mutex lock failed"))))
 
-(defn emission-unlock! [(e (ptr Emission))] (-> void)
-  (match (Mutex::unlock! (field e mutex))
-    (Ok [_] 0) (Err [_] (fail "emission" "mutex unlock failed"))))
+(defn pool-unlock! [(pool (ptr Pool))] (-> void)
+  (match (Mutex::unlock! (field pool mutex))
+    (Ok [_] 0) (Err [_] (fail "worker pool" "mutex unlock failed"))))
 
-;;; Wait for a change of the guarded state; the caller holds the mutex.
-(defn emission-wait! [(e (ptr Emission))] (-> void)
-  (match (Condition::wait! (field e progress) (field e mutex))
-    (Ok [_] 0) (Err [_] (fail "emission" "condition wait failed"))))
+;;; Wait on CONDITION (of POOL); the caller holds the mutex.
+(defn pool-wait! [(pool (ptr Pool)) (condition (ptr Condition))] (-> void)
+  (match (Condition::wait! condition (field pool mutex))
+    (Ok [_] 0) (Err [_] (fail "worker pool" "condition wait failed"))))
 
-(defn emission-notify! [(e (ptr Emission))] (-> void)
-  (match (Condition::notify-all! (field e progress))
-    (Ok [_] 0) (Err [_] (fail "emission" "condition notify failed"))))
+(defn pool-notify-one! [(condition (ptr Condition))] (-> void)
+  (match (Condition::notify-one! condition)
+    (Ok [_] 0) (Err [_] (fail "worker pool" "condition notify failed"))))
 
-;;; How many threads generate function images. COIL_TPDE_SERIAL (set to
-;;; anything, as for the TPDE pipeline) is always one: the serial path.
-;;; Otherwise COIL_STOGIR_THREADS=N (1 to 64) is N. Otherwise one while
-;;; COIL_CODEGEN_TIMINGS is on, whose records are summed as serial CPU time,
-;;; and else the online processors, at most eight.
-(defn emission-threads [] (-> i64)
+(defn pool-notify-all! [(condition (ptr Condition))] (-> void)
+  (match (Condition::notify-all! condition)
+    (Ok [_] 0) (Err [_] (fail "worker pool" "condition notify failed"))))
+
+(defn pool-worker [(argument (ptr i8))] (-> (ptr i8))
+  (let [pool (p/cast (ptr Pool) argument)]
+    (pool-lock! pool)
+    (loop
+      (while (and (>= (.next pool) (len (.tasks pool))) (not (.closed pool)))
+        (pool-wait! pool (field pool work)))
+      (if (>= (.next pool) (len (.tasks pool)))
+          (break)
+          (let [index (.next pool)
+                task (.argument (get (.tasks pool) index))
+                run (.run pool)]
+            (set! (.next pool) (+ index 1))
+            (pool-unlock! pool)
+            (run task)
+            (pool-lock! pool)
+            (set! (.done (elem (mut (.tasks pool)) index)) true)
+            (when (= index (.awaited pool)) (pool-notify-one! (field pool finished))))))
+    (pool-unlock! pool)
+    (p/cast (ptr i8) 0)))
+
+;;; A pool of up to THREADS workers for at most CAPACITY tasks, or null when
+;;; not even one thread could be started (nothing has been done; the caller
+;;; takes its serial path). Workers get the stack of the compiler's own
+;;; pipeline thread, which is what this work runs on serially.
+(defn pool-start [(run (fnptr (cc/C) [(ptr i8)] (ptr i8))) (capacity i64) (threads i64)]
+  (-> (ptr Pool))
+  (when (or (< threads 1) (< capacity 0)) (fail "worker pool" "invalid pool size"))
+  (let [pool (box! (malloc-allocator) Pool (zeroed Pool))
+        (mut refused) false]
+    (set! (.run pool) run) (set! (.capacity pool) capacity) (set! (.awaited pool) -1)
+    (set! (.tasks pool) (ArrayList::new [PoolTask] (malloc-allocator)))
+    (reserve! (mut (.tasks pool)) capacity)
+    (set! (.threads pool) (ArrayList::new [Thread] (malloc-allocator)))
+    ; Thread handles must not move once a thread has been created into one.
+    (for [i 0 threads] (push! (mut (.threads pool)) (zeroed Thread)))
+    (match (Mutex::init (field pool mutex))
+      (Ok [_] 0) (Err [_] (fail "worker pool" "mutex creation failed")))
+    (match (Condition::init (field pool work))
+      (Ok [_] 0) (Err [_] (fail "worker pool" "condition creation failed")))
+    (match (Condition::init (field pool finished))
+      (Ok [_] 0) (Err [_] (fail "worker pool" "condition creation failed")))
+    (while (and (not refused) (< (.started pool) threads))
+      (if (= (Thread::spawn-configured (elem (mut (.threads pool)) (.started pool))
+                                       (fnptr-of pool-worker)
+                                       (p/cast (ptr i8) pool)
+                                       (ThreadConfig::new (worker-stack-size) -1))
+             (: 0 i32))
+          (set! (.started pool) (+ (.started pool) 1))
+          (set! refused true)))
+    (if (> (.started pool) 0)
+        pool
+        (do (pool-finish! pool) (p/cast (ptr Pool) 0)))))
+
+;;; Hand ARGUMENT to the workers; the result is its task index, counting up
+;;; from zero. The submitter must not touch what ARGUMENT designates again
+;;; before pool-await! of that index.
+(defn pool-submit! [(pool (ptr Pool)) (argument (ptr i8))] (-> i64)
+  (pool-lock! pool)
+  (let [index (len (.tasks pool))]
+    (when (or (.closed pool) (>= index (.capacity pool)))
+      (fail "worker pool" "task submitted beyond the pool's capacity"))
+    (push! (mut (.tasks pool)) (PoolTask :argument argument :done false))
+    (pool-notify-one! (field pool work))
+    (pool-unlock! pool)
+    index))
+
+;;; Block until task INDEX has run.
+(defn pool-await! [(pool (ptr Pool)) (index i64)] (-> void)
+  (pool-lock! pool)
+  (when (>= index (len (.tasks pool))) (fail "worker pool" "awaited task was never submitted"))
+  (set! (.awaited pool) index)
+  (while (not (.done (get (.tasks pool) index))) (pool-wait! pool (field pool finished)))
+  (set! (.awaited pool) -1)
+  (pool-unlock! pool))
+
+;;; Let the workers run out of tasks, join them and release POOL.
+(defn pool-finish! [(pool (ptr Pool))] (-> void)
+  (pool-lock! pool)
+  (set! (.closed pool) true)
+  (pool-notify-all! (field pool work))
+  (pool-unlock! pool)
+  (for [i 0 (.started pool)]
+    (unless (= (Thread::join (elem (mut (.threads pool)) i)) (: 0 i32))
+      (fail "worker pool" "thread join failed")))
+  (match (Condition::destroy! (field pool work))
+    (Ok [_] 0) (Err [_] (fail "worker pool" "condition release failed")))
+  (match (Condition::destroy! (field pool finished))
+    (Ok [_] 0) (Err [_] (fail "worker pool" "condition release failed")))
+  (match (Mutex::destroy! (field pool mutex))
+    (Ok [_] 0) (Err [_] (fail "worker pool" "mutex release failed")))
+  (free! (mut (.threads pool)))
+  (free! (mut (.tasks pool)))
+  (destroy (malloc-allocator) pool))
+
+;;; How many threads do the per-function work of module generation.
+;;; COIL_TPDE_SERIAL (set to anything, as for the TPDE pipeline) is always
+;;; one: the serial path. Otherwise COIL_STOGIR_THREADS=N (1 to 64) is N.
+;;; Otherwise one while COIL_CODEGEN_TIMINGS is on, whose records are summed
+;;; as serial CPU time, and else the online processors, at most eight.
+(defn generation-threads [] (-> i64)
   (let [requested (stogir-getenv c"COIL_STOGIR_THREADS")]
     (cond (!= (p/cast usize (stogir-getenv c"COIL_TPDE_SERIAL")) 0) 1
           (!= (p/cast usize requested) 0)
@@ -3560,6 +3691,128 @@
               (Ok [n] (cond (< n 1) 1 (> n 8) 8 :else n))
               (Err [_] 1)))))
 
+;;; How far the submitting thread lets submitted work run ahead of the work
+;;; it has taken back, per pool: enough that workers do not idle behind one
+;;; slow function, bounded so that retained scratch arenas are.
+(defn generation-lead [(threads i64)] (-> i64)
+  (* 64 threads))
+
+;;; ---- Parallel template preparation ----
+
+;;; One template candidate between its adaptation and its commit. The arena
+;;; holds the adapted graph and everything optimization allocates.
+(defstruct PreparationItem
+  [(source (ptr cir/Func)) (symbol u32) (always bool)
+   (arena scratch/ScratchArena) (state Adapter)
+   (failed bool) (message (slice u8)) (prepared PreparedTemplate)])
+
+;;; module-prepare! with prepare-optimize! on workers. `items` holds the
+;;; candidates submitted and not yet committed, oldest at `committed`.
+(defstruct Preparation
+  [(module (ptr Module)) (ta (ptr asm/Asm)) (pool (ptr Pool))
+   (items (ArrayList (ptr PreparationItem))) (committed i64) (lead i64)])
+
+(defn preparation-task [(argument (ptr i8))] (-> (ptr i8))
+  (let [item (p/cast (ptr PreparationItem) argument)]
+    (match (prepare-optimize! (cast (ptr Adapter) (mut (.state item)))
+                              (allocator (field item arena)))
+      (Err [message] (set! (.failed item) true) (set! (.message item) message))
+      (Ok [prepared] (set! (.prepared item) prepared)))
+    (p/cast (ptr i8) 0)))
+
+;;; Start parallel preparation of at most CAPACITY functions, or null when no
+;;; worker thread could be started (the caller then uses module-prepare!).
+(defn preparation-start [(module (ptr Module)) (ta (ptr asm/Asm)) (capacity i64) (threads i64)]
+  (-> (ptr Preparation))
+  (when (or (.frozen module) (.trace module))
+    (fail "preparation" "parallel preparation needs an unfrozen module without tracing"))
+  (let [pool (pool-start (fnptr-of preparation-task) capacity threads)]
+    (if (= (p/cast usize pool) 0)
+        (p/cast (ptr Preparation) 0)
+        (let [preparation (box! (malloc-allocator) Preparation (zeroed Preparation))]
+          (set! (.module preparation) module) (set! (.ta preparation) ta)
+          (set! (.pool preparation) pool) (set! (.lead preparation) (generation-lead threads))
+          (set! (.items preparation)
+                (ArrayList::new [(ptr PreparationItem)] (malloc-allocator)))
+          preparation))))
+
+;;; Take back the oldest submitted candidate and enter it into the module:
+;;; module-prepare!'s commit, in submission order. A failed optimization is
+;;; reported here.
+(defn preparation-commit! [(preparation (ptr Preparation))] (-> void)
+  (let [index (.committed preparation)
+        item (get (.items preparation) index)]
+    (pool-await! (.pool preparation) index)
+    (when (.failed item) (fail (.name (.source item)) (.message item)))
+    (prepare-commit! (.module preparation) (cast (ptr Adapter) (mut (.state item)))
+                     (.source item) (.symbol item) (.always item) (.prepared item))
+    (close! (field item arena))
+    (destroy (malloc-allocator) item)
+    (set! (.committed preparation) (+ index 1))))
+
+;;; module-prepare! for F, with its optimization on a worker. F is adapted
+;;; here, on the submitting thread, so import symbols are bound in the serial
+;;; order. Its commit follows once `lead` later candidates have been
+;;; submitted (or at preparation-finish!): a point fixed by submission
+;;; counts, not by when workers finish. Neither adaptation nor optimization
+;;; reads what a commit writes, so the module is the one module-prepare!
+;;; builds.
+(defn preparation-submit! [(preparation (ptr Preparation)) (f (ptr cir/Func)) (symbol u32)
+                           (never bool) (always bool)] (-> void)
+  (let [module (.module preparation)]
+    (prepare-note! module f symbol never)
+    (when (template-candidate? module f never)
+      (let [item (box! (malloc-allocator) PreparationItem (zeroed PreparationItem))
+            work (field item arena)]
+        (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
+        (set! (.source item) f) (set! (.symbol item) symbol) (set! (.always item) always)
+        (if (prepare-adapt! module (cast (ptr Adapter) (mut (.state item))) f
+                            (.ta preparation) (allocator work))
+            (do
+              (push! (mut (.items preparation)) item)
+              (unless (= (pool-submit! (.pool preparation) (p/cast (ptr i8) item))
+                         (- (len (.items preparation)) 1))
+                (fail (.name f) "preparation task index differs from its item"))
+              (while (> (- (len (.items preparation)) (.committed preparation))
+                        (.lead preparation))
+                (preparation-commit! preparation)))
+            (do (close! work) (destroy (malloc-allocator) item)))))))
+
+;;; Commit every remaining candidate, join the workers and release PREPARATION.
+(defn preparation-finish! [(preparation (ptr Preparation))] (-> void)
+  (while (< (.committed preparation) (len (.items preparation)))
+    (preparation-commit! preparation))
+  (pool-finish! (.pool preparation))
+  (free! (mut (.items preparation)))
+  (destroy (malloc-allocator) preparation))
+
+;;; ---- Parallel emission ----
+;;;
+;;; After module-finish!, emission planning and the native leaf cache, every
+;;; function still to be emitted has a frozen Definition (its finalized
+;;; template or its prepared emission body) and its image depends on nothing
+;;; else that changes: native-image reads that one graph, the sealed native
+;;; context and the module's settings. So the images are generated on
+;;; workers, and the submitting thread merges them into the assembler in
+;;; submission order, exactly where the serial loop would have.
+
+;;; One function awaiting its image. The arena is the worker's scratch for
+;;; this function; it owns the image and is closed by the merging thread once
+;;; the image is in the assembler.
+(defstruct EmissionItem
+  [(emission (ptr Emission)) (source (ptr cir/Func)) (symbol u32)
+   (definition (ptr Definition))
+   (failed bool) (message (slice u8)) (image image/Image)
+   (arena scratch/ScratchArena)])
+
+;;; `items` is complete before the pool starts and does not move afterwards.
+;;; Items below `submitted` have been handed to the pool and those below
+;;; `merged` are in the assembler.
+(defstruct Emission
+  [(module (ptr Module)) (ta (ptr asm/Asm)) (level i32)
+   (items (ArrayList EmissionItem))
+   (pool (ptr Pool)) (lead i64) (submitted i64) (merged i64)])
+
 ;;; Whether F can be emitted from frozen module state alone: it is already
 ;;; published from the native cache, or it has a prepared definition. A
 ;;; function without one is still adapted at emission, which creates
@@ -3578,30 +3831,31 @@
   (let [e (box! (malloc-allocator) Emission (zeroed Emission))]
     (set! (.module e) module) (set! (.ta e) ta) (set! (.level e) level)
     (set! (.items e) (ArrayList::new [EmissionItem] (malloc-allocator)))
-    (set! (.threads e) (ArrayList::new [Thread] (malloc-allocator)))
     e))
 
 ;;; Queue F for emission and return its item index, or -1 when its code is
 ;;; already published from the native cache. Items are merged in this order.
 (defn emission-add! [(e (ptr Emission)) (f (ptr cir/Func)) (symbol u32)] (-> i64)
   (let [module (.module e)]
-    (when (> (.started e) 0) (fail (.name f) "emission item added after start"))
+    (when (!= (p/cast usize (.pool e)) 0) (fail (.name f) "emission item added after start"))
     (if (native-cached? module f symbol)
         -1
         (let [definition (emission-definition module f symbol)
               (mut item) (zeroed EmissionItem)]
           (when (= (p/cast usize definition) 0)
             (fail (.name f) "parallel emission of an unprepared function"))
+          (set! (.emission item) e)
           (set! (.source item) f) (set! (.symbol item) symbol)
           (set! (.definition item) definition)
           (push! (mut (.items e)) item)
           (- (len (.items e)) 1)))))
 
-;;; A worker's whole effect on shared memory: the claimed item's result
-;;; fields. The definition, the module settings and the sealed native context
-;;; are only read; every allocation is from the item's own arena.
-(defn emission-run! [(e (ptr Emission)) (item (ptr EmissionItem))] (-> void)
-  (let [module (.module e) definition (.definition item)
+;;; A worker's whole effect on shared memory: the item's result fields. The
+;;; definition, the module settings and the sealed native context are only
+;;; read; every allocation is from the item's own arena.
+(defn emission-task [(argument (ptr i8))] (-> (ptr i8))
+  (let [item (p/cast (ptr EmissionItem) argument)
+        e (.emission item) module (.module e) definition (.definition item)
         work (field item arena)]
     (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
     (match (native-image module (.graph definition) (.entry definition)
@@ -3609,68 +3863,39 @@
                          (and (.clean definition) (> (.level e) 1)) (.level e)
                          (allocator work) (.native-context module) (p/cast usize (.ta e)))
       (Err [message] (set! (.failed item) true) (set! (.message item) message))
-      (Ok [result] (set! (.image item) result)))))
-
-(defn emission-worker [(argument (ptr i8))] (-> (ptr i8))
-  (let [e (p/cast (ptr Emission) argument)
-        count (len (.items e))]
-    (emission-lock! e)
-    (loop
-      (let [index (.next e)]
-        (if (>= index count)
-            (break)
-            (do
-              (set! (.next e) (+ index 1))
-              ; The item the merge waits for is always inside the window, so
-              ; some worker is always able to run it.
-              (while (>= index (+ (.merged e) (.window e))) (emission-wait! e))
-              (emission-unlock! e)
-              (emission-run! e (elem (mut (.items e)) index))
-              (emission-lock! e)
-              (set! (.done (elem (mut (.items e)) index)) true)
-              (emission-notify! e)))))
-    (emission-unlock! e)
+      (Ok [result] (set! (.image item) result)))
     (p/cast (ptr i8) 0)))
 
-;;; Start up to THREADS workers over the queued items. False when not even one
-;;; thread could be started: nothing has been emitted and the caller emits
-;;; serially (emission-finish! still releases E).
+;;; Start up to THREADS workers for the queued items. False when no thread
+;;; could be started: nothing has been emitted and the caller emits serially
+;;; (emission-finish! still releases E).
 (defn emission-start! [(e (ptr Emission)) (threads i64)] (-> bool)
-  (when (or (< threads 1) (> (.started e) 0)) (fail "emission" "invalid emission start"))
-  (match (Mutex::init (field e mutex))
-    (Ok [_] 0) (Err [_] (fail "emission" "mutex creation failed")))
-  (match (Condition::init (field e progress))
-    (Ok [_] 0) (Err [_] (fail "emission" "condition creation failed")))
-  (set! (.window e) (* 64 threads))
-  ; Thread handles must not move once a thread has been created into one.
-  (for [i 0 threads] (push! (mut (.threads e)) (zeroed Thread)))
-  (let [(mut started) (: 0 i64) (mut refused) false]
-    (while (and (not refused) (< started threads))
-      (if (= (Thread::spawn-configured (elem (mut (.threads e)) started)
-                                       (fnptr-of emission-worker)
-                                       (p/cast (ptr i8) e)
-                                       (ThreadConfig::new (worker-stack-size) -1))
-             (: 0 i32))
-          (set! started (+ started 1))
-          (set! refused true)))
-    (set! (.started e) started)
-    (> started 0)))
+  (when (!= (p/cast usize (.pool e)) 0) (fail "emission" "emission started twice"))
+  (set! (.lead e) (generation-lead threads))
+  (set! (.pool e) (pool-start (fnptr-of emission-task) (len (.items e)) threads))
+  (!= (p/cast usize (.pool e)) 0))
 
 ;;; Merge item INDEX into the assembler, waiting for its image. Items must be
 ;;; merged in increasing order with no gaps: that order, not the order in
-;;; which workers finish, fixes every offset and symbol in the object. A
-;;; failed function is reported here, so the first failure in submission
-;;; order is the one reported, as on the serial path.
+;;; which workers finish, fixes every offset and symbol in the object. Items
+;;; are handed to the workers up to `lead` ahead of the merge. A failed
+;;; function is reported here, so the first failure in submission order is
+;;; the one reported, as on the serial path.
 (defn emission-merge! [(e (ptr Emission)) (index i64)
                        (text-data (ptr (ArrayList MTextData)))] (-> void)
-  (when (or (<= (.started e) 0) (!= index (.merged e)) (>= index (len (.items e))))
+  (when (or (= (p/cast usize (.pool e)) 0) (!= index (.merged e)) (>= index (len (.items e))))
     (fail "emission" "emission merge out of order"))
+  (while (and (< (.submitted e) (len (.items e)))
+              (< (.submitted e) (+ index (.lead e))))
+    (unless (= (pool-submit! (.pool e)
+                             (p/cast (ptr i8) (elem (mut (.items e)) (.submitted e))))
+               (.submitted e))
+      (fail "emission" "emission task index differs from its item"))
+    (set! (.submitted e) (+ (.submitted e) 1)))
+  (pool-await! (.pool e) index)
   (let [item (elem (mut (.items e)) index)
         definition (.definition item)
         work (field item arena)]
-    (emission-lock! e)
-    (while (not (.done item)) (emission-wait! e))
-    (emission-unlock! e)
     (when (.failed item) (fail (.name (.source item)) (.message item)))
     (let [(mut state) (zeroed Adapter)
           s (cast (ptr Adapter) (mut state))]
@@ -3680,24 +3905,14 @@
       (set! (.import-ids s) (.import-ids definition))
       (merge! s (.image item) (.symbol item) (.module e)))
     (close! work)
-    (emission-lock! e)
-    (set! (.merged e) (+ index 1))
-    (emission-notify! e)
-    (emission-unlock! e)))
+    (set! (.merged e) (+ index 1))))
 
 ;;; Join the workers and release E. Every item must have been merged.
 (defn emission-finish! [(e (ptr Emission))] (-> void)
-  (when (and (> (.started e) 0) (!= (.merged e) (len (.items e))))
-    (fail "emission" "emission finished with unmerged functions"))
-  (for [i 0 (.started e)]
-    (unless (= (Thread::join (elem (mut (.threads e)) i)) (: 0 i32))
-      (fail "emission" "emission thread join failed")))
-  (when (> (len (.threads e)) 0)
-    (match (Condition::destroy! (field e progress))
-      (Ok [_] 0) (Err [_] (fail "emission" "condition release failed")))
-    (match (Mutex::destroy! (field e mutex))
-      (Ok [_] 0) (Err [_] (fail "emission" "mutex release failed"))))
-  (free! (mut (.threads e)))
+  (when (!= (p/cast usize (.pool e)) 0)
+    (when (!= (.merged e) (len (.items e)))
+      (fail "emission" "emission finished with unmerged functions"))
+    (pool-finish! (.pool e)))
   (free! (mut (.items e)))
   (destroy (malloc-allocator) e))
 

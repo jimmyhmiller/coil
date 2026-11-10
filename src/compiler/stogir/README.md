@@ -335,3 +335,34 @@ November 10, 2026 (later) — `COIL_STOGIR_SELECT` (late select conversion, `sel
 
 November 10, 2026 — callee effect records and private frame objects. The library computes, from a finalized body, which pointer parameters a function may write through (and how far), which it may keep, and whether it may write anything else (`call-effects/summarize`), and carries the result on call prototypes (trailer version 4; `docs/CALL_EFFECTS.md`). Always on, at no measured generation cost: a frame object whose address is only a load/store address, a builtin move/compare operand, the place of register result pieces or an argument a callee cannot keep is spared by stores through other pointers and by calls it is not handed to (`private-object.coil`). `COIL_STOGIR_EFFECTS=1` (off by default) summarizes every finalized template, writes the full record on direct calls of module bodies, promotes loads of stack objects passed to reading callees, and optimizes a template once more when its records enable something; off, a body is only classified non-writing as before. It is opt-in because on the compiler itself it removes 0.06B of 37.2B executed loads for +1.8% generator instructions. Functions that are `:inline (Never)`, over the template bound or in another unit never have a record.
 
+
+## Parallel emission
+
+November 10, 2026. At `-O3` the adapter (`src/compiler/backend/codegen_stogir.coil`, driven by `pipe-finish!` in `codegen_tpde.coil`) generates a module in stages. Two of them now run their per-function work on worker threads; the rest is serial. The library itself needed no change: it has no global or static state, every entry point allocates only from the allocator it is given, and the passes behind `native/image-*` and `sccp/optimize-memory-owned!` return a new graph instead of editing a borrowed one.
+
+| Stage | Where it runs | Why |
+|---|---|---|
+| Copy forwarding over the module (`copies/forward-module!`) | serial | Coil-side whole-module pass |
+| Template preparation (`module-prepare!`): adapt CIR to a graph | serial, submission order | adaptation binds import symbols in the assembler; their numbering is part of the object |
+| Template preparation: SCCP and return canonicalization (`prepare-optimize!`) | **workers** | reads and writes one function's own graph, allocates from that function's arena |
+| Template preparation: enter the definition and its bindings into the module (`prepare-commit!`) | serial, submission order | writes the module's lists, bindings and arena |
+| Finalization (`module-finish!`): inline expansion in callee-before-caller order, effect summaries, registry snapshots | serial | each template reads the finalized bodies of its callees and registers itself in the shared callee registry |
+| Emission planning (`stogir-emission-plan`, `prepare-emission-body!`): reachability, adaptation and final expansion of non-template callers | serial | discovery order decides which bodies are adapted and in what order (assembler symbols), and final expansion reads and fills the registry's bounded specialization cache |
+| Native leaf cache (`precompile-native-leaf!`, `seal-native!`) | serial | publishes into the assembler and the private native context |
+| Emission: image of each live function from its frozen definition (`native-image`) | **workers** | reads one frozen graph, the sealed native context and module settings; allocates from the function's arena |
+| Emission: merge each image into the assembler (`merge!`), machine-code bodies, shim trampolines, body release | serial, submission order | everything that fixes an offset or a symbol index |
+
+Mechanism. `Pool` is a set of worker threads that run one function pointer over submitted arguments, each once; a mutex guards the task list and two condition variables carry "there is work" and "the task you await is done". The submitting thread (the compiler's pipeline thread) hands a task its item, does not touch the item again until `pool-await!` of that task returns, and then performs the serial step for it. So an item (its scratch arena, its adapter state, its result) has one owner at a time, and the hand-over in each direction is under the pool's mutex. Workers never see the assembler, the module's lists, the module arena or the callee registry.
+
+Why the object is identical for any thread count and scheduling:
+
+- The serial steps happen in submission order at points fixed by task indices alone. In preparation the commit of candidate `i` follows the submission of candidate `i + lead` (`lead` is 64 per thread); in emission, items are submitted up to `lead` ahead of the merge and merged in order. Nothing the submitting thread does depends on which worker finished first; it only blocks until the task it needs is done.
+- The worker steps are functions of their item alone. A template's optimization does not read other templates; an image depends on its definition, on module settings fixed at `module-create`, and on the native context sealed before emission starts.
+- Reordering commits against later adaptations is sound because adaptation (`prepare-adapt!`) reads no module state a commit writes, and a commit does not touch the assembler.
+- Functions that are not emitted from frozen state stay on the serial path as a whole: if any live function has no prepared definition (host/comptime images, where emission planning does not run), or tracing is on (`COIL_TPDE_STATS`), emission is serial. That choice depends on the module, never on the thread count's effect.
+- A failed function is recorded in its item and reported at its serial step, so the first failure in submission order is the one reported.
+
+Each worker item has its own `ScratchArena` over the process allocator. In emission the arena owns the image and is closed by the merging thread after the merge; in preparation it holds the adapted and optimized graph until the commit has copied the definition into the module. At most `lead` items are outstanding per stage, which bounds the retained arenas.
+
+Option. `COIL_STOGIR_THREADS=N` (1 to 64; anything else is a hard error) sets the number of workers; 1 is the serial path, with no thread started. Unset, it is the online processors, at most eight. `COIL_TPDE_SERIAL` (set to anything) always selects the serial path, as it does for TPDE. While `COIL_CODEGEN_TIMINGS` is on and `COIL_STOGIR_THREADS` is unset the path is also serial, because those records are summed as serial CPU time (`docs/benchmarks/idioms/tools/mkhost-env.sh` sets `COIL_TPDE_SERIAL=1` and keeps its meaning). With both `COIL_CODEGEN_TIMINGS` and an explicit `COIL_STOGIR_THREADS` above one, the parallel stages each contribute one record of elapsed time, so the sum is the wall-clock time of generation. Levels one and two do not build a module and keep the two-stage lowering/compiling pipeline shared with TPDE.
+
