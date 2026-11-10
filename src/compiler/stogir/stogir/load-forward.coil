@@ -140,7 +140,10 @@
 ;;; preserve all memory; register-result capture is checked against the queried
 ;;; footprint and indirect results remain barriers. RSTORE stays
 ;;; conservative relative to upstream.
-(defn find [(graph g/Graph) (load i32) (pointer-bytes i32)] (-> Found)
+(defstruct Boundary [(join i32) (steps i32)])
+
+(defn find-linear [(graph g/Graph) (load i32) (pointer-bytes i32)
+                   (boundary (mut Boundary))] (-> Found)
   (let [node (get (.instructions graph) (cast i64 load))
         target (n/type-id node)
         target-size (cast i64 (ty/size (cast i32 target) pointer-bytes))
@@ -148,6 +151,7 @@
         (mut cursor) (.op1 node)
         (mut steps) 0
         (mut found) (Found :value 0 :offset 0)]
+    (set! (.join boundary) 0) (set! (.steps boundary) 0)
     (while (and (> cursor 0) (< steps 32) (= (.value found) 0))
       (let [prior (get (.instructions graph) (cast i64 cursor))
             opcode (cast i32 (n/opcode prior))]
@@ -184,9 +188,143 @@
                     (and (= opcode 79)
                          (effects/preserves-address? graph cursor target-address target-size pointer-bytes)))
                 (set! cursor (.op1 prior))
-                (set! cursor 0))))
+                (do
+                  (when (or (= opcode 112) (= opcode 113))
+                    (set! (.join boundary) cursor)
+                    (set! (.steps boundary) (cast i32 steps)))
+                  (set! cursor 0)))))
       (set! steps (+ steps 1)))
     found))
+
+;;; Public pinned linear query retains its existing result contract.
+(defn find [(graph g/Graph) (load i32) (pointer-bytes i32)] (-> Found)
+  (let [(mut boundary) (Boundary :join 0 :steps 0)]
+    (find-linear graph load pointer-bytes (mut boundary))))
+
+;;; Independent bounded all-path extension of the pinned linear search, for a
+;;; LOAD whose linear search stopped at the join BOUNDARY names.
+;;; Every backward path must reach the same existing value before a clobber or
+;;; entry. Revisited joins share an already queued proof obligation; no path is
+;;; assumed safe merely because another predecessor succeeded. On a backedge,
+;;; the queried read is skipped as a non-writing event, never used as its own
+;;; replacement. Entry paths still need an independent already executed source.
+;;; No load is speculated or moved earlier: the answer was read or written on
+;;; every path that reaches LOAD, so it dominates LOAD and its location still
+;;; holds it there. At most 128 control nodes, 64 path heads and 64 joins and
+;;; branches are visited; paths meeting at a visited join or branch share what
+;;; lies before it.
+(defn find-joined [(graph g/Graph) (load i32) (pointer-bytes i32)
+                   (boundary Boundary)] (-> Found)
+  (let [node (get (.instructions graph) (cast i64 load))
+        target (n/type-id node)
+        target-size (cast i64 (ty/size (cast i32 target) pointer-bytes))
+        target-address (alias/decompose graph (.op2 node) pointer-bytes)
+        (mut pending) (zeroed (array i32 64))
+        (mut joins) (zeroed (array i32 64))
+        (mut queued) (: 1 i64)
+        (mut joined) (: 0 i64)
+        (mut answer) (Found :value 0 :offset 0)
+        (mut good) true (mut head) (: 0 i64) (mut steps) (.steps boundary)]
+    (set! (mut pending) 0 (.join boundary))
+    (while (and good (< head queued))
+      (let [(mut cursor) (get pending head)]
+        (set! head (+ head 1))
+        (when (<= cursor 0) (set! good false))
+        (while (and good (> cursor 0))
+          (if (>= steps 128)
+              (set! good false)
+              (let [prior (get (.instructions graph) (cast i64 cursor))
+                    opcode (cast i32 (n/opcode prior))]
+                (set! steps (+ steps 1))
+                (cond
+                  (= cursor load) (set! cursor (.op1 prior))
+                  (or (= opcode 91) (= opcode 93))
+                    (let [source (if (= opcode 91) cursor (.op3 prior))
+                          value (match (g/lookup graph source)
+                                  (Some [v] v) (None [] (n/make 0 0 0 0 0 0)))
+                          source-type (n/type-id value)
+                          source-size (cast i64 (ty/size (cast i32 source-type) pointer-bytes))
+                          source-address (alias/decompose graph (.op2 prior) pointer-bytes)
+                          delta (- (.offset target-address) (.offset source-address))]
+                      (if (and (alias/same-origin? target-address source-address)
+                               (convertible? source-type target delta pointer-bytes)
+                               (!= (n/opcode value) 89))
+                          (do
+                            (if (= (.value answer) 0)
+                                (set! answer (Found :value source :offset delta))
+                                (unless (and (= (.value answer) source) (= (.offset answer) delta))
+                                  (set! good false)))
+                            (set! cursor 0))
+                          (if (and (= opcode 93)
+                                   (not (alias/disjoint? graph target-address source-address
+                                                        target-size source-size pointer-bytes)))
+                              (set! good false)
+                              (set! cursor (.op1 prior)))))
+                  (or (= opcode 112) (= opcode 113))
+                    (let [(mut seen) false
+                          count (cast i64 (get (.arities graph) (cast i64 cursor)))]
+                      (for [i 0 joined] (when (= (get joins i) cursor) (set! seen true)))
+                      (unless seen
+                        (if (or (<= count 0) (>= joined 64) (> (+ queued count) 64))
+                            (set! good false)
+                            (do
+                              (set! (mut joins) joined cursor)
+                              (set! joined (+ joined 1))
+                              (for [k 1 (+ count 1)]
+                                (match (g/operand graph cursor (cast i32 k))
+                                  (None [] (set! good false))
+                                  (Some [predecessor]
+                                    (if (<= predecessor 0) (set! good false)
+                                        (do (set! (mut pending) queued predecessor)
+                                            (set! queued (+ queued 1))))))))))
+                      (set! cursor 0))
+                  ; Paths that split at one branch share everything before
+                  ; it: the first to arrive carries the obligation.
+                  (or (= opcode 116) (= opcode 117))
+                    (let [(mut seen) false]
+                      (for [i 0 joined] (when (= (get joins i) cursor) (set! seen true)))
+                      (cond seen (set! cursor 0)
+                            (>= joined 64) (set! good false)
+                            :else (do (set! (mut joins) joined cursor)
+                                      (set! joined (+ joined 1))
+                                      (set! cursor (.op1 prior)))))
+                  (or (= opcode 107) (= opcode 108) (= opcode 109)
+                      (= opcode 110) (= opcode 111)
+                      (= opcode 114) (= opcode 115)
+                      (and (= opcode 106) (= (.op2 prior) 0))
+                      (and (= opcode 79)
+                           (effects/preserves-address? graph cursor target-address target-size pointer-bytes)))
+                    (set! cursor (.op1 prior))
+                  :else (set! good false)))))))
+    (if (and good (!= (.value answer) load)) answer (Found :value 0 :offset 0))))
+
+;;; Opcode-only preview of the linear search: could it stop at a join? True
+;;; for some loads whose search stops earlier, never false for one that
+;;; reaches a join.
+(defn under-join? [(graph g/Graph) (load i32)] (-> bool)
+  (let [(mut cursor) (.op1 (get (.instructions graph) (cast i64 load)))
+        (mut steps) 0
+        (mut answer) false]
+    (while (and (> cursor 0) (< steps 32))
+      (let [prior (get (.instructions graph) (cast i64 cursor))
+            opcode (cast i32 (n/opcode prior))]
+        (cond (or (= opcode 112) (= opcode 113))
+                (do (set! answer true) (set! cursor 0))
+              (or (= opcode 91) (= opcode 93) (= opcode 79) (= opcode 106)
+                  (and (>= opcode 107) (<= opcode 111))
+                  (and (>= opcode 114) (<= opcode 117)))
+                (set! cursor (.op1 prior))
+              :else (set! cursor 0)))
+      (set! steps (+ steps 1)))
+    answer))
+
+;;; The linear search, then the all-path proof when it stopped at a join.
+(defn find-across [(graph g/Graph) (load i32) (pointer-bytes i32)] (-> Found)
+  (let [(mut boundary) (Boundary :join 0 :steps 0)
+        found (find-linear graph load pointer-bytes (mut boundary))]
+    (if (and (= (.value found) 0) (> (.join boundary) 0))
+        (find-joined graph load pointer-bytes boundary)
+        found)))
 
 (defn append! [(graph (mut g/Graph))
                (opcode u8)

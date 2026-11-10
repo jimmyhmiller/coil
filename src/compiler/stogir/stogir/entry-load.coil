@@ -1,0 +1,253 @@
+;;; A loop header's invariant read moves onto the loop's entry edge.
+;;; Independent of upstream; uses the pinned memory model of load-forward.
+(module stogir.entry-load)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.types" :as ty)
+(import "stogir.uses" :as uses)
+(import "stogir.address-alias" :as alias)
+(import "stogir.call-effects" :as effects)
+(import "stogir.bitqueue" :as q)
+(import "coil.result" :use [Some None])
+
+;;; HEADER is the two-input join LOAD is sequenced under, ENTRY the join input
+;;; that keeps the read, BACK the other one. Zero HEADER means no proof.
+(defstruct Plan [(header i32) (entry i32) (back i32)])
+
+(defn none [] (-> Plan)
+  (Plan :header 0 :entry 0 :back 0))
+
+;;; Plain reads sequenced between a join and LOAD, nearest first.
+(defstruct Chain [(loads (array i32 8)) (count i64) (header i32)])
+
+;;; LOAD executes whenever its join does: only plain reads separate them, and a
+;;; read neither writes nor leaves the block. Zero header when the bounded walk
+;;; meets anything else.
+(defn chain [(graph g/Graph) (load i32)] (-> Chain)
+  (let [(mut result) (Chain :loads (zeroed (array i32 8)) :count 0 :header 0)
+        (mut cursor) (.op1 (get (.instructions graph) (cast i64 load)))
+        (mut more) true]
+    (while (and more (> cursor 0))
+      (let [opcode (n/opcode (get (.instructions graph) (cast i64 cursor)))]
+        (cond (or (= opcode 112) (= opcode 113))
+                (do (set! (.header result) cursor) (set! more false))
+              (and (= opcode 91) (< (.count result) 8))
+                (do (set! (mut (.loads result)) (.count result) cursor)
+                    (set! (.count result) (+ (.count result) 1))
+                    (set! cursor (.op1 (get (.instructions graph) (cast i64 cursor)))))
+              :else (set! more false))))
+    result))
+
+;;; Every value the address is computed from is defined outside the join's own
+;;; block. A pinned definition (anything sequenced, a parameter, storage, a PHI
+;;; of another join) dominates LOAD; unless it is one of the reads between the
+;;; join and LOAD or a PHI of the join itself, it dominates the join, hence
+;;; each of the join's inputs. Pure operations are followed to such leaves;
+;;; any other opcode, or more than 16 visited nodes, is no proof.
+(defn invariant? [(graph g/Graph) (address i32) (path Chain)] (-> bool)
+  (let [(mut pending) (zeroed (array i32 16))
+        (mut depth) (: 1 i64)
+        (mut visited) (: 0 i64)
+        (mut good) true]
+    (set! (mut pending) 0 address)
+    (while (and good (> depth 0))
+      (set! depth (- depth 1))
+      (set! visited (+ visited 1))
+      (let [current (get pending depth)]
+        (when (> current 0)
+          (let [node (get (.instructions graph) (cast i64 current))
+                opcode (cast i32 (n/opcode node))]
+            (cond
+              (= opcode 67) (when (= (.op1 node) (.header path)) (set! good false))
+              ; PARAM, VAR, ALLOCA, CALL, the load family, TLS_ADDR, VA_ARG.
+              (or (= opcode 71) (= opcode 72) (= opcode 79) (= opcode 81)
+                  (= opcode 85) (= opcode 86) (= opcode 89) (= opcode 91)
+                  (= opcode 92) (= opcode 95) (= opcode 100))
+                (for [i 0 (.count path)]
+                  (when (= (get (.loads path) i) current) (set! good false)))
+              ; Comparisons through FP2FP, NOT through FRAME_ADDR, and COPY:
+              ; values of their operands alone.
+              (or (and (>= opcode 14) (<= opcode 39))
+                  (and (>= opcode 45) (<= opcode 66))
+                  (= opcode 68))
+                (let [count (get (.arities graph) (cast i64 current))]
+                  (if (> visited 16)
+                      (set! good false)
+                      (for [i 1 (+ (cast i64 count) 1)]
+                        (when (uses/edge-code? (op/operand-code opcode (cast i32 i)))
+                          (match (g/operand graph current (cast i32 i))
+                            (None [] (set! good false))
+                            (Some [input]
+                              (when (> input 0)
+                                (if (>= depth 16)
+                                    (set! good false)
+                                    (do (set! (mut pending) depth input)
+                                        (set! depth (+ depth 1)))))))))))
+              :else (set! good false))))))
+    good))
+
+;;; Every backward control path from START reaches LOAD, and nothing on the
+;;; way can write LOAD's bytes: a STORE must be provably disjoint, a CALL must
+;;; preserve the address under the declared-effect model, and every other
+;;; sequenced node must be a plain read, a branch, a projection, an END or an
+;;; unannotated BEGIN. At most 128 control nodes, 64 path heads and 64 joins
+;;; and branches are visited;
+;;; exhausting either, or reaching anything else (the function entry, volatile
+;;; and register accesses, allocation scopes), is no proof.
+(defn returns-clean? [(graph g/Graph) (load i32) (start i32) (pointer-bytes i32)] (-> bool)
+  (let [node (get (.instructions graph) (cast i64 load))
+        size (cast i64 (ty/size (cast i32 (n/type-id node)) pointer-bytes))
+        address (alias/decompose graph (.op2 node) pointer-bytes)
+        (mut pending) (zeroed (array i32 64))
+        (mut joins) (zeroed (array i32 64))
+        (mut queued) (: 1 i64)
+        (mut joined) (: 0 i64)
+        (mut head) (: 0 i64)
+        (mut steps) 0
+        (mut good) true]
+    (set! (mut pending) 0 start)
+    (while (and good (< head queued))
+      (let [(mut cursor) (get pending head)]
+        (set! head (+ head 1))
+        (when (<= cursor 0) (set! good false))
+        (while (and good (> cursor 0) (!= cursor load))
+          (if (>= steps 128)
+              (set! good false)
+              (let [prior (get (.instructions graph) (cast i64 cursor))
+                    opcode (cast i32 (n/opcode prior))]
+                (set! steps (+ steps 1))
+                (cond
+                  (= opcode 91) (set! cursor (.op1 prior))
+                  (= opcode 93)
+                    (let [value (match (g/lookup graph (.op3 prior))
+                                  (Some [v] v) (None [] (n/make 0 0 0 0 0 0)))
+                          width (cast i64 (ty/size (cast i32 (n/type-id value)) pointer-bytes))]
+                      (if (alias/disjoint? graph address
+                                           (alias/decompose graph (.op2 prior) pointer-bytes)
+                                           size width pointer-bytes)
+                          (set! cursor (.op1 prior))
+                          (set! good false)))
+                  (or (= opcode 112) (= opcode 113))
+                    (let [(mut seen) false
+                          count (cast i64 (get (.arities graph) (cast i64 cursor)))]
+                      (for [i 0 joined] (when (= (get joins i) cursor) (set! seen true)))
+                      (unless seen
+                        (if (or (<= count 0) (>= joined 64) (> (+ queued count) 64))
+                            (set! good false)
+                            (do
+                              (set! (mut joins) joined cursor)
+                              (set! joined (+ joined 1))
+                              (for [k 1 (+ count 1)]
+                                (match (g/operand graph cursor (cast i32 k))
+                                  (None [] (set! good false))
+                                  (Some [predecessor]
+                                    (if (<= predecessor 0) (set! good false)
+                                        (do (set! (mut pending) queued predecessor)
+                                            (set! queued (+ queued 1))))))))))
+                      (set! cursor 0))
+                  ; Paths that split at one branch share everything before
+                  ; it: the first to arrive carries the obligation.
+                  (or (= opcode 116) (= opcode 117))
+                    (let [(mut seen) false]
+                      (for [i 0 joined] (when (= (get joins i) cursor) (set! seen true)))
+                      (cond seen (set! cursor 0)
+                            (>= joined 64) (set! good false)
+                            :else (do (set! (mut joins) joined cursor)
+                                      (set! joined (+ joined 1))
+                                      (set! cursor (.op1 prior)))))
+                  (or (= opcode 107) (= opcode 108) (= opcode 109)
+                      (= opcode 110) (= opcode 111)
+                      (= opcode 114) (= opcode 115)
+                      (and (= opcode 106) (= (.op2 prior) 0))
+                      (and (= opcode 79)
+                           (effects/preserves-address? graph cursor address size pointer-bytes)))
+                    (set! cursor (.op1 prior))
+                  :else (set! good false)))))))
+    good))
+
+;;; LOAD is read on every arrival at its join and its location cannot change
+;;; on the way back round through BACK, so reading it once per arrival through
+;;; ENTRY yields the same value: after any number of clean returns the bytes
+;;; are still those of the latest ENTRY crossing. ENTRY reaches the join only
+;;; by entering it, and LOAD ran on every such entry, so the read is not
+;;; speculated onto a path that did not perform it (a loop whose body runs zero
+;;; times still evaluates its header). BACK comes from LOAD on every path, so
+;;; the join is first reached through ENTRY: the moved read dominates the join
+;;; and every former use.
+(defn plan [(graph g/Graph) (load i32) (pointer-bytes i32)] (-> Plan)
+  (let [node (get (.instructions graph) (cast i64 load))
+        path (chain graph load)
+        header (.header path)]
+    (if (or (= header 0)
+            (!= (n/opcode node) 91)
+            (<= (ty/size (cast i32 (n/type-id node)) pointer-bytes) 0)
+            (not (ty/valid-scalar? (cast i32 (n/type-id node))))
+            (!= (get (.arities graph) (cast i64 header)) 2)
+            (not (invariant? graph (.op2 node) path)))
+        (none)
+        (let [h (get (.instructions graph) (cast i64 header))
+              first (.op1 h)
+              second (.op2 h)]
+          ; A join whose two inputs both returned from LOAD would be
+          ; unreachable; the first proven return decides.
+          (cond
+            (or (<= first 0) (<= second 0) (= first second)) (none)
+            (and (entry-edge? graph first load)
+                 (returns-clean? graph load second pointer-bytes))
+              (Plan :header header :entry first :back second)
+            (and (entry-edge? graph second load)
+                 (returns-clean? graph load first pointer-bytes))
+              (Plan :header header :entry second :back first)
+            :else (none))))))
+
+;;; An END or LOOP_END is the single control edge into its join; a read
+;;; sequenced directly before it runs exactly when that edge is taken.
+(defn entry-edge? [(graph g/Graph) (reference i32) (load i32)] (-> bool)
+  (let [opcode (n/opcode (get (.instructions graph) (cast i64 reference)))
+        before (.op1 (get (.instructions graph) (cast i64 reference)))]
+    ; An edge sequenced directly after LOAD belongs to an unreachable cycle;
+    ; moving the read before it would sequence the read after itself.
+    (and (or (= opcode 114) (= opcode 115)) (> before 0) (!= before load))))
+
+(defn set-control! [(graph (mut g/Graph)) (edges (mut uses/Uses)) (queue (mut q/Queue))
+                    (user i32) (old i32) (new i32)] (-> void)
+  (unless (uses/remove! (mut edges) old (uses/Use :user user :operand 1))
+    (panic "entry load control use missing"))
+  (unless (g/set-operand! (mut graph) user 1 new)
+    (panic "entry load control rewrite failed"))
+  (uses/add! (mut edges) new (uses/Use :user user :operand 1))
+  (q/add! (mut queue) (cast i64 user)))
+
+;;; Unlink LOAD from its block and sequence it directly before PLAN's entry
+;;; END. The cell, its value and its data uses stay; no node is created. Other
+;;; reads of the same address are queued: the moved read now reaches them.
+(defn move! [(graph (mut g/Graph)) (edges (mut uses/Uses)) (queue (mut q/Queue))
+             (load i32) (target Plan)] (-> void)
+  (let [node (get (.instructions graph) (cast i64 load))
+        previous (.op1 node)
+        entry (.entry target)
+        before (.op1 (get (.instructions graph) (cast i64 entry)))]
+    ; Control successors of the read follow its predecessor instead.
+    (let [(mut more) true]
+      (while more
+        (set! more false)
+        (let [range (get (.ranges edges) (cast i64 load))
+              (mut position) (.offset range)]
+          (while (and (not more) (< position (+ (.offset range) (.count range))))
+            (let [edge (get (.edges edges) position)
+                  user (get (.instructions graph) (cast i64 (.user edge)))]
+              (when (= (op/operand-code (cast i32 (n/opcode user)) (.operand edge))
+                       op/OPERAND-SRC)
+                (unless (= (.operand edge) 1)
+                  (panic "entry load control successor shape"))
+                (set-control! (mut graph) (mut edges) (mut queue) (.user edge) load previous)
+                (set! more true)))
+            (set! position (+ position 1))))))
+    (set-control! (mut graph) (mut edges) (mut queue) load previous before)
+    (set-control! (mut graph) (mut edges) (mut queue) entry before load)
+    (let [range (get (.ranges edges) (cast i64 (.op2 node)))]
+      (for [i (.offset range) (+ (.offset range) (.count range))]
+        (let [user (.user (get (.edges edges) i))]
+          (when (= (n/opcode (get (.instructions graph) (cast i64 user))) 91)
+            (q/add! (mut queue) (cast i64 user))))))))
