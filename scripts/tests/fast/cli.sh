@@ -1343,6 +1343,12 @@ EOF
       "$COIL" run "$ROOT/tests/backend/stogir-return-piece-placement.coil" --backend stogir -O1 --no-debug --debug-checks
     expect_rc 0 "random conditional call crossings keep their values (Stogir O3)" \
       "$COIL" run "$ROOT/tests/backend/stogir-frame-split.coil" --backend stogir -O3 --no-debug
+    expect_rc 0 "calls in tail position run in constant stack (Stogir O3)" \
+      "$COIL" run "$ROOT/tests/backend/stogir-tail-calls.coil" --backend stogir -O3 --no-debug
+    expect_rc 0 "calls in tail position run in constant stack (Stogir O1, debug checks)" \
+      "$COIL" run "$ROOT/tests/backend/stogir-tail-calls.coil" --backend stogir -O1 --no-debug --debug-checks
+    expect_rc 0 "128-bit arithmetic by literal powers of two is inline (Stogir)" \
+      python3 "$ROOT/scripts/tests/stogir-wide-powers.py" "$COIL"
     expect_rc 0 "native Mach-O data-in-code serialization and JIT loader" \
       "$COIL" run "$ROOT/src/compiler/selftest/jit_selftest.coil" --backend llvm
   fi
