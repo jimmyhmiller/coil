@@ -14,10 +14,14 @@
 (import "stogir.node" :as n)
 (import "stogir.calls" :as calls)
 (import "stogir.call-results" :as results)
+(import "stogir.call-groups" :as groups)
+(import "stogir.types" :as types)
+(import "stogir.opcode" :as op)
 (import "stogir.strings" :as strings)
 (import "stogir.address-alias" :as alias)
 (import "stogir.mem2ssa" :as memory)
 (import "stogir.uses" :as uses)
+(import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [Allocator])
 (import "coil.result" :use [Option Some None Ok Err])
 
@@ -34,14 +38,23 @@
                 (match (calls/signature graph (.op2 node) (n/type-id node) actual)
                   (Err [_] (None))
                   (Ok [signature]
-                      (if (or (= (.id signature) 0) (= (& (.flags signature) 96) 0)
+                      (if (or (= (.id signature) 0)
                               (!= (.result signature) (n/type-id node))
                               (if (= (& (.flags signature) 16) 0)
                                   (!= (.count signature) actual) (> (.count signature) actual)))
                           (None)
                           (match (strings/lookup (.strings graph) (.id signature))
                             (None [] (None))
-                            (Some [bytes] (Some (results/decode bytes))))))))))))
+                            (Some [bytes]
+                                  ; A flag, or a record computed from the body
+                                  ; that names no write at all.
+                                  (if (or (!= (& (.flags signature) 96) 0)
+                                          (and (= (& (.flags signature) 16) 0)
+                                               (let [record (groups/effects bytes)]
+                                                 (and (.present record) (not (.unknown record))
+                                                      (= (.writes record) 0)))))
+                                      (Some (results/decode bytes))
+                                      (None))))))))))))
 
 (defn target-readonly? [(graph g/Graph) (reference i32)] (-> bool)
   (match (declared-result graph reference)
@@ -53,26 +66,66 @@
   (match (declared-result graph reference)
     (None [] false) (Some [spec] (= (.kind spec) 0))))
 
+;;; The register pieces of a role-1 result are captured contiguously into the
+;;; place the CALL names after the target returns; only a disjoint queried
+;;; footprint may cross that write.
+(defn capture-disjoint? [(graph g/Graph) (reference i32) (spec results/Spec)
+                         (address alias/Address) (width i64) (pointer-bytes i32)] (-> bool)
+  (match (g/operand graph reference 3)
+    (None [] false)
+    (Some [place]
+          (match (g/lookup graph place)
+            (None [] false)
+            (Some [node]
+                  (and (= (n/type-id node) 6)
+                       (alias/disjoint? graph address
+                                        (alias/decompose graph place pointer-bytes)
+                                        width (results/size spec) pointer-bytes)))))))
+
+;;; A callee whose record names every write it can make: through the listed
+;;; parameters only, within the record's extent of the pointer passed. The
+;;; queried bytes survive when each such argument's footprint is provably
+;;; disjoint from them under the ordinary alias rules (no two incoming
+;;; pointers are assumed to differ). An x8 result place is parameter 0 of the
+;;; callee and is judged like any other written argument.
+(defn written-arguments-disjoint? [(graph g/Graph) (reference i32)
+                                   (address alias/Address) (width i64) (pointer-bytes i32)]
+  (-> bool)
+  (match (calls/effect-prototype graph reference)
+    (None [] false)
+    (Some [bytes]
+          (let [record (groups/effects bytes)
+                spec (results/decode bytes)
+                count (- (cast i64 (get (.arities graph) (cast i64 reference))) 2)
+                (mut good) (and (not (.unknown record)) (= pointer-bytes 8) (> (.extent record) 0)
+                                (or (!= (.kind spec) 1)
+                                    (capture-disjoint? graph reference spec address width
+                                                       pointer-bytes)))
+                (mut j) (: 0 i64)]
+            (while (and good (< j 16))
+              (when (!= (& (.writes record) (<< (: 1 i32) (cast i32 j))) 0)
+                (if (>= j count)
+                    (set! good false)
+                    (match (g/operand graph reference (cast i32 (+ j 3)))
+                      (None [] (set! good false))
+                      (Some [argument]
+                            (unless (alias/disjoint? graph address
+                                                     (alias/decompose graph argument pointer-bytes)
+                                                     width (.extent record) pointer-bytes)
+                              (set! good false))))))
+              (set! j (+ j 1)))
+            good))))
+
 ;;; Verified load address/width, with declaration checks retained at the call.
-;;; Native register results are captured contiguously after the target returns;
-;;; only a disjoint queried footprint may cross that write. x8 stays a barrier.
+;;; x8 stays a barrier unless the callee's record accounts for its writes.
 (defn preserves-address? [(graph g/Graph) (reference i32)
                           (address alias/Address) (width i64) (pointer-bytes i32)] (-> bool)
   (match (declared-result graph reference)
-    (None [] false)
+    (None [] (written-arguments-disjoint? graph reference address width pointer-bytes))
     (Some [spec]
           (if (= (.kind spec) 0) true
               (and (= pointer-bytes 8) (= (.kind spec) 1)
-                   (match (g/operand graph reference 3)
-                     (None [] false)
-                     (Some [place]
-                           (match (g/lookup graph place)
-                             (None [] false)
-                             (Some [node]
-                                   (and (= (n/type-id node) 6)
-                                        (alias/disjoint? graph address
-                                                          (alias/decompose graph place pointer-bytes)
-                                                          width (results/size spec) pointer-bytes)))))))))))
+                   (capture-disjoint? graph reference spec address width pointer-bytes))))))
 
 ;;; Requires a validated immutable64-bit graph. PARAM0 for a register result is
 ;;; synthetic private callee storage, not a native argument or caller address.
@@ -119,3 +172,247 @@
                     (free! (mut offsets)) (free! (mut owners))
                     (uses/release! (mut edges))))
                 good)))))
+
+;;; Parameter origins of pointer values, for summarize. ORIGINS gets one code
+;;; per cell: 0 not derived from a parameter by the steps below, else
+;;; 2 + 2*ordinal + varying. The steps are a full-width BITCAST, a COPY, and an
+;;; ADD or SUB whose first operand (for an ADD with a literal first operand,
+;;; the second) is the pointer; "varying" records that some displacement on
+;;; the way was not a literal. Cells are swept in order until a sweep that met
+;;; no step reading a later cell changes nothing; false when 16 sweeps do not
+;;; settle it. Also false when the graph holds an operation summarize gives no
+;;; record for.
+(defn trace-parameters! [(graph g/Graph) (origins (mut (ArrayList i32)))] (-> bool)
+  (let [size (len (.instructions graph))
+        (mut good) true (mut again) true (mut sweeps) 0]
+    (while (and good again)
+      (set! again false)
+      (let [(mut r) (: 1 i64) (mut forward) false (mut changed) false]
+        (while (and good (< r size))
+          (let [node (get (.instructions graph) r)
+                opcode (cast i32 (n/opcode node))]
+            (cond
+              (= opcode 71)
+                (when (= (get origins r) 0)
+                  (set! (mut origins) r (+ 2 (* 2 (.op3 node)))) (set! changed true))
+              (or (= opcode 36) (= opcode 68) (= opcode 26) (= opcode 27))
+                (when (and (= (get origins r) 0) (alias/word? (n/type-id node) 8))
+                  (let [swapped (and (= opcode 26) (< (.op1 node) 0))
+                        pointer (if swapped (.op2 node) (.op1 node))
+                        other (if swapped (.op1 node) (.op2 node))]
+                    (when (and (> pointer 0) (< (cast i64 pointer) size))
+                      (let [source (get origins (cast i64 pointer))]
+                        (if (= source 0)
+                            (when (> (cast i64 pointer) r) (set! forward true))
+                            (when (or (= opcode 26) (= opcode 27)
+                                      (alias/word? (n/type-id (get (.instructions graph)
+                                                                   (cast i64 pointer))) 8))
+                              (set! (mut origins) r
+                                    (if (and (or (= opcode 26) (= opcode 27))
+                                             (= (alias/displacement graph other 8)
+                                                (: 0x7FFFFFFFFFFFFFFF i64)))
+                                        (| source 1) source))
+                              (set! changed true)))))))
+              ; A builtin move returns its destination.
+              (= opcode 79)
+                (when (and (= (get origins r) 0)
+                           (= (calls/builtin-call graph (cast i32 r)) groups/BUILTIN-MOVE))
+                  (let [pointer (.op3 node)]
+                    (when (and (> pointer 0) (< (cast i64 pointer) size))
+                      (let [source (get origins (cast i64 pointer))]
+                        (if (= source 0)
+                            (when (> (cast i64 pointer) r) (set! forward true))
+                            (do (set! (mut origins) r source) (set! changed true)))))))
+              (or (= opcode 86) (= opcode 88) (= opcode 89) (= opcode 90) (= opcode 92)
+                  (= opcode 94) (and (>= opcode 97) (<= opcode 103))
+                  (= opcode 118) (= opcode 119) (>= opcode 122))
+                (set! good false)
+              :else 0)
+            (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4)))))
+        (set! sweeps (+ sweeps 1))
+        (when (and forward changed)
+          (if (>= sweeps 16) (set! good false) (set! again true)))))
+    good))
+
+(defn parameter-origin [(origins (ArrayList i32)) (reference i32)] (-> i32)
+  (if (or (<= reference 0) (>= (cast i64 reference) (len origins))) 0
+      (get origins (cast i64 reference))))
+
+(defstruct Summary [(record groups/Effects) (local-place bool)])
+
+;;; One STORE-like write of WIDTH bytes at ADDRESS inside the function being
+;;; summarized. The function's own stack storage is not caller-visible; a
+;;; write at a literal non-negative offset of an ADDR parameter is recorded
+;;; against it; anything else is a write the record cannot describe.
+(defn note-write! [(graph g/Graph) (summary (mut Summary)) (address i32) (width i64)] (-> void)
+  (let [target (alias/decompose graph address 8)]
+    (match (g/lookup graph (.base target))
+      (None [] (set! (.unknown (.record summary)) true))
+      (Some [base]
+            (let [opcode (n/opcode base)]
+              (cond (or (= opcode 81) (= opcode 72)) 0
+                    (and (= opcode 71) (.local-place summary) (= (.op3 base) 0)) 0
+                    (and (= opcode 71) (> (.base target) 0) (= (.index target) 0)
+                         (>= (.op3 base) 0) (< (.op3 base) 16)
+                         (>= (.offset target) 0) (> width 0)
+                         (<= (+ (.offset target) width) groups/MAX-EXTENT))
+                      (do (set! (.writes (.record summary))
+                                (| (.writes (.record summary)) (<< (: 1 i32) (.op3 base))))
+                          (when (> (+ (.offset target) width) (.extent (.record summary)))
+                            (set! (.extent (.record summary)) (+ (.offset target) width))))
+                    :else (set! (.unknown (.record summary)) true)))))))
+
+(defn note-capture! [(summary (mut Summary)) (origin i32)] (-> void)
+  (when (>= origin 2)
+    (let [ordinal (/ (- origin 2) 2)]
+      (when (and (< ordinal 16) (not (and (.local-place summary) (= ordinal 0))))
+        (set! (.captures (.record summary))
+              (| (.captures (.record summary)) (<< (: 1 i32) ordinal)))))))
+
+;;; What a function may do to memory its caller can observe, from one walk of
+;;; its validated 64-bit graph. The record is a property of the function's
+;;; behaviour, so it stays true of every later equivalent form of the body.
+;;;
+;;; writes: the ADDR parameters (ordinals 0..15) it may store through, each
+;;; store at a literal offset inside [0, extent). unknown: it may write
+;;; something else the caller can see (a store through any other address, a
+;;; call of something without a record, a tail call). captures: the parameters
+;;; whose value may outlive the read-through uses the walk understands
+;;; (address of a LOAD or STORE, comparison, the pointer steps of
+;;; parameter-origin, an argument its callee's record does not capture);
+;;; every other use counts as a capture, a RETURN and a stored value included.
+;;; A parameter in neither mask is only read through.
+;;;
+;;; Volatile, atomic and register accesses, variadic-argument access, guards,
+;;; indirect jumps and inline assembly give no record at all. For a
+;;; register-piece result, parameter 0 is the function's private result
+;;; storage and is treated as its own stack.
+(defn summarize [(graph g/Graph) (a (dyn Allocator))] (-> groups/Effects)
+  (match (calls/function-result graph)
+    (Err [_] (groups/no-effects))
+    (Ok [result]
+        (let [size (len (.instructions graph))
+              (mut origins) (memory/zeros size a)
+              (mut summary) (Summary :record (groups/Effects :present true :unknown false :writes 0
+                                                             :captures 0 :extent 0)
+                                     :local-place (= (.kind result) 1))
+              (mut good) (trace-parameters! graph (mut origins))
+              (mut r) (: 1 i64)]
+          (while (and good (< r size))
+            (let [node (get (.instructions graph) r)
+                  opcode (cast i32 (n/opcode node))
+                  count (cast i64 (get (.arities graph) r))]
+              (cond
+                ; Builtins do exactly what their declaration says: a move
+                ; writes its destination range and keeps nothing (its result,
+                ; the destination, is traced like any derived pointer); a
+                ; compare only reads.
+                (and (= opcode 79) (!= (calls/builtin-call graph (cast i32 r)) 0))
+                  (when (= (calls/builtin-call graph (cast i32 r)) groups/BUILTIN-MOVE)
+                    (note-write! graph (mut summary) (.op3 node)
+                                 (calls/move-bytes graph (cast i32 r))))
+                (= opcode 79)
+                  (match (calls/effect-prototype graph (cast i32 r))
+                    (Some [bytes]
+                          (let [record (groups/effects bytes)
+                                spec (results/decode bytes)]
+                            (when (.unknown record) (set! (.unknown (.record summary)) true))
+                            (when (= (.kind spec) 1)
+                              (note-write! graph (mut summary) (.op3 node) (results/size spec)))
+                            (for [j 0 (- count 2)]
+                              (match (g/operand graph (cast i32 r) (cast i32 (+ j 3)))
+                                (None [] (set! good false))
+                                (Some [argument]
+                                      (when (and (< j 16)
+                                                 (!= (& (.writes record) (<< (: 1 i32) (cast i32 j))) 0))
+                                        (note-write! graph (mut summary) argument (.extent record)))
+                                      (when (or (>= j 16)
+                                                (!= (& (.captures record) (<< (: 1 i32) (cast i32 j))) 0))
+                                        (note-capture! (mut summary)
+                                                       (parameter-origin origins argument))))))))
+                    (None []
+                          (let [declared (declared-result graph (cast i32 r))
+                                readonly (match declared
+                                           (Some [spec] (or (= (.kind spec) 0) (= (.kind spec) 1)))
+                                           (None [] false))
+                                ; A result as wide as a pointer may be the argument.
+                                narrow (and readonly
+                                            (match declared
+                                              (Some [spec] (= (.kind spec) 0)) (None [] false))
+                                            (< (types/size (cast i32 (n/type-id node)) 8) 8))]
+                            (unless readonly (set! (.unknown (.record summary)) true))
+                            (match declared
+                              (Some [spec]
+                                    (when (and readonly (= (.kind spec) 1))
+                                      (note-write! graph (mut summary) (.op3 node) (results/size spec))))
+                              (None [] 0))
+                            (unless narrow
+                              (for [j 2 (+ count 1)]
+                                (match (g/operand graph (cast i32 r) (cast i32 j))
+                                  (None [] (set! good false))
+                                  (Some [argument]
+                                        (note-capture! (mut summary)
+                                                       (parameter-origin origins argument)))))))))
+                (= opcode 93)
+                  (do (note-write! graph (mut summary) (.op2 node)
+                                   (match (g/lookup graph (.op3 node))
+                                     (Some [value] (cast i64 (types/size (cast i32 (n/type-id value)) 8)))
+                                     (None [] 0)))
+                      (note-capture! (mut summary) (parameter-origin origins (.op3 node))))
+                ; A read through the pointer, a comparison, or nothing to see.
+                (or (= opcode 91) (and (>= opcode 14) (<= opcode 23))
+                    (= opcode 0) (= opcode 104) (= opcode 71)) 0
+                ; No operand word of a short node names a traced cell: the
+                ; common case, decided without asking which words are inputs.
+                (and (<= count 3) (!= opcode 80)
+                     (= (parameter-origin origins (.op1 node)) 0)
+                     (= (parameter-origin origins (.op2 node)) 0)
+                     (= (parameter-origin origins (.op3 node)) 0)) 0
+                :else
+                  (do
+                    (when (= opcode 80) (set! (.unknown (.record summary)) true))
+                    (let [own (get origins r)]
+                      (for [i 1 (+ count 1)]
+                        (let [kind (op/operand-code opcode (cast i32 i))]
+                          (when (and (uses/edge-code? kind) (!= kind op/OPERAND-SRC))
+                            (match (g/operand graph (cast i32 r) (cast i32 i))
+                              (None [] (set! good false))
+                              (Some [input]
+                                    (let [origin (parameter-origin origins input)]
+                                      (when (and (>= origin 2)
+                                                 (or (< own 2) (!= (/ own 2) (/ origin 2))))
+                                        (note-capture! (mut summary) origin)))))))))))
+              (set! r (+ r (/ (+ count 4) 4)))))
+          (free! (mut origins))
+          (if good (.record summary) (groups/no-effects))))))
+
+;;; Whether the effect records on GRAPH's calls can let memory optimization do
+;;; something it could not do without them: some call is known not to write
+;;; outside its listed arguments (loads may now cross it), or a stack
+;;; allocation's address is an argument its callee only reads through (its
+;;; loads may now take stored values). A cheap reason to optimize again;
+;;; false loses only that chance.
+(defn enables? [(graph g/Graph)] (-> bool)
+  (let [size (len (.instructions graph)) (mut found) false (mut r) (: 1 i64)]
+    (while (and (not found) (< r size))
+      (let [node (get (.instructions graph) r)
+            count (cast i64 (get (.arities graph) r))]
+        (when (= (n/opcode node) 79)
+          (match (calls/effect-prototype graph (cast i32 r))
+            (None [] 0)
+            (Some [bytes]
+                  (let [record (groups/effects bytes)]
+                    (if (not (.unknown record))
+                        (set! found true)
+                        (for [j 3 (+ count 1)]
+                          (when (memory/reads-argument? graph (cast i32 r) (cast i32 j))
+                            (match (g/operand graph (cast i32 r) (cast i32 j))
+                              (None [] 0)
+                              (Some [argument]
+                                    (let [target (alias/decompose graph argument 8)]
+                                      (when (and (= (.index target) 0) (> (.base target) 0)
+                                                 (= (n/opcode (get (.instructions graph)
+                                                                   (cast i64 (.base target)))) 81))
+                                        (set! found true))))))))))))
+        (set! r (+ r (/ (+ count 4) 4)))))
+    found))
