@@ -476,18 +476,19 @@ Copy forwarding (`cir_copies.coil`). The pass is whole-module only through the a
 
 Native leaf cache (`precompile-native-leaves!`). The image of a candidate is a function of its frozen definition and the module's settings, so images are made on workers up to `lead` ahead; retaining the image, registering it in the native context, merging it into the assembler and confirming the publication happen on the backend thread in function order. Whether a function is a candidate is asked when it is handed out and again at its turn, and a difference is a hard error.
 
-Measurements (the compiler workload R, `coil build --backend stogir -O3 --no-debug --timings` with `COIL_NATIVE_STAGES=1`; milliseconds; the machine carried a load average of 20 to 45 from unrelated jobs during this work, so the elapsed figures at more than one worker are upper bounds and the backend thread's own CPU is the reliable part):
+Measurements (the compiler workload R, `coil build --backend stogir -O3 --no-debug --timings` with `COIL_NATIVE_STAGES=1`; elapsed milliseconds, minimum of three; load average 8 to 15 from unrelated jobs):
 
-| Stage | before, serial | serial now | 8 workers, elapsed | 8 workers, backend thread's own CPU |
-|---|---|---|---|---|
-| module setup (`backend.native.setup`) | 12.5 | 10.8 | 10.8 | 10.8 |
-| lowering (`backend.native.lower`) | 227 | 184 | 42 | 22 |
-| copy forwarding (`backend.stogir.copies`) | 324 | 255 | 49 | 8 |
-| native leaf cache (`backend.stogir.native`) | 137 | 137 | 28 | 11 |
-| close, merge, object encoding and write | 12 | 12 | 12 | 12 |
-| these stages together | 713 | 599 | 142 | 64 |
+| Stage | before, serial | 1 worker | 2 | 4 | 8 | 12 | backend thread's own CPU at 8 |
+|---|---|---|---|---|---|---|---|
+| module setup (`backend.native.setup`) | 12.5 | 14.6 | 13.4 | 12.8 | 12.8 | 12.2 | 12.8 |
+| lowering (`backend.native.lower`) | 227 | 188 | 85 | 52 | 35 | 33 | 24 |
+| copy forwarding (`backend.stogir.copies`) | 324 | 250 | 91 | 59 | 44 | 41 | 6 in the joins; it also takes chunks |
+| native leaf cache (`backend.stogir.native`) | 137 | 133 | 68 | 39 | 25 | 22 | 11 |
+| close, merge, object encoding and write | 12 | 12 | 12 | 12 | 12 | 12 | 12 |
+| these stages together | 713 | 598 | 270 | 175 | 128 | 121 | |
+| `backend.tpde-object` (with the base's parallel preparation, finalization and planning) | | 6942 | 3069 | 1734 | 1093 | 1075 | |
 
-The stage records account for the whole span: the sum of the records differs from `backend.tpde-object` by about 1 ms, so there is no time between stages, in arena teardown or in the object write beyond what the table shows. The serial path's generator instructions fell from 156.9B to 155.7B. What remains serial in these stages is the last column: the commit of each lowered function (about 0.7 microseconds each: its events, 4.7 symbols and 5.7 references on average), the three summary joins, publishing each leaf, module setup (signature and symbol registration in `native_module.coil`, shared with TPDE) and writing the object.
+The stage records account for the whole span: their sum differs from `backend.tpde-object` by about 1 ms, so nothing is spent between stages, in arena teardown or around the object write beyond the rows above. The serial path's generator instructions fell from 156.9B to 155.7B. What stays serial in these stages: the commit of each lowered function (about 0.7 microseconds each for its events, 4.7 symbols and 5.7 references on average), the three summary joins, publishing each leaf, module setup (signature and symbol registration in `native_module.coil`, shared with TPDE) and writing the object. Lowering itself is bound by memory latency walking the checked program (1.3B instructions in 0.19 s), so its workers lose more to shared caches than the other stages'.
 
 ### Worker scaling and generator work, measured (November 10, 2026, `cpu`)
 
