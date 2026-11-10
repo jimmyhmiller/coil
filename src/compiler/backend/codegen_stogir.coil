@@ -11,9 +11,9 @@
 (import "coil.cc" :as cc)
 
 (extern terminate :as "exit" :cc (cc/C) [i32] (-> never))
-(extern stogir-getenv :as "getenv" :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
 
 (import "coil.compiler.trace" :as tr)
+(import "coil.compiler.unit_state" :use [unit-getenv])
 (import "coil.compiler.parser" :use [sconcat i64->str])
 (import "coil.slice" :use [subslice])
 (import "tpde.cir" :as cir)
@@ -72,6 +72,15 @@
    (ends (ArrayList i32))
    (branches (ArrayList i32))
    (exits (ArrayList i32))
+   ; The function's own symbol, or -1 when the adapter was not given one.
+   (self i64)
+   ; Self calls in tail position that jump back to the body (self-loop-site?):
+   ; one reserved END per site in block order, the parameter PHIs of the body
+   ; region (zero for a high half that does not exist), and the next site.
+   (self-ends (ArrayList i32))
+   (self-phis (ArrayList i32))
+   (self-high-phis (ArrayList i32))
+   (self-next i64)
    (import-names (ArrayList (slice u8)))
    (import-ids (ArrayList u32))
    ; g belongs to a frozen definition: an expansion replaces it without
@@ -609,6 +618,14 @@
             (set! (.control s) r)
             r)))))
 
+;;; Whether X is a call in tail position whose register result pieces are the
+;;; function's own: it captures them straight into the function's result place
+;;; (the callee returns what this function returns), so the call stays directly
+;;; in front of its RETURN and can run as a jump.
+(defn forwarded-result? [(s (ptr Adapter)) (x (ptr cir/Value))] (-> bool)
+  (and (= (cast i64 (.op x)) cir/OP-TAILCALL)
+       (> (physical-results s x (cast i32 (.aux x))) 1)))
+
 (defn lower-call! [(s (ptr Adapter)) (id u32) (x (ptr cir/Value))] (-> i32)
   (let [(mut args) (ArrayList::new [i32] (.a s))
         (mut types) (ArrayList::new [u8] (.a s))
@@ -633,7 +650,7 @@
                 "mixed aggregate result registers are unsupported"))
         (set! nr (+ nr (if (= (.ty v) 2) 2 1)))))
     (when (> nr 1)
-      (set! place (capture-place s id))
+      (set! place (if (forwarded-result? s x) (.return-place s) (capture-place s id)))
       (push! (mut types) 6)
       (push! (mut args) place))
     (for [i (cast i64 first) (cast i64 (.nops x))]
@@ -709,7 +726,7 @@
                                           (slice args)
                                           (.a s)))]
               (set! (.control s) r)
-              (if (> nr 1)
+              (if (and (> nr 1) (not (forwarded-result? s x)))
                   (let [(mut first-result) (: 0 i32)
                         (mut offset) 0]
                     (for [i 0 (cast i64 logical-count)]
@@ -853,6 +870,191 @@
               fill (if (= op cir/OP-ASHR) (sar! s (.hi a) (word! s 63)) zero)]
           (Wide :lo (choose! s small lo hi) :hi (choose! s small hi fill))))))
 
+;;; The 64-bit literal that CIR value ID is, when it is an I64 constant.
+(defn word-literal [(s (ptr Adapter)) (id u32) (bits (mut u64))] (-> bool)
+  (let [v (cir/val (.f s) (cir/resolve (.f s) id))]
+    (if (and (= (cast i64 (.op v)) cir/OP-CONST) (= (cast i64 (.ty v)) cir/T-I64))
+        (do (set! bits (p/cast u64 (.imm v))) true)
+        false)))
+
+;;; The two words of the 128-bit literal that CIR value ID is: a wide
+;;; constant, a pair of word constants, a word constant extended from its low
+;;; `imm` bits (as wide-instruction! lowers SEXT and ZEXT), or such a literal
+;;; shifted left by a word constant (the count modulo 128, as wide-shift!).
+(defn wide-literal [(s (ptr Adapter)) (id u32) (lo (mut u64)) (hi (mut u64))] (-> bool)
+  (let [v (cir/val (.f s) (cir/resolve (.f s) id))
+        op (cast i64 (.op v))]
+    (cond (!= (.ty v) 2) false
+          (= op cir/OP-CONST)
+            (do
+              (set! lo (p/cast u64 (.imm v)))
+              (set! hi (p/cast u64 (.imm2 v)))
+              true)
+          (and (= op cir/OP-PAIR) (= (.nops v) 2))
+            (and (word-literal s (cir/operand (.f s) v 0) (mut lo))
+                 (word-literal s (cir/operand (.f s) v 1) (mut hi)))
+          (and (or (= op cir/OP-SEXT) (= op cir/OP-ZEXT))
+               (= (.nops v) 1)
+               (>= (.imm v) 1)
+               (<= (.imm v) 64))
+            (let [(mut word) (: 0 u64)
+                  unused (- 64 (p/cast u64 (.imm v)))]
+              (if (word-literal s (cir/operand (.f s) v 0) (mut word))
+                  (if (= op cir/OP-SEXT)
+                      (let [extended (>> (p/cast i64 (<< word unused)) (p/cast i64 unused))]
+                        (set! lo (p/cast u64 extended))
+                        (set! hi (p/cast u64 (>> extended 63)))
+                        true)
+                      (do
+                        (set! lo (>> (<< word unused) unused))
+                        (set! hi 0)
+                        true))
+                  false))
+          (and (= op cir/OP-SHL) (= (.nops v) 2))
+            (let [(mut count) (: 0 u64)
+                  (mut low) (: 0 u64)
+                  (mut high) (: 0 u64)]
+              (if (and (or (word-literal s (cir/operand (.f s) v 1) (mut count))
+                           ; A wide count: its low word counts.
+                           (wide-literal s (cir/operand (.f s) v 1) (mut count) (mut high)))
+                       (wide-literal s (cir/operand (.f s) v 0) (mut low) (mut high)))
+                  (let [k (& count 127)]
+                    (cond (= k 0) (do (set! lo low) (set! hi high))
+                          (< k 64)
+                            (do
+                              (set! lo (<< low k))
+                              (set! hi (| (<< high k) (>> low (- 64 k)))))
+                          :else (do (set! lo 0) (set! hi (<< low (- k 64)))))
+                    true)
+                  false))
+          :else false)))
+
+;;; The exponent K when the 128-bit pattern HI:LO is 2^K, otherwise -1.
+(defn power-exponent [(lo u64) (hi u64)] (-> i64)
+  (let [word (if (= hi 0) lo hi)]
+    (if (and (or (= lo 0) (= hi 0))
+             (!= word 0)
+             (= (& word (p/isub word 1)) 0))
+        (let [(mut k) (if (= hi 0) (: 0 i64) 64)
+              (mut bit) word]
+          (while (!= bit 1)
+            (set! bit (>> bit 1))
+            (set! k (+ k 1)))
+          k)
+        -1)))
+
+;;; The exponent K when CIR value ID is the 128-bit literal 2^K (0..127 as an
+;;; unsigned pattern), otherwise -1.
+(defn wide-power [(s (ptr Adapter)) (id u32)] (-> i64)
+  (let [(mut lo) (: 0 u64)
+        (mut hi) (: 0 u64)]
+    (if (wide-literal s id (mut lo) (mut hi)) (power-exponent lo hi) -1)))
+
+;;; The exponent K when wide division or remainder X is computed inline
+;;; (wide-divide-power!), otherwise -1: its divisor is the literal 2^K, or for
+;;; a signed operation -(2^K), which sets NEGATIVE. As a signed divisor the
+;;; pattern 2^127 is the minimum, neither form; it stays a runtime call like
+;;; every other divisor.
+(defn wide-division-power [(s (ptr Adapter)) (x (ptr cir/Value)) (negative (mut bool))] (-> i64)
+  (let [op (cast i64 (.op x))
+        signed (or (= op cir/OP-SDIV) (= op cir/OP-SREM))
+        (mut lo) (: 0 u64)
+        (mut hi) (: 0 u64)]
+    (set! negative false)
+    (if (and (= (.ty x) 2) (>= op cir/OP-SDIV) (<= op cir/OP-UREM) (= (.nops x) 2)
+             (wide-literal s (cir/operand (.f s) x 1) (mut lo) (mut hi)))
+        (let [k (power-exponent lo hi)]
+          (cond (not signed) k
+                (and (>= k 0) (< k 127)) k
+                :else
+                  ; The two's complement negation of the pattern.
+                  (let [low (p/isub 0 lo)
+                        high (p/isub (^ hi (: 0xFFFFFFFFFFFFFFFF u64)) (if (= lo 0) (: -1 u64) 0))
+                        opposite (power-exponent low high)]
+                    (if (and (>= opposite 0) (< opposite 127))
+                        (do (set! negative true) opposite)
+                        -1))))
+        -1)))
+
+(defn inline-wide-division? [(s (ptr Adapter)) (x (ptr cir/Value))] (-> bool)
+  (let [(mut negative) false]
+    (>= (wide-division-power s x (mut negative)) 0)))
+
+;;; A shift of both halves by the literal count K in 0..127.
+(defn wide-shift-by! [(s (ptr Adapter)) (op i64) (a Wide) (k i64)] (-> Wide)
+  (let [zero (word! s 0)
+        left (= op cir/OP-SHL)
+        arithmetic (= op cir/OP-ASHR)
+        count (word! s (cast u64 (if (< k 64) k (- k 64))))
+        inverse (word! s (cast u64 (if (< k 64) (- 64 k) 0)))]
+    (cond (= k 0) a
+          left
+            (cond (< k 64)
+                    (Wide :lo (emit! s 49 5 [(.lo a) count])
+                          :hi (emit! s 46 5 [(emit! s 49 5 [(.hi a) count])
+                                             (emit! s 50 5 [(.lo a) inverse])]))
+                  (= k 64) (Wide :lo zero :hi (.lo a))
+                  :else (Wide :lo zero :hi (emit! s 49 5 [(.lo a) count])))
+          :else
+            (let [fill (if arithmetic (sar! s (.hi a) (word! s 63)) zero)]
+              (cond (< k 64)
+                      (Wide :lo (emit! s 46 5 [(emit! s 50 5 [(.lo a) count])
+                                               (emit! s 49 5 [(.hi a) inverse])])
+                            :hi (if arithmetic
+                                    (sar! s (.hi a) count)
+                                    (emit! s 50 5 [(.hi a) count])))
+                    (= k 64) (Wide :lo (.hi a) :hi fill)
+                    :else
+                      (Wide :lo (if arithmetic
+                                    (sar! s (.hi a) count)
+                                    (emit! s 50 5 [(.hi a) count]))
+                            :hi fill))))))
+
+;;; A with its low K bits kept (KEEP) or cleared, K in 1..127.
+(defn wide-low-bits! [(s (ptr Adapter)) (a Wide) (k i64) (keep bool)] (-> Wide)
+  (let [zero (word! s 0)
+        bits (if (< k 64) k (- k 64))
+        low (p/isub (<< (: 1 u64) (cast u64 bits)) 1)
+        mask (word! s (if keep low (^ low (: 0xFFFFFFFFFFFFFFFF u64))))]
+    (cond (< k 64)
+            (Wide :lo (emit! s 47 5 [(.lo a) mask]) :hi (if keep zero (.hi a)))
+          (= k 64) (Wide :lo (if keep (.lo a) zero) :hi (if keep zero (.hi a)))
+          :else
+            (Wide :lo (if keep (.lo a) zero) :hi (emit! s 47 5 [(.hi a) mask])))))
+
+;;; Wide division or remainder by the literal 2^K, or -(2^K) when NEGATIVE, as
+;;; wide-division-power gives them. Unsigned: a shift, or the low K bits.
+;;; Signed division truncates toward zero: a negative dividend is first raised
+;;; by 2^K - 1 (the sign spread over 128 bits and shifted right by 128 - K),
+;;; then shifted arithmetically; the remainder is the dividend less that
+;;; quotient's multiple, the raised dividend with its low K bits cleared. A
+;;; negative divisor negates the quotient (wrapping, as the division does) and
+;;; leaves the remainder, whose sign is the dividend's.
+(defn wide-divide-power! [(s (ptr Adapter)) (op i64) (a Wide) (k i64) (negative bool)] (-> Wide)
+  (let [zero (word! s 0)
+        quotient (or (= op cir/OP-SDIV) (= op cir/OP-UDIV))
+        signed (or (= op cir/OP-SDIV) (= op cir/OP-SREM))]
+    (cond (and negative quotient)
+            (wide-add! s (Wide :lo zero :hi zero) (wide-divide-power! s op a k false) true)
+          (= k 0) (if quotient a (Wide :lo zero :hi zero))
+          (not signed)
+            (if quotient
+                (wide-shift-by! s cir/OP-LSHR a k)
+                (wide-low-bits! s a k true))
+          :else
+            (let [sign (sar! s (.hi a) (word! s 63))
+                  raise (wide-shift-by! s cir/OP-LSHR (Wide :lo sign :hi sign) (- 128 k))
+                  raised
+                    (if (<= k 64)
+                        ; The raise fits the low word: only its carry reaches the high one.
+                        (let [lo (emit! s 26 5 [(.lo a) (.lo raise)])]
+                          (Wide :lo lo
+                                :hi (emit! s 26 5 [(.hi a) (bool-word! s (cmp! s 20 lo (.lo a)))])))
+                        (wide-add! s a raise false))]
+              (if quotient
+                  (wide-shift-by! s cir/OP-ASHR raised k)
+                  (wide-add! s a (wide-low-bits! s raised k false) true))))))
+
 (defn wide-compare! [(s (ptr Adapter)) (a Wide) (b Wide) (predicate i64)]
   (-> i32)
   (let [equal-hi (cmp! s 14 (.hi a) (.hi b))
@@ -922,6 +1124,14 @@
             (set! (.control s) hi)
             (Wide :lo lo :hi hi))))))
 
+;;; LOAD and STORE, or LOAD_v and STORE_v for an access CIR marks volatile:
+;;; those Stogir never removes, forwards, moves, repeats or merges.
+(defn load-opcode [(s (ptr Adapter)) (id u32)] (-> i32)
+  (if (cir/volatile? (.f s) id) 92 91))
+
+(defn store-opcode [(s (ptr Adapter)) (id u32)] (-> i32)
+  (if (cir/volatile? (.f s) id) 94 93))
+
 (defn wide-context? [(s (ptr Adapter)) (x (ptr cir/Value))] (-> bool)
   (or (= (.ty x) 2)
       (and (> (.nops x) 0) (wide-value? s (cir/operand (.f s) x 0)))
@@ -958,8 +1168,9 @@
                   (Wide :lo (high-value s (cir/operand (.f s) x 0)) :hi zero))
           (= op cir/OP-LOAD)
             (let [pointer (address! s (add-offset! s (operand s x 0) (.imm x)))
-                  lo (emit! s 91 5 [(.control s) pointer])
-                  hi (emit! s 91 5 [lo (place-offset! s pointer 8)])]
+                  load (load-opcode s id)
+                  lo (emit! s load 5 [(.control s) pointer])
+                  hi (emit! s load 5 [lo (place-offset! s pointer 8)])]
               (when (!= (& (.imm2 x) 255) 16)
                 (fail (.name (.f s)) "invalid wide load extent"))
               (set! (.control s) hi)
@@ -967,8 +1178,9 @@
           (= op cir/OP-STORE)
             (let [pointer (address! s (add-offset! s (operand s x 0) (.imm x)))
                   v (wide-operand s x 1)
-                  lo (emit! s 93 0 [(.control s) pointer (.lo v)])
-                  hi (emit! s 93 0 [lo (place-offset! s pointer 8) (.hi v)])]
+                  store (store-opcode s id)
+                  lo (emit! s store 0 [(.control s) pointer (.lo v)])
+                  hi (emit! s store 0 [lo (place-offset! s pointer 8) (.hi v)])]
               (when (!= (.imm2 x) 16)
                 (fail (.name (.f s)) "invalid wide store extent"))
               (set! (.control s) hi)
@@ -1000,7 +1212,14 @@
                                        (wide-operand s x 1)
                                        (= op cir/OP-SUB)))
                     (= op cir/OP-MUL)
-                      (set! result (wide-mul! s a (wide-operand s x 1)))
+                      ; By a literal power of two: a shift of the other operand.
+                      (let [right (wide-power s (cir/operand (.f s) x 1))
+                            left (wide-power s (cir/operand (.f s) x 0))]
+                        (set! result
+                              (cond (>= right 0) (wide-shift-by! s cir/OP-SHL a right)
+                                    (>= left 0)
+                                      (wide-shift-by! s cir/OP-SHL (wide-operand s x 1) left)
+                                    :else (wide-mul! s a (wide-operand s x 1)))))
                     (and (>= op cir/OP-AND) (<= op cir/OP-XOR))
                       (set! result
                             (wide-bitwise! s
@@ -1008,7 +1227,19 @@
                                            a
                                            (wide-operand s x 1)))
                     (and (>= op cir/OP-SHL) (<= op cir/OP-ASHR))
-                      (set! result (wide-shift! s op a (operand s x 1)))
+                      ; The count is taken modulo 128 either way.
+                      (let [(mut count) (: 0 u64)
+                            (mut unused) (: 0 u64)
+                            amount (cir/operand (.f s) x 1)]
+                        (set! result
+                              (if (or (word-literal s amount (mut count))
+                                      (wide-literal s amount (mut count) (mut unused)))
+                                  (wide-shift-by! s op a (cast i64 (& count 127)))
+                                  (wide-shift! s op a (operand s x 1)))))
+                    (inline-wide-division? s x)
+                      (let [(mut negative) false
+                            k (wide-division-power s x (mut negative))]
+                        (set! result (wide-divide-power! s op a k negative)))
                     (and (>= op cir/OP-SDIV) (<= op cir/OP-UREM))
                       (let [b (wide-operand s x 1)
                             name
@@ -1477,7 +1708,7 @@
                         (integer-type bytes (!= (& (.imm2 x) 256) 0))
                         ty)
                   pointer (address! s (add-offset! s (operand s x 0) (.imm x)))
-                  r (emit! s 91 memty [(.control s) pointer])]
+                  r (emit! s (load-opcode s id) memty [(.control s) pointer])]
               (set! (.control s) r)
               (if (= ty 5) (container! s memty r) r))
           (= op cir/OP-STORE)
@@ -1492,7 +1723,7 @@
                     (if (and (= (.ty source) 1) (< (.imm2 x) 8))
                         (convert! s 35 memty input)
                         input)
-                  stored (emit! s 93 0 [(.control s) pointer r])]
+                  stored (emit! s (store-opcode s id) 0 [(.control s) pointer r])]
               (set! (.control s) stored)
               stored)
           (or (= op cir/OP-CALL) (= op cir/OP-TAILCALL)) (lower-call! s id x)
@@ -1566,13 +1797,14 @@
                 bytes
                   (cond (or (= op cir/OP-CALL) (= op cir/OP-TAILCALL))
                           (let [count (physical-results s x (cast i32 (.aux x)))]
-                            (if (> count 1)
+                            (if (and (> count 1) (not (forwarded-result? s x)))
                                 (* (piece-size (type-id s (.ty x)))
                                    (cast i64 count))
                                 (: 0 i64)))
                         (and (= (.ty x) 2)
                              (>= op cir/OP-SDIV)
-                             (<= op cir/OP-UREM))
+                             (<= op cir/OP-UREM)
+                             (not (inline-wide-division? s x)))
                           (: 16 i64)
                         :else (: 0 i64))]
             (when (> bytes 0)
@@ -1584,6 +1816,98 @@
                                                 16))]
                 (set! (.control s) place)
                 (set! (mut (.capture-places s)) id place)))))))
+
+;;; Whether terminator X is a self call in tail position that runs as a jump
+;;; back to the function body with the parameters replaced. This is the rule
+;;; of the other CIR backend (tpde cir/a64 tail-ok?) without its register
+;;; limit: every argument passed plainly with the parameter's own type, and no
+;;; integer or pointer argument once an address of the frame has escaped (it
+;;; could address a local, which the next iteration reuses).
+(defn self-loop-site? [(s (ptr Adapter)) (x (ptr cir/Value))] (-> bool)
+  (let [f (.f s)]
+    (and (= (cast i64 (.op x)) cir/OP-TAILCALL)
+         (>= (.self s) 0)
+         (= (.imm x) (.self s))
+         (= (cast i64 (.nops x)) (len (.args f)))
+         (block :plain
+           (for [i 0 (len (.args f))]
+             (let [flags (get (.argflags f) (+ (cast i64 (.opb x)) i))
+                   own (get (.arg-flags f) i)
+                   ty (.ty (cir/val f (cir/operand f x (cast u32 i))))
+                   float (or (= (cast i64 ty) cir/T-F32) (= (cast i64 ty) cir/T-F64))]
+               (when (or (get (.arg-sret f) i)
+                         (!= (& flags (: 0x1b00 u32)) 0)
+                         (!= (& own (: 0x1b00 u32)) 0)
+                         (!= ty (.ty (cir/val f (get (.args f) i))))
+                         (and (.frame-escapes f) (not float))
+                         (!= (argument-type s ty flags) (argument-type s ty own)))
+                 (return-from :plain false))))
+           true))))
+
+;;; The body region of a function with self-loop sites: the entry path and one
+;;; reserved edge per site meet in a MERGE, and every parameter becomes a PHI
+;;; over its incoming value and the arguments of each site.
+(defn open-self-loop! [(s (ptr Adapter)) (sites i64)] (-> void)
+  (let [f (.f s)
+        (mut inputs) (ArrayList::new [i32] (.a s))]
+    (push! (mut inputs) (reserve! s 114 0 [(.control s)]))
+    (for [i 0 sites]
+      (let [end (reserve! s 114 0 [(: 0 i32)])]
+        (push! (mut inputs) end)
+        (push! (mut (.self-ends s)) end)))
+    (let [region (emit! s 112 0 (slice inputs))]
+      (set! (.control s) region)
+      (for [i 0 (len (.args f))]
+        (let [id (get (.args f) i)
+              (mut low) (ArrayList::new [i32] (.a s))
+              (mut high) (ArrayList::new [i32] (.a s))
+              wide (= (.ty (cir/val f id)) 2)]
+          (push! (mut low) region)
+          (push! (mut low) (get (.values s) (cast i64 id)))
+          (push! (mut high) region)
+          (push! (mut high) (get (.high-values s) (cast i64 id)))
+          (for [k 0 sites] (push! (mut low) 0) (push! (mut high) 0))
+          (let [phi (reserve! s 67 (type-id s (.ty (cir/val f id))) (slice low))]
+            (push! (mut (.self-phis s)) phi)
+            (set! (mut (.values s)) (cast i64 id) phi))
+          (if wide
+              (let [phi (reserve! s 67 5 (slice high))]
+                (push! (mut (.self-high-phis s)) phi)
+                (set! (mut (.high-values s)) (cast i64 id) phi))
+              (push! (mut (.self-high-phis s)) 0))
+          (free! (mut low))
+          (free! (mut high)))))
+    (free! (mut inputs))))
+
+;;; Self-loop site X: each parameter PHI receives the argument exactly as the
+;;; call would deliver it (narrowed to the parameter's ABI type and widened
+;;; again by the callee), and control returns to the body region.
+(defn close-self-loop! [(s (ptr Adapter)) (x (ptr cir/Value))] (-> void)
+  (let [f (.f s)
+        site (.self-next s)
+        slot (cast i32 (+ site 3))
+        end (get (.self-ends s) site)]
+    (for [i 0 (len (.args f))]
+      (let [id (get (.args f) i)
+            argid (cir/operand f x (cast u32 i))
+            ty (argument-type s (.ty (cir/val f id)) (get (.arg-flags f) i))
+            v (value s argid)
+            passed
+              (if (= ty 6)
+                  (address! s v)
+                  (if (and (>= ty 1) (<= ty 10) (!= ty 5) (!= ty 6))
+                      (convert! s 35 ty v)
+                      v))]
+        (require s (b/patch! (mut (.g s)) (get (.self-phis s) i) slot (container! s ty passed)))
+        (when (= (.ty (cir/val f id)) 2)
+          (require s
+                   (b/patch! (mut (.g s))
+                             (get (.self-high-phis s) i)
+                             slot
+                             (high-value s argid))))))
+    (require s (b/patch! (mut (.g s)) end 1 (.control s)))
+    (push! (mut (.exits s)) end)
+    (set! (.self-next s) (+ site 1))))
 
 (defn translate! [(s (ptr Adapter))] (-> void)
   (let [f (.f s)
@@ -1699,6 +2023,11 @@
         (for [j (cast i64 (.ibegin bb)) (cast i64 (.iend bb))]
           (reserve-capture! s (get (.insts f) j)))
         (reserve-capture! s (.term bb))))
+    (let [(mut sites) 0]
+      (for block (.order s)
+        (when (self-loop-site? s (cir/val f (.term (cir/blk f (cast u32 block)))))
+          (set! sites (+ sites 1))))
+      (when (> sites 0) (open-self-loop! s sites)))
     (for block (.order s)
       (unless (= block 0) (set! (.control s) (get (.regions s) block)))
       (let [bb (cir/blk f (cast u32 block))]
@@ -1727,6 +2056,7 @@
                                          (get (.ends s) k)
                                          1
                                          (.control s)))))
+                (self-loop-site? s x) (close-self-loop! s x)
                 (or (= op cir/OP-RET) (= op cir/OP-TAILCALL))
                   (let [r
                           (if (= op cir/OP-TAILCALL)
@@ -1736,6 +2066,8 @@
                         count (.return-count s)]
                     (if (> count 1)
                         (do
+                          ; A forwarded call already wrote the result place.
+                          (unless (forwarded-result? s x)
                           (let [(mut offset) 0
                                 logical
                                   (if (= op cir/OP-TAILCALL)
@@ -1770,7 +2102,7 @@
                                                                (.return-place s)
                                                                offset)
                                                 (high-value s source-id)]))
-                                  (set! offset (+ offset 8))))))
+                                  (set! offset (+ offset 8)))))))
                           (push! (mut (.exits s))
                                  (emit! s 120 0 [(.control s) (: 0 i32) 0])))
                         (push! (mut (.exits s))
@@ -2064,6 +2396,8 @@
    ; direct calls the full effect record, optimizing a template once more
    ; when the records enable it. Off, a body is only classified non-writing.
    (effects bool)
+   ; COIL_STOGIR_GRAPH: the function whose graph and allocation are traced.
+   (graph (slice u8))
    (frozen bool)
    (callees inlining/Registry)
    (definitions (ArrayList Definition))
@@ -2085,29 +2419,34 @@
    (shims (HashMap (slice u8) u32))])
 
 (defn module-create [(a (dyn Allocator)) (trace bool)] (-> Module)
+  (module-create-with a trace (settings-read)))
+
+;;; Every option of a module comes from SETTINGS, so settings-key describes it.
+(defn module-create-with [(a (dyn Allocator)) (trace bool) (settings Settings)] (-> Module)
   (Module
     :a a
     :trace trace
-    :inline (inline-settings a)
-    :shrink-wrap (shrink-wrap-setting)
-    :shrink-retry (env-flag c"COIL_STOGIR_SHRINK_RETRY" "COIL_STOGIR_SHRINK_RETRY")
-    :prune-default (env-flag-on c"COIL_STOGIR_PRUNE_DEFAULT" "COIL_STOGIR_PRUNE_DEFAULT")
-    :loop-reloads (env-flag-on c"COIL_STOGIR_LOOP_RELOAD" "COIL_STOGIR_LOOP_RELOAD")
-    :loop-evict (env-flag-on c"COIL_STOGIR_LOOP_EVICT" "COIL_STOGIR_LOOP_EVICT")
-    :call-holes (env-flag c"COIL_STOGIR_CALL_HOLES" "COIL_STOGIR_CALL_HOLES")
-    :frame-split (frame-split-setting)
-    :predict (env-flag-on c"COIL_STOGIR_PREDICT" "COIL_STOGIR_PREDICT")
-    :rotate (env-flag c"COIL_STOGIR_ROTATE" "COIL_STOGIR_ROTATE")
-    :branch-facts (env-flag c"COIL_STOGIR_BRANCH_FACTS" "COIL_STOGIR_BRANCH_FACTS")
-    :induction (env-flag c"COIL_STOGIR_INDUCTION" "COIL_STOGIR_INDUCTION")
-    :recolor (env-flag c"COIL_STOGIR_RECOLOR" "COIL_STOGIR_RECOLOR")
-    :regional (env-flag c"COIL_STOGIR_REGIONAL" "COIL_STOGIR_REGIONAL")
-    :global-loads (env-flag c"COIL_STOGIR_GLOBAL_LOADS" "COIL_STOGIR_GLOBAL_LOADS")
-    :if-convert (env-flag c"COIL_STOGIR_IF_CONVERT" "COIL_STOGIR_IF_CONVERT")
-    :select (env-flag-on c"COIL_STOGIR_SELECT" "COIL_STOGIR_SELECT")
-    :hoist-loads (env-flag c"COIL_STOGIR_HOIST_LOADS" "COIL_STOGIR_HOIST_LOADS")
-    :strength (env-flag c"COIL_STOGIR_STRENGTH" "COIL_STOGIR_STRENGTH")
-    :effects (env-flag c"COIL_STOGIR_EFFECTS" "COIL_STOGIR_EFFECTS")
+    :graph (.graph settings)
+    :inline (inline-settings-from a (.inline settings))
+    :shrink-wrap (.shrink-wrap settings)
+    :shrink-retry (.shrink-retry settings)
+    :prune-default (.prune-default settings)
+    :loop-reloads (.loop-reload settings)
+    :loop-evict (.loop-evict settings)
+    :call-holes (.call-holes settings)
+    :frame-split (.frame-split settings)
+    :predict (.predict settings)
+    :rotate (.rotate settings)
+    :branch-facts (.branch-facts settings)
+    :induction (.induction settings)
+    :recolor (.recolor settings)
+    :regional (.regional settings)
+    :global-loads (.global-loads settings)
+    :if-convert (.if-convert settings)
+    :select (.select settings)
+    :hoist-loads (.hoist-loads settings)
+    :strength (.strength settings)
+    :effects (.effects settings)
     :frozen false
     :callees (inlining/registry-create 8 a)
     :definitions (ArrayList::new [Definition] a)
@@ -2125,11 +2464,23 @@
     :native-certified 0
     :shims (HashMap::new [(slice u8) u32] a (keyops))))
 
+;;; adapt-as! for a function whose own symbol is not known: a call to itself
+;;; is then a call like any other.
 (defn adapt! [(s (ptr Adapter))
               (f (ptr cir/Func))
               (ta (ptr asm/Asm))
               (text-data (ptr (ArrayList MTextData)))
               (a (dyn Allocator))] (-> void)
+  (adapt-as! s f ta -1 text-data a))
+
+;;; SELF is the symbol F is emitted as (or -1): a marked call to it in tail
+;;; position can then jump back to the body (self-loop-site?).
+(defn adapt-as! [(s (ptr Adapter))
+                 (f (ptr cir/Func))
+                 (ta (ptr asm/Asm))
+                 (self i64)
+                 (text-data (ptr (ArrayList MTextData)))
+                 (a (dyn Allocator))] (-> void)
   (set! (.a s) a)
   (set! (.f s) f)
   (set! (.ta s) ta)
@@ -2145,6 +2496,11 @@
   (set! (.ends s) (ArrayList::new [i32] a))
   (set! (.branches s) (ArrayList::new [i32] a))
   (set! (.exits s) (ArrayList::new [i32] a))
+  (set! (.self s) self)
+  (set! (.self-ends s) (ArrayList::new [i32] a))
+  (set! (.self-phis s) (ArrayList::new [i32] a))
+  (set! (.self-high-phis s) (ArrayList::new [i32] a))
+  (set! (.self-next s) 0)
   (set! (.import-names s) (ArrayList::new [(slice u8)] a))
   (set! (.import-ids s) (ArrayList::new [u32] a))
   (set! (.start s) (emit! s 104 0 [(: 0 i32)]))
@@ -2260,9 +2616,9 @@
 ;;; trades one executed call for one and drops a frame. A template that takes
 ;;; a thunk around a pointer or two-register-result call is then itself a
 ;;; call at sites whose policy does not clone that shape).
-;;; Any other key or value is a hard error. Unit keys record the compiler
-;;; binary but no COIL_STOGIR_ setting, so a cached unit object keeps the
-;;; settings it was built under until its sources or the compiler change.
+;;; Any other key or value is a hard error. A unit's key records the settings
+;;; it was generated under (settings-key), so a cached unit is rebuilt when
+;;; any of them differs.
 (defstruct InlineSettings [(policy inlining/Policy) (template i32) (self bool) (growth i32)
                            (keep i32)
                            ; Templates of at most this many cells stay that small (wrap=N).
@@ -2288,57 +2644,96 @@
   (eprintln "COIL_STOGIR_INLINE: invalid setting {}={}" key value)
   (terminate 1))
 
-;;; Module emission shrink-wraps by default: a function builds its frame only on
-;;; paths that leave the frameless entry region (a64.shrink-wrap), at about 0.2%
-;;; of generation. COIL_STOGIR_SHRINK_WRAP=0 turns it off; 1 is accepted and any
-;;; other value is a hard error. COIL_STOGIR_SHRINK_RETRY=1 additionally allocates
-;;; a second time with preserved registers assigned late where they alone keep
-;;; the entry path framed; that costs about 2% of generation and is off by default.
-(defn shrink-wrap-setting [] (-> bool)
-  (let [raw (stogir-getenv c"COIL_STOGIR_SHRINK_WRAP")]
-    (if (= (p/cast u64 raw) 0)
-        true
-        (inline-setting-flag "COIL_STOGIR_SHRINK_WRAP" (str/from-cstr raw)))))
-
-;;; Module emission splits frames by default: a value that lives through calls
-;;; is cut at the blocks expected to run with the frame built, so paths that
-;;; make no call hold it in a call-clobbered register (a64.frame-spans,
+;;; Everything the environment tells this backend, read in one place
+;;; (settings-read). A module takes its options from this structure only
+;;; (module-create-with), and settings-key renders the whole structure into
+;;; the key of a cached unit, so an option added here is part of the key
+;;; without anyone having to remember it. Nothing else in this backend may
+;;; read the environment.
+;;;
+;;; inline: COIL_STOGIR_INLINE, or inline-default-text when unset.
+;;; shrink-wrap (default on): a function builds its frame only on paths that
+;;; leave the frameless entry region (a64.shrink-wrap), at about 0.2% of
+;;; generation. shrink-retry additionally allocates a second time with
+;;; preserved registers assigned late where they alone keep the entry path
+;;; framed; that costs about 2% of generation.
+;;; frame-split (default on): a value that lives through calls is cut at the
+;;; blocks expected to run with the frame built, so paths that make no call
+;;; hold it in a call-clobbered register (a64.frame-spans,
 ;;; stogir.allocation-spans), and the frame is released again where framed
 ;;; blocks rejoin frameless code (a64.shrink-wrap). About +0.2% of generation.
-;;; COIL_STOGIR_FRAME_SPLIT=0 turns it off; 1 is accepted and any other value is a
-;;; hard error.
-(defn frame-split-setting [] (-> bool)
-  (let [raw (stogir-getenv c"COIL_STOGIR_FRAME_SPLIT")]
-    (if (= (p/cast u64 raw) 0)
-        true
-        (inline-setting-flag "COIL_STOGIR_FRAME_SPLIT" (str/from-cstr raw)))))
-
-;;; A strict 0|1 environment setting; unset is off.
-(defn env-flag [(name (ptr i8)) (label (slice u8))] (-> bool)
-  (let [raw (stogir-getenv name)]
-    (if (= (p/cast u64 raw) 0) false (inline-setting-flag label (str/from-cstr raw)))))
-
-;;; A strict 0|1 environment setting; unset is on. Module emission has five,
-;;; each turned off by NAME=0; all but COIL_STOGIR_SELECT have no measurable generation cost:
-;;; COIL_STOGIR_LOOP_EVICT lets a value used in a loop take a preserved
+;;; loop-evict (default on) lets a value used in a loop take a preserved
 ;;; register from a holder unused there (allocation.cold-owner).
-;;; COIL_STOGIR_LOOP_RELOAD reloads spilled values used inside a loop at its
+;;; loop-reload (default on) reloads spilled values used inside a loop at its
 ;;; entry rather than at each use (allocation.reload-cut).
-;;; COIL_STOGIR_PREDICT orders blocks by static branch prediction
+;;; predict (default on) orders blocks by static branch prediction
 ;;; (block-layout.predict!).
-;;; COIL_STOGIR_SELECT: two-way choices whose values are nearly free become
+;;; select (default on): two-way choices whose values are nearly free become
 ;;; conditional selects late (select-diamond). This one is measurable: about
 ;;; half a percent of generation, all of it the structural check of each
 ;;; function the conversion edits.
-;;; COIL_STOGIR_PRUNE_DEFAULT: an exhaustive SWITCH (default reaching only
+;;; prune-default (default on): an exhaustive SWITCH (default reaching only
 ;;; UNREACHABLE) uses its last case as the fallback.
-(defn env-flag-on [(name (ptr i8)) (label (slice u8))] (-> bool)
-  (let [raw (stogir-getenv name)]
-    (if (= (p/cast u64 raw) 0) true (inline-setting-flag label (str/from-cstr raw)))))
+;;; graph: COIL_STOGIR_GRAPH, the function whose graph and allocation a
+;;; traced build prints; "" for none. It changes no code, and is in the key so
+;;; that asking for a trace is not answered by a cached unit.
+;;; Each flag is COIL_STOGIR_<NAME> with the value 0 or 1; any other value is
+;;; a hard error.
+(defstruct Settings
+  [(inline (slice u8))
+   (shrink-wrap bool) (shrink-retry bool) (prune-default bool)
+   (loop-reload bool) (loop-evict bool) (call-holes bool) (frame-split bool)
+   (predict bool) (rotate bool) (branch-facts bool) (induction bool)
+   (recolor bool) (regional bool) (global-loads bool) (if-convert bool)
+   (select bool) (hoist-loads bool) (strength bool) (effects bool)
+   (graph (slice u8))])
+(derive Debug Settings)
 
-(defn inline-settings [(a (dyn Allocator))] (-> InlineSettings)
-  (let [raw (stogir-getenv c"COIL_STOGIR_INLINE")]
-    (inline-settings-from a (if (= (p/cast u64 raw) 0) (inline-default-text) (str/from-cstr raw)))))
+(defn settings-text [(name (ptr i8)) (unset (slice u8))] (-> (slice u8))
+  (let [raw (unit-getenv name)]
+    (if (= (p/cast u64 raw) 0) unset (str/from-cstr raw))))
+
+;;; A strict 0|1 setting; UNSET is its value when the variable is not set.
+(defn settings-flag [(name (ptr i8)) (label (slice u8)) (unset bool)] (-> bool)
+  (let [raw (unit-getenv name)]
+    (if (= (p/cast u64 raw) 0) unset (inline-setting-flag label (str/from-cstr raw)))))
+
+(defn settings-read [] (-> Settings)
+  (Settings
+    :inline (settings-text c"COIL_STOGIR_INLINE" (inline-default-text))
+    :shrink-wrap (settings-flag c"COIL_STOGIR_SHRINK_WRAP" "COIL_STOGIR_SHRINK_WRAP" true)
+    :shrink-retry (settings-flag c"COIL_STOGIR_SHRINK_RETRY" "COIL_STOGIR_SHRINK_RETRY" false)
+    :prune-default (settings-flag c"COIL_STOGIR_PRUNE_DEFAULT" "COIL_STOGIR_PRUNE_DEFAULT" true)
+    :loop-reload (settings-flag c"COIL_STOGIR_LOOP_RELOAD" "COIL_STOGIR_LOOP_RELOAD" true)
+    :loop-evict (settings-flag c"COIL_STOGIR_LOOP_EVICT" "COIL_STOGIR_LOOP_EVICT" true)
+    :call-holes (settings-flag c"COIL_STOGIR_CALL_HOLES" "COIL_STOGIR_CALL_HOLES" false)
+    :frame-split (settings-flag c"COIL_STOGIR_FRAME_SPLIT" "COIL_STOGIR_FRAME_SPLIT" true)
+    :predict (settings-flag c"COIL_STOGIR_PREDICT" "COIL_STOGIR_PREDICT" true)
+    :rotate (settings-flag c"COIL_STOGIR_ROTATE" "COIL_STOGIR_ROTATE" false)
+    :branch-facts (settings-flag c"COIL_STOGIR_BRANCH_FACTS" "COIL_STOGIR_BRANCH_FACTS" false)
+    :induction (settings-flag c"COIL_STOGIR_INDUCTION" "COIL_STOGIR_INDUCTION" false)
+    :recolor (settings-flag c"COIL_STOGIR_RECOLOR" "COIL_STOGIR_RECOLOR" false)
+    :regional (settings-flag c"COIL_STOGIR_REGIONAL" "COIL_STOGIR_REGIONAL" false)
+    :global-loads (settings-flag c"COIL_STOGIR_GLOBAL_LOADS" "COIL_STOGIR_GLOBAL_LOADS" false)
+    :if-convert (settings-flag c"COIL_STOGIR_IF_CONVERT" "COIL_STOGIR_IF_CONVERT" false)
+    :select (settings-flag c"COIL_STOGIR_SELECT" "COIL_STOGIR_SELECT" true)
+    :hoist-loads (settings-flag c"COIL_STOGIR_HOIST_LOADS" "COIL_STOGIR_HOIST_LOADS" false)
+    :strength (settings-flag c"COIL_STOGIR_STRENGTH" "COIL_STOGIR_STRENGTH" false)
+    :effects (settings-flag c"COIL_STOGIR_EFFECTS" "COIL_STOGIR_EFFECTS" false)
+    :graph (settings-text c"COIL_STOGIR_GRAPH" "")))
+
+;;; One line naming every field of SETTINGS and its value: what a cached unit
+;;; records about the backend settings it was generated under.
+(defn settings-key [(a (dyn Allocator)) (settings Settings)] (-> (slice u8))
+  (let [(mut text) (str/StrBuf::new a)]
+    (str/format! (mut text) "{:?}" settings)
+    (let [key (str/StrBuf::finish! (mut text))]
+      ; A key is one line of the unit's key file.
+      (for [i 0 (len key)]
+        (when (< (get key i) #\space)
+          (eprintln "stogir: settings key holds a control character")
+          (terminate 1)))
+      key)))
 
 ;;; The settings TEXT spells; a key it does not name is off or zero, with the
 ;;; fixed budget and template bound.
@@ -2440,7 +2835,7 @@
             (mut state) (zeroed Adapter)
             s (cast (ptr Adapter) (mut state))]
         (set! (.shims s) (p/cast (ptr (HashMap (slice u8) u32)) (mut (.shims module))))
-        (adapt! s f ta (p/cast (ptr (ArrayList MTextData)) 0) a)
+        (adapt-as! s f ta (cast i64 symbol) (p/cast (ptr (ArrayList MTextData)) 0) a)
         ; The template's adapted graph is consumed by optimization. Only an
         ; optimized graph of at most budget+1 cells is registered; an adapted
         ; graph over 1.5x the budget is not optimized just to be discarded
@@ -3339,7 +3734,7 @@
             (mut owned) (zeroed Definition)
             definition (cast (ptr Definition) (mut owned))]
         (set! (.shims s) (p/cast (ptr (HashMap (slice u8) u32)) (mut (.shims module))))
-        (adapt! s f ta (p/cast (ptr (ArrayList MTextData)) 0) a)
+        (adapt-as! s f ta (cast i64 symbol) (p/cast (ptr (ArrayList MTextData)) 0) a)
         (annotate-call-effects! module (mut (.g s)) a)
         (when (> level 1) (prepare-inline-caller! s))
         (let [changes (expand-module! s module (.budget (.policy (.inline module))) true
@@ -3425,10 +3820,9 @@
 ;;; Lossless semantic graph records for offline inspection/replay. This path is
 ;;; opt-in under existing tracing and never mutates borrowed graph or bindings.
 ;;; Raw cells preserve references/prototype flags; binary strings use byte rows.
-(defn trace-graph! [(s (ptr Adapter))] (-> void)
-  (let [selected (stogir-getenv c"COIL_STOGIR_GRAPH")]
-    (when (and (!= (p/cast u64 selected) 0)
-               (= (str/from-cstr selected) (.name (.f s))))
+(defn trace-graph! [(s (ptr Adapter)) (selected (slice u8))] (-> void)
+  (do
+    (when (= selected (.name (.f s)))
       (let [g (.g s)]
         (println "stogir-snapshot begin {} {}" (.start s) (.function-prototype g))
         (for root (.exits s) (println "stogir-snapshot root {}" root))
@@ -3548,7 +3942,7 @@
           (set! (.start s) (.entry definition)) (set! (.exits s) (.observed definition))
           (set! (.import-names s) (.import-names definition))
           (set! (.import-ids s) (.import-ids definition))
-          (when (.trace module) (trace-graph! s))
+          (when (.trace module) (trace-graph! s (.graph module)))
           (match (native/image-with-private (.graph definition) (.entry definition)
                    (slice (.observed definition)) "_coil_stogir_body"
                    (native-options/Options :level level) (allocator work)
@@ -3617,10 +4011,7 @@
   (-> private/Context)
   (let [context (.native-context module)]
     (if (.trace module)
-        (let [selected (stogir-getenv c"COIL_STOGIR_GRAPH")]
-          (private/with-allocation-trace context
-            (and (!= (p/cast usize selected) 0)
-                 (= (str/from-cstr selected) (.name f)))))
+        (private/with-allocation-trace context (= (.graph module) (.name f)))
         context)))
 
 (defn compile-with-module! [(f (ptr cir/Func))
@@ -3661,7 +4052,7 @@
         (unless prepared
           (when (!= (p/cast i64 module) 0)
             (set! (.shims s) (p/cast (ptr (HashMap (slice u8) u32)) (mut (.shims module)))))
-          (adapt! s f ta text-data a)
+          (adapt-as! s f ta (cast i64 symbol) text-data a)
           (when (!= (p/cast i64 module) 0)
             (annotate-call-effects! module (mut (.g s)) a))
           (when (and (!= (p/cast i64 module) 0) (> optimization 1))
@@ -3672,7 +4063,7 @@
                                                 (.budget (.policy (.inline module)))) true
                                    (and (!= (p/cast i64 module) 0) (body-deferred? module symbol))) 0)
             (set! optimized false))))
-      (when (and (!= (p/cast u64 module) 0) (.trace module)) (trace-graph! s))
+      (when (and (!= (p/cast u64 module) 0) (.trace module)) (trace-graph! s (.graph module)))
       (match (cond (and (!= (p/cast usize module) 0) (> (.native-certified module) 0) optimized)
                      (native/image-for-private-module-proven (.g s) (.start s) (slice (.exits s))
                        "_coil_stogir_body" (native-options/Options :level optimization) a
