@@ -531,7 +531,9 @@ struct's fields, a constant's type), `body`, or both. A dependent is
 `(OWNER KIND WHERE…)`. A method is named as the function the checker makes of it
 (`inherent$TYPE$method`, `TRAIT$TYPE$method`), a `def` is a `const`, and an
 extern is a `function`. The operators are trait methods, so `+` on two `i64`s is
-a dependency on `coil.core.Add`.
+a dependency on `coil.core.Add`. A definition a metaprogram named with
+`fresh-identifier` is answered as that identifier: it reads as it was spelled,
+and `bound-identifier=?` tells it from another definition of the same spelling.
 
 A metaprogram asks with `(meta/dependencies NAME)`, `(meta/dependents NAME)` and
 `(meta/dependents `(STRUCT FIELD))` from `coil.meta`, which answer the same
