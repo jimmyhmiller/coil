@@ -276,6 +276,10 @@ uint32_t env_setenv(uint32_t name, uint32_t value, uint32_t overwrite) {
 uint32_t env_unsetenv(uint32_t name) { return (uint32_t)unsetenv(hoststr(name)); }
 // Always "not a terminal", as runtime.c and run-coil-wasm.mjs answer.
 uint32_t env_isatty(uint32_t fd) { (void)fd; return 0; }
+// The native code generator's stage timing (clock(3): processor time in
+// CLOCKS_PER_SEC units) and its wait between pipeline hand-overs.
+uint64_t env_clock(void) { return (uint64_t)clock(); }
+uint32_t env_sched_yield(void) { return 0; }
 uint32_t env_clock_gettime(uint32_t clock_id, uint32_t out) {
     struct timespec ts;
     int rc = clock_gettime((clockid_t)clock_id, &ts);

@@ -418,6 +418,11 @@ function makeEnv(run) {
 
     // Coil's wasm64 Timespec is two i64 fields. Wall-clock rather than monotonic, but
     // it preserves the libc ABI and is only used for compiler timing.
+    // The native code generator's stage timing (clock(3), microseconds; the
+    // worker has no processor-time clock, so elapsed time) and its wait
+    // between pipeline hand-overs.
+    clock: () => BigInt(Math.round(performance.now() * 1000)),
+    sched_yield: () => 0,
     clock_gettime: (_clockId, out) => {
       const ms = Date.now(), sec = Math.floor(ms / 1000), nsec = (ms % 1000) * 1000000;
       run.dv().setBigInt64(Number(out), BigInt(sec), true);

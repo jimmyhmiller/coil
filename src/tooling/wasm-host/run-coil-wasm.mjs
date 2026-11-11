@@ -440,6 +440,10 @@ const env = {
   kill:(pid,sig)=>{ try{process.kill(Number(pid),Number(sig));return 0;}catch(e){return hostFail(e);} },
   // Coil's wasm64 Timespec uses two i64 fields. Date.now is wall-clock rather than
   // monotonic, but it preserves the libc ABI and is sufficient for compiler timing.
+  // The native code generator's stage timing (clock(3), microseconds of
+  // processor time) and its wait between pipeline hand-overs.
+  clock:()=>BigInt(Math.round(process.cpuUsage().user+process.cpuUsage().system)),
+  sched_yield:()=>0,
   clock_gettime:(_clockId,out)=>{
     const ms=Date.now(), sec=Math.floor(ms/1000), nsec=(ms%1000)*1000000;
     dv().setBigInt64(Number(out),BigInt(sec),true);
