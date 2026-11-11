@@ -315,6 +315,8 @@ def main() -> None:
         run(COMPILER, "build", FIXTURES / "adopted_state.coil", "-o", adopted,
             "--emit-state", state, *flags)
         run(adopted, state)
+        if JIT == "llvm":
+            run(adopted, state, "llvm")
         print("PASS: a program's session adopts the state the program was built with", flush=True)
 
         # The demo in src/examples/jit_expose: a metaprogram hands an application to a

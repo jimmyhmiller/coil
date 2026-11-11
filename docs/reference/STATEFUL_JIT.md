@@ -679,6 +679,10 @@ why). From then on the session is as if it had compiled the program itself:
   process. Code the session compiles calls the program's functions and reads and
   writes its static storage, and it makes the instances of the program's generics
   that the program did not.
+- A function the session retires and defines again keeps the static storage
+  (`alloc-static`) the program's function of that name has, as a function
+  defined again keeps the storage an earlier submission gave it. The program's
+  code and the new function read and write the same cell.
 - The queries answer for the program: `jit-env-dependencies`,
   `jit-env-dependents`, `jit-env-definition-source`, and `coil.meta`'s from a
   metaprogram.
