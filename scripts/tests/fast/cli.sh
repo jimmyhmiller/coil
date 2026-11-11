@@ -1160,10 +1160,6 @@ EOF
       python3 "$ROOT/scripts/tests/stogir-unit-settings.py" "$COIL"
     expect_rc 0 "Stogir -O1, -O2 and -O3 agree and -O0 is refused" \
       python3 "$ROOT/scripts/tests/stogir-levels.py" "$COIL"
-    expect_rc 0 "deferred Stogir graph ownership under ASAN" \
-      "$COIL" run "$ROOT/tests/backend/stogir-emission-lifetime.coil" --backend llvm -O1 --no-debug --debug-checks --sanitize=address
-    expect_rc 0 "hosted read-only C routines reach Stogir as PURE calls" \
-      "$COIL" run "$ROOT/tests/backend/stogir-pure-runtime-calls.coil" --backend llvm -O1 --no-debug --debug-checks
     expect_rc 0 "loops calling memcmp reload only what a store can change (Stogir O3)" \
       "$COIL" run "$ROOT/tests/backend/stogir-readonly-library-calls.coil" --backend stogir -O3 --no-debug --debug-checks
     expect_rc 0 "a returned aggregate piece used on one path only is computed on every path (Stogir O3)" \
@@ -1188,17 +1184,6 @@ EOF
       "$COIL" run "$ROOT/tests/backend/stogir-frame-split.coil" --backend stogir -O3 --no-debug
     expect_rc 0 "native Mach-O data-in-code serialization and JIT loader" \
       "$COIL" run "$ROOT/src/compiler/selftest/jit_selftest.coil" --backend llvm
-  fi
-  if [ "$HOST_OS-$HOST_ARCH" = Linux-x86_64 ]; then
-    # The Stogir adapter's x86-64 side, which does not need the library's code
-    # generator: a hand-built image to a linked ELF program, the SHIMCALL thunk
-    # run as machine code, and the System V shapes given to the library.
-    expect_rc 0 "an x86-64 Stogir image merges into an ELF object that links and runs" \
-      python3 "$ROOT/scripts/tests/stogir-x64-merge.py" "$COIL"
-    expect_rc 0 "the x86-64 SHIMCALL thunk moves arguments and keeps preserved registers" \
-      "$COIL" run "$ROOT/tests/backend/stogir-x64-shim-thunk.coil" --backend llvm -O1 --no-debug --debug-checks
-    expect_rc 0 "System V indirect results and MEMORY arguments reach Stogir in the library's shapes" \
-      "$COIL" run "$ROOT/tests/backend/stogir-x64-abi-shapes.coil" --backend llvm -O1 --no-debug --debug-checks
   fi
   expect_rc_out 1 'could not write object file' "LLVM measured emission reports an unwritable output" \
     env COIL_CODEGEN_TIMINGS=1 "$COIL" emit-obj "$T/lib.coil" --backend llvm --no-debug -o "$T/no-such-parent/output.o"
@@ -2007,6 +1992,31 @@ section_debuginfo() {
 }
 
 # ---------------------------------------------------------------------------
+# COMPREHENSIVE's stogir/adapter step: tests that import the Stogir adapter
+# (coil.compiler.codegen_stogir) and so compile it, the library and much of the
+# native backend with LLVM. They take about a minute and 4.6 GB under ASAN,
+# which is a build of the compiler rather than a FAST check.
+section_stogir_adapter() {
+  if [ "$HOST_OS-$HOST_ARCH" = Darwin-arm64 ] || [ "$HOST_OS-$HOST_ARCH" = Linux-x86_64 ]; then
+    expect_rc 0 "deferred Stogir graph ownership under ASAN" \
+      "$COIL" run "$ROOT/tests/backend/stogir-emission-lifetime.coil" --backend llvm -O1 --no-debug --debug-checks --sanitize=address
+    expect_rc 0 "hosted read-only C routines reach Stogir as PURE calls" \
+      "$COIL" run "$ROOT/tests/backend/stogir-pure-runtime-calls.coil" --backend llvm -O1 --no-debug --debug-checks
+  fi
+  if [ "$HOST_OS-$HOST_ARCH" = Linux-x86_64 ]; then
+    # The Stogir adapter's x86-64 side, which does not need the library's code
+    # generator: a hand-built image to a linked ELF program, the SHIMCALL thunk
+    # run as machine code, and the System V shapes given to the library.
+    expect_rc 0 "an x86-64 Stogir image merges into an ELF object that links and runs" \
+      python3 "$ROOT/scripts/tests/stogir-x64-merge.py" "$COIL"
+    expect_rc 0 "the x86-64 SHIMCALL thunk moves arguments and keeps preserved registers" \
+      "$COIL" run "$ROOT/tests/backend/stogir-x64-shim-thunk.coil" --backend llvm -O1 --no-debug --debug-checks
+    expect_rc 0 "System V indirect results and MEMORY arguments reach Stogir in the library's shapes" \
+      "$COIL" run "$ROOT/tests/backend/stogir-x64-abi-shapes.coil" --backend llvm -O1 --no-debug --debug-checks
+  fi
+}
+
+# ---------------------------------------------------------------------------
 section_sanitizers() {
   cat > "$T/asan.coil" <<'EOF'
 (module asan-uaf)
@@ -2476,6 +2486,7 @@ run_section() {
     fmt) section_fmt ;;
     lint) section_lint ;;
     objects) section_objects ;;
+    stogir-adapter) section_stogir_adapter ;;
     cross) section_cross ;;
     cimport) section_cimport ;;
     cexport) section_cexport ;;

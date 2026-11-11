@@ -83,6 +83,9 @@ def steps(x64: bool) -> list[Step]:
         Step("bootstrap-imports", [PY, "scripts/tests/bootstrap-imports.py", "--compiler", "{compiler}"],
              whole_compiler=True, memory_gb=HEAVY_LINE_GB),
         Step("install-pairing", [PY, "scripts/tests/install-pairing.py"]),
+        # The Stogir adapter's own tests compile it and the library with LLVM.
+        Step("stogir/adapter", ["scripts/tests/fast/cli.sh", "stogir-adapter"],
+             whole_compiler=True, memory_gb=HEAVY_LINE_GB),
         Step("corpus/safety-all", [*corpus, "safety", "--all"]),
         Step("corpus/opt3", [*corpus, "opt3"]),
         Step("corpus/meta-interp-all", [*corpus, "meta-interp", "--all"]),

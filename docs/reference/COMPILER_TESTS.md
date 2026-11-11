@@ -110,7 +110,10 @@ running the native engine. The LLVM-free and x64 bootstraps run the corpus on
 the native backend, tpde. The `arm64`, `x64` and `tpde` lanes all compile with
 tpde: `arm64` and `x64` name it for one architecture, `tpde` for the target's.
 The `stogir` lane compiles with the Stogir backend (`STOGIR_BACKEND.md`); its
-checks in FAST are the Stogir rows of `scripts/tests/fast/cli.sh objects`, and
+checks in FAST are the Stogir rows of `scripts/tests/fast/cli.sh objects`
+(about a minute and a half of that step), the tests that import the adapter
+itself and so compile it with LLVM are COMPREHENSIVE's `stogir/adapter` step
+(`cli.sh stogir-adapter`), and
 `scripts/tests/stogir-x86-sweep.py` compares it with LLVM over the corpus, the
 demos, the stdlib suites and the examples at -O1, -O2 and -O3.
 
