@@ -1352,6 +1352,17 @@ EOF
     expect_rc 0 "native Mach-O data-in-code serialization and JIT loader" \
       "$COIL" run "$ROOT/src/compiler/selftest/jit_selftest.coil" --backend llvm
   fi
+  if [ "$HOST_OS-$HOST_ARCH" = Linux-x86_64 ]; then
+    # The Stogir adapter's x86-64 side, which does not need the library's code
+    # generator: a hand-built image to a linked ELF program, the SHIMCALL thunk
+    # run as machine code, and the System V shapes given to the library.
+    expect_rc 0 "an x86-64 Stogir image merges into an ELF object that links and runs" \
+      python3 "$ROOT/scripts/tests/stogir-x64-merge.py" "$COIL"
+    expect_rc 0 "the x86-64 SHIMCALL thunk moves arguments and keeps preserved registers" \
+      "$COIL" run "$ROOT/tests/backend/stogir-x64-shim-thunk.coil" --backend llvm -O1 --no-debug --debug-checks
+    expect_rc 0 "System V indirect results and MEMORY arguments reach Stogir in the library's shapes" \
+      "$COIL" run "$ROOT/tests/backend/stogir-x64-abi-shapes.coil" --backend llvm -O1 --no-debug --debug-checks
+  fi
   expect_rc_out 1 'could not write object file' "LLVM measured emission reports an unwritable output" \
     env COIL_CODEGEN_TIMINGS=1 "$COIL" emit-obj "$T/lib.coil" --backend llvm --no-debug -o "$T/no-such-parent/output.o"
   if "$COIL" build "$T/lib.coil" --lib -o "$T/libobj.a" >/dev/null 2>&1 \
