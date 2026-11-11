@@ -23,6 +23,8 @@ make linked terminal lists or other rejected control regions inlineable.
 
 Native debug/ASAN tests cover void/Boolean/U64 results, linked/unlinked lists,
 branch stores and output canaries, original versus canonical execution, extra
-root preservation, and native execution after ordinary inlining. Failure checks
+root preservation, and native execution after ordinary inlining. A separate surviving side exit
+between two returns retains its membership and observed root; links through
+replaced returns are removed without losing that side exit. Failure checks
 include omitted returns, wrong entry, missing roots, pointer width, malformed
 source arity and cyclic terminal lists. No compiler performance claim yet.

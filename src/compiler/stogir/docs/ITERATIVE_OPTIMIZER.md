@@ -58,3 +58,9 @@ current SCCP pipeline before native preparation; level 1 retains the legacy
 path. O0 explicitly rejects until its separate fast path exists. This supersedes
 the pending standalone mode-API status above. Coil flag transport, complete
 optimizer/allocator parity, delivery and performance acceptance remain open.
+
+Full standalone compatibility validation at executable source `799bba6` passes:
+228 standalone programs and 69 linked AOT consumers. Object freshness and frozen
+source/toolchain hashes are verified. See
+[validation/sccp-full-regressions.json](validation/sccp-full-regressions.json).
+This does not substitute for compiler integration or performance measurements.

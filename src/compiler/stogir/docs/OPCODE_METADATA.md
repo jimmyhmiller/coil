@@ -25,3 +25,11 @@ consumers. All 5406 generated AOT objects are byte-identical to source 7801b60.
 The opcode oracle additionally passes AddressSanitizer. Assembly confirms a
 bounded indexed load and nibble extraction, with no metadata array copy.
 Actual Coil benchmark and integration validation remain required.
+
+## Extension opcodes
+
+Opcodes 131..141 are not part of the pinned upstream order: scalar floating
+operations appended after it (see [FLOATING_EXTENSIONS.md](FLOATING_EXTENSIONS.md)).
+Their metadata reuses the upstream records of a unary (`ABS`), a noncommutative
+binary (`SUB`) and a three-value (`COND`) data operation. The opcode test's
+oracle lists them after the 131 frozen rows.

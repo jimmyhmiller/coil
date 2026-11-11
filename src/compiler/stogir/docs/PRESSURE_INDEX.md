@@ -11,9 +11,10 @@ last leaf, and follow descendants when it splits again. No constraint is inferre
 from range coverage: the generic API permits fixed uses outside live ranges.
 
 This changes pressure discovery only. Free-until, next-use, fixed-at, class masks,
-spill geometry, decisions and all allocator checks remain in force. Assigned-range
-intersections still use the previous scan, so this is not a complete active/inactive
-allocator port and does not claim linear whole-solver complexity. Construction,
+spill geometry, decisions and all allocator checks remain in force. The event-only compatibility query retains the previous assigned-range scan.
+The current solver composes the assigned-value and reservation indexes below;
+this is not a complete active/inactive allocator port and does not claim linear
+whole-solver complexity. Construction,
 sorting, ownership updates and queries stay inside IR-to-machine-code generation.
 
 The old full scan and previous fixed-part index remain available as compatibility
@@ -27,8 +28,9 @@ splits and constraints outside their owners' ranges. All three pressure vectors
 are compared with the full scan. A targeted sequence invokes each actual tracked
 solver mutation, including eviction's nested spill split. Existing256 previous-index
 configurations remain. Split allocation, scalar/call/floating/checked/switch pressure,
-dynamic stack scopes and captured stencil checks pass. This component is still
-isolated; no full compiler performance or installed delivery claim is made here.
+dynamic stack scopes and captured stencil checks pass. Both indexes are merged and integrated in Coil32c67fbd. See
+`benchmarks/ASSIGNED_PRESSURE_COMPILER_CHECKPOINT.md` for full-source diagnostic
+results; acceptance and installation are separate checks.
 
 ## Assigned values and immutable physical reservations
 

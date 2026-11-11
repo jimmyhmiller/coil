@@ -52,3 +52,10 @@ cc -O3 docs/validation/result-projections/driver.c /tmp/coil-stogir-result-proje
 
 Upstream design references and credits remain centralized in LICENSE, NOTICE
 and docs/PROVENANCE.md. This aggregate ABI optimization is Coil-specific.
+
+The follow-up pressure fixture uses36 control-pinned loads from caller input
+storage, instead of movable pure multiplications. It explicitly checks that all36
+live intervals cover the aggregate call's definition boundary. The independent
+C driver initializes/checks the input words as well as output canaries. All120
+O1/O3 JIT answers and40 linked AOT answers pass again. This strengthens test
+coverage without changing library source or the measured compiler candidate.

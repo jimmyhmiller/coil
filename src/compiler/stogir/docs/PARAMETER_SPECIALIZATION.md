@@ -94,3 +94,76 @@ callee descriptors are live; only one expansion reserves8cells under one shared
 paths. Existing graph/constants/vector constants/JIT vector constants/module
 execution and29700 validation-transaction checks pass. Evidence: validation/
 specialization-cache. No compiler integration or performance adoption yet.
+
+
+## First actual-verifier integration: no demonstrated gain
+
+Coil candidateafdf07bb uses the opt-in path before ranking. Same verifier source
+and LLVM-built caller: baseline32.1790ms, candidate32.2165ms, LLVM9.0380ms median
+CPU (16 rotating samples after warmup). Median IR generation over4alternating
+samples after warmup:89.6555/90.3430/351.7025ms. Both optimizer preparation and
+final emission remain inside the existing generation boundary. No clear gain.
+
+The trace is object-byte-identical to untraced output. Structure still expands
+15of23sites, reserves509cells and leaves3; its two string-equality calls remain.
+Only5contexts exist by then, so resource-cap exhaustion is ruled out. Inspect
+actual caller argument forms next: requiring literal known arguments may miss
+values whose constants emerge only in a later caller optimization epoch. This
+is a hypothesis, not yet proof of their form. No budget/cap increase is justified.
+Raw results, all library source hashes, caller/object hashes and compressed
+assembly/trace are in validation/context-cache-verifier. No bootstrap run or
+performance adoption is claimed. Compiler source/evidence is committed separately
+and is not installed globally or pushed; FAST has not run.
+
+
+Diagnostic29275e1d confirms all16actual argument occurrences across structure's
+four equality sites are positive LOAD91/typeU64 nodes, including empty-string
+length. Its object exactly equalsafdf07bb. Literal-only specialization therefore
+has no applicable argument at those sites. Caller preparation/pass ordering,
+not raising the cache cap, is the next reduction. No load is assumed constant.
+
+
+### Dynamic-argument prefilter
+
+The opt-in registry path first scans the already validated CALL actuals (including
+its final operand). If none is a canonical negative scalar literal, a nonempty
+numeric context cannot match or be constructed. It returns to ordinary inlining
+before inspecting the original callee for specialization. Batch validation and
+ordinary expansion proofs remain unchanged; every potentially selected derived
+callee still passes the existing full eligibility proof. This does not change
+cache keys, budgets, or selected specializations. The native specialization test
+also checks that an all-dynamic call still expands ordinarily and creates no
+context. No generation-time improvement is claimed until measured in Coil.
+
+
+### Reading a closed registry from several threads
+
+The cache admits 128 creation attempts in a registry's lifetime. When they are
+spent the registry is closed (`registry-closed?`): context selection can only
+pick an existing context, so an expansion reads the registry and writes nothing
+except the closed-control memo of a callee or context, which caches a pure
+predicate of that immutable graph. Four entry points make that a read-only
+operation that any number of threads can run at once, provided nothing registers
+or adopts meanwhile:
+
+- `optimize-frozen-specialized-policy` is `optimize-registered-specialized-policy`
+  without the memo write. A site (`FrozenSite`) names a registry handle or a
+  snapshot outside the registry. A snapshot has no contexts, exactly as a callee
+  registered after the registry closed has none. An open registry is an error.
+- `snapshot-create` validates and copies a callee as `register-proven!` does, into
+  the caller's allocator and without touching a registry, and answers the
+  closed-control question at once. `snapshot-borrow` does the same checks and
+  reads the provider's graph in place; it cannot be adopted.
+- `registry-adopt!` enters an owned snapshot in O(1): no copy and no second
+  validation. Its storage stays with the snapshot's allocator, which must outlive
+  the registry.
+- `registry-settle!` answers the memo for every callee and context not asked yet,
+  so the read-only entry does not recompute it at each site.
+
+The result of the read-only entry is the graph the registered entry returns for
+the same sites; `tests/jit-parameter-specialize.coil` compares content digests
+with a cached context, without one, through a handle, through owned and borrowed
+snapshots and through an adopted snapshot, and checks that only the registered
+entry leaves a memo behind. The Coil adapter uses these to finalize definitions,
+plan emission bodies and expand them on worker threads once its module registry
+is closed (see "Parallel emission" in Coil's `src/compiler/stogir/README.md`).

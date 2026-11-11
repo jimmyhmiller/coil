@@ -1,9 +1,16 @@
 # stogir backend integration
 
 `--backend stogir` selects the independent [coil-stogir library](https://github.com/jimmyhmiller/coil-stogir).
-Work is in progress. It currently targets macOS AArch64 and reports unsupported
-operations explicitly. This is not yet a general-purpose backend or a completed
-benchmark result.
+It generates code for the machine the compiler itself was built for: AArch64
+macOS (Mach-O) or x86-64 Linux (System V, ELF); any other target is refused
+with a message naming both. `-O1`, `-O2` and `-O3` are supported, `-O0` and
+`-g` are refused, and an operation the library cannot compile is an error,
+never another backend's code. The compiler builds itself with it on both
+machines and the bootstrap reproduces. The current state, the vendoring
+history, the measurements and the open work are in the package's
+[README](../../src/compiler/stogir/README.md) and, for x86-64, in
+`docs/benchmarks/x86/tuning.md`; the sections below describe the integration
+as it was first built on AArch64.
 
 The compiler shares its AST-to-native-CIR lowering with TPDE, then translates CIR
 into a stogir graph. Stogir performs scheduling, allocation and instruction
@@ -12,7 +19,7 @@ and module transport lets the engines consume the same native lowering while
 remaining distinct code generators. LLVM retains its existing lowering path.
 
 The library is a separately declared package, vendored under
-`src/compiler/stogir` at revision `9d4d792`. Its [README](../../src/compiler/stogir/README.md),
+`src/compiler/stogir` (its `NOTICE` names the vendored commit). Its [README](../../src/compiler/stogir/README.md),
 [LICENSE](../../src/compiler/stogir/LICENSE), [NOTICE](../../src/compiler/stogir/NOTICE)
 and provenance preserve credit to coil-stogir and Dmitry Stogov's IR. No per-file
 license headers are added by the integration.

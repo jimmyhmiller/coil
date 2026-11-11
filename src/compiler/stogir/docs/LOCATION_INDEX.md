@@ -24,3 +24,20 @@ is diagnostic only, not the actual Coil acceptance boundary. Full validation pas
 236 standalone programs and 72 linked AOT consumers. All 5406 generated AOT
 objects are byte-identical to library 0fc663a. Actual compiler integration and
 measurements remain required.
+
+## Compiler performance checkpoint
+
+Coil executable f9f0b602, delivered in report a9b15305, confirms the agreed
+fixed-workload target. On native-stencil (200000 passes, seed 12345), LLVM O3
+IR-to-object/runtime medians are 26.120/359.693ms; stogir 4.859/380.500ms;
+TPDE 0.132/3994.737ms. The confirming ratios are 5.3756x faster codegen and
+1.05785x runtime. An independent first run meets both median thresholds.
+The confirming full sample ranges also satisfy both thresholds: >=5.2407x
+codegen and <=1.09442x runtime. Normal OS background activity is recorded;
+a repeat under severe external Node saturation is retained and rejected.
+
+FAST 49/49, official global install, off-checkout AOT/SDK checks and all 133
+module byte comparisons pass. Benchmark objects for all three backends are
+unchanged. Whole CLI speed and other workloads are not covered by the 5x claim.
+Exact raw data and qualification are in Coil docs/benchmarks/STOGIR_LOCATION_INDEX.md.
+The historical baseline is unchanged. Upstream parity gaps remain documented.

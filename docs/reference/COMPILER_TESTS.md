@@ -101,7 +101,7 @@ python3 scripts/oracle.py corpus bless --compiler <coil> [--only types_traits]
 ```
 
 `bless` writes a reference from the LLVM build only after checking that the
-arm64 build agrees with it. The lanes are `arm64`, `llvm`, `x64`, `tpde`,
+arm64 build agrees with it. The lanes are `arm64`, `llvm`, `x64`, `tpde`, `stogir`,
 `interp`, `safety`, `meta-interp` and `opt3`; `--all` puts every program in the `safety`
 and `meta-interp` lanes. The `meta-interp` lane always includes the programs
 marked `meta-interp-refused=`: only the interpreted engine refuses them, so the
@@ -109,6 +109,10 @@ refusal proves `COIL_META_INTERP=1` selected it and the lane is not silently
 running the native engine. The LLVM-free and x64 bootstraps run the corpus on
 the native backend, tpde. The `arm64`, `x64` and `tpde` lanes all compile with
 tpde: `arm64` and `x64` name it for one architecture, `tpde` for the target's.
+The `stogir` lane compiles with the Stogir backend (`STOGIR_BACKEND.md`); its
+checks in FAST are the Stogir rows of `scripts/tests/fast/cli.sh objects`, and
+`scripts/tests/stogir-x86-sweep.py` compares it with LLVM over the corpus, the
+demos, the stdlib suites and the examples at -O1, -O2 and -O3.
 
 ### Diagnostics
 

@@ -41,6 +41,40 @@ must pass compiler delivery gates before being described as installed.
 - Keep a working graph alive until pending graph references have been resolved
   into the owned image. Compilation must preserve the caller's graph when the
   API promises immutable input.
+- **A compile call only reads its graph.** Every compile entry point
+  (`stogir.native.compile`, `stogir.a64.compile`, `stogir.x64.compile`:
+  `validate`, `text`, `image*`, `object*`, the private-module forms) takes
+  its graph by value and may be called concurrently with other compiles of
+  other graphs, including graphs whose storage shares one allocator (an
+  embedder's module arena). A compile therefore
+  - never writes a graph cell, constant, string or interning table of its
+    input, and never appends to or reallocates any of its containers;
+  - never allocates from the graph's allocator: all scratch and all results
+    come from the allocator passed to the call (`validate`, which takes
+    none, uses the process allocator). No code a compile reaches may read
+    the `alc` of a graph container; verification
+    (`verify/native-input*`, `calls/verify*`, `switch/verify*`,
+    `terminal/verify-chains*`, `argval/verify`) takes the allocator as a
+    parameter;
+  - mutates only copies it made itself with that allocator (`g/duplicate`,
+    `compact/compact`; an `instruction-overlay` borrows the input's constants
+    and strings and may only append instructions and write operands);
+  - keeps no state outside the call: the library has no mutable globals and
+    no caches on the graph, and a private-leaf context is read-only once
+    frozen (registration, freezing, confirmation and sealing are the
+    embedder's single-threaded setup).
+  `stogir.graph-seal` fingerprints everything a graph owns;
+  `tests/compile-reads-graph.coil` and `tests/x64-verify-borrowed-graph.coil`
+  hold every entry point to this with graphs that live in an arena, and the
+  x86-64 test support checks the seal around every compile it makes.
+  The inliner's read-only entry (`call-inline/optimize-frozen-specialized-policy`
+  on a closed registry, with registered and borrowed-snapshot templates) is
+  under the same contract. `tests/compile-module-concurrent.coil` runs the
+  embedder's whole worker job (expand template calls, then the
+  `image-for-private-module*` forms at levels two and three, with a sealed
+  private-leaf context and, on x86-64, MEMORY-class arguments) for a module
+  whose graphs share one arena: serially, then from eight threads, checking
+  arena total, fingerprints and byte-identical images.
 - JIT and AOT consume the same relocatable image. There is no alternate optimizer
   or LLVM/TPDE fallback behind either path.
 - Keep all optimization, matching, allocation and image generation inside the
@@ -181,6 +215,45 @@ and RETURN before liveness and constraints; the semantic graph stays unchanged.
 Caller-clobber reservations use the resulting live ranges, so a selected CALL
 with no virtual result does not leave x0/v0 unreserved. Native eligibility uses
 the same declared ABI and frame lifetime proof as explicit tail calls.
+
+Calls in tail position behind a return join (`tail-split.coil`). Return
+canonicalization for inline templates and inline expansion itself leave one
+RETURN reading a PHI at a MERGE of every returning path, so a CALL whose result
+is that PHI's input no longer sits in front of its RETURN and the late
+recognition above cannot see it. Before any structural preparation, every image
+entry (`a64/compile.coil:image-split`) gives each such path its own RETURN
+again, in an owned copy of the final graph: the path's END becomes
+`RETURN(call, call)` and the MERGE and PHI lose that input. The join's block
+must hold nothing but the PHI and the RETURN. Inner joins of the same shape (an
+expanded callee's own return join: a PHI and an END into the caller's) are
+followed up to eight deep; a join left with one path hands it to its parent, or
+moves the RETURN onto it, and a join left with none disappears. When every
+path ends in such a call the original RETURN takes the last one, so it keeps
+its reference and its terminal-chain position; new RETURNs join the chain just
+before it. Functions without such a path are found from the roots alone and
+are not copied. Whether a split call then jumps is still the late plan's
+decision; a declined one merely owns a copy of the return.
+
+Stack arguments of a native tail call. A callee's stack arguments are read at
+its entry SP, which after frame teardown is this function's own entry SP: the
+stack arguments this function received. The late plan therefore accepts stack
+arguments when they fit in the bytes the function's declared prototype
+receives (`incoming.coil:stack-bytes`; never for a variadic prototype on
+either side, and at most 4088 bytes). Emission builds them in the ordinary
+outgoing area like any call's, after every argument source has been read and
+before the register arguments are installed, and `function.coil:
+tail-stack-arguments!` then moves them byte for byte over the received
+arguments through x17 (entry SP through x16 for an over-aligned frame) before
+the frame is released. Incoming stack parameters are only ever read by their
+entry loads, so nothing still depends on the overwritten bytes. Copied
+(ARGVAL) arguments keep the call/return fallback.
+
+`tests/tail-split.coil` runs four shapes at levels one to three, each ten
+million calls deep through a function pointer with no BL/BLR left in the text:
+a three-way join that dissolves (also nested through an inner join), three
+stack arguments that all move with two plain paths left, a join whose every
+path is a call, and a two-register aggregate result forwarded through the
+result place with two stack arguments.
 
 ### Exact dominating predicate proof
 

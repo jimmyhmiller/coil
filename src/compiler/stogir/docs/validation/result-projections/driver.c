@@ -15,14 +15,17 @@ int main(void) {
     uint64_t inputs[]={0,1,17,UINT64_C(0x8000000000000000),UINT64_MAX};
     for(unsigned i=0;i<sizeof(inputs)/sizeof(inputs[0]);i++) {
         uint64_t x=inputs[i], canary=UINT64_C(0xAABBCCDDEEFF0011);
-        uint64_t out[]={canary,canary,canary,canary};
+        uint64_t out[40];
+        for(unsigned j=0;j<40;j++) out[j]=canary;
+        for(unsigned j=0;j<36;j++) out[j+3]=x*(j+3);
         Pair p=target(x);
         uint64_t expected=p.a+(ONE?p.a:p.b)+clobber(x);
         for(unsigned j=0;j<36;j++) expected+=x*(j+3);
         assert(result_projection((uintptr_t)target,(uintptr_t)clobber,x,out+1)==expected);
-        assert(out[0]==canary && out[3]==canary);
+        assert(out[0]==canary && out[39]==canary);
         assert(out[1]==(REVERSE?p.b:p.a));
         assert(out[2]==((REVERSE||ONE)?p.a:p.b));
+        for(unsigned j=0;j<36;j++) assert(out[j+3]==x*(j+3));
     }
     puts("result projection AOT:5 answers and canaries passed");
 }
