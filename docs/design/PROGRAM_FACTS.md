@@ -97,6 +97,38 @@ The facts are recorded wherever a checker runs: `coil lint`, and a build whose
 program registers a checker (`--use`, `--debug-checks`). A build without one
 records nothing.
 
+## Dependency facts
+
+`meta/dependencies NAME` and `meta/dependents NAME` answer what a definition
+depends on and what depends on a declaration (implemented 2026-11-11). They are
+facts of the same kind, with two differences from the ones above.
+
+They are recorded by the checker at its declaration lookups (`sig-find-local`,
+`struct-find`, `sum-find`, `vts-find`, `trait-find`, `const-find` in
+check.coil), under the definition being checked. Those lookups are the only way
+the checker reads a declaration, so a dependency cannot be missed by forgetting
+to record one kind of expression. A match arm's variant and a field access are
+the two the checker resolves without such a lookup, and each records its own.
+
+They live in the checker's persistent tables, beside the signatures and structs,
+and so in the `Env`: a session's facts cover everything it accepted, a later
+compile extends them without copying, and they are saved and loaded with the
+state. Each direction is a map, so a query costs its answer.
+
+Recording is on in a session, in a build that registers a checker or transform,
+and in a Code-to-Code run; any other build records none, because nothing could
+ask. The session that builds the library state records none either: every
+compile loads that state, and measured on a hello-world compile the library's
+own facts cost 4% of it. With recording on, a check of the whole compiler costs
+1.1% more instructions and 52 MB (2026-11-11, with a no-op checker registered);
+with it off, nothing measurable.
+
+The queries the retained snapshot offered before 2026-10-26
+(`meta/dependencies`, `dependents`, the closures, `module-uses`) were recorded
+by the resolver as untyped name-to-name reads and stored in the snapshot's own
+graph. These share the names and nothing else. There are no closure queries: a
+client that wants a closure asks again for each answer.
+
 ## The boundary
 
 Iterating `Code` allocated a view node per step (`code-rest`), boxed. `Code`

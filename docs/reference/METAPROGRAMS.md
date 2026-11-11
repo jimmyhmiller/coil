@@ -463,6 +463,12 @@ New API this project added (all shipped):
   `(ref T)`, as `fnptr-of` types it) or of a `def`'s storage, a record or sum with
   qualified types, or the source of what is instantiated or expanded where it is
   used; `(meta/definition-source NAME)` is the form that defines NAME as written;
+  `(meta/dependencies NAME)` is what the definition NAME depends on, every
+  declaration the checker looked up while checking it, as `(KIND TARGET WHERE…)`
+  records, and `(meta/dependents NAME)` is the definitions that depend on NAME,
+  as `(OWNER KIND WHERE…)` records, with `(meta/dependents `(STRUCT FIELD))` for
+  one field ([STATEFUL_JIT.md](STATEFUL_JIT.md#what-a-definition-depends-on) says
+  what they cover);
   `(meta/module-header M)` and `(meta/module-impls M)` are its
   `module`/`import`/`export` and `impl`/`derive` forms; `(meta/annotations NAME)`
   is the `:key value` pairs NAME's `defn` or `def` carries, as one list (empty if

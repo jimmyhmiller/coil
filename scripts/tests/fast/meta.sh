@@ -4,7 +4,8 @@
 #   * `coil run` on a Code -> Code program: a transform file as the program over
 #     stdin, two Code parameters read from two files, a generator whose output
 #     compiles, a semantic checker whose error is located in the loaded file, the
-#     declaration records of method calls on generic and plain types, and the
+#     declaration records of method calls on generic and plain types, the
+#     dependency facts of a function and of a type and a field, and the
 #     diagnostics for a wrong input count or a target that does not exist;
 #   * hygiene in both directions: identifiers that must connect (quote, a shared
 #     fresh identifier, an alias-qualified template name, a semantic transform's
@@ -86,6 +87,13 @@ esac
 expect_stdout "run: a method's declaration record names its type's module, generic or not; a binding list declares nothing" \
   '((coil.arraylist coil.arraylist.new) (coil.alloc coil.alloc.malloc-allocator) (coil.arraylist coil.arraylist.push!) (mt_runcmmethods mt_runcmmethods.peek) (coil.arraylist coil.arraylist.free!) (mt_runcmmethods mt_runcmmethods.use-pipe) (mt_runcmmethods mt_runcmmethods.value))' \
   "$COIL" run $M/run_code_main_decls.coil $M/run_code_main_methods.coil
+
+# What a definition depends on is what the checker looked up while checking it:
+# the functions and methods it calls (a method under its function's name), the
+# types it names and where, the fields it reads; and the other way round.
+expect_stdout "run: a definition's dependencies, and a type's and a field's dependents" \
+  '((main ((trait coil.alloc.Allocator body) (struct coil.alloc.Allocator-dyn body) (function coil.alloc.malloc-allocator body) (struct coil.arraylist.ArrayList body) (trait coil.core.Push body) (function coil.core.Push$coil.arraylist.ArrayList$push! body) (function inherent$coil.arraylist.ArrayList$free! body) (function inherent$coil.arraylist.ArrayList$new body) (function inherent$mt_runcmmethods.Cell$peek body) (function inherent$mt_runcmmethods.Plain$value body) (struct mt_runcmmethods.Cell body) (struct mt_runcmmethods.Fd body) (struct mt_runcmmethods.Plain body) (function mt_runcmmethods.use-pipe body))) (Fd ((mt_runcmmethods.main struct body) (mt_runcmmethods.use-pipe struct declaration body))) (Fd.open ((mt_runcmmethods.use-pipe field body))) (Cell ((inherent$mt_runcmmethods.Cell$peek struct declaration body) (mt_runcmmethods.main struct body))))' \
+  "$COIL" run $M/run_code_main_deps.coil $M/run_code_main_methods.coil
 
 expect "run: a target that is neither a file nor a namespace" 1 'no such file' "$COIL" run hello
 
