@@ -314,9 +314,13 @@ def main() -> None:
         adopted, state = work / "adopted-state", work / "adopted.state"
         run(COMPILER, "build", FIXTURES / "adopted_state.coil", "-o", adopted,
             "--emit-state", state, *flags)
-        run(adopted, state)
+        # Freed memory is overwritten (macOS and glibc each have a switch), so a
+        # state that still points into storage an earlier state owned is found.
+        scribbled = dict(TOOLCHAIN_ENV, MallocScribble="1", MallocPreScribble="1",
+                         MALLOC_PERTURB_="85")
+        run(adopted, state, env=scribbled)
         if JIT == "llvm":
-            run(adopted, state, "llvm")
+            run(adopted, state, "llvm", env=scribbled)
         # the state of another build of the same source is another program's
         other, other_state = work / "adopted-state-2", work / "adopted-2.state"
         run(COMPILER, "build", FIXTURES / "adopted_state.coil", "-o", other,
