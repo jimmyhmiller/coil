@@ -7,9 +7,12 @@ reports, for each program and level, whether it compiled (emit-obj), linked
 built with the LLVM backend).
 
 While the library's x86-64 code generator is a placeholder every compile
-stops at its "x86-64 backend: NAME is not implemented yet" error. That is
-reported as "backend not implemented" with the library's message, and the
-script exits 3. Any other failure exits 1; all programs correct exits 0.
+stops at its "x86-64 backend: NAME is not implemented yet" error, reported as
+"backend not implemented" with the library's message, or earlier at a System V
+shape the adapter cannot give the library yet ("stogir: FUNCTION: ... is not
+implemented"), reported as "shape not implemented". When that is all that
+went wrong the script exits 3. Any other failure exits 1; all programs
+correct exits 0.
 
 usage: stogir-x86-smoke.py COMPILER [--target TRIPLE] [--keep DIR]
 
@@ -40,6 +43,7 @@ ENV = {k: v for k, v in os.environ.items() if not k.startswith('COIL_')}
 ENV['COIL_LIBRARY_STATE'] = '0'
 LEVELS = ('-O1', '-O2', '-O3')
 NOT_IMPLEMENTED = re.compile(r'x86-64 backend: .* is not implemented yet')
+SHAPE = re.compile(r'^stogir: .* is not implemented.*$', re.M)
 
 PROGRAMS = {
     'hello': '''
@@ -100,11 +104,15 @@ def run(arguments, cwd):
 
 
 def diagnosis(result):
-    """Why a compiler invocation failed: the library placeholder, or its last lines."""
+    """Why a compiler invocation failed: the library placeholder, a shape the
+    adapter refuses, or its last lines."""
     text = result.stdout + result.stderr
     placeholder = NOT_IMPLEMENTED.search(text)
     if placeholder:
         return 'backend not implemented', placeholder.group(0)
+    shape = SHAPE.search(text)
+    if shape:
+        return 'shape not implemented', shape.group(0)
     lines = [line for line in text.strip().splitlines() if line.strip()]
     return 'FAILED', ' | '.join(lines[-3:]) if lines else f'exit {result.returncode}, no output'
 
@@ -150,17 +158,19 @@ def main(work):
             except subprocess.TimeoutExpired as expired:
                 status, detail = 'FAILED', f'timed out: {expired.cmd[1]}'
             statuses.append(status)
-            print(f'{name:8} {level}  {status:24} {detail}')
+            print(f'{name:8} {level}  {status:25} {detail}')
     total = len(statuses)
     if all(status == 'ok' for status in statuses):
         print(f'stogir x86 smoke: {total} of {total} correct: PASS')
         return 0
     missing = statuses.count('backend not implemented')
+    shapes = statuses.count('shape not implemented')
     failed = statuses.count('FAILED')
     print(f'stogir x86 smoke: {statuses.count("ok")} correct, {statuses.count("compiled")} compiled only, '
-          f'{missing} backend not implemented, {failed} failed, of {total}')
-    if failed == 0 and missing > 0:
-        print('stogir x86 smoke: BACKEND NOT IMPLEMENTED (the library x86-64 code generator is a placeholder)')
+          f'{missing} backend not implemented, {shapes} shape not implemented, {failed} failed, of {total}')
+    if failed == 0 and missing + shapes > 0:
+        print('stogir x86 smoke: BACKEND NOT IMPLEMENTED (the library x86-64 code generator is a '
+              'placeholder, or lacks a System V shape)')
         return 3
     return 1
 
