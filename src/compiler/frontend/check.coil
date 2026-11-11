@@ -160,6 +160,51 @@
 ; and are replaced, not edited, unless this checker made them (`cx-bucket-add!`).
 (defstruct ImplBucket [(items (AVec i64))])
 
+;;; Where a definition names a declaration it depends on: in its own declaration
+;;; (a function's signature, a struct's or variant's fields, a constant's type),
+;;; in its body (a function's body, a constant's value), or both.
+(defstruct DepUse [(declaration bool) (body bool)])
+
+;;; What a declaration a definition depends on is. A method is the function the
+;;; checker made of it; an extern is a function; a `def` is a constant.
+(defsum DepKind
+  (DepFunction)
+  (DepStruct)
+  (DepSum)
+  (DepVariant)
+  (DepConst)
+  (DepTrait))
+
+;;; How a definition uses one qualified name: for each kind of declaration that
+;;; name is, where the definition names it. A name is rarely more than one kind.
+(defstruct DepUses
+  [(as_function DepUse)
+   (as_struct DepUse)
+   (as_sum DepUse)
+   (as_variant DepUse)
+   (as_const DepUse)
+   (as_trait DepUse)])
+
+;;; What one definition looked up while it was checked: by qualified name, how
+;;; it uses each declaration (`edges`), and the struct fields it reads, writes or
+;;; takes the offset of, each under `STRUCT FIELD` (`fields`).
+(defstruct DepSet
+  [(edges (AMap (slice u8) DepUses))
+   (fields (AMap (slice u8) DepUse))])
+
+;;; The definitions that looked one name up, and how each uses it.
+(defstruct DepOwners [(owners (AMap (slice u8) DepUses))])
+
+;;; The definitions that use one struct field, and where.
+(defstruct DepFieldOwners [(owners (AMap (slice u8) DepUse))])
+
+;;; A lookup the definition being checked has already recorded: the address and
+;;; length of the declaration's name, which name it alone while its record
+;;; lives, and one bit for each kind and place it was recorded under
+;;; (`dep-seen-bit`). A definition looks the same few declarations up again and
+;;; again; this answers those without hashing a name.
+(defstruct DepSeen [(data i64) (count i64) (bits i64)])
+
 (defstruct Cx
   [(a (dyn Allocator))
    ; where impl selection builds its lookup keys, kept for the checker's
@@ -268,7 +313,32 @@
    (base_consts i64)
    ; How many of the program's externs the base registered (its checked
    ; program's, in front of the program's own). Appended field.
-   (base_externs i64)])
+   (base_externs i64)
+   ; Dependency facts: for each definition checked here or in a state this
+   ; builds on, the declarations the checker looked up while checking it
+   ; (`deps`, by the definition's name); and the other way round, the
+   ; definitions that looked a name up (`dependents`) or use a struct's field
+   ; (`field_dependents`, by `STRUCT FIELD`). Persistent, as the tables above.
+   ; Appended fields.
+   (deps (AMap (slice u8) (ptr DepSet)))
+   (dependents (AMap (slice u8) (ptr DepOwners)))
+   (field_dependents (AMap (slice u8) (ptr DepFieldOwners)))
+   ; Whether this check records them: its facts can be read, by a metaprogram
+   ; it runs or by a compile that builds on the state it leaves
+   ; (`dependency-facts-wanted?`). Appended field.
+   (dep_recording bool)
+   ; The definition being checked and its set, null outside one, and whether
+   ; what it looks up now is named in its declaration or its body
+   ; (`dep-owner-enter!`). Appended fields.
+   (dep_owner (slice u8))
+   (dep_set (ptr DepSet))
+   (dep_in_body bool)
+   ; The buffer a field's key is built in: a field the definition already uses
+   ; allocates nothing. Appended field.
+   (dep_probe StrBuf)
+   ; The lookups the definition being checked has recorded most recently, by
+   ; the address of the name (`dep-seen-slot`). Appended field.
+   (dep_seen (array DepSeen 64))])
 
 (defn mk-evalpair [(e Expr) (t Type)] (-> EvalPair)
   (let [p (primitive/alloc-stack EvalPair)]
@@ -421,6 +491,263 @@
         0)))
   0)
 
+; ---- dependency facts --------------------------------------------------------
+; A definition depends on every declaration the checker looked up while checking
+; it. The lookups below (`sig-find-local`, `struct-find`, `sum-find`, `vts-find`,
+; `trait-find`, `const-find`) are the only way the checker reads a declaration,
+; so recording there misses none. What is recorded is what was found: a name the
+; resolver settled before the checker ran (an alias, a macro, a name that would
+; resolve differently if a new one appeared) is not a lookup and leaves no fact.
+
+;;; The use of KIND in USES.
+(defn dep-kind-use [(uses (ptr DepUses)) (kind DepKind)] (-> (ptr DepUse))
+  (match kind
+    (DepFunction [] (field uses as_function))
+    (DepStruct [] (field uses as_struct))
+    (DepSum [] (field uses as_sum))
+    (DepVariant [] (field uses as_variant))
+    (DepConst [] (field uses as_const))
+    (DepTrait [] (field uses as_trait))))
+
+;;; The bit of KIND, named where IN-BODY says, in a `DepSeen`.
+(defn dep-seen-bit [(kind DepKind) (in-body bool)] (-> i64)
+  (primitive/ishl 1
+                  (+ (* 2
+                        (match kind
+                          (DepFunction [] 0)
+                          (DepStruct [] 1)
+                          (DepSum [] 2)
+                          (DepVariant [] 3)
+                          (DepConst [] 4)
+                          (DepTrait [] 5)))
+                     (if in-body 1 0))))
+
+;;; Where NAME's lookups are remembered among CX's recent ones.
+(defn dep-seen-slot [(cx (ptr Cx)) (name (slice u8))] (-> (ptr DepSeen))
+  (primitive/index (field cx dep_seen)
+                   (primitive/iand (primitive/ishr (primitive/cast i64 (data name))
+                                                   4)
+                                   63)))
+
+;;; Forget the recent lookups: they were another definition's.
+(defn dep-seen-clear! [(cx (ptr Cx))] (-> i64)
+  (for [i 0 64]
+    (set! (.data (primitive/index (field cx dep_seen) i)) 0))
+  0)
+
+;;; Whether USE says the definition names the declaration where IN-BODY says.
+(defn dep-used? [(use (ptr DepUse)) (in-body bool)] (-> bool)
+  (if in-body (.body use) (.declaration use)))
+
+(defn dep-use! [(use (ptr DepUse)) (in-body bool)] (-> i64)
+  (if in-body (set! (.body use) true) (set! (.declaration use) true))
+  0)
+
+;;; The owners of NAME, to change: this check's own record, a copy of one a state
+;;; it builds on left, or a new one.
+(defn dep-owners-own! [(cx (ptr Cx)) (name (slice u8))] (-> (ptr DepOwners))
+  (let [tag (.edit_tag cx)
+        a (.a cx)
+        prior (get (.dependents cx) name)
+        mine
+          (match prior
+            (Some [owners] (= (.tag (.owners owners)) tag))
+            (None [] false))]
+    (match (if mine prior (None [(ptr DepOwners)]))
+      (Some [owners] owners)
+      (None []
+            (let [made
+                    (box! a
+                          DepOwners
+                          (DepOwners
+                            :owners
+                              (amap-retag (match prior
+                                            (Some [owners] (.owners owners))
+                                            (None []
+                                                  (amap-new [(slice u8) DepUses]
+                                                            (keyops)
+                                                            a)))
+                                          tag
+                                          a)))]
+              (set! (mut (.dependents cx)) name made)
+              made)))))
+
+;;; As `dep-owners-own!`, for the field KEY (`STRUCT FIELD`).
+(defn dep-field-owners-own! [(cx (ptr Cx)) (key (slice u8))]
+  (-> (ptr DepFieldOwners))
+  (let [tag (.edit_tag cx)
+        a (.a cx)
+        prior (get (.field_dependents cx) key)
+        mine
+          (match prior
+            (Some [owners] (= (.tag (.owners owners)) tag))
+            (None [] false))]
+    (match (if mine prior (None [(ptr DepFieldOwners)]))
+      (Some [owners] owners)
+      (None []
+            (let [made
+                    (box! a
+                          DepFieldOwners
+                          (DepFieldOwners
+                            :owners
+                              (amap-retag (match prior
+                                            (Some [owners] (.owners owners))
+                                            (None []
+                                                  (amap-new [(slice u8) DepUse]
+                                                            (keyops)
+                                                            a)))
+                                          tag
+                                          a)))]
+              (set! (mut (.field_dependents cx)) key made)
+              made)))))
+
+;;; The definition being checked looked up the declaration NAME of KIND. NAME is
+;;; the declaration's own record's, which lives as long as the tables do: it is
+;;; kept as the key. Nothing is recorded outside a definition, or for a
+;;; definition's lookup of itself.
+(defn dep-read! [(cx (ptr Cx)) (kind DepKind) (name (slice u8))] (-> i64)
+  (let [set (.dep_set cx)]
+    (unless (= (primitive/cast i64 set) 0)
+      (let [in-body (.dep_in_body cx)
+            seen (dep-seen-slot cx name)
+            bit (dep-seen-bit kind in-body)
+            same
+              (and (= (.data seen) (primitive/cast i64 (data name)))
+                   (= (.count seen) (len name)))]
+        (unless (and same (!= (primitive/iand (.bits seen) bit) 0))
+          (let [uses (primitive/alloc-stack DepUses)]
+            (set! uses
+                  (match (get (.edges set) name)
+                    (Some [known] known)
+                    (None [] (primitive/zeroed DepUses))))
+            (unless (or (dep-used? (dep-kind-use uses kind) in-body)
+                        (= name (.dep_owner cx)))
+              (dep-use! (dep-kind-use uses kind) in-body)
+              (set! (mut (.edges set)) name (load uses))
+              (set! (mut (.owners (dep-owners-own! cx name)))
+                    (.dep_owner cx)
+                    (load uses))
+              0)
+            (set! (.bits seen) (if same (primitive/ior (.bits seen) bit) bit))
+            (set! (.data seen) (primitive/cast i64 (data name)))
+            (set! (.count seen) (len name))
+            0))
+        0)))
+  0)
+
+;;; The definition being checked reads, writes or takes the offset of the field
+;;; FNAME of the struct SNAME.
+(defn dep-read-field! [(cx (ptr Cx)) (sname (slice u8)) (fname (slice u8))]
+  (-> i64)
+  (let [set (.dep_set cx)]
+    (unless (= (primitive/cast i64 set) 0)
+      (set! (.len (field (field cx dep_probe) bytes)) 0)
+      (push-str! (mut (.dep_probe cx)) sname)
+      (push-str! (mut (.dep_probe cx)) " ")
+      (push-str! (mut (.dep_probe cx)) fname)
+      (let [probe (str (.dep_probe cx))
+            in-body (.dep_in_body cx)
+            use (primitive/alloc-stack DepUse)]
+        (set! use
+              (match (get (.fields set) probe)
+                (Some [known] known)
+                (None [] (primitive/zeroed DepUse))))
+        (unless (dep-used? use in-body)
+          (let [key (sconcat (.a cx) probe "")]
+            (dep-use! use in-body)
+            (set! (mut (.fields set)) key (load use))
+            (set! (mut (.owners (dep-field-owners-own! cx key)))
+                  (.dep_owner cx)
+                  (load use))
+            0))
+        0)))
+  0)
+
+;;; Forget what OWNER looked up: it is no longer a dependent of anything.
+(defn dep-owner-forget! [(cx (ptr Cx)) (owner (slice u8))] (-> i64)
+  (match (get (.deps cx) owner)
+    (None [] 0)
+    (Some [set]
+          (let [edges (amap-entries (field set edges) (.a cx))
+                fields (amap-entries (field set fields) (.a cx))]
+            (for [i 0 (len edges)]
+              (let [name (.key (get edges i))]
+                (when (contains? (.dependents cx) name)
+                  (remove! (mut (.owners (dep-owners-own! cx name))) owner)
+                  0)))
+            (for [i 0 (len fields)]
+              (let [key (.key (get fields i))]
+                (when (contains? (.field_dependents cx) key)
+                  (remove! (mut (.owners (dep-field-owners-own! cx key))) owner)
+                  0)))
+            (remove! (mut (.deps cx)) owner)
+            0)))
+  0)
+
+;;; What `dep-owner-enter!` replaced, for `dep-owner-leave!` to put back.
+(defstruct DepScope [(owner (slice u8)) (set (ptr DepSet)) (in_body bool)])
+
+;;; A set with EDGES and FIELDS under CX's tag, its edits CX's.
+(defn dep-set-own [(cx (ptr Cx))
+                   (edges (ref (AMap (slice u8) DepUses)))
+                   (fields (ref (AMap (slice u8) DepUse)))] (-> (ptr DepSet))
+  (box! (.a cx)
+        DepSet
+        (DepSet
+          :edges (amap-retag edges (.edit_tag cx) (.a cx))
+          :fields (amap-retag fields (.edit_tag cx) (.a cx)))))
+
+;;; Record what the checker looks up from here on as the definition OWNER's, named
+;;; in its body when IN-BODY and in its declaration otherwise; with no OWNER, or
+;;; in a check that records no facts, record nothing. The set recorded into is
+;;; this check's own: a new one, or a copy of the one a state it builds on left
+;;; for OWNER, which is never written. Only retiring a definition forgets what it
+;;; looked up (`dep-owner-forget!`).
+(defn dep-owner-enter! [(cx (ptr Cx)) (owner (slice u8)) (in-body bool)]
+  (-> DepScope)
+  (let [prior
+          (DepScope
+            :owner (.dep_owner cx)
+            :set (.dep_set cx)
+            :in_body (.dep_in_body cx))
+        set
+          (if (or (= (len owner) 0) (not (.dep_recording cx)))
+              (primitive/cast (ptr DepSet) 0)
+              (match (get (.deps cx) owner)
+                (Some [set]
+                      (if (= (.tag (.edges set)) (.edit_tag cx))
+                          set
+                          (let [mine
+                                  (dep-set-own cx
+                                               (field set edges)
+                                               (field set fields))]
+                            (set! (mut (.deps cx)) owner mine)
+                            mine)))
+                (None []
+                      (let [a (.a cx)
+                            mine
+                              (dep-set-own cx
+                                           (amap-new [(slice u8) DepUses]
+                                                     (keyops)
+                                                     a)
+                                           (amap-new [(slice u8) DepUse]
+                                                     (keyops)
+                                                     a))]
+                        (set! (mut (.deps cx)) owner mine)
+                        mine))))]
+    (set! (.dep_owner cx) owner)
+    (set! (.dep_set cx) set)
+    (set! (.dep_in_body cx) in-body)
+    (dep-seen-clear! cx)
+    prior))
+
+(defn dep-owner-leave! [(cx (ptr Cx)) (prior DepScope)] (-> i64)
+  (set! (.dep_owner cx) (.owner prior))
+  (set! (.dep_set cx) (.set prior))
+  (set! (.dep_in_body cx) (.in_body prior))
+  (dep-seen-clear! cx)
+  0)
+
 ; ---- Cx table lookups (return a live (ptr T) or null) ----------------------
 ; Record that the signature just appended is the one `name` now resolves to. Overwriting
 ; is the point: on a duplicate name the LAST one declared wins, which is exactly what a
@@ -453,7 +780,10 @@
 (defn sig-find-local [(cx (ptr Cx)) (name (slice u8))] (-> (ptr Sig))
   (match (get (field cx sigidx) name)
     (None [] (primitive/cast (ptr Sig) 0))
-    (Some [i] (avec-at (field cx sigs) i))))
+    (Some [i]
+          (let [sig (avec-at (field cx sigs) i)]
+            (dep-read! cx (DepFunction) (.name sig))
+            sig))))
 
 (defn sig-find [(cx (ptr Cx)) (name (slice u8))] (-> (ptr Sig))
   (let [found (sig-find-built-on cx name)]
@@ -760,19 +1090,44 @@
     (None [] (primitive/cast (ptr T) 0))))
 
 (defn struct-find [(cx (ptr Cx)) (name (slice u8))] (-> (ptr StructInfo))
-  (cx-table-find [StructInfo] (field cx structs) (field cx struct_idx) name))
+  (let [found
+          (cx-table-find [StructInfo]
+                         (field cx structs)
+                         (field cx struct_idx)
+                         name)]
+    (unless (= (primitive/cast i64 found) 0)
+      (dep-read! cx (DepStruct) (.name found))
+      0)
+    found))
 
 (defn sum-find [(cx (ptr Cx)) (name (slice u8))] (-> (ptr SumInfo))
-  (cx-table-find [SumInfo] (field cx sums) (field cx sum_idx) name))
+  (let [found (cx-table-find [SumInfo] (field cx sums) (field cx sum_idx) name)]
+    (unless (= (primitive/cast i64 found) 0)
+      (dep-read! cx (DepSum) (.name found))
+      0)
+    found))
 
 (defn vts-find [(cx (ptr Cx)) (variant (slice u8))] (-> (ptr VtoS))
-  (cx-table-find [VtoS]
-                 (field cx variant_to_sum)
-                 (field cx variant_idx)
-                 variant))
+  (let [found
+          (cx-table-find [VtoS]
+                         (field cx variant_to_sum)
+                         (field cx variant_idx)
+                         variant)]
+    (unless (= (primitive/cast i64 found) 0)
+      (dep-read! cx (DepVariant) (.variant found))
+      0)
+    found))
 
 (defn trait-find [(cx (ptr Cx)) (name (slice u8))] (-> (ptr TraitDef))
-  (cx-table-find [TraitDef] (field cx trait_defs) (field cx trait_idx) name))
+  (let [found
+          (cx-table-find [TraitDef]
+                         (field cx trait_defs)
+                         (field cx trait_idx)
+                         name)]
+    (unless (= (primitive/cast i64 found) 0)
+      (dep-read! cx (DepTrait) (.name found))
+      0)
+    found))
 
 (defn cx-struct-add! [(cx (ptr Cx)) (info StructInfo)] (-> i64)
   (set! (mut (.struct_idx cx)) (.name info) (len (.structs cx)))
@@ -876,7 +1231,10 @@
 (defn const-find [(cx (ptr Cx)) (name (slice u8))] (-> (ptr ConstEntry))
   (match (get (field cx constidx) name)
     (None [] (primitive/cast (ptr ConstEntry) 0))
-    (Some [i] (avec-at (field cx consts) i))))
+    (Some [i]
+          (let [entry (avec-at (field cx consts) i)]
+            (dep-read! cx (DepConst) (.name entry))
+            entry))))
 
 ;;; Whether NAME's constant is one this check registered, not its base's.
 (defn const-registered-here? [(cx (ptr Cx)) (name (slice u8))] (-> bool)
@@ -2805,7 +3163,19 @@
     (set! (.inherent_name_idx cx)
           (amap-retag (amap-new [(slice u8) (ptr ImplBucket)] (keyops) a) tag a))
     (set! (.method_idx cx)
-          (amap-retag (amap-new [(slice u8) (ptr ImplBucket)] (keyops) a) tag a)))
+          (amap-retag (amap-new [(slice u8) (ptr ImplBucket)] (keyops) a) tag a))
+    (set! (.deps cx)
+          (amap-retag (amap-new [(slice u8) (ptr DepSet)] (keyops) a) tag a))
+    (set! (.dependents cx)
+          (amap-retag (amap-new [(slice u8) (ptr DepOwners)] (keyops) a) tag a))
+    (set! (.field_dependents cx)
+          (amap-retag (amap-new [(slice u8) (ptr DepFieldOwners)] (keyops) a)
+                      tag
+                      a)))
+  (set! (.dep_owner cx) "")
+  (set! (.dep_set cx) (primitive/cast (ptr DepSet) 0))
+  (set! (.dep_in_body cx) false)
+  (set! (.dep_probe cx) (StrBuf::new a))
   (set! (.cur_bounds cx) (ArrayList::new [Bound] a))
   (set! (.loops cx) (ArrayList::new [LoopFrame] a))
   0)
@@ -5107,6 +5477,7 @@
                           (box-type a (opt-type-val (field cp ty)))
                           (null-type)))]
             (match (let [prior (with-caller-module cx (module-prefix nm))
+                         scope (dep-owner-enter! cx nm true)
                          r
                            (do-synth a
                                      (field cp value)
@@ -5115,6 +5486,7 @@
                                      cx
                                      tps
                                      (sconcat a "const " nm))]
+                     (dep-owner-leave! cx scope)
                      (set! (.caller_module cx) prior)
                      r)
               (Err [d] (Err [EvalPair Diag] d))
@@ -5486,10 +5858,23 @@
                                                     (const-accepted-entry parent
                                                                           cp))
                                     0)))
-                    (match (validate-type (box-type a
-                                                    (opt-type-val (field cp ty)))
-                                          cx
-                                          (empty-strs a))
+                    (match (let [scope
+                                   (dep-owner-enter! cx
+                                                     (if (= (primitive/cast i64
+                                                                            (const-accepted-entry parent
+                                                                                                  cp))
+                                                            0)
+                                                         nm
+                                                         "")
+                                                     false)
+                                 r
+                                   (validate-type (box-type a
+                                                            (opt-type-val (field cp
+                                                                                 ty)))
+                                                  cx
+                                                  (empty-strs a))]
+                             (dep-owner-leave! cx scope)
+                             r)
                       (Err [d]
                            (do
                              (store! err
@@ -5672,10 +6057,19 @@
     (loop (if (>= (load i) n)
               (break)
               (do
-                (match (validate-one-struct-fields a
-                                                   cx
-                                                   (elem fs
-                                                         (load i)))
+                (match (let [scope
+                               (dep-owner-enter! cx
+                                                 (if (>= (load i)
+                                                         (.base_structs cx))
+                                                     (.name (elem fs (load i)))
+                                                     "")
+                                                 false)
+                             r
+                               (validate-one-struct-fields a
+                                                           cx
+                                                           (elem fs (load i)))]
+                         (dep-owner-leave! cx scope)
+                         r)
                   (Err [d]
                        (let [sp (elem fs (load i))]
                          (set! err
@@ -5788,9 +6182,19 @@
     (loop (if (>= (load i) n)
               (break)
               (do
-                (match (validate-one-sum-fields a
-                                                cx
-                                                (elem fs (load i)))
+                (match (let [scope
+                               (dep-owner-enter! cx
+                                                 (if (>= (load i)
+                                                         (.base_sums cx))
+                                                     (.name (elem fs (load i)))
+                                                     "")
+                                                 false)
+                             r
+                               (validate-one-sum-fields a
+                                                        cx
+                                                        (elem fs (load i)))]
+                         (dep-owner-leave! cx scope)
+                         r)
                   (Err [d]
                        (let [sp (elem fs (load i))]
                          (set! err
@@ -6152,7 +6556,11 @@
       (set! (.inherent_name_idx cx)
             (amap-retag (field base inherent_name_idx) tag (.a cx)))
       (set! (.method_idx cx) (amap-retag (field base method_idx) tag (.a cx)))
-      0))
+      0)
+    (set! (.deps cx) (amap-retag (field base deps) tag (.a cx)))
+    (set! (.dependents cx) (amap-retag (field base dependents) tag (.a cx)))
+    (set! (.field_dependents cx)
+          (amap-retag (field base field_dependents) tag (.a cx))))
   (setup-forget-retired! cx prog)
   0)
 
@@ -6166,6 +6574,9 @@
       (for [i 0 (len (load rs))]
         (let [r (elem rs i)
               q (qualify-in-module a (.module r) (.name r))]
+          ; a retired definition is no longer a dependent of anything; what
+          ; depended on it still says so, having been checked against it
+          (dep-owner-forget! cx q)
           (cond (= (.kind r) 4) (do (remove! (mut (.sigidx cx)) q) 0)
                 (or (= (.kind r) 7) (= (.kind r) 8))
                   (do (remove! (mut (.constidx cx)) q) 0)
@@ -6176,6 +6587,7 @@
       0)
     (unless (= (primitive/cast i64 fs) 0)
       (for [i 0 (len (load fs))]
+        (dep-owner-forget! cx (get (load fs) i))
         (remove! (mut (.sigidx cx)) (get (load fs) i)))
       0))
   0)
@@ -6728,7 +7140,10 @@
 (defn check-func [(a (dyn Allocator)) (cx (ptr Cx)) (fp (ptr Func))]
   (-> (Result Func Diag))
   (match (let [prior (with-caller-module cx (func-caller-module fp))
+               scope
+                 (dep-owner-enter! cx (context-definition-name (.name fp)) false)
                r (check-func-unlocated a cx fp)]
+           (dep-owner-leave! cx scope)
            (set! (.caller_module cx) prior)
            r)
     ; the declaration as written: not the `defn` macro's expansion it came out of
@@ -6915,6 +7330,8 @@
                                                     fnm
                                                     "' return type: ")))))
                (Ok [_] 0)))
+           ; the signature is validated: what is looked up from here is the body's
+           (set! (.dep_in_body cx) true)
            (let [env (build-param-env a cx (load (field fp params)) tps)
                  body (load (field fp body))
                  bn (len (load body))]
@@ -17030,7 +17447,11 @@
                             ; no name to `covered` and binds nothing — which also keeps
                             ; the (null) `v` below out of reach, since the bind loop
                             ; that reads its fields runs zero times.
-                            (unless wild (push! [(slice u8)] covered av))
+                            (unless wild
+                              (push! [(slice u8)] covered av)
+                              ; an arm names its variant without looking it up
+                              (dep-read! cx (DepVariant) (.name v))
+                              0)
                             (let [saved (len (load env))
                                   nbn (len (load abinds))
                                   (mut runtime-binds)
@@ -19530,6 +19951,9 @@
                ; a type parameter names no struct: its field is filed under `_`
                (source-field-use! (if (= (primitive/cast i64 si) 0) "_" sname)
                                   ffld)
+               (unless (= (primitive/cast i64 si) 0)
+                 (dep-read-field! cx (.name si) ffld)
+                 0)
                (when (and (!= (primitive/cast i64 si) 0)
                           (load (field si is_bits)))
                  (break
@@ -20296,6 +20720,7 @@
            (err-ep (prefix-diag a d (sconcat3 a "in '" fname "': offsetof: "))))
       (Ok [_]
           (try (let [_use (source-field-use! (struct-name tp) ffld)
+                     _dep (dep-read-field! cx (struct-name tp) ffld)
                      fs
                        (try-or! (struct-fields a tp cx)
                                 (err-ep (derr (sconcat a
@@ -27323,6 +27748,7 @@
     (set! (.recover_statements cx) (not validate-ownership))
     (set! (.replaces_meta_consts cx) replaces-meta-consts)
     (set! (.trait_uses cx) (ArrayList::new [MonoTraitUse] a))
+    (set! (.dep_recording cx) (dependency-facts-wanted?))
     (set! impb (.imports s))
     (set! expb (.exports s))
     (let [setup-span (tr/span-begin "frontend.check.setup")
