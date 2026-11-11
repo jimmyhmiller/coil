@@ -1,0 +1,190 @@
+;;; Vector values in XMM registers on x86-64: constants, operands, results
+;;; and the per-node scratch frame object.
+;;;
+;;; Representation
+;;;   * A 16-byte vector occupies a whole XMM register.
+;;;   * An 8-byte vector occupies the low quadword. The upper quadword is
+;;;     UNSPECIFIED: nothing may depend on it, and every emitter may leave
+;;;     anything there. Lane-wise instructions run on the whole register (the
+;;;     upper lanes compute garbage, which never traps: SSE floating
+;;;     exceptions are masked and integer division is never done in an XMM
+;;;     register); lane transfers, compares feeding nothing but the low lanes,
+;;;     loads (`movq`, which happens to zero the upper half), stores (`movq`)
+;;;     and spills (8-byte slots) touch only the low quadword.
+;;;   * Register copies are `movaps`; memory moves are `movups`/`movq`, with
+;;;     no alignment assumed (spill slots are aligned, user memory is not).
+;;;
+;;; Constants are LONG_CONST payloads. All zero bytes is `pxor x, x` and all
+;;; ones `pcmpeqd x, x`; anything else is loaded from the constant's private
+;;; image data with `movups/movq x, [rip + payload]`, which leaves a pending
+;;; PC32 reference (stogir.x64.code/rip-reference!) for the image layer. A
+;;; function with such a constant therefore needs an image, like one that
+;;; names a symbol; bare text is refused, as on AArch64.
+;;;
+;;; The scratch frame object: sequences that SSE2 cannot express in registers
+;;; (integer division, per-lane shift counts, leading-zero counts, a lane
+;;; chosen by a run-time index) move the vector through 32 bytes of frame
+;;; that the node owns (`scratch!` in constrain!, `scratch` in emit!). The
+;;; a64 backend does all of these in registers (TBL, USHL, CLZ); SSE2 has no
+;;; variable shuffle, no per-lane shift and no lane-indexed move.
+(module stogir.x64.vector-value)
+(import "stogir.graph" :as g)
+(import "stogir.long-constant" :as long)
+(import "stogir.locations" :as loc)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.frame-address" :as frame)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.simd-lanes" :as simd)
+(import "stogir.x64.uses" :as uses)
+(import "stogir.x64.value" :as value)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(const UNSUPPORTED "x86-64 backend: only 8- and 16-byte vectors are supported")
+
+;;; Whether `ty` is a vector this backend holds in an XMM register.
+(defn supported? [(ty i32)] (-> bool)
+  (types/short-vector? ty 8))
+
+;;; 0: every payload byte is zero; 1: every byte is 0xFF; 2: anything else;
+;;; -1: `reference` is not a vector constant of a supported shape.
+(defn constant-kind [(graph g/Graph) (reference i32)] (-> i32)
+  (match (g/lookup graph reference)
+    (None [] -1)
+    (Some [node]
+          (let [ty (cast i32 (n/type-id node))
+                size (g/long-size graph reference)]
+            (if (or (>= reference 0)
+                    (not (long/valid-header? node 8))
+                    (not (supported? ty))
+                    (!= size (cast i64 (types/size ty 8))))
+                -1
+                (let [(mut zeros) true
+                      (mut ones) true
+                      (mut valid) true]
+                  (for [i 0 size]
+                    (match (g/long-byte graph reference i)
+                      (None [] (set! valid false))
+                      (Some [byte]
+                            (when (!= byte 0) (set! zeros false))
+                            (when (!= byte 255) (set! ones false)))))
+                  (cond (not valid) -1
+                        zeros 0
+                        ones 1
+                        :else 2)))))))
+
+;;; Build vector constant `reference` in XMM register `destination`. Flags
+;;; are untouched.
+(defn constant! [(out (mut code/Buffer)) (graph g/Graph) (reference i32) (destination i32)]
+  (-> (Result i32 (slice u8)))
+  (let [kind (constant-kind graph reference)
+        size (types/size (value/type-of graph reference) 8)
+        (mut error) ""]
+    (cond (not (registers/simd? destination))
+            (set! error "vector constant requires an XMM register")
+          (< kind 0) (set! error "invalid or unsupported x86-64 vector constant")
+          (= kind 0) (simd/zero! (mut out) (mut error) destination)
+          (= kind 1) (simd/ones! (mut out) (mut error) destination)
+          :else
+            (match (if (= size 16)
+                       (encode/sse-mov-rm (mut (.text out)) encode/MOVUPS destination
+                                          (encode/mem-rip 0))
+                       (encode/movd-xm (mut (.text out)) 64 destination (encode/mem-rip 0)))
+              (Err [message] (set! error message))
+              (Ok [field]
+                  (simd/check! (mut error) (code/rip-reference! (mut out) field reference)))))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; Where the vector value `reference` is at `position`: its XMM register,
+;;; or `scratch` (xmm14 or xmm15) after building a constant or loading a
+;;; spilled value there. Flags are untouched.
+(defn register! [(out (mut code/Buffer))
+                 (graph g/Graph)
+                 (parts loc/View)
+                 (base frame/Base)
+                 (reference i32)
+                 (position i64)
+                 (scratch i32)] (-> (Result i32 (slice u8)))
+  (let [ty (value/type-of graph reference)]
+    (cond (not (supported? ty)) (Err UNSUPPORTED)
+          (< reference 0)
+            (match (constant! (mut out) graph reference scratch)
+              (Err [message] (Err message))
+              (Ok [_] (Ok scratch)))
+          :else
+            (match (loc/resolve parts reference position)
+              (Err [message] (Err message))
+              (Ok [location]
+                  (cond (= (.kind location) 1)
+                          (match (value/spill location base)
+                            (Err [message] (Err message))
+                            (Ok [m]
+                                (let [(mut error) ""]
+                                  (simd/read! (mut out) (mut error) scratch m (types/size ty 8))
+                                  (if (= error "") (Ok scratch) (Err error)))))
+                        (and (= (.kind location) 0)
+                             (registers/simd? (cast i32 (.value location)))
+                             (registers/allocatable? ty (cast i32 (.value location))))
+                          (Ok (cast i32 (.value location)))
+                        :else (Err "vector operand requires an XMM register or a spill slot")))))))
+
+;;; The XMM register that holds the vector result of `reference`, defined at
+;;; `position + 1`.
+(defn destination [(graph g/Graph) (parts loc/View) (reference i32) (position i64)]
+  (-> (Result i32 (slice u8)))
+  (match (loc/resolve parts reference (+ position 1))
+    (Err [message] (Err message))
+    (Ok [location]
+        (if (and (= (.kind location) 0)
+                 (supported? (value/type-of graph reference))
+                 (registers/simd? (cast i32 (.value location)))
+                 (registers/allocatable? (value/type-of graph reference)
+                                         (cast i32 (.value location))))
+            (Ok (cast i32 (.value location)))
+            (Err "vector result requires an XMM register")))))
+
+;;; Copy the vector value `reference` (register, spill slot or constant) into
+;;; XMM register `destination`. Flags are untouched.
+(defn into! [(out (mut code/Buffer))
+             (graph g/Graph)
+             (parts loc/View)
+             (base frame/Base)
+             (reference i32)
+             (position i64)
+             (destination i32)] (-> (Result i32 (slice u8)))
+  (match (register! (mut out) graph parts base reference position destination)
+    (Err [message] (Err message))
+    (Ok [source]
+        (let [(mut error) ""]
+          (simd/move! (mut out) (mut error) destination source)
+          (if (= error "") (Ok 0) (Err error))))))
+
+;;; The XMM register holding vector value `reference` at `position`, or -1
+;;; when it is a constant, spilled or otherwise not in a register.
+(defn register-of [(graph g/Graph) (parts loc/View) (reference i32) (position i64)] (-> i32)
+  (value/float-register-of graph parts reference position))
+
+;;; Bytes of the scratch frame object: two 16-byte vectors.
+(const SCRATCH-SIZE 32)
+
+;;; Ask for the scratch frame object of node `reference` (see the module
+;;; comment). The frame's alignment stays 16.
+(defn scratch! [(set (mut uses/Set)) (reference i32)] (-> void)
+  (push! (mut (.locals set))
+         (uses/Local :owner reference :size SCRATCH-SIZE :alignment 16)))
+
+;;; The memory operand of the first byte of node `reference`'s scratch frame
+;;; object. Its base is the frame base (rsp or rbp), never a scratch register.
+(defn scratch [(cx context/Context) (reference i32)] (-> (Result encode/Mem (slice u8)))
+  (match (get (.locals (.frame cx)) reference)
+    (None [] (Err "x86-64 vector node has no scratch frame object"))
+    (Some [index]
+          (if (or (< index 0) (>= index (len (.slots (.frame cx)))))
+              (Err "invalid x86-64 vector scratch frame slot")
+              (let [placed (get (.slots (.frame cx)) index)]
+                (if (or (!= (.size placed) SCRATCH-SIZE) (!= (.alignment placed) 16))
+                    (Err "x86-64 vector scratch frame slot has another shape")
+                    (frame/slot (.base cx) (.offset placed))))))))

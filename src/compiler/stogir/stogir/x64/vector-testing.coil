@@ -1,0 +1,299 @@
+;;; Test support for the x86-64 vector family (tests/x64-vector-*.coil; nothing
+;;; else imports it). It builds on stogir.x64.testing.
+;;;
+;;;   * a lane-wise reference evaluator: every vector operation as a function
+;;;     of lane bit patterns (u64 in, u64 out), written with wide integer
+;;;     arithmetic and the scalar floating reference of stogir.x64.testing,
+;;;     sharing nothing with the backend. It defines the results the x86-64
+;;;     backend must produce bit for bit, which are the AArch64 backend's;
+;;;   * lane values worth testing for every lane type;
+;;;   * compile-as-image and call helpers: a function with a vector constant
+;;;     needs an image (its payload is private data), so vector tests map
+;;;     images rather than bare text;
+;;;   * little-endian lane access to byte buffers.
+(module stogir.x64.vector-testing)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.image" :as image)
+(import "stogir.jit.native" :as jit)
+(import "stogir.options" :as options)
+(import "stogir.types" :as types)
+(import "stogir.x64.compile" :as compile)
+(import "stogir.x64.testing" :as t)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+;;; ---- Lane reference -----------------------------------------------------------
+
+(defn lane-bytes [(base i32)] (-> i32)
+  (types/scalar-size base 8))
+
+(defn lane-bits [(base i32)] (-> i32)
+  (* 8 (lane-bytes base)))
+
+(defn lane-mask [(base i32)] (-> u64)
+  (if (= (lane-bits base) 64)
+      (: 0xFFFFFFFFFFFFFFFF u64)
+      (- (<< (: 1 u64) (cast u64 (lane-bits base))) 1)))
+
+;;; An integer type with the lane's width and the given signedness: the
+;;; scalar reference of stogir.x64.testing is keyed by type.
+(defn integer-of [(base i32) (signed bool)] (-> i32)
+  (case (lane-bytes base)
+    1 (if signed 8 2)
+    2 (if signed 9 3)
+    4 (if signed 10 4)
+    (if signed 11 5)))
+
+;;; The lane's own integer view (floating lanes compare as raw bits never).
+(defn own-integer [(base i32)] (-> i32)
+  (integer-of base (types/signed? base)))
+
+(defn all-ones [(base i32) (truth bool)] (-> u64)
+  (if truth (lane-mask base) 0))
+
+;;; Whether lane operation `opcode` is defined for these operand lanes: an
+;;; integer DIV or MOD needs a divisor that is not zero and, for 4- and
+;;; 8-byte signed lanes, not MIN / -1 (both trap on x86-64). Narrower lanes
+;;; divide as 32-bit values and cannot overflow.
+(defn lane-defined? [(opcode i32) (base i32) (a u64) (b u64)] (-> bool)
+  (if (and (types/integer? base) (or (= opcode 29) (= opcode 30)))
+      (if (< (lane-bytes base) 4)
+          (!= (& b (lane-mask base)) 0)
+          (t/divisible? (own-integer base) a b))
+      true))
+
+;;; Whether the result lane may legitimately be either of two NaNs.
+(defn lane-ambiguous? [(opcode i32) (base i32) (a u64) (b u64)] (-> bool)
+  (and (types/floating? base) (>= opcode 26) (<= opcode 29) (t/float-ambiguous? base a b)))
+
+;;; Reference result of binary lane operation `opcode`: arithmetic and logic
+;;; (26..30, 46..48), shifts and rotates (49..53, `b` the count), extrema
+;;; (58, 59) and comparisons (14..25, a full-lane mask).
+(defn lane-binary [(opcode i32) (base i32) (a u64) (b u64)] (-> u64)
+  (let [m (lane-mask base)
+        x (& a m)
+        y (& b m)]
+    (if (types/floating? base)
+        (cond (and (>= opcode 14) (<= opcode 25))
+                (all-ones base (= (t/float-compare opcode base x y) 1))
+              :else (t/float-binary opcode base x y))
+        (cond (and (>= opcode 14) (<= opcode 19))
+                (all-ones base (= (t/binary opcode (integer-of base true) x y) 1))
+              (and (>= opcode 20) (<= opcode 23))
+                (all-ones base (= (t/binary opcode (integer-of base false) x y) 1))
+              (= opcode 58)
+                (if (= (t/binary (if (types/signed? base) 18 22) (own-integer base) x y) 1) x y)
+              (= opcode 59)
+                (if (= (t/binary (if (types/signed? base) 17 21) (own-integer base) x y) 1) x y)
+              (and (or (= opcode 29) (= opcode 30)) (types/signed? base)
+                   (= x (<< (: 1 u64) (cast u64 (- (lane-bits base) 1)))) (= y m))
+                ; MIN / -1 on a narrow lane, computed at 32 bits: the
+                ; quotient wraps to MIN and the remainder is zero.
+                (if (= opcode 29) x 0)
+              ; An undefined division is never compared (lane-defined?).
+              (and (or (= opcode 29) (= opcode 30)) (= y 0)) 0
+              (and (>= opcode 49) (<= opcode 53))
+                ; Only the low bits of a count matter, whatever its type.
+                (t/binary opcode (own-integer base) x (& b (cast u64 (- (lane-bits base) 1))))
+              :else (t/binary opcode (own-integer base) x y)))))
+
+;;; Reference result of unary lane operation `opcode`: NEG (31), ABS (32),
+;;; NOT (45), BSWAP (54), leading zeros (55), trailing zeros (56), set bits
+;;; (57).
+(defn lane-unary [(opcode i32) (base i32) (a u64)] (-> u64)
+  (let [m (lane-mask base)
+        bits (lane-bits base)
+        sign (<< (: 1 u64) (cast u64 (- bits 1)))
+        x (& a m)
+        negated (& (+ (^ x m) 1) m)]
+    (if (types/floating? base)
+        (if (= opcode 31) (^ x sign) (& x (^ m sign)))
+        (cond (= opcode 31) negated
+              (= opcode 32) (if (= (& x sign) 0) x negated)
+              (= opcode 45) (^ x m)
+              (= opcode 54)
+                (let [(mut result) (: 0 u64)]
+                  (for [i 0 (cast i64 (/ bits 8))]
+                    (set! result (| (<< result 8) (& (>> x (cast u64 (* i 8))) 255))))
+                  result)
+              (= opcode 55)
+                (let [(mut count) (: 0 u64)
+                      (mut i) (- bits 1)]
+                  (while (and (>= i 0) (= (& (>> x (cast u64 i)) 1) 0))
+                    (set! count (+ count 1))
+                    (set! i (- i 1)))
+                  count)
+              (= opcode 56)
+                (let [(mut count) (: 0 u64)
+                      (mut i) (: 0 i32)]
+                  (while (and (< i bits) (= (& (>> x (cast u64 i)) 1) 0))
+                    (set! count (+ count 1))
+                    (set! i (+ i 1)))
+                  count)
+              (= opcode 57)
+                (let [(mut count) (: 0 u64)]
+                  (for [i 0 (cast i64 bits)]
+                    (set! count (+ count (& (>> x (cast u64 i)) 1))))
+                  count)
+              :else (panic "x64 vector test reference: unknown unary opcode {}" opcode)))))
+
+;;; ---- Lane values ----------------------------------------------------------------
+
+(const SPECIALS 16)
+
+;;; Lane bit patterns every vector test should cover: for integer lanes the
+;;; boundaries of both signednesses and mixed bytes, for floating lanes
+;;; zeros, ones, extremes, infinities and NaNs. Index in 0..SPECIALS-1.
+(defn special [(base i32) (index i64)] (-> u64)
+  (let [integers [(: 0 u64) 1 0xFFFFFFFFFFFFFFFF 0x8000000000000000 0x7FFFFFFFFFFFFFFF
+                  0x8080808080808080 0x7F7F7F7F7F7F7F7F 0xFFFF0000FFFF0000
+                  0x123456789ABCDEF0 0xFFFFFFFFFFFFFFFE 0x0102030405060708 2
+                  0x00FF00FF00FF00FF 0xFEDCBA9876543210 0x0000000100000000 0x8000000000000001]
+        doubles [(: 0 u64) 0x8000000000000000 0x3FF0000000000000 0xBFF0000000000000 1
+                 0x000FFFFFFFFFFFFF 0x7FEFFFFFFFFFFFFF 0x7FF0000000000000 0xFFF0000000000000
+                 0x7FF8123456789ABC 0x7FF0123456789ABC 0x4000000000000000 0xC008000000000000
+                 0x3FE0000000000000 0xFFF8000000000001 0x0010000000000000]
+        floats [(: 0 u64) 0x80000000 0x3F800000 0xBF800000 1 0x007FFFFF 0x7F7FFFFF 0x7F800000
+                0xFF800000 0x7FC12345 0x7F812345 0x40000000 0xC0400000 0x3F000000 0xFFC00001
+                0x00800000]
+        bits (lane-bits base)
+        raw (get integers index)]
+    (cond (= base 12) (get doubles index)
+          (= base 13) (get floats index)
+          (= index 3) (<< (: 1 u64) (cast u64 (- bits 1)))
+          (= index 4) (- (<< (: 1 u64) (cast u64 (- bits 1))) 1)
+          (= index 15) (| (<< (: 1 u64) (cast u64 (- bits 1))) 1)
+          :else (& raw (lane-mask base)))))
+
+;;; Every vector type the backend supports, by index 0..TYPES-1: each lane
+;;; type at 8 and at 16 bytes.
+(const TYPES 26)
+
+(defn vector-type [(index i64)] (-> i32)
+  (let [base (cast i32 (+ (/ index 2) 1))
+        size (if (= (% index 2) 0) (: 8 i32) 16)]
+    (types/vector-type base (/ size (lane-bytes base)))))
+
+;;; ---- Byte buffers ---------------------------------------------------------------
+
+;;; The `size`-byte little-endian value at `offset`.
+(defn word [(buffer (slice u8)) (offset i64) (size i32)] (-> u64)
+  (let [(mut result) (: 0 u64)]
+    (for [i 0 (cast i64 size)]
+      (set! result (| result (<< (cast u64 (get buffer (+ offset i))) (cast u64 (* i 8))))))
+    result))
+
+(defn put! [(buffer (mut (ArrayList u8))) (offset i64) (size i32) (value u64)] (-> void)
+  (for [i 0 (cast i64 size)]
+    (set! (mut buffer) (+ offset i) (cast u8 (& (>> value (cast u64 (* i 8))) 255)))))
+
+;;; A buffer of `count` bytes, each `fill`.
+(defn buffer [(count i64) (fill u8) (allocator (dyn Allocator))] (-> (ArrayList u8))
+  (let [(mut result) (ArrayList::new [u8] allocator)]
+    (for [i 0 count] (push! (mut result) fill))
+    result))
+
+(defn address [(buffer (ArrayList u8)) (offset i64)] (-> u64)
+  (+ (primitive/cast u64 (.data buffer)) (cast u64 offset)))
+
+;;; ---- Graph shorthands -----------------------------------------------------------
+
+;;; The vector constant of `ty` whose lane i is `(lane i)` masked.
+(defn constant! [(graph (mut g/Graph)) (ty i32) (lanes (slice u64)) (allocator (dyn Allocator))]
+  (-> i32)
+  (let [base (types/base-type ty)
+        size (lane-bytes base)
+        (mut payload) (ArrayList::new [u8] allocator)]
+    (for [i 0 (cast i64 (types/lanes ty))]
+      (for [k 0 (cast i64 size)]
+        (push! (mut payload) (cast u8 (& (>> (get lanes i) (cast u64 (* k 8))) 255)))))
+    (let [reference (t/require (b/vector-constant! (mut graph) ty 8 (slice payload)))]
+      (free! (mut payload))
+      reference)))
+
+;;; ptr + offset.
+(defn offset! [(graph (mut g/Graph)) (pointer i32) (offset i64)] (-> i32)
+  (if (= offset 0)
+      pointer
+      (t/binary! (mut graph) 26 6 pointer (t/constant! (mut graph) 6 (cast u64 offset)))))
+
+(defn load! [(graph (mut g/Graph)) (ty i32) (control i32) (pointer i32)] (-> i32)
+  (t/require (b/vector-load! (mut graph) ty 8 control pointer false)))
+
+(defn save! [(graph (mut g/Graph)) (control i32) (pointer i32) (value i32)] (-> i32)
+  (t/require (b/vector-store! (mut graph) 8 control pointer value false)))
+
+;;; ---- Compiling and calling ------------------------------------------------------
+
+;;; Mapped generated code and the size of its text in bytes.
+(defstruct Mapped [(loaded jit/Loaded) (text-size i64)])
+
+;;; Compile `graph` as an image and map it: as given at `level` 1
+;;; (stogir.x64.compile/image), else through image-with-options at that
+;;; optimization level. A failure is printed with `label` and counted.
+(defn compiled-at [(counts (mut t/Tally)) (label (slice u8)) (graph g/Graph) (start i32)
+                   (roots (slice i32)) (level i32) (allocator (dyn Allocator))]
+  (-> (Option Mapped))
+  (set! (.functions counts) (+ (.functions counts) 1))
+  (match (if (= level 1)
+             (compile/image graph start roots "vector_test" allocator)
+             (compile/image-with-options graph start roots "vector_test"
+                                         (options/Options :level level) allocator))
+    (Err [message]
+         (println "{}: compile failed: {}" label message)
+         (t/fail! (mut counts))
+         (None))
+    (Ok [source]
+        (let [(mut source) source
+              result (match (jit/map-image source allocator)
+                       (Err [message]
+                            (println "{}: map failed: {}" label message)
+                            (t/fail! (mut counts))
+                            (None [Mapped]))
+                       (Ok [loaded]
+                           (Some (Mapped :loaded loaded :text-size (len (.text source))))))]
+          (image/release! (mut source))
+          result))))
+
+;;; Compile `graph` as given and map it.
+(defn compiled [(counts (mut t/Tally)) (label (slice u8)) (graph g/Graph) (start i32)
+                (roots (slice i32)) (allocator (dyn Allocator))] (-> (Option Mapped))
+  (compiled-at (mut counts) label graph start roots 1 allocator))
+
+(defn release! [(code (mut Mapped))] (-> void)
+  (jit/release-image! (mut (.loaded code)))
+  0)
+
+;;; Call the function with up to six integer arguments; rax is returned.
+(defn invoke [(code Mapped) (arguments (slice u64))] (-> u64)
+  (let [f (primitive/cast (fnptr (cc/C) [u64 u64 u64 u64 u64 u64] u64)
+                          (.base (.memory (.loaded code))))
+        (mut a) (zeroed (array u64 6))]
+    (when (> (len arguments) 6) (panic "x64 vector test call with more than six arguments"))
+    (for [i 0 (len arguments)] (set! (mut a) i (get arguments i)))
+    (call-ptr f (get a 0) (get a 1) (get a 2) (get a 3) (get a 4) (get a 5))))
+
+;;; As invoke with one floating argument in xmm0 (the bits of a DOUBLE, or
+;;; of a FLOAT in the low half) and the bits of xmm0 returned.
+(defn invoke-floating [(code Mapped) (floating u64) (arguments (slice u64))] (-> u64)
+  (let [f (primitive/cast (fnptr (cc/C) [f64 u64 u64 u64 u64 u64 u64] f64)
+                          (.base (.memory (.loaded code))))
+        (mut a) (zeroed (array u64 6))]
+    (when (> (len arguments) 6) (panic "x64 vector test call with more than six arguments"))
+    (for [i 0 (len arguments)] (set! (mut a) i (get arguments i)))
+    (t/f64-bits (call-ptr f (t/f64-of floating) (get a 0) (get a 1) (get a 2) (get a 3)
+                          (get a 4) (get a 5)))))
+
+;;; Count one comparison of lane values; print the first failures.
+(defn expect! [(counts (mut t/Tally)) (label (slice u8)) (ty i32) (opcode i32) (mode i64)
+               (lane i64) (actual u64) (expected u64)] (-> void)
+  (set! (.checks counts) (+ (.checks counts) 1))
+  (when (!= actual expected)
+    (when (< (.failures counts) 30)
+      (println "{}: type {} opcode {} mode {} lane {}: got {:x} expected {:x}"
+               label ty opcode mode lane actual expected))
+    (t/fail! (mut counts))))

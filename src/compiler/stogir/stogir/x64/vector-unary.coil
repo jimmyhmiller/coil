@@ -1,0 +1,200 @@
+;;; Lane-wise unary operations on 8- and 16-byte vectors, SSE2.
+;;;
+;;; The count opcodes follow the library's lane semantics, which the AArch64
+;;; backend and the tests define: 55 counts leading zero bits, 56 trailing
+;;; zero bits and 57 set bits; a zero lane has as many leading or trailing
+;;; zeros as it has bits.
+;;;
+;;;   NEG (31)    0 - a; floating lanes flip the sign bit (xor with a mask)
+;;;   ABS (32)    1-byte: pminub(a, -a) (the unsigned minimum of the two is
+;;;               the magnitude); 2-byte: pmaxsw(a, -a); 4- and 8-byte:
+;;;               (a ^ s) - s with s the lane's sign spread over it (pabs* is
+;;;               SSSE3). The minimum value keeps itself, as it wraps.
+;;;               Floating lanes clear the sign bit.
+;;;   NOT (45)    xor with all ones
+;;;   BSWAP (54)  bytes exchanged inside words with two shifts, then the
+;;;               words reversed inside the lane with pshuflw/pshufhw (pshufb
+;;;               is SSSE3)
+;;;   57          per byte by the parallel bit-count reduction, then the byte
+;;;               counts summed over the lane with shifts and adds
+;;;   56          the set bits of ~a & (a - 1), which are exactly the
+;;;               trailing zeros (all of them for a zero lane)
+;;;   55          one `bsr` per lane through the node's scratch frame object
+;;;               (`leading-zeros!`): SSE2 has no lane-wise count
+;;;
+;;; Registers: see stogir.x64.simd-lanes; r10 carries the bit-count masks.
+(module stogir.x64.vector-unary)
+(import "stogir.types" :as types)
+(import "stogir.vector-arithmetic" :as vector)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.simd-lanes" :as simd)
+
+;;; Leading-zero counts are done lane by lane in general registers.
+(defn lane-expanded? [(opcode i32) (ty i32)] (-> bool)
+  (= opcode 55))
+
+(defn temporaries [(opcode i32) (ty i32)] (-> i32)
+  (cond (or (= opcode 56) (= opcode 57)) 3
+        (= opcode 55) 0
+        (or (= opcode 54) (and (= opcode 32) (not (simd/floating? ty)) (>= (simd/element ty) 4)))
+          2
+        :else 1))
+
+;;; x = the number of set bits of each `lane`-byte lane of x. s1 and s2 are
+;;; written; r10 carries the masks.
+(defn count-bits! [(out (mut code/Buffer)) (error (mut (slice u8))) (lane i32) (x i32)
+                   (s1 i32) (s2 i32)] (-> void)
+  ; x -= (x >> 1) & 0x55: two-bit sums.
+  (simd/move! (mut out) (mut error) s1 x)
+  (simd/shift! (mut out) (mut error) encode/PSRLW-I s1 1)
+  (simd/splat-bits! (mut out) (mut error) s2 (simd/bytes-of 0x55))
+  (simd/sse! (mut out) (mut error) encode/PAND s1 s2)
+  (simd/sse! (mut out) (mut error) encode/PSUBB x s1)
+  ; x = (x & 0x33) + ((x >> 2) & 0x33): four-bit sums.
+  (simd/splat-bits! (mut out) (mut error) s2 (simd/bytes-of 0x33))
+  (simd/move! (mut out) (mut error) s1 x)
+  (simd/shift! (mut out) (mut error) encode/PSRLW-I s1 2)
+  (simd/sse! (mut out) (mut error) encode/PAND s1 s2)
+  (simd/sse! (mut out) (mut error) encode/PAND x s2)
+  (simd/sse! (mut out) (mut error) encode/PADDB x s1)
+  ; x = (x + (x >> 4)) & 0x0F: byte sums.
+  (simd/move! (mut out) (mut error) s1 x)
+  (simd/shift! (mut out) (mut error) encode/PSRLW-I s1 4)
+  (simd/sse! (mut out) (mut error) encode/PADDB x s1)
+  (simd/splat-bits! (mut out) (mut error) s2 (simd/bytes-of 0x0F))
+  (simd/sse! (mut out) (mut error) encode/PAND x s2)
+  ; Sum the bytes of each lane into its low byte, doubling the lane size.
+  (when (>= lane 2)
+    (simd/move! (mut out) (mut error) s1 x)
+    (simd/shift! (mut out) (mut error) encode/PSRLW-I s1 8)
+    (simd/sse! (mut out) (mut error) encode/PADDW x s1)
+    (simd/shift! (mut out) (mut error) encode/PSLLW-I x 8)
+    (simd/shift! (mut out) (mut error) encode/PSRLW-I x 8))
+  (when (>= lane 4)
+    (simd/move! (mut out) (mut error) s1 x)
+    (simd/shift! (mut out) (mut error) encode/PSRLD-I s1 16)
+    (simd/sse! (mut out) (mut error) encode/PADDD x s1)
+    (simd/shift! (mut out) (mut error) encode/PSLLD-I x 16)
+    (simd/shift! (mut out) (mut error) encode/PSRLD-I x 16))
+  (when (= lane 8)
+    (simd/move! (mut out) (mut error) s1 x)
+    (simd/shift! (mut out) (mut error) encode/PSRLQ-I s1 32)
+    (simd/sse! (mut out) (mut error) encode/PADDQ x s1)
+    (simd/shift! (mut out) (mut error) encode/PSLLQ-I x 32)
+    (simd/shift! (mut out) (mut error) encode/PSRLQ-I x 32)))
+
+;;; rd = OPCODE a for every unary operation that stays in XMM registers
+;;; (everything but opcode 55).
+(defn emit-registers! [(out (mut code/Buffer)) (error (mut (slice u8))) (opcode i32)
+                       (ty i32) (rd i32) (a i32)] (-> void)
+  (let [lane (simd/element ty)
+        wide (= lane 8)
+        t1 (: simd/T1 i32)
+        t2 (: simd/T2 i32)
+        t3 (: simd/T3 i32)]
+    (cond (or (not (vector/unary? opcode))
+              (not (vector/valid-type? opcode ty))
+              (not (types/short-vector? ty 8))
+              (lane-expanded? opcode ty)
+              (not (registers/simd? rd))
+              (not (registers/simd? a)))
+            (simd/fail! (mut error) "unsupported x86-64 vector unary shape or registers")
+          (simd/floating? ty)
+            (let [absolute (= opcode 32)]
+              ; The sign bit of each lane (NEG) or everything but it (ABS).
+              (simd/ones! (mut out) (mut error) t1)
+              (simd/shift! (mut out) (mut error)
+                           (cond (and wide absolute) encode/PSRLQ-I
+                                 wide encode/PSLLQ-I
+                                 absolute encode/PSRLD-I
+                                 :else encode/PSLLD-I)
+                           t1
+                           (if absolute 1 (if wide 63 31)))
+              (simd/sse! (mut out) (mut error) (if absolute encode/PAND encode/PXOR) t1 a)
+              (simd/move! (mut out) (mut error) rd t1))
+          (= opcode 31)
+            (do
+              (simd/zero! (mut out) (mut error) t1)
+              (simd/sse! (mut out) (mut error) (simd/subtract-op lane) t1 a)
+              (simd/move! (mut out) (mut error) rd t1))
+          (= opcode 45)
+            (do
+              (simd/ones! (mut out) (mut error) t1)
+              (simd/sse! (mut out) (mut error) encode/PXOR t1 a)
+              (simd/move! (mut out) (mut error) rd t1))
+          (and (= opcode 32) (<= lane 2))
+            (do
+              (simd/zero! (mut out) (mut error) t1)
+              (simd/sse! (mut out) (mut error) (simd/subtract-op lane) t1 a)
+              (simd/sse! (mut out) (mut error) (if (= lane 1) encode/PMINUB encode/PMAXSW) t1 a)
+              (simd/move! (mut out) (mut error) rd t1))
+          (= opcode 32)
+            (do
+              (simd/move! (mut out) (mut error) t1 a)
+              (simd/shift! (mut out) (mut error) encode/PSRAD-I t1 31)
+              (when wide (simd/sse-imm! (mut out) (mut error) encode/PSHUFD t1 t1 0xF5))
+              (simd/move! (mut out) (mut error) t2 a)
+              (simd/sse! (mut out) (mut error) encode/PXOR t2 t1)
+              (simd/sse! (mut out) (mut error) (simd/subtract-op lane) t2 t1)
+              (simd/move! (mut out) (mut error) rd t2))
+          (= opcode 54)
+            (do
+              (simd/move! (mut out) (mut error) t1 a)
+              (simd/shift! (mut out) (mut error) encode/PSLLW-I t1 8)
+              (simd/move! (mut out) (mut error) t2 a)
+              (simd/shift! (mut out) (mut error) encode/PSRLW-I t2 8)
+              (simd/sse! (mut out) (mut error) encode/POR t1 t2)
+              (when (>= lane 4)
+                (simd/sse-imm! (mut out) (mut error) encode/PSHUFLW t1 t1 (if wide 0x1B 0xB1))
+                (simd/sse-imm! (mut out) (mut error) encode/PSHUFHW t1 t1 (if wide 0x1B 0xB1)))
+              (simd/move! (mut out) (mut error) rd t1))
+          (= opcode 57)
+            (do
+              (simd/move! (mut out) (mut error) t1 a)
+              (count-bits! (mut out) (mut error) lane t1 t2 t3)
+              (simd/move! (mut out) (mut error) rd t1))
+          :else
+            (do
+              ; t2 = ~a & (a - 1): ones exactly below the lowest set bit.
+              (simd/move! (mut out) (mut error) t1 a)
+              (simd/ones! (mut out) (mut error) t2)
+              (simd/sse! (mut out) (mut error) (simd/add-op lane) t1 t2)
+              (simd/move! (mut out) (mut error) t2 a)
+              (simd/sse! (mut out) (mut error) encode/PANDN t2 t1)
+              (count-bits! (mut out) (mut error) lane t2 t1 t3)
+              (simd/move! (mut out) (mut error) rd t2)))))
+
+;;; rd = the leading-zero count of each lane of a, through the scratch frame
+;;; object `slot`: a is stored there, each lane becomes
+;;; `(bsr lane) ^ (bits - 1)`, with 2 * bits - 1 standing in for the
+;;; undefined bsr of zero so that a zero lane gives `bits`, and rd is loaded
+;;; back. r10 and r11 are written.
+(defn leading-zeros! [(out (mut code/Buffer)) (error (mut (slice u8))) (ty i32)
+                      (slot encode/Mem) (rd i32) (a i32)] (-> void)
+  (let [lane (simd/element ty)
+        bits (* lane 8)
+        wide (if (= bits 64) (: 64 i32) 32)]
+    (if (or (not (vector/valid-type? 55 ty)) (not (types/short-vector? ty 8)))
+        (simd/fail! (mut error) "unsupported x86-64 vector leading-zero count shape")
+        (do
+          (simd/write! (mut out) (mut error) slot a 16)
+          (for [index 0 (cast i64 (types/lanes ty))]
+            (let [m (simd/after slot (* index (cast i64 lane)))]
+              (code/accept! (mut error)
+                            (if (< bits 32)
+                                (encode/movzx-rm (mut (.text out)) 32 bits simd/R10 m)
+                                (encode/mov-rm (mut (.text out)) bits simd/R10 m)))
+              (code/accept! (mut error)
+                            (encode/mov-ri (mut (.text out)) 32 simd/R11
+                                           (cast i64 (- (* bits 2) 1))))
+              (code/accept! (mut error)
+                            (encode/scan-rr (mut (.text out)) encode/BSR wide simd/R10 simd/R10))
+              (code/accept! (mut error)
+                            (encode/cmov-rr (mut (.text out)) encode/CC-E 32 simd/R10 simd/R11))
+              (code/accept! (mut error)
+                            (encode/alu-ri (mut (.text out)) encode/XOR 32 simd/R10
+                                           (cast i64 (- bits 1))))
+              (code/accept! (mut error) (encode/mov-mr (mut (.text out)) bits m simd/R10))))
+          (simd/read! (mut out) (mut error) rd slot (simd/width ty))))))

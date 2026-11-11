@@ -1,0 +1,191 @@
+;;; EXTRACT, REPLACE and SPLAT on 8- and 16-byte vectors, SSE2.
+;;;
+;;; The scalar side is a general register for integer lanes and an XMM
+;;; register for FLOAT/DOUBLE lanes (stogir.vector-lanes/compatible?).
+;;;
+;;; A literal lane index stays in registers:
+;;;   EXTRACT  integer: stogir.x64.simd-lanes/lane-extract! (pextrw, or
+;;;            movd/movq after a pshufd); floating: movaps or pshufd brings
+;;;            the lane to the bottom of the result register
+;;;   REPLACE  1-, 2- and 4-byte lanes go in through pinsrw (a FLOAT is moved
+;;;            to r10 first); 8-byte lanes through movsd (lane 0, the upper
+;;;            quadword is kept) or punpcklqdq (lane 1)
+;;;   SPLAT    movd/movq and punpcklbw / pshuflw / pshufd / punpcklqdq;
+;;;            floating scalars with pshufd
+;;;
+;;; A run-time index goes through the node's scratch frame object, because
+;;; SSE2 has neither a variable shuffle nor a lane-indexed move (the AArch64
+;;; backend uses TBL and compare masks and never touches memory):
+;;;   EXTRACT  the vector is stored at slot and eight zero bytes at slot + 16;
+;;;            an index at or above the lane count is replaced by the index
+;;;            of those zero bytes (cmovae), so the result is zero, as on
+;;;            AArch64; then one indexed load.
+;;;   REPLACE  the vector is stored, the scalar is written to the indexed
+;;;            lane unless the index is out of range (the vector is then
+;;;            unchanged, as on AArch64), and the vector is loaded back.
+;;; The index is compared as an unsigned number of its own width: a negative
+;;; index is out of range.
+;;;
+;;; Registers: see stogir.x64.simd-lanes. r10 carries the index, r11 a
+;;; reloaded or constant scalar.
+(module stogir.x64.vector-lanes)
+(import "stogir.types" :as types)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.local" :as local)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.simd-lanes" :as simd)
+
+(defn temporaries [(opcode i32) (ty i32)] (-> i32)
+  (if (= opcode 62) 1 0))
+
+;;; rd = lane `lane` of `source`. rd is a general register for an integer
+;;; scalar type and an XMM register for a floating one.
+(defn extract! [(out (mut code/Buffer)) (error (mut (slice u8))) (ty i32) (scalar i32)
+                (lane i32) (rd i32) (source i32)] (-> void)
+  (let [size (simd/element ty)]
+    (cond (or (< lane 0) (>= lane (types/lanes ty)) (not (registers/simd? source)))
+            (simd/fail! (mut error) "invalid x86-64 vector lane extraction")
+          (types/floating? scalar)
+            (if (= lane 0)
+                (simd/move! (mut out) (mut error) rd source)
+                (simd/sse-imm! (mut out) (mut error) encode/PSHUFD rd source
+                               (if (= size 4) lane 0xEE)))
+          :else
+            ; xmm15 never holds the vector (it is the first operand).
+            (simd/lane-extract! (mut out) (mut error) size lane rd source simd/X15))))
+
+;;; r10d = the bits of the FLOAT in XMM register `source`.
+(defn float-bits! [(out (mut code/Buffer)) (error (mut (slice u8))) (source i32)] (-> void)
+  (code/accept! (mut error) (encode/movd-rx (mut (.text out)) 32 simd/R10 source)))
+
+;;; rd = `source` with lane `lane` replaced by the scalar in `value` (a
+;;; general register for integer lanes, an XMM register for floating lanes).
+;;; The scalar is captured before rd is written, so rd may be its register.
+;;; T1 and r10 are written; `value` may be r11 or xmm15.
+(defn replace! [(out (mut code/Buffer)) (error (mut (slice u8))) (ty i32) (lane i32)
+                (rd i32) (source i32) (value i32)] (-> void)
+  (let [size (simd/element ty)
+        floating (simd/floating? ty)]
+    (cond (or (< lane 0) (>= lane (types/lanes ty)) (not (registers/simd? source))
+              (not (registers/simd? rd)) (= value simd/R10))
+            (simd/fail! (mut error) "invalid x86-64 vector lane replacement")
+          (and floating (= size 4))
+            (do
+              (float-bits! (mut out) (mut error) value)
+              (simd/move! (mut out) (mut error) rd source)
+              (code/accept! (mut error)
+                            (encode/pinsr-xr (mut (.text out)) 16 rd simd/R10 (* lane 2)))
+              (code/accept! (mut error)
+                            (encode/shift-ri (mut (.text out)) encode/SHR 32 simd/R10 16))
+              (code/accept! (mut error)
+                            (encode/pinsr-xr (mut (.text out)) 16 rd simd/R10 (+ (* lane 2) 1))))
+          floating
+            (do
+              (simd/move! (mut out) (mut error) simd/T1 value)
+              (simd/move! (mut out) (mut error) rd source)
+              (if (= lane 0)
+                  (code/accept! (mut error)
+                                (encode/sse-mov-rr (mut (.text out)) encode/MOVSD rd simd/T1))
+                  (simd/sse! (mut out) (mut error) encode/PUNPCKLQDQ rd simd/T1)))
+          :else
+            (do
+              (simd/move! (mut out) (mut error) rd source)
+              (simd/lane-insert! (mut out) (mut error) size lane rd value simd/R10 simd/T1)))))
+
+;;; rd = every lane equal to the scalar in `value` (a general register for
+;;; integer lanes, an XMM register for floating lanes).
+(defn splat! [(out (mut code/Buffer)) (error (mut (slice u8))) (ty i32) (rd i32)
+              (value i32)] (-> void)
+  (let [size (simd/element ty)
+        whole (= (simd/width ty) 16)]
+    (cond (not (registers/simd? rd))
+            (simd/fail! (mut error) "invalid x86-64 vector splat register")
+          (simd/floating? ty)
+            (if (= size 4)
+                (simd/sse-imm! (mut out) (mut error) encode/PSHUFD rd value 0)
+                (if whole
+                    (simd/sse-imm! (mut out) (mut error) encode/PSHUFD rd value 0x44)
+                    (simd/move! (mut out) (mut error) rd value)))
+          :else
+            (do
+              (code/accept! (mut error)
+                            (encode/movd-xr (mut (.text out)) (if (= size 8) 64 32) rd value))
+              (when (= size 1) (simd/sse! (mut out) (mut error) encode/PUNPCKLBW rd rd))
+              (when (<= size 2) (simd/sse-imm! (mut out) (mut error) encode/PSHUFLW rd rd 0))
+              (when (and (= size 4) (not whole))
+                (simd/sse-imm! (mut out) (mut error) encode/PSHUFD rd rd 0))
+              (when whole
+                (if (= size 8)
+                    (simd/sse! (mut out) (mut error) encode/PUNPCKLQDQ rd rd)
+                    (simd/sse-imm! (mut out) (mut error) encode/PSHUFD rd rd 0)))))))
+
+;;; r10 = the lane index in general register `index` (of integer type
+;;; `index-type`), zero-extended from its own width.
+(defn index! [(out (mut code/Buffer)) (error (mut (slice u8))) (index-type i32)
+              (index i32)] (-> void)
+  (let [bits (* 8 (types/scalar-size index-type 8))]
+    (code/accept! (mut error)
+                  (if (< bits 32)
+                      (encode/movzx-rr (mut (.text out)) 32 bits simd/R10 index)
+                      (encode/mov-rr (mut (.text out)) bits simd/R10 index)))))
+
+;;; The scratch lane `[slot + r10 * size]`.
+(defn indexed [(slot encode/Mem) (size i32)] (-> encode/Mem)
+  (encode/mem-index (.base slot) simd/R10 size (.disp slot)))
+
+;;; rd = lane `index` of `source` for a run-time index, zero when the index
+;;; is out of range. `index` is the general register of the index operand
+;;; (it may be r10 or r11). r10 and r11 are written.
+(defn extract-dynamic! [(out (mut code/Buffer)) (error (mut (slice u8))) (ty i32)
+                        (scalar i32) (index-type i32) (slot encode/Mem) (rd i32)
+                        (source i32) (index i32)] (-> void)
+  (let [size (simd/element ty)
+        bits (* size 8)]
+    (index! (mut out) (mut error) index-type index)
+    (simd/write! (mut out) (mut error) slot source 16)
+    (code/accept! (mut error) (encode/mov-mi (mut (.text out)) 64 (simd/after slot 16) 0))
+    (code/accept! (mut error)
+                  (encode/mov-ri (mut (.text out)) 32 simd/R11 (cast i64 (/ 16 size))))
+    (code/accept! (mut error)
+                  (encode/alu-ri (mut (.text out)) encode/CMP 64 simd/R10
+                                 (cast i64 (types/lanes ty))))
+    (code/accept! (mut error) (encode/cmov-rr (mut (.text out)) encode/CC-AE 64 simd/R10 simd/R11))
+    (code/accept! (mut error)
+                  (cond (types/floating? scalar)
+                          (encode/sse-mov-rm (mut (.text out))
+                                             (if (= size 8) encode/MOVSD encode/MOVSS) rd
+                                             (indexed slot size))
+                        (< bits 32)
+                          (encode/movzx-rm (mut (.text out)) 32 bits rd (indexed slot size))
+                        :else (encode/mov-rm (mut (.text out)) bits rd (indexed slot size))))))
+
+;;; rd = `source` with lane `index` replaced by the scalar in `value` for a
+;;; run-time index; unchanged when the index is out of range. `index` may be
+;;; r10; `value` (general or XMM by lane class) may be r11 or xmm15 but not
+;;; r10. r10 is written.
+(defn replace-dynamic! [(out (mut code/Buffer)) (error (mut (slice u8))) (ty i32)
+                        (index-type i32) (slot encode/Mem) (rd i32) (source i32)
+                        (index i32) (value i32)] (-> void)
+  (let [size (simd/element ty)
+        bits (* size 8)
+        (mut jumps) (local/create)
+        done (local/label! (mut jumps))]
+    (if (= value simd/R10)
+        (simd/fail! (mut error) "invalid x86-64 vector lane replacement scalar register")
+        (do
+          (index! (mut out) (mut error) index-type index)
+          (simd/write! (mut out) (mut error) slot source 16)
+          (code/accept! (mut error)
+                        (encode/alu-ri (mut (.text out)) encode/CMP 64 simd/R10
+                                       (cast i64 (types/lanes ty))))
+          (local/jump! (mut out) (mut error) (mut jumps) encode/CC-AE done)
+          (code/accept! (mut error)
+                        (if (simd/floating? ty)
+                            (encode/sse-mov-mr (mut (.text out))
+                                               (if (= size 8) encode/MOVSD encode/MOVSS)
+                                               (indexed slot size) value)
+                            (encode/mov-mr (mut (.text out)) bits (indexed slot size) value)))
+          (local/bind! (mut out) (mut jumps) done)
+          (local/finish! (mut out) (mut error) jumps)
+          (simd/read! (mut out) (mut error) rd slot (simd/width ty))))))
