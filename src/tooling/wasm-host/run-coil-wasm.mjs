@@ -447,6 +447,18 @@ const env = {
     return 0;
   },
   // string
+  atol:(p)=>{ const m=u8(); let e=Number(p), t=''; while(m[e]!==0)t+=String.fromCharCode(m[e++]); return BigInt(parseInt(t,10)||0); },
+  memchr:(p,c,n)=>{ const m=u8(); const b=Number(p), want=Number(c)&255, end=b+Number(n); for(let i=b;i<end;i++) if(m[i]===want) return BigInt(i); return 0n; },
+  // uname(2), in the layout of the host's struct utsname, as src/bootstrap/runtime.c
+  // hands it over: five fields of 256 bytes on Darwin and 65 on Linux.
+  uname:(p)=>{
+    const width=process.platform==='darwin'?256:65, m=u8(), at=Number(p);
+    const fields=[process.platform==='darwin'?'Darwin':'Linux','','','',process.arch==='x64'?'x86_64':process.arch];
+    m.fill(0,at,at+width*5);
+    fields.forEach((text,i)=>{ for(let k=0;k<text.length;k++) m[at+i*width+k]=text.charCodeAt(k); });
+    return 0;
+  },
+  pthread_mutex_destroy:()=>0,
   strlen:(p)=>{ const m=u8(); let e=Number(p); while(m[e]!==0)e++; return BigInt(e-Number(p)); },
   snprintf,
   // strtod MUST set *endptr = first-unparsed byte: the reader computes the consumed

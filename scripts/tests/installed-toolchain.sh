@@ -10,6 +10,7 @@
 # <prefix>/lib/coil), with the coil.jit unit warmed by `dev.py install`; the
 # comprehensive harness installs one and passes it. Nothing here installs again.
 set -uo pipefail
+. "$(dirname "$0")/../compiler/clear-project-config.sh"
 cd "$(dirname "$0")/../.."
 SECTION=${1:?usage: installed-toolchain.sh layout|allns|jit-sdk|repl}
 COIL=${COIL:?COIL must name an installed compiler}
@@ -61,7 +62,7 @@ layout() {
 }
 
 allns() {
-  expect_rc 0 "the stdlib manifest and API-REEXPORTS match src/stdlib" python3 scripts/compiler/gen-stdlib-manifest.py --check
+  expect_rc 0 "the stdlib manifest matches src/stdlib" python3 scripts/compiler/gen-stdlib-manifest.py --check
   "$COIL" namespaces > "$T/ns.txt" 2>/dev/null
   python3 scripts/compiler/gen-stdlib-manifest.py --print-namespaces > "$T/ns-want.txt"
   if diff -u "$T/ns-want.txt" "$T/ns.txt" > "$T/ns.diff" 2>&1; then

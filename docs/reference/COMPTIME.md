@@ -1,135 +1,122 @@
-# Compile-time evaluation (`comptime`)
+# Constants and `comptime`
 
-`(comptime E)` runs `E` in the **real language** during compilation and splices
-the resulting literal. The same `defn`s, the same `=`/arithmetic, the same `match`
-— compiled and executed during the build instead of being lowered into the output.
-This is "the whole language available at compile time": runtime code becomes usable
-at compile time by *running* it.
+Coil has two metaprogramming systems, macros and metaprograms
+([METAPROGRAMS.md](METAPROGRAMS.md)). This page is about two things built on the
+first: a value computed while the program compiles, and the constant expressions
+that need no computing at all.
 
-```lisp
-(defn fact [(n i64)] (-> i64) (if (primitive/icmp-le n 0) 1 (primitive/imul n (fact (primitive/isub n 1)))))
-(defn main [] (-> i64) (comptime (fact 5)))     ; main compiles to `ret i64 120`
-```
+## Constants are expressions
 
-It also dissolves the "two `=`" question: inside `comptime`, the `Eq` trait's `=`
-is the same impl the runtime uses — literally the same `=`.
+`(const NAME VALUE)` names an expression. Each use is a copy of the value, and no
+code runs to produce it:
 
 ```lisp
-(comptime (if (= 7 7) 100 0))   ; the runtime Eq trait, evaluated at compile time
+(const WORD 8)
+(const DIGEST-BYTES (* WORD 4))
+(const ORIGIN (Span :sec 5 :nsec 0))
+(const HEADER-SIZE (cast i64 (sizeof Header)))
+(const FIELDS (primitive/field-count Header))
 ```
 
-## How it works
+The value may hold literals, other constants, operators on primitive types, casts,
+`if`, constructors and array literals, `sizeof` and the other questions about a
+type. Because it is an expression of the program, a constant answers for the
+target: on wasm32 `HEADER-SIZE` counts 4-byte pointers, whatever machine runs the
+compiler. An array length may name a constant whose value is integers and operators.
 
-- The parser produces one `EComptime` node. The checker type-checks the inner
-  expression (so the form has its type) but does **not** evaluate it yet.
-- After every function is checked, `comptime.coil`'s `fold-expr` walks the elaborated
-  program and replaces each `EComptime` node with the literal its inner expression
-  evaluates to. Because it runs post-check, a `comptime` form can call any `defn`,
-  recursively. Mono/codegen never see an `EComptime` node.
-- The evaluator is the **compiled engine** (`comptime_eval.coil`): it recovers the
-  site's checked type, builds a minimal closure sub-program of everything `E` calls
-  plus a synthetic `(defn coil.ct.thunk [] (-> T) E)` exported as `coil_ct_thunk`,
-  monomorphizes and builds it, runs the entry, and reads the result back — scalars out
-  of the return register, aggregates through a write-through pointer thunk walked by
-  the natural C layout. `build-value` turns that into a literal. There is no
-  interpreter (`docs/archive/INTERP_DELETION.md`).
-- ⚠ Because the thunk is real compiled code, a runaway comptime computation is
-  **unbounded**, and deep non-tail recursion crashes rather than reporting (a self
-  call in tail position is a jump, as in any compiled code). Division by zero **is**
-  explicitly guarded (integer only — a comptime float division to infinity is
-  legal), on a type parameter too when its bounds admit only integers.
-- Comptime code runs in the compiler's process. An exit handler it registers with
-  `atexit` (the debug allocator under `coil.safety` registers one) runs when the
-  compiler unloads that code, as `dlclose` runs a library's.
+A value that needs code run says so: a function call is an error, naming the call
+and `comptime`.
 
-## Supported
+A `def` is storage laid out when the program links. Its value may hold what a
+constant's may, plus addresses (`fnptr-of`, a C string, `alloc-static`). Its
+numbers are folded for the target as the program is built, so
+`(def HEADER-BYTES (* 4 (sizeof Header)))` counts 4-byte pointers on wasm32 too.
+Arithmetic on integers wider than 64 bits is not folded; `(comptime …)` computes it.
 
-- scalars: `int`/`bool`/`float` literals, arithmetic + comparison + `inot`, `cast`.
-- control flow: `if`, `let` (immutable **and** mutable), `do`, `match`,
-  `loop`/`break`/`continue`.
-- the `=` trait (it lowers to an ordinary impl call) — so one `=` at both phases.
-- calls to any `defn`, including recursion and generics.
-- **memory:** mutable locals, `zeroed`/`alloc`, `load`/`store!`, `field`/`index`
-  places, struct/array/sum aggregates, and passing aggregates **across function
-  calls**. It is real memory in the compiler's process, not a model of it.
+## `comptime`
 
-**Aggregate results:** a `comptime` form may return any aggregate — a
-**struct** (incl. nested), a **sum**, or an **array**. The value-builder
-synthesizes the elaborated expression that reconstructs it: a struct/array becomes
-`(let [(mut t) (primitive/zeroed T)] (primitive/store! (field/index (mut t) …) v)… (primitive/load t))` (an immutable
-`t` holding a real `(ptr T)`); a sum becomes a variant call. The classic use — a
-**compile-time lookup table** — works: build an array with a loop in `comptime`,
-index it at runtime.
-
-**Static-asserts can run real code:** `(static-assert (comptime (= (check) 42)) …)`
-folds its condition at compile time, so an assertion can call any `defn`.
-
-**The computation is unrestricted** — generic calls, FFI/`extern` (a comptime
-`(strlen c"hello!")` calls libc), function pointers, strings, allocators and
-collections, and `sizeof`/`alignof`/`offsetof` all work.
-
-What is refused — as a clear located error, never a miscompile — is the **result**,
-which has to become a literal:
-
-- a **pointer** (a compile-time address is meaningless in the built program), and
-- an aggregate that is a **generic instance** (`(Option i64)`, `(Pair i64 i64)`):
-  "cannot be materialized". Return a plain struct/sum, or the scalar you need.
-
-**Computed `const`s:** a `const`'s value is any expression. A bare literal inlines
-as before; a scalar/sum computation is evaluated at compile time —
-`(const FACT5 (fact 5))`, `(const DOUBLE (* BASE 2))`.
-
-**Aggregate consts = static data tables.** A `const` whose type is a struct or
-array is evaluated once and emitted as a **constant global**; references become a
-pointer to it. So a compile-time lookup table is real static data:
+`(comptime E)` runs `E` while the program compiles and leaves the literal it comes
+to in its place:
 
 ```lisp
-(const SQUARES (squares))         ; => @const.SQUARES = private constant [8 x i64] [0,1,4,9,…]
-(primitive/load (primitive/index SQUARES 5))          ; reads 25 straight from the global, at runtime
+(defn fib [(n i64)] (-> i64) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+(const FIB-20 (comptime (fib 20)))
+(defn main [] (-> i64) (comptime (* 6 7)))
 ```
 
-⚠ A **sum-typed `const`** is not supported: it does not fall back to rebuilding at use
-sites, it aborts the build with `UNIMPLEMENTED: codegen: unknown static const <name>`.
-Use `(comptime …)` at the use site, or a struct/array const.
-
-## Compile-time reflection
-
-Compile-time code can introspect a type's structure — so reflection isn't
-macro-only. These forms take a *type* and fold to a literal (like `sizeof`), usable
-in `comptime`/`const`/`static-assert`/ordinary code:
-
-- `(primitive/field-count T)` → `i64` (struct fields)
-- `(primitive/variant-count T)` → `i64` (sum variants)
-- `(primitive/struct? T)` / `(primitive/sum? T)` / `(primitive/int? T)` / `(primitive/float? T)` / `(primitive/ptr? T)` / `(primitive/array? T)` → `bool`
-
-Per-field reflection (the index is a compile-time value — a literal or a
-`comptime`/loop variable):
-
-- `(primitive/field-name T i)` → the i-th field's name, as a comptime **string** (`(slice u8)`)
-- `(primitive/field-type-kind T i)` → its type's kind tag (`i64`: 0 int, 1 float, 2 bool,
-  3 struct, 4 sum, 5 ptr, 6 array, 7 slice, 8 other)
+It is an ordinary macro in `coil.core`. Without anything around it to read, it comes to
+this:
 
 ```lisp
-(const NF (primitive/field-count Point))                 ; a compile-time constant
-(static-assert (primitive/struct? Point) "must be a struct")
-(comptime (* (primitive/field-count Point) (primitive/variant-count Shape)))
-
-; THE PAYOFF — a runtime field-metadata table, generated at compile time:
-(defstruct FieldDesc [(name (slice u8)) (kind i64)])
-(const FIELDS
-  (comptime (let [(mut t) (primitive/zeroed (array FieldDesc 3)) (mut i) 0]
-    (loop (if (>= (primitive/load i) (primitive/field-count Mix)) (break)
-      (do (primitive/store! (primitive/field (primitive/index (mut t) (primitive/load i)) name) (primitive/field-name Mix (primitive/load i)))
-          (primitive/store! (primitive/field (primitive/index (mut t) (primitive/load i)) kind) (primitive/field-type-kind Mix (primitive/load i)))
-          (primitive/store! i (+ (primitive/load i) 1)))))
-    (primitive/load t))))
-; => @const.FIELDS = constant [3 x %FieldDesc] [ {{"a",1},0}, {{"b",1},1}, … ]
+(defn comptime [(value Code)] (-> Code)
+  (let [form `(defn* _ [(unused Code)] (-> Code)
+                (primitive/code-lift ~value))
+        name (primitive/code-hoist form form)]
+    `(~name 0)))
 ```
 
-## Roadmap
+`primitive/code-hoist` adds a definition to the module being expanded, and the
+compiler reuses it when the same syntax comes round again. `primitive/code-lift` makes syntax for a
+value. The rest is what any macro gets: `E` is compiled and run by the metaprogram
+engine, with the whole language at hand (allocation, collections, FFI), and division
+by zero is an error located at the divisor.
 
-- field *types* as first-class comptime `Type` values (recurse into a field's type),
-  and reflecting a generic type parameter (resolved at mono).
-- materializing a **generic-instance aggregate** as a comptime result.
-- a **bound on runaway comptime** (there is none today), and TCO
-  on the comptime thunk path.
+### What it can make
+
+The result becomes syntax, so it has to have some:
+
+- scalars and strings keep their type: `(comptime (narrow))` of an `i32` is an `i32`;
+- a struct, sum or array becomes the construction that rebuilds it, generic
+  instances included;
+- a pointer, function or other run-time-only value has no literal, and fails where
+  it is lifted.
+
+The same goes for `~` in a template, except that a bare scalar takes the type its
+context gives it, as a literal does.
+
+### What it sees
+
+`E` can use whatever has a value while the program compiles:
+
+```lisp
+(const LIMIT 100)
+
+(defn known [] (-> i64)
+  (let [base 3
+        next (+ base 4)]
+    (comptime (fib next))))             ; a `let` a constant could hold: 13
+
+(defn per-instance [T (const N i64)] [] (-> i64)
+  (comptime (+ N (cast i64 (sizeof T))))) ; a generic parameter: once per instance
+```
+
+- **Top-level definitions**, by the rules any code has: a local of the same name is
+  what the name means, not the definition.
+- **A `let` around it** whose value is what a constant may hold, or is itself
+  `(comptime …)`. `E` gets a copy of it, and of the `let`s it reads.
+- **Generic parameters**, types and values, of the function or `impl` around it.
+  They have a value once the code is specialized, so `E` runs then, once per instance,
+  and an instance nothing uses never runs. Its type comes from checking `E` in the generic.
+
+Everything else about the code around it is still to come: a parameter, a `(mut x)`, a
+loop's or a pattern's variable, a `let` computed by calling something. Reading one is an
+error naming it. `(let [x (f)] (comptime x))` says to write `(comptime (f))`, if that is
+what is meant.
+
+`comptime` is a macro, so it also has what macros have:
+
+- **The machine running the compiler.** `E` is compiled for that machine, so `sizeof`
+  inside it, and in anything it calls, answers for the host in a cross build. Ask
+  about the target with a constant, or from a macro with `target-arch` and `target-os`.
+  `(sizeof T)` in a generic needs no `comptime`, and does answer for the target.
+- **The program before whole-program transforms.**
+- **No expected type.** Its value's type comes from `E`; write `(comptime (: E T))`
+  where inference would have needed the context.
+
+How it finds out what is around it is available to any macro: `primitive/code-call-scope`
+lists what is bound at the call, and `primitive/code-specialized-value` leaves a form for
+each instance of a generic, with the instance's arguments where it reads the parameters.
+A name `E` binds again with `let`, `match` or a definition is not the parameter there; one
+a macro in `E` binds is not known until that macro expands, so give it another name.
+
+A value that needs itself is an error naming the function that closes the cycle.

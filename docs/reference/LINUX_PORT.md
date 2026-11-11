@@ -30,14 +30,12 @@ except where noted):
   behavior-neutral swap on macOS too. Host probe `me-host-linux?`
   (`access("/proc/self/maps")`) picks the dylib link line: `cc -shared` + `.so` on
   ELF vs `cc -dynamiclib` + `.dylib` + `-Wl,-undefined,dynamic_lookup` on Mach-O.
-- **`comptime_eval.coil`** — same host-aware link line for compiled-comptime dylibs.
 - **`jit.coil`** — `sys_icache_invalidate` is now `dlsym`'d at runtime (found on
   Darwin, absent-and-unneeded on x86 ELF) so the ELF link has no Darwin extern. The
   MObj JIT itself emits arm64 and never runs on this host (see gaps).
-- **`main.coil`** — the in-memory MObj comptime fast path is registered only when
-  the HOST is arm64 (`host-arm64?`); on Linux, comptime sites the interpreter can't
-  fold take `comptime_eval`'s dylib route (`cc -shared` + `dlopen`), which handles
-  aggregate, sum and string readbacks (`tests/corpus/comptime.coil`).
+- **`main.coil`** — the in-memory MObj metaprogram fast path is registered only when
+  the HOST is arm64 (`host-arm64?`); on Linux, metaprograms take the dylib route
+  (`cc -shared` + `dlopen`).
 - **`driver.coil`** — `run`/`test` prepend `exec` to the `system()` command so a
   signal death reaches `wait-report` unmasked on shells that fork (Linux dash);
   `-arch` (a Mach-O toolchain flag) is not passed on ELF hosts; `dsymutil` is

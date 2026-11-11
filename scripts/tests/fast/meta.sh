@@ -4,7 +4,8 @@
 #   * `coil run` on a Code -> Code program: a transform file as the program over
 #     stdin, two Code parameters read from two files, a generator whose output
 #     compiles, a semantic checker whose error is located in the loaded file, the
-#     declaration records of method calls on generic and plain types, and the
+#     declaration records of method calls on generic and plain types, the
+#     dependency facts of a function and of a type and a field, and the
 #     diagnostics for a wrong input count or a target that does not exist;
 #   * hygiene in both directions: identifiers that must connect (quote, a shared
 #     fresh identifier, an alias-qualified template name, a semantic transform's
@@ -24,6 +25,7 @@
 #
 # Usage: scripts/tests/fast/meta.sh        (compiler from $COIL, else `coil`)
 set -uo pipefail
+. "$(dirname "$0")/../../compiler/clear-project-config.sh"
 cd "$(dirname "$0")/../../.."
 COIL=${COIL:-$(command -v coil)}
 [ -x "$COIL" ] || { echo "FAIL meta: no compiler (set COIL)"; exit 2; }
@@ -86,6 +88,13 @@ expect_stdout "run: a method's declaration record names its type's module, gener
   '((coil.arraylist coil.arraylist.new) (coil.alloc coil.alloc.malloc-allocator) (coil.arraylist coil.arraylist.push!) (mt_runcmmethods mt_runcmmethods.peek) (coil.arraylist coil.arraylist.free!) (mt_runcmmethods mt_runcmmethods.use-pipe) (mt_runcmmethods mt_runcmmethods.value))' \
   "$COIL" run $M/run_code_main_decls.coil $M/run_code_main_methods.coil
 
+# What a definition depends on is what the checker looked up while checking it:
+# the functions and methods it calls (a method under its function's name), the
+# types it names and where, the fields it reads; and the other way round.
+expect_stdout "run: a definition's dependencies, and a type's and a field's dependents" \
+  '((main ((trait coil.alloc.Allocator body) (struct coil.alloc.Allocator-dyn body) (function coil.alloc.malloc-allocator body) (struct coil.arraylist.ArrayList body) (trait coil.core.Push body) (function coil.core.Push$coil.arraylist.ArrayList$push! body) (function inherent$coil.arraylist.ArrayList$free! body) (function inherent$coil.arraylist.ArrayList$new body) (function inherent$mt_runcmmethods.Cell$peek body) (function inherent$mt_runcmmethods.Plain$value body) (struct mt_runcmmethods.Cell body) (struct mt_runcmmethods.Fd body) (struct mt_runcmmethods.Plain body) (function mt_runcmmethods.use-pipe body))) (Fd ((mt_runcmmethods.main struct body) (mt_runcmmethods.use-pipe struct declaration body))) (Fd.open ((mt_runcmmethods.use-pipe field body))) (Cell ((inherent$mt_runcmmethods.Cell$peek struct declaration body) (mt_runcmmethods.main struct body))))' \
+  "$COIL" run $M/run_code_main_deps.coil $M/run_code_main_methods.coil
+
 expect "run: a target that is neither a file nor a namespace" 1 'no such file' "$COIL" run hello
 
 # Source output preserves binary strings and names derived from fresh scopes.
@@ -118,7 +127,7 @@ expect "hygiene: a reflected type of a module not imported is not in scope" 1 \
 out=$("$COIL" check $M/hygiene_capture.coil 2>&1); rc=$?
 case "$rc|$out" in
   *'$scope'*|*'$datum'*) bad "hygiene: captures report no internal scope key" "$out" ;;
-  "1|"*"unbound variable 'total'"*"unbound variable 'state'"*"unbound variable 'hidden'"*"3 errors"*)
+  "1|"*"unbound variable 'state'"*"unbound variable 'hidden'"*"unbound variable 'total'"*"3 errors"*)
     ok "hygiene: three captures, each reported, in one run" ;;
   *) bad "hygiene: three captures, each reported, in one run" "exit $rc: $out" ;;
 esac
@@ -172,22 +181,18 @@ else
 fi
 
 # A file edited while lint --fix analyses it is the editor's. The rule appends a
-# line to its target during the analysis (tests/meta/concurrent_edit_rule.coil);
-# the preflight has already proposed a rewrite of the target's removed name by
-# then, in memory, so the one write that ends the run must leave the file as the
-# editor left it: the original text and the appended line. (The target is
-# written here: a removed name in tests/ would make every build of this
-# repository offer the migration.)
+# line to its target during the analysis (tests/meta/concurrent_edit_rule.coil), and
+# the one write that ends the run must leave the file as the editor left it: the
+# original text and the appended line.
 mkdir -p "$WORK/race"
 cp $M/concurrent_edit_rule.coil "$WORK/race/"
-printf '(module mt.concurrent-edit-target)\n(import "coil.primitive" :as primitive)\n(import "coil.args" :use [args-count])\n\n(defn main [] (-> i64)\n  (primitive/imul (args-count) 1))\n' \
+printf '(module mt.concurrent-edit-target)\n(import "coil.primitive" :as primitive)\n\n(defn main [] (-> i64)\n  (primitive/imul 7 1))\n' \
   > "$WORK/race/concurrent_edit_target.coil"
 out=$(cd "$WORK/race" && "$COIL" lint concurrent_edit_target.coil --use mt.concurrent-edit-rule --fix 2>&1); rc=$?
 raced=$(cat "$WORK/race/concurrent_edit_target.coil")
-case "$raced" in *"(count)"*) rc="wrote its rewrite, exit $rc" ;; esac
 case "$rc|$out|$raced" in
   *"fixed "*) bad "lint --fix leaves a file edited during its analysis to the editor" "exit $rc, it claims the file: $out" ;;
-  "2|"*"left untouched: concurrent_edit_target.coil"*"|"*"(args-count)"*"; edited meanwhile"*)
+  "2|"*"left untouched: concurrent_edit_target.coil"*"|"*"(primitive/imul 7 1)"*"; edited meanwhile"*)
     ok "lint --fix leaves a file edited during its analysis to the editor" ;;
   *) bad "lint --fix leaves a file edited during its analysis to the editor" "exit $rc: $out
 $raced" ;;

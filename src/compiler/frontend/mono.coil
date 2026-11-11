@@ -24,10 +24,14 @@
 (import "coil.control" :use *)
 (import "coil.try" :use *)
 (import "coil.reader" :use *)
-(import "coil.compiler.comptime" :use [type-map-lookup type-map-record])
+(import "coil.compiler.metastate"
+        :use [type-map-lookup
+              type-map-record
+              type->code
+              const-value-sexp])
 (import "coil.compiler.unit_state" :use [core-name])
 (import "coil.compiler.ast" :use *)
-(import "coil.compiler.codeop" :use [codeop-name])
+(import "coil.compiler.codeop" :use *)
 (import "coil.compiler.check" :use *)
 (import "coil.compiler.parser" :use *)
 (import "coil.compiler.resolve" :use *)
@@ -36,12 +40,11 @@
 (import "coil.compiler.mono_subst" :use *)
 (import "coil.compiler.mono_core" :use *)
 (import "coil.compiler.mono_abi" :use *)
-(import "coil.compiler.assert_fold" :use [InlineSource assert-inline-calls])
+(import "coil.compiler.assert_fold" :use [InlineSource assert-inline-calls def-inline-calls])
 (import "coil.compiler.diverge" :use [hoist-diverging-operand])
 (import "coil.compiler.phase_split"
         :use
         [phase-only-nominals phase-only-fields? phase-only-variants?])
-(import "coil.compiler.name_sort" :use [Named def-name])
 
 ;;; ---- specializing expressions ----------------------------------------------
 
@@ -241,12 +244,16 @@
                         (EBitGet (try! (resolve-boxed m p map)) fname)))
            ; two or three operands
            (EBin [op lhs rhs]
-                 (let [l (try! (resolve-boxed m lhs map))]
+                 (let [l (try! (resolve-boxed m lhs map))
+                       r (try! (resolve-boxed m rhs map))]
                    (Ok [ExprKind Diag]
                        (EBin
                          :op op
                          :lhs l
-                         :rhs (try! (resolve-boxed m rhs map))))))
+                         :rhs
+                           (match (try! (mono-guarded-divisor m op lhs rhs map))
+                             (Some [t] (mono-guard-divisor m op t r))
+                             (None [] r))))))
            (ECmp [op lhs rhs]
                  (let [l (try! (resolve-boxed m lhs map))]
                    (Ok [ExprKind Diag]
@@ -444,10 +451,6 @@
            (EBracketCall [_ _ _ _]
                          (Err [ExprKind Diag]
                               (derr "internal: a bracket call survived resolution")))
-           (EComptime [_]
-                      (Err [ExprKind Diag]
-                           (compiler-bug e
-                                         "mono: unresolved comptime node (compiler bug)")))
            (EAscribe [_ _]
                      (Err [ExprKind Diag]
                           (derr "mono: unlowered ascription node — the checker should have replaced (: v t) with its coerced value (compiler bug)")))
@@ -482,15 +485,113 @@
                        (Err [ExprKind Diag]
                             (derr "mono: comptime-only code value reached mono (compiler bug)"))))
            (ECodeOp [op args]
-                    (if (.keep_code m)
-                        (Ok [ExprKind Diag]
-                            (ECodeOp op (try! (mono-code-operands m args map))))
-                        (Err [ExprKind Diag]
-                             (compiler-bug e
-                                           (sconcat3 a
-                                                     "mono: comptime-only code operation "
-                                                     (codeop-name op)
-                                                     " reached mono (compiler bug)")))))))))
+                    (cond (specialized-value-op? op)
+                            (mono-specialized-value m e args map)
+                          (.keep_code m)
+                            (Ok [ExprKind Diag]
+                                (ECodeOp op
+                                         (if (mono-lift-op? op)
+                                             (try! (mono-lift-operands m args map))
+                                             (try! (mono-code-operands m args map)))))
+                          :else
+                            (Err [ExprKind Diag]
+                                 (compiler-bug e
+                                               (sconcat3 a
+                                                         "mono: comptime-only code operation "
+                                                         (codeop-name op)
+                                                         " reached mono (compiler bug)")))))))))
+
+;;; T as its source spelling: an instance's mangled name as the generic and arguments
+;;; it came from. What a macro compiles and what the checker reads name a type this way.
+(defn mono-source-type [(m (ptr MonoCtx)) (t Type)] (-> Type)
+  (let [a (.a m)]
+    (match t
+      (TStruct [name]
+               (match (instance-origin m name)
+                 (Some [o]
+                       (let [(mut args) (ArrayList::new [Type] a)]
+                         (for [i 0 (len (load (.args o)))]
+                           (push! (mut args)
+                                  (mono-source-type m (get (load (.args o)) i))))
+                         (TApp (.source o) (box-al [Type] a (load args)))))
+                 (None [] t)))
+      (TPtr [inner] (TPtr (box-type a (mono-source-type m (load inner)))))
+      (TRef [mutable inner]
+            (TRef mutable (box-type a (mono-source-type m (load inner)))))
+      (TSlice [elem] (TSlice (box-type a (mono-source-type m (load elem)))))
+      (TArray [elem n] (TArray (box-type a (mono-source-type m (load elem))) n))
+      (TVec [elem n] (TVec (box-type a (mono-source-type m (load elem))) n))
+      (_ t))))
+
+;;; What the argument T of an instance is in a form: a type by its source spelling, a
+;;; constant as its literal.
+(defn mono-instance-argument [(m (ptr MonoCtx)) (t Type)] (-> Sexp)
+  (match t
+    (TConst [v] (const-value-sexp v))
+    (_ (type->code (box-type (.a m) (mono-source-type m t))))))
+
+;;; `(code-specialized-value MODULE PARAM… (quote FORM) (zeroed T))` in the instance MAP:
+;;; FORM with each read of a PARAM replaced by its argument, expanded and resolved as a
+;;; form of MODULE, checked as a T and specialized like the code around it.
+(defn mono-specialized-value [(m (ptr MonoCtx))
+                              (e (ptr Expr))
+                              (args (ptr (ArrayList Expr)))
+                              (map (ptr (ArrayList SubstEntry)))]
+  (-> (Result ExprKind Diag))
+  (try (let [a (.a m)
+             n (len (load args))
+             module
+               (match (.kind (elem args 0))
+                 (EStr [text] (if (= (len text) 0) (None [(slice u8)]) (Some text)))
+                 (_ (break :try
+                      (Err [ExprKind Diag]
+                           (compiler-bug e "mono: a specialized value names no module (compiler bug)")))))
+             form
+               (match (.kind (elem args (- n 2)))
+                 (EQuote [held] (load held))
+                 (_ (break :try
+                      (Err [ExprKind Diag]
+                           (compiler-bug e "mono: a specialized value holds no form (compiler bug)")))))
+             declared
+               (match (.kind (elem args (- n 1)))
+                 (EZeroed [t] t)
+                 (_ (break :try
+                      (Err [ExprKind Diag]
+                           (compiler-bug e "mono: a specialized value reached mono unchecked (compiler bug)")))))
+             (mut params) (ArrayList::new [(slice u8)] a)
+             (mut arguments) (ArrayList::new [Sexp] a)]
+         (for [i 1 (- n 2)]
+           (match (.kind (elem args i))
+             (EStr [param]
+                   (push! (mut params) param)
+                   (push! (mut arguments)
+                          (mono-instance-argument m
+                                                  (try! (resolve-ty-value m (TStruct param) map))))
+                   0)
+             (_ (break :try
+                  (Err [ExprKind Diag]
+                       (compiler-bug e "mono: a specialized value's parameter is not a name (compiler bug)"))))))
+         (let [resolved
+                 (try! (expand-for-instance (.instances m)
+                                            a
+                                            form
+                                            (box-al [(slice u8)] a (load params))
+                                            (box-al [Sexp] a (load arguments))
+                                            module))
+               want (mono-source-type m (try! (resolve-ty-value m declared map)))
+               typed (try! (synth a
+                                  resolved
+                                  (box-type a want)
+                                  (box-al [EnvEntry] a (ArrayList::new [EnvEntry] a))
+                                  (load (field m ownership_cx))
+                                  (empty-strs a)
+                                  ""))
+               ; a constructor's storage is read, as the value this stands for
+               value (place-as-value a
+                                     (SynPair :e (box-expr a (.e typed))
+                                              :t (box-type a (.t typed))))]
+           (Ok [ExprKind Diag]
+               (.kind (try! (resolve-expr m (box-expr a (.e value)) map))))))))
 
 ;;; A Code operation's operand E, specialized by MAP, typed for metalower. How an
 ;;; operand crosses into the host depends on its type, and in a generic body that
@@ -505,6 +606,87 @@
          (if (> (len (load map)) 0)
              (mono-code-typed m e out map)
              (Ok [Expr Diag] out)))))
+
+;;; The integer type of a division code that runs at compile time must guard, or
+;;; None. Run as compiled code, dividing by zero stops the compiler on one machine
+;;; and answers 0 on another, and either way says nothing about where. A float
+;;; division has its own answers, and a literal divisor other than 0 cannot fail.
+(defn mono-guarded-divisor [(m (ptr MonoCtx))
+                            (op i64)
+                            (lhs (ptr Expr))
+                            (rhs (ptr Expr))
+                            (map (ptr (ArrayList SubstEntry)))]
+  (-> (Result (Option Type) Diag))
+  (try (if (or (not (.keep_code m))
+               (< op 3)
+               (> op 6)
+               (match (.kind rhs) (EInt [v] (!= v 0)) (_ false)))
+           (Ok [(Option Type) Diag] (None [Type]))
+           (Ok [(Option Type) Diag]
+               (match (try! (mono-operand-type m rhs map))
+                 (Some [t] (mono-int-type t))
+                 (None []
+                       (match (try! (mono-operand-type m lhs map))
+                         (Some [t] (mono-int-type t))
+                         (None [] (None [Type])))))))))
+
+(defn mono-int-type [(t Type)] (-> (Option Type))
+  (match t (TInt [_ _] (Some t)) (_ (None [Type]))))
+
+(defn mono-operand-type [(m (ptr MonoCtx))
+                         (e (ptr Expr))
+                         (map (ptr (ArrayList SubstEntry)))]
+  (-> (Result (Option Type) Diag))
+  (try (match (type-map-lookup (.node-id e))
+         (Some [t]
+               (Ok [(Option Type) Diag] (Some (try! (resolve-ty-value m t map)))))
+         (None []
+               (Ok [(Option Type) Diag]
+                   (match (.kind e)
+                     (EInt [_] (Some (TInt 64 true)))
+                     (ECast [t _] (Some t))
+                     (_ (None [Type]))))))))
+
+;;; R, the divisor of a division or remainder (OP) of integer type T, checked for
+;;; zero at run time; the failure is located at the divisor.
+(defn mono-guard-divisor [(m (ptr MonoCtx)) (op i64) (t Type) (r (ptr Expr))]
+  (-> (ptr Expr))
+  (let [a (.a m)
+        zero (mono-at r (ECast t (box-expr a (mono-at r (EInt 0)))))
+        (mut fail) (ArrayList::new [Expr] a)
+        (mut failed) (ArrayList::new [Expr] a)
+        (mut binds) (ArrayList::new [Bind] a)
+        (mut body) (ArrayList::new [Expr] a)]
+    (push! (mut fail) (mono-at r (EInt (if (or (= op 3) (= op 5)) 5 6))))
+    (push! (mut fail) (mono-at r (EInt (.source r))))
+    (push! (mut fail) (mono-at r (EInt (.lo r))))
+    (push! (mut fail) (mono-at r (EInt (.hi r))))
+    (push! (mut failed)
+           (mono-at r (ECall
+                   :func "coil.compiler.metashim.mp-parity-fail"
+                   :type_args (box-al [Type] a (ArrayList::new [Type] a))
+                   :args (box-al [Expr] a (load fail)))))
+    (push! (mut failed) (mono-at r (EInt 0)))
+    (push! (mut binds)
+           (Bind
+             :name "$divisor"
+             :mutable false
+             :value (load r)
+             :bid 0
+             :owned_type (primitive/cast (ptr Type) 0)))
+    (push! (mut body)
+           (mono-at r (EIf
+                   :cnd
+                     (box-expr a
+                               (mono-at r (ECmp 4
+                                           (box-expr a (mono-at r (EVar "$divisor")))
+                                           (box-expr a zero))))
+                   :thn (box-expr a (mono-at r (EDo (box-al [Expr] a (load failed)))))
+                   :els (box-expr a (mono-at r (EInt 0))))))
+    (push! (mut body) (mono-at r (EVar "$divisor")))
+    (box-expr a
+              (mono-at r (ELet (box-al [Bind] a (load binds))
+                          (box-al [Expr] a (load body)))))))
 
 ;;; OUT, the specialization of E, with E's recorded type made concrete under a
 ;;; fresh node. A read of a mutable binding has no record of its own: metalower
@@ -551,6 +733,23 @@
            (push! (mut out) (try! (mono-code-operand m (elem args i) map))))
          (Ok [(ptr (ArrayList Expr)) Diag] (box-al [Expr] (.a m) (load out))))))
 
+;;; `code-lift` answers by its operand's type, outside a generic function as in one.
+(defn mono-lift-op? [(op CodeOp)] (-> bool)
+  (match op
+    (ExpansionOps [o] (match o (CodeLift [] true) (_ false)))
+    (_ false)))
+
+(defn mono-lift-operands [(m (ptr MonoCtx))
+                          (args (ptr (ArrayList Expr)))
+                          (map (ptr (ArrayList SubstEntry)))]
+  (-> (Result (ptr (ArrayList Expr)) Diag))
+  (try (let [(mut out) (ArrayList::new [Expr] (.a m))]
+         (for [i 0 (len (load args))]
+           (let [e (elem args i)]
+             (push! (mut out)
+                    (try! (mono-code-typed m e (try! (resolve-expr m e map)) map)))))
+         (Ok [(ptr (ArrayList Expr)) Diag] (box-al [Expr] (.a m) (load out))))))
+
 ;;; A quasiquote template specialized by MAP: its unquoted operands, typed as a
 ;;; Code operation's are.
 (defn mono-quasi [(m (ptr MonoCtx))
@@ -559,10 +758,16 @@
   (try (let [a (.a m)]
          (match q
            (QLit [_] (Ok [Quasi Diag] q))
+           ; An unquoted value becomes Code by its type, so even outside a generic
+           ; function that type must name the instance, not the generic and its
+           ; arguments.
            (QUnquote [e]
                      (Ok [Quasi Diag]
                          (QUnquote (box-expr a
-                                             (try! (mono-code-operand m e map))))))
+                                             (try! (mono-code-typed m
+                                                                    e
+                                                                    (try! (resolve-expr m e map))
+                                                                    map))))))
            (QSplice [e]
                     (Ok [Quasi Diag]
                         (QSplice (box-expr a (try! (mono-code-operand m e map))))))
@@ -1949,7 +2154,6 @@
     ; trait environment without reconstructing compiler-generated method names.
     (set! (.traits out) (load (field p traits)))
     (set! (.impls out) (load (field p impls)))
-    (set! (.metas out) (box-al [Expr] a (ArrayList::new [Expr] a)))
     (set! (.exports out) exports)
     (set! (.function_abis out) (load (field p function_abis)))
     (set! (.mono_origins out) (box-al [MonoOrigin] a (.origins m)))
@@ -2164,7 +2368,8 @@
                 (p (ptr Program))
                 (checked (ptr Program))
                 (accepted (ptr LS))
-                (keep-code bool)] (-> (Result (ptr MonoCtx) Diag))
+                (keep-code bool)
+                (instances (dyn InstanceExpansion))] (-> (Result (ptr MonoCtx) Diag))
   (try (let [phase-only (phase-only-nominals a p)
              cx (try! (mono-ownership-context a checked accepted))
              templates (try! (templates-of a p))
@@ -2197,7 +2402,8 @@
                        :phase_only phase-only
                        :instance_entries (def-table-new [ExportC] a)
                        :stage (Elaborated)
-                       :keep_code keep-code))
+                       :keep_code keep-code
+                       :instances instances))
              impls (load (field p impls))]
          (for [i 0 (len (load impls))]
            (let [ip (elem impls i)]
@@ -2238,33 +2444,39 @@
 ;;; Specialize P, the runtime part of the checked program CHECKED (see
 ;;; `drop-code-funcs-unless-root`). PRIOR is the native program an earlier run
 ;;; made, whose declarations are borrowed (see `adopt-prior!`), or null; ACCEPTED
-;;; the state CHECKED was checked on top of, or null.
+;;; the state CHECKED was checked on top of, or null. INSTANCES expands what a
+;;; generic left for each of its instances.
 (defn monomorphize-reusing [(a (dyn Allocator))
                             (p (ptr Program))
                             (checked (ptr Program))
                             (prior (ptr Program))
-                            (accepted (ptr LS))]
+                            (accepted (ptr LS))
+                            (instances (dyn InstanceExpansion))]
   (-> (Result (ptr Program) Diag))
-  (monomorphize-mode a p checked prior accepted false))
+  (monomorphize-mode a p checked prior accepted false instances))
 
 ;;; Specialize the checked metaprogram P, keeping its compile-time code for
 ;;; metalower (see MonoCtx.keep_code).
-(defn monomorphize-keeping-code [(a (dyn Allocator)) (p (ptr Program))]
+(defn monomorphize-keeping-code [(a (dyn Allocator))
+                                 (p (ptr Program))
+                                 (instances (dyn InstanceExpansion))]
   (-> (Result (ptr Program) Diag))
   (monomorphize-mode a
                      p
                      p
                      (primitive/cast (ptr Program) 0)
                      (primitive/cast (ptr LS) 0)
-                     true))
+                     true
+                     instances))
 
 (defn monomorphize-mode [(a (dyn Allocator))
                          (p (ptr Program))
                          (checked (ptr Program))
                          (prior (ptr Program))
                          (accepted (ptr LS))
-                         (keep-code bool)] (-> (Result (ptr Program) Diag))
-  (try (let [m (try! (mono-new a p checked accepted keep-code))
+                         (keep-code bool)
+                         (instances (dyn InstanceExpansion))] (-> (Result (ptr Program) Diag))
+  (try (let [m (try! (mono-new a p checked accepted keep-code instances))
              empty (subst-new a)]
          (unless (= (primitive/cast i64 prior) 0)
            (adopt-prior! m p prior))
@@ -2290,13 +2502,16 @@
                                      p
                                      (assert-inline-calls (mut functions)
                                                           asserts)
-                                     consts
+                                     (def-inline-calls (mut functions) consts)
                                      (with-instance-entries a m exports))))))))
 
-(defn monomorphize [(a (dyn Allocator)) (p (ptr Program))]
+(defn monomorphize [(a (dyn Allocator))
+                    (p (ptr Program))
+                    (instances (dyn InstanceExpansion))]
   (-> (Result (ptr Program) Diag))
   (monomorphize-reusing a
                         p
                         p
                         (primitive/cast (ptr Program) 0)
-                        (primitive/cast (ptr LS) 0)))
+                        (primitive/cast (ptr LS) 0)
+                        instances))

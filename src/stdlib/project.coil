@@ -1,0 +1,2645 @@
+;;; A project's manifest: Coil.toml as a value, what it says about the package or
+;;; workspace, and the source files that belong to it. Everything that reads a project,
+;;; the compiler and the source tools alike, reads it through this module.
+(module coil.project)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :as str :use * :exclude [parse-int])
+(import "coil.arraylist" :use *)
+(import "coil.io" :use *)
+(import "coil.fs" :as fs :use [access])
+(import "coil.os" :as os)
+(import "coil.path" :use *)
+(import "coil.text" :use [sconcat sconcat3 i64->str])
+(import "coil.reader" :use [char-literal-end])
+(import "coil.cc" :as cc)
+
+(defn m-ps [(w (ptr Writer)) (s (slice u8))] (-> i64)
+  (print-str w s)
+  0)
+
+(defn m-wb [(w (ptr Writer)) (b i64)] (-> i64)
+  (write-byte w (primitive/cast u8 b))
+  0)
+
+;;; NAME, when it names a JIT implementation.
+(defn m-jit-name [(name (slice u8))] (-> (Option (slice u8)))
+  (if (or (= name "llvm") (= name "tpde")) (Some name) (None [(slice u8)])))
+
+;;; The bytes of the file at PATH, or empty when it cannot be read.
+(defn m-read-text [(a (dyn Allocator)) (path (ptr i8))] (-> (slice u8))
+  (match (fs/read-file a (from-cstr path))
+    (Ok [text] text)
+    (Err [_] "")))
+
+(defn dir? [(path (ptr i8))] (-> bool)
+  (let [d (fs/opendir path)]
+    (if (= (primitive/cast i64 d) 0)
+        false
+        (do (fs/closedir d) true))))
+
+; `coil build` / `coil run` with no source file read ./Coil.toml and expand it
+; into the flags the CLI already accepts. Deliberately
+; tiny: a line-based reader for the project sections below.
+(defn m-ws? [(c u8)] (-> bool)
+  (or (= c (: 32 u8))
+      (= c (: 9 u8))
+      (= c (: 10 u8))
+      (= c (: 13 u8))))
+
+(defn m-trim [(s (slice u8))] (-> (slice u8))
+  (let [n (len s)
+        (mut lo) 0
+        (mut hi) n]
+    (loop (if (and (< (load lo) (load hi))
+                   (m-ws? (get s (load lo))))
+              (set! lo (primitive/iadd (load lo) 1))
+              (break)))
+    (loop (if (and (< (load lo) (load hi))
+                   (m-ws? (get s (primitive/isub (load hi) 1))))
+              (set! hi (primitive/isub (load hi) 1))
+              (break)))
+    (subslice [u8] s (load lo) (load hi))))
+
+(defn m-unquote [(s (slice u8))] (-> (slice u8))
+  (let [n (len s)]
+    (if (and (>= n 2)
+             (and (or (= (get s 0) (: 34 u8))
+                      (= (get s 0) (: 39 u8)))
+                  (= (get s (primitive/isub n 1)) (get s 0))))
+        (subslice [u8] s 1 (primitive/isub n 1))
+        s)))
+
+; lines of a text (split on \n).
+(defn m-lines [(a (dyn Allocator)) (text (slice u8))]
+  (-> (ptr (ArrayList (slice u8))))
+  (let [out (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a))
+        n (len text)
+        (mut start) 0
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (when (= (get text (load i)) (: 10 u8))
+                  (push! [(slice u8)]
+                         out
+                         (subslice [u8] text (load start) (load i)))
+                  (set! start (primitive/iadd (load i) 1))
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (when (< (load start) n)
+      (push! [(slice u8)] out (subslice [u8] text (load start) n)))
+    out))
+
+; Comments are recognized only outside basic/literal strings. In particular,
+; '#' and closing brackets inside a search path are ordinary path bytes.
+(defn m-without-comment [(line (slice u8))] (-> (slice u8))
+  (let [(mut quote) 0
+        (mut escaped) false
+        (mut end) (len line)]
+    (for [i 0 (len line)]
+      (let [c (primitive/cast i64 (get line i))]
+        (if (!= (load quote) 0)
+            (cond (load escaped) (set! escaped false)
+                  (and (= (load quote) 34) (= c 92)) (set! escaped true)
+                  (= c (load quote)) (do (set! quote 0) 0)
+                  :else 0)
+            (cond (or (= c 34) (= c 39)) (do (set! quote c) 0)
+                  (= c 35) (do (set! end i) (break))
+                  :else 0)))
+      0)
+    (subslice line 0 (load end))))
+
+; Consume a complete array while retaining physical line numbers for subsequent
+; diagnostics. Custom provider sections still receive the original manifest.
+(defn m-logical-value [(a (dyn Allocator))
+                       (lines (ptr (ArrayList (slice u8))))
+                       (line-index (mut i64))
+                       (initial (slice u8))
+                       (line-number i64)] (-> (slice u8))
+  (if (or (= (len initial) 0) (!= (get initial 0) (: 91 u8)))
+      initial
+      (let [(mut out) (StrBuf::new a)
+            (mut current) initial
+            (mut depth) 0
+            (mut quote) 0
+            (mut escaped) false
+            (mut done) false]
+        (loop (for [i 0 (len (load current))]
+                (let [c (primitive/cast i64 (get (load current) i))]
+                  (if (load done)
+                      (unless (m-ws? (primitive/cast u8 c))
+                        (m-err a
+                               line-number
+                               "unexpected text after manifest array")
+                        0)
+                      (if (!= (load quote) 0)
+                          (cond (load escaped) (set! escaped false)
+                                (and (= (load quote) 34) (= c 92))
+                                  (set! escaped true)
+                                (= c (load quote)) (do (set! quote 0) 0)
+                                :else 0)
+                          (cond (or (= c 34) (= c 39)) (do (set! quote c) 0)
+                                (= c 91) (do (set! depth (+ (load depth) 1)) 0)
+                                (= c 93)
+                                  (do
+                                    (set! depth (- (load depth) 1))
+                                    (when (= (load depth) 0)
+                                      (set! done true)
+                                      0)
+                                    0)
+                                :else 0))))
+                0)
+          (push-str! (mut out) (load current))
+          (when (load done) (break) 0)
+          (when (!= (load quote) 0)
+            (m-err a line-number "unterminated string in manifest array")
+            0)
+          (set! line-index (+ (load line-index) 1))
+          (when (>= (load line-index) (len (load lines)))
+            (m-err a line-number "unterminated manifest array")
+            (break))
+          (push-str! (mut out) "\n")
+          (set! current
+                (m-trim (m-without-comment (get (load lines)
+                                                (load line-index))))))
+        (str (load out)))))
+
+; append the string elements of a TOML array literal `["a", "b"]` to `dst`.
+; Commas inside a quoted string belong to that element (notably linker flags such
+; as `-Wl,-force_load,archive.a`).  Honor backslash escapes while deciding whether
+; a quote closes the string; m-unquote deliberately leaves the contents otherwise
+; untouched for the downstream command-line builder.
+(defn m-parse-array [(a (dyn Allocator))
+                     (val (slice u8))
+                     (dst (ptr (ArrayList (slice u8))))] (-> i64)
+  (let [n (len val)
+        inner
+          (if (>= n 2)
+              (subslice [u8] val 1 (primitive/isub n 1))
+              val)  ; strip [ ]
+        (mut start) 0
+        (mut j) 0
+        (mut quoted) 0
+        (mut escaped) false
+        m (len inner)]
+    (loop (if (> (load j) m)
+              (break)
+              (if (or (= (load j) m)
+                      (and (= (load quoted) 0)
+                           (= (get inner (load j)) (: 44 u8))))  ; unquoted ',' or end
+                  (let [piece
+                          (m-trim (subslice [u8] inner (load start) (load j)))]
+                    (when (> (len piece) 0)
+                      (push! [(slice u8)] dst (m-unquote piece)))
+                    (set! start (primitive/iadd (load j) 1))
+                    (set! j (primitive/iadd (load j) 1)))
+                  (let [c (get inner (load j))]
+                    (if (!= (load quoted) 0)
+                        (if (load escaped)
+                            (set! escaped false)
+                            (if (and (= (load quoted) 34)
+                                     (= c (: 92 u8)))
+                                (set! escaped true)
+                                (when (= (primitive/cast i64 c) (load quoted))
+                                  (set! quoted 0)
+                                  0)))
+                        (when (or (= c (: 34 u8))
+                                  (= c (: 39 u8)))
+                          (set! quoted (primitive/cast i64 c))
+                          0))
+                    (set! j (primitive/iadd (load j) 1))))))
+    0))
+
+; Strict manifest validation (tool-12): the reader knows exactly six sections
+; and a fixed key set per non-dependency section. A typo'd section/key is a
+; LOCATED hard error, not a silent no-op.
+(defn m-known-section? [(s (slice u8))] (-> bool)
+  (or (= s "workspace")
+      (= s "project")
+      (= s "package")
+      (= s "dependencies")
+      (= s "build")
+      (= s "link")
+      (= s "cc")
+      (= s "run")
+      (= s "test")
+      (= s "lint")
+      (= s "metaprograms")
+      (= s "readers")
+      (= s "language")
+      (= s "modules")
+      (= s
+         "manifest.providers")
+      (= s
+         "native-dependencies")))
+
+; The first component of a custom section is its owner. Thus `[c.raylib]` is
+; owned by the provider registered as `c` under `[manifest.providers]`.
+(defn m-section-root [(s (slice u8))] (-> (slice u8))
+  (let [dot (m-index s (: 46 u8))]
+    (if (< dot 0) s (subslice s 0 dot))))
+
+(defn m-provider-for [(providers (ptr (ArrayList ManifestMapping)))
+                      (section (slice u8))] (-> (slice u8))
+  (let [root (m-section-root section)
+        (mut out) ""]
+    (for [i 0 (len (load providers))]
+      (let [p (elem providers i)]
+        (when (= (.key p) root) (set! out (.value p)) 0))
+      0)
+    (load out)))
+
+; `[test.suites.<name>]` is the one nested section the reader understands. The header
+; text arrives verbatim, so the suite name is whatever follows the prefix.
+(defn m-suite-section? [(s (slice u8))] (-> bool)
+  (starts-with s "test.suites."))
+
+(defn m-suite-section-name [(s (slice u8))] (-> (slice u8))
+  (subslice [u8] s (len "test.suites.") (len s)))
+
+; Suite names reach `--suite` and the [opt-in] listing, so keep them to the identifier
+; shape a shell and a human both read without quoting.
+(defn m-suite-name? [(s (slice u8))] (-> bool)
+  (let [n (len s)
+        (mut ok) (> n 0)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (get s (load i))]
+                (unless (or (and (>= c (: 97 u8))
+                                 (<= c (: 122 u8)))
+                            (and (>= c (: 65 u8))
+                                 (<= c (: 90 u8)))
+                            (and (>= c (: 48 u8))
+                                 (<= c (: 57 u8)))
+                            (= c (: 45 u8))
+                            (= c (: 95 u8)))
+                  (set! ok false)
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (load ok)))
+
+;;; Where a manifest error goes. A command reports it and exits. A long-lived
+;;; process -- a REPL, an editor's JIT session -- parses CHECKED: the first error is
+;;; recorded, the parse stops at the line, and the caller gets it as a value.
+(defstruct ManifestErrors [(checked bool) (failed bool) (message (slice u8))])
+
+(defn manifest-errors [] (-> (ptr ManifestErrors))
+  (primitive/alloc-static ManifestErrors))
+
+(defn manifest-failed? [] (-> bool)
+  (.failed (manifest-errors)))
+
+(defn m-err [(a (dyn Allocator)) (lineno i64) (msg (slice u8))] (-> i64)
+  (m-error a
+           (cat3-d a
+                   "Coil.toml:"
+                   (cat3-d a (i64->str a lineno) (cat3-d a ": " msg)))))
+
+;;; A manifest error that belongs to no line of it, such as a profile a command
+;;; names that the manifest does not define.
+(defn m-error [(a (dyn Allocator)) (msg (slice u8))] (-> i64)
+  (let [e (manifest-errors)]
+    (if (.checked e)
+        (do
+          (unless (.failed e)
+            (set! (.message e) (sconcat (malloc-allocator) msg ""))
+            (set! (.failed e) true)
+            0)
+          0)
+        (let [w (stderr)]
+          (m-ps w "error: ")
+          (m-ps w msg)
+          (m-wb w 10)
+          (os/exit 1)
+          0))))
+
+(defn m-bad-key [(a (dyn Allocator))
+                 (lineno i64)
+                 (section (slice u8))
+                 (key (slice u8))] (-> i64)
+  (m-err a
+         lineno
+         (cat3-d a
+                 "unknown key '"
+                 (cat3-d a
+                         key
+                         (cat3-d a "' in [" (cat3-d a section "] section"))))))
+
+(defstruct ManifestDep
+  [(name (slice u8))
+   (path (slice u8))
+   (git (slice u8))
+   (sha (slice u8))
+   (tag (slice u8))
+   (branch (slice u8))
+   (subdir (slice u8))
+   ; `checkout` is the immutable Git repository root (or the path dependency
+   ; root). `resolved` is the selected package root. A Git dependency with a
+   ; subdir deliberately keeps these distinct.
+   (checkout (slice u8))
+   (resolved (slice u8))
+   (roots (ptr (ArrayList (slice u8))))
+   (excludes (ptr (ArrayList (slice u8))))
+   ; `prebuilt = true`: compile this dependency's entry module once, ahead of
+   ; the consumer's build, and link the object instead of recompiling the
+   ; dependency every time. Its export surface must be concrete.
+   (prebuilt bool)
+   ; The dependency package that declared this dependency, as a `dep-packages` id,
+   ; or 0 for one the root package declared. Transitive link inputs follow these
+   ; edges: a package whose code is loaded brings the packages it depends on.
+   (owner i64)
+   (line i64)])
+
+(defstruct ManifestNativeDep
+  [(name (slice u8))
+   ; Exactly one provider is populated. `pkg` names a pkg-config package;
+   ; `flags-command` is a project-owned command whose stdout is linker argv.
+   (pkg (slice u8))
+   (flags-command (slice u8))
+   (line i64)])
+
+(defstruct ManifestMapping [(key (slice u8)) (value (slice u8)) (line i64)])
+
+(defn m-parse-native-dep [(a (dyn Allocator))
+                          (dst (ptr (ArrayList ManifestNativeDep)))
+                          (name (slice u8))
+                          (val (slice u8))
+                          (ln i64)] (-> i64)
+  (let [(mut pkg) ""
+        (mut flags-command) ""]
+    (match (m-dep-field a val "pkg-config")
+      (Some [v] (set! pkg v))
+      (None [] 0))
+    (match (m-dep-field a val "flags-command")
+      (Some [v] (set! flags-command v))
+      (None [] 0))
+    (unless (and (m-dep-name? name)
+                 (and (m-shell-value? (load pkg))
+                      (m-shell-value? (load flags-command))))
+      (m-err a ln "invalid native dependency name or provider value"))
+    (unless (or (and (> (len (load pkg)) 0)
+                     (= (len (load flags-command)) 0))
+                (and (= (len (load pkg)) 0)
+                     (> (len (load flags-command)) 0)))
+      (m-err a
+             ln
+             "native dependency must specify exactly one of pkg-config or flags-command"))
+    (let [(mut d) (zeroed ManifestNativeDep)]
+      (set! (.name d) name)
+      (set! (.pkg d) (load pkg))
+      (set! (.flags-command d) (load flags-command))
+      (set! (.line d) ln)
+      (push! [ManifestNativeDep] dst d))
+    0))
+
+(defn m-dep-name? [(s (slice u8))] (-> bool)
+  (let [n (len s)
+        (mut i) 0
+        (mut ok) (> n 0)]
+    (loop (if (or (not (load ok)) (>= (load i) n))
+              (break)
+              (let [c (primitive/cast i64 (get s (load i)))]
+                (if (or (and (>= c 97)
+                             (<= c 122))
+                        (and (>= c 65)
+                             (<= c 90))
+                        (and (>= c 48)
+                             (<= c 57))
+                        (= c 45)
+                        (= c 95))
+                    (set! i (primitive/iadd (load i) 1))
+                    (set! ok false)))))
+    (load ok)))
+
+(defn m-sha? [(s (slice u8))] (-> bool)
+  (let [n (len s)
+        (mut i) 0
+        (mut ok) (or (= n 40) (= n 64))]
+    (loop (if (or (not (load ok)) (>= (load i) n))
+              (break)
+              (let [c (primitive/cast i64 (get s (load i)))]
+                (if (or (and (>= c 48)
+                             (<= c 57))
+                        (and (>= c 97)
+                             (<= c 102))
+                        (and (>= c 65)
+                             (<= c 70)))
+                    (set! i (primitive/iadd (load i) 1))
+                    (set! ok false)))))
+    (load ok)))
+
+; Shell commands below single-quote dependency values. Reject the only bytes that
+; could terminate that quoting (or split a command) instead of trying to invent a
+; second escaping language inside the deliberately-small manifest reader.
+(defn m-shell-value? [(s (slice u8))] (-> bool)
+  (let [n (len s)
+        (mut i) 0
+        (mut ok) true]
+    (loop (if (or (not (load ok)) (>= (load i) n))
+              (break)
+              (let [c (primitive/cast i64 (get s (load i)))]
+                (if (or (= c 0)
+                        (= c 10)
+                        (= c 13)
+                        (= c 39))
+                    (set! ok false)
+                    (set! i (primitive/iadd (load i) 1))))))
+    (load ok)))
+
+; A selected Git package is lexical repository-relative input. Reject absolute
+; paths and every `..` component before any filesystem access; the later
+; realpath containment check also catches symlinks inside a hostile checkout.
+(defn m-safe-subdir? [(s (slice u8))] (-> bool)
+  (let [n (len s)
+        (mut start) 0
+        (mut i) 0
+        (mut ok)
+          (and (> n 0)
+               (and (!= (primitive/cast i64 (get s 0)) 47)
+                    (not (and (> n 1)
+                              (= (primitive/cast i64 (get s 1)) 58)))))]
+    (loop (if (or (not (load ok)) (> (load i) n))
+              (break)
+              (if (or (= (load i) n)
+                      (= (primitive/cast i64 (get s (load i))) 47))
+                  (let [part (subslice s (load start) (load i))]
+                    (when (or (= (len part) 0) (= part ".."))
+                      (set! ok false)
+                      0)
+                    (set! start (primitive/iadd (load i) 1))
+                    (set! i (primitive/iadd (load i) 1)))
+                  (set! i (primitive/iadd (load i) 1)))))
+    (load ok)))
+
+(defn m-mapping-value? [(s (slice u8))] (-> bool)
+  (let [n (len s)
+        (mut ok) (> n 0)]
+    (for [i 0 n]
+      (let [c (primitive/cast i64 (get s i))]
+        (when (or (= c 0) (= c 10) (= c 13) (= c 61))
+          (set! ok false)
+          0))
+      0)
+    (load ok)))
+
+(defn m-add-mapping! [(a (dyn Allocator))
+                      (dst (ptr (ArrayList ManifestMapping)))
+                      (section (slice u8))
+                      (raw-key (slice u8))
+                      (raw-value (slice u8))
+                      (ln i64)] (-> i64)
+  (let [key (m-unquote raw-key)
+        value (m-unquote raw-value)
+        n (len (load dst))]
+    (unless (and (m-mapping-value? key) (m-mapping-value? value))
+      (m-err a ln (cat3-d a "invalid mapping in [" (cat3-d a section "]"))))
+    (when (= section "readers")
+      (unless (and (> (len key) 1)
+                   (= (primitive/cast i64 (get key 0)) 46))
+        (m-err a
+               ln
+               "reader keys must be extensions beginning with '.', such as '.json'"))
+      0)
+    (for [i 0 n]
+      (let [old (elem dst i)]
+        (when (= (.key old) key)
+          (m-err a
+                 ln
+                 (cat3-d a
+                         "duplicate key '"
+                         (cat3-d a
+                                 key
+                                 (cat3-d a "' in [" (cat3-d a section "]")))))
+          0)
+        (when (and (= section "modules") (= (.value old) value))
+          (m-err a
+                 ln
+                 (cat3-d a
+                         "source path '"
+                         (cat3-d a value "' is mapped to more than one module")))
+          0))
+      0)
+    (let [(mut x) (zeroed ManifestMapping)]
+      (set! (.key x) key)
+      (set! (.value x) value)
+      (set! (.line x) ln)
+      (push! [ManifestMapping] dst x))
+    0))
+
+; The `key = value` fields of an inline table `{ … }`, split at the commas
+; outside quoted strings. A comma inside a value belongs to it: a provider
+; command such as `echo -Wl,-rpath,/opt/lib` is one field. Quotes and escapes
+; are tracked exactly as m-parse-array tracks them.
+(defn m-table-fields [(a (dyn Allocator)) (val (slice u8))]
+  (-> (ArrayList (slice u8)))
+  (let [n (len val)
+        inner
+          (if (and (>= n 2)
+                   (= (primitive/cast i64 (get val 0)) 123)
+                   (= (primitive/cast i64 (get val (primitive/isub n 1))) 125))
+              (subslice val 1 (primitive/isub n 1))
+              val)
+        m (len inner)
+        (mut fields) (ArrayList::new [(slice u8)] a)
+        (mut start) 0
+        (mut quoted) 0
+        (mut escaped) false]
+    (for [j 0 (+ m 1)]
+      (if (or (= j m)
+              (and (= (load quoted) 0) (= (get inner j) (: 44 u8))))
+          (do
+            (push! (mut fields) (m-trim (subslice inner (load start) j)))
+            (set! start (+ j 1)))
+          (let [c (get inner j)]
+            (cond (= (load quoted) 0)
+                    (when (or (= c (: 34 u8)) (= c (: 39 u8)))
+                      (set! quoted (primitive/cast i64 c)))
+                  (load escaped) (set! escaped false)
+                  (and (= (load quoted) 34) (= c (: 92 u8))) (set! escaped true)
+                  (= (primitive/cast i64 c) (load quoted)) (set! quoted 0)
+                  :else 0))))
+    (load fields)))
+
+; Look up one `key = "value"` in a dependency's inline table. Dependency URLs
+; and paths may contain '='; only the first one in each field is structural.
+(defn m-dep-field [(a (dyn Allocator)) (val (slice u8)) (wanted (slice u8))]
+  (-> (Option (slice u8)))
+  (let [fields (m-table-fields a val)
+        (mut out) (None [(slice u8)])]
+    (for piece fields
+      (let [eq (m-index piece (: 61 u8))]
+        (when (and (>= eq 0) (= (m-trim (subslice piece 0 eq)) wanted))
+          (set! out
+                (Some (m-unquote (m-trim (subslice piece (+ eq 1) (len piece)))))))))
+    (load out)))
+
+(defn m-validate-dep-fields [(a (dyn Allocator)) (ln i64) (val (slice u8))]
+  (-> i64)
+  (for piece (m-table-fields a val)
+    (let [eq (m-index piece (: 61 u8))]
+      (if (< eq 0)
+          (m-err a
+                 ln
+                 "dependency fields must use key = \"value\"")
+          (let [key (m-trim (subslice piece 0 eq))]
+            (unless (or (= key "path")
+                        (= key "git")
+                        (= key "sha")
+                        (= key "tag")
+                        (= key "branch")
+                        (= key "subdir")
+                        (= key "prebuilt"))
+              (m-err a
+                     ln
+                     (cat3-d a
+                             "unknown dependency field '"
+                             (cat3-d a key "'"))))))))
+  0)
+
+(defn m-parse-dep [(a (dyn Allocator))
+                   (deps (ptr (ArrayList ManifestDep)))
+                   (name (slice u8))
+                   (val (slice u8))
+                   (ln i64)] (-> i64)
+  (unless (m-dep-name? name)
+    (m-err a
+           ln
+           "dependency names may contain only letters, digits, '-' and '_'"))
+  (let [nd (len (load deps))
+        (mut di) 0]
+    (loop (if (>= (load di) nd)
+              (break)
+              (let [old (get (load deps) (load di))]
+                (when (= (.name old) name)
+                  (m-err a
+                         ln
+                         (cat3-d a "duplicate dependency '" (cat3-d a name "'"))))
+                (set! di (primitive/iadd (load di) 1))))))
+  (let [n (len val)
+        table
+          (and (>= n 2)
+               (and (= (primitive/cast i64 (get val 0))
+                       123)
+                    (= (primitive/cast i64 (get val (primitive/isub n 1)))
+                       125)))
+        (mut path) ""
+        (mut git) ""
+        (mut sha) ""
+        (mut tag) ""
+        (mut branch) ""
+        (mut subdir) ""]
+    (if table
+        (do
+          (m-validate-dep-fields a ln val)
+          (match (m-dep-field a val "path")
+            (Some [v] (set! path v))
+            (None [] 0))
+          (match (m-dep-field a val "git") (Some [v] (set! git v)) (None [] 0))
+          (match (m-dep-field a val "sha") (Some [v] (set! sha v)) (None [] 0))
+          (match (m-dep-field a val "tag") (Some [v] (set! tag v)) (None [] 0))
+          (match (m-dep-field a val "branch")
+            (Some [v] (set! branch v))
+            (None [] 0))
+          (match (m-dep-field a val "subdir")
+            (Some [v] (set! subdir v))
+            (None [] 0))
+          0)
+        (set! path (m-unquote val)))
+    (let [has-path (> (len (load path)) 0)
+          has-git (> (len (load git)) 0)
+          has-sha (> (len (load sha)) 0)
+          has-tag (> (len (load tag)) 0)
+          has-branch (> (len (load branch)) 0)
+          selectors
+            (+ (if has-sha 1 0) (+ (if has-tag 1 0) (if has-branch 1 0)))]
+      (unless (or (and has-path (and (not has-git) (= selectors 0)))
+                  (and (not has-path) (and has-git (= selectors 1))))
+        (m-err a
+               ln
+               "dependency must specify either path, or git together with exactly one of sha, tag, or branch"))
+      (when (and has-sha (not (m-sha? (load sha))))
+        (m-err a
+               ln
+               "git dependency sha must be a full 40- or 64-digit hexadecimal object id"))
+      (when (and (> (len (load subdir)) 0) (not has-git))
+        (m-err a ln "dependency subdir is supported only for git dependencies"))
+      (when (> (len (load subdir)) 0)
+        (unless (m-safe-subdir? (load subdir))
+          (m-err a
+                 ln
+                 "git dependency subdir must be a relative path that does not escape the checkout"))
+        0)
+      (unless (and (m-shell-value? (load path))
+                   (and (m-shell-value? (load git))
+                        (and (m-shell-value? (load sha))
+                             (and (m-shell-value? (load tag))
+                                  (and (m-shell-value? (load branch))
+                                       (m-shell-value? (load subdir)))))))
+        (m-err a ln "dependency values cannot contain quotes or newlines"))
+      (let [(mut d) (zeroed ManifestDep)]
+        (set! (.name d) name)
+        (set! (.path d) (load path))
+        (set! (.git d) (load git))
+        (set! (.sha d) (load sha))
+        (set! (.tag d) (load tag))
+        (set! (.branch d) (load branch))
+        (set! (.subdir d) (load subdir))
+        (set! (.checkout d) "")
+        (set! (.resolved d) "")
+        (set! (.prebuilt d)
+              (match (m-dep-field a val "prebuilt")
+                (Some [v] (= v "true"))
+                (None [] false)))
+        (set! (.roots d)
+              (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+        (set! (.excludes d)
+              (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+        (set! (.line d) ln)
+        (push! [ManifestDep] deps d)))
+    0))
+
+; A named test suite, declared as `[test.suites.<name>]`. Suites exist so a project
+; can own tests that must NOT run on a bare `coil test` — live integration tests that
+; hit a network service, tests that cost money, tests that take minutes. Membership is
+; opt-OUT: a suite runs by default unless it declares `default = false`. That keeps
+; `coil test` meaning "run the tests" for the ordinary project while giving the
+; expensive suite exactly one line to hide behind.
+;
+; `roots-declared` records whether the suite named its own roots. A declared root that
+; does not exist is a configuration error; the implicit `tests` fallback is not, because
+; the compiler guessed it and a project without a tests/ directory is legitimate.
+(defstruct ManifestSuite
+  [(name (slice u8))
+   (roots (ptr (ArrayList (slice u8))))
+   (suffixes (ptr (ArrayList (slice u8))))
+   (is-default bool)
+   (roots-declared bool)
+   (line i64)])
+
+; One group of native link inputs: the `[link]` lists, native dependencies, and the
+; `[cc]` translation units with their compile settings. Dependency packages
+; contribute one of these beside the root package's own inputs, and each executable
+; artifact carries one for its own `[artifacts.NAME]` link keys.
+(defstruct ManifestLinkSet
+  [(frameworks (ptr (ArrayList (slice u8))))
+   (libs (ptr (ArrayList (slice u8))))
+   (flags (ptr (ArrayList (slice u8))))
+   (search-paths (ptr (ArrayList (slice u8))))
+   (objects (ptr (ArrayList (slice u8))))
+   (native-deps (ptr (ArrayList ManifestNativeDep)))
+   (sources (ptr (ArrayList (slice u8))))
+   (include-dirs (ptr (ArrayList (slice u8))))
+   (ccflags (ptr (ArrayList (slice u8))))])
+
+(defn m-new-strings [(a (dyn Allocator))] (-> (ptr (ArrayList (slice u8))))
+  (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+
+(defn m-new-link-set [(a (dyn Allocator))] (-> (ptr ManifestLinkSet))
+  (let [s (box! a ManifestLinkSet (zeroed ManifestLinkSet))]
+    (set! (.frameworks s) (m-new-strings a))
+    (set! (.libs s) (m-new-strings a))
+    (set! (.flags s) (m-new-strings a))
+    (set! (.search-paths s) (m-new-strings a))
+    (set! (.objects s) (m-new-strings a))
+    (set! (.native-deps s)
+          (box! a
+                (ArrayList ManifestNativeDep)
+                (ArrayList::new [ManifestNativeDep] a)))
+    (set! (.sources s) (m-new-strings a))
+    (set! (.include-dirs s) (m-new-strings a))
+    (set! (.ccflags s) (m-new-strings a))
+    s))
+
+; One dependency package's own link contribution. Its inputs apply to a build
+; target only when that target's compilation loads a module from `roots` (or from
+; a package that requires this one) -- a dependency a program never imports
+; contributes nothing to its link.
+(defstruct ManifestDepPackage
+  [(id i64)
+   (name (slice u8))
+   (root (slice u8))
+   (roots (ptr (ArrayList (slice u8))))
+   (link (ptr ManifestLinkSet))
+   (requires (ptr (ArrayList i64)))])
+
+; `[artifacts.NAME]`. `kind` is "object" or "executable". An executable's own link
+; keys live in `link`; `native-dep-names` selects entries of the root
+; `[native-dependencies]` table and is resolved into `native-deps` once the whole
+; manifest has been read. `link-key` remembers the first link key written so an
+; object artifact can reject it where it appears.
+(defstruct ManifestArtifact
+  [(name (slice u8))
+   (kind (slice u8))
+   (entry (slice u8))
+   (out (slice u8))
+   (optimization (slice u8))
+   (link (ptr ManifestLinkSet))
+   (native-dep-names (ptr (ArrayList (slice u8))))
+   (native-deps (ptr (ArrayList ManifestNativeDep)))
+   (native-deps-line i64)
+   (link-key (slice u8))
+   (link-key-line i64)
+   (line i64)])
+
+(defn m-artifact-executable? [(item (ptr ManifestArtifact))] (-> bool)
+  (= (.kind item) "executable"))
+
+(defn m-artifact-link-key! [(item (ptr ManifestArtifact))
+                            (key (slice u8))
+                            (ln i64)] (-> i64)
+  (when (= (len (.link-key item)) 0)
+    (set! (.link-key item) key)
+    (set! (.link-key-line item) ln)
+    0)
+  0)
+
+(defn m-find-native-dep [(deps (ptr (ArrayList ManifestNativeDep)))
+                         (name (slice u8))] (-> (Option ManifestNativeDep))
+  (let [(mut found) (None [ManifestNativeDep])]
+    (for [i 0 (len (load deps))]
+      (let [d (elem deps i)]
+        (when (= (.name d) name) (set! found (Some (load d))) 0))
+      0)
+    (load found)))
+
+; Check every `[artifacts.NAME]` once the whole manifest is read, resolve each
+; executable's `native-dependencies` against the root table, and move the selected
+; native dependencies out of the package executable's inputs.
+(defn m-validate-artifacts! [(a (dyn Allocator)) (m (ptr Manifest))] (-> i64)
+  (let [items (load (field m artifacts))
+        hermetic (= (.language-stdlib-profile m) "hermetic")]
+    (for [i 0 (len items)]
+      (let [item (get (load items) i)]
+        (unless (or (= (.kind item) "object") (m-artifact-executable? item))
+          (m-err a
+                 (.line item)
+                 "artifact kind must be \"object\" or \"executable\""))
+        (when (= (len (.entry item)) 0)
+          (m-err a (.line item) "artifact entry is required"))
+        (when (= (len (.out item)) 0)
+          (m-err a (.line item) "artifact out is required"))
+        (when (and (= (.kind item) "object") (> (len (.link-key item)) 0))
+          (m-err a
+                 (.link-key-line item)
+                 (cat3-d a
+                         "artifact '"
+                         (cat3-d a
+                                 (.name item)
+                                 (cat3-d a
+                                         "' has kind = \"object\"; '"
+                                         (cat3-d a
+                                                 (.link-key item)
+                                                 "' is a link input and applies only to kind = \"executable\"")))))
+          0)
+        (when (and hermetic (> (len (.link-key item)) 0))
+          (m-err a
+                 (.link-key-line item)
+                 "artifact link inputs are unavailable under [language] stdlib = \"hermetic\"")
+          0)
+        (let [names (.native-dep-names item)]
+          (for [j 0 (len (load names))]
+            (let [dname (get (load names) j)]
+              (for [k 0 j]
+                (when (= (get (load names) k) dname)
+                  (m-err a
+                         (.native-deps-line item)
+                         (cat3-d a
+                                 "artifact '"
+                                 (cat3-d a
+                                         (.name item)
+                                         (cat3-d a
+                                                 "' selects native dependency '"
+                                                 (cat3-d a
+                                                         dname
+                                                         "' more than once")))))
+                  0)
+                0)
+              (match (m-find-native-dep (load (field m native-deps)) dname)
+                (Some [d]
+                      (do (push! [ManifestNativeDep] (.native-deps item) d) 0))
+                (None []
+                      (m-err a
+                             (.native-deps-line item)
+                             (cat3-d a
+                                     "artifact '"
+                                     (cat3-d a
+                                             (.name item)
+                                             (cat3-d a
+                                                     "' selects unknown native dependency '"
+                                                     (cat3-d a
+                                                             dname
+                                                             "' (declare it in [native-dependencies])"))))))))
+            0)))
+      0)
+    ; A selected native dependency belongs to the artifacts that name it. Keeping it
+    ; out of the package executable is what lets two artifacts link archives that
+    ; define the same symbols.
+    (let [(mut kept) (ArrayList::new [ManifestNativeDep] a)
+          natives (load (field m native-deps))]
+      (for [i 0 (len (load natives))]
+        (let [d (load (elem natives i))
+              (mut selected) false]
+          (for [j 0 (len items)]
+            (let [item (get (load items) j)]
+              (when (m-artifact-executable? item)
+                (match (m-find-native-dep (.native-deps item) (.name d))
+                  (Some [_] (do (set! selected true) 0))
+                  (None [] 0)))
+              0)
+            0)
+          (if (load selected)
+              (push! [ManifestNativeDep]
+                     (load (field m artifact-native-deps))
+                     d)
+              (push! [ManifestNativeDep] (mut kept) d)))
+        0)
+      (set! (load (field m native-deps)) (load kept)))
+    0))
+
+(defn m-artifact-section? [(s (slice u8))] (-> bool)
+  (starts-with s "artifacts."))
+
+(defn m-artifact-section-name [(s (slice u8))] (-> (slice u8))
+  (subslice [u8] s 10 (len s)))
+
+(defn m-find-artifact [(artifacts (ptr (ArrayList (ptr ManifestArtifact))))
+                       (name (slice u8))] (-> (ptr ManifestArtifact))
+  (let [(mut result) (primitive/cast (ptr ManifestArtifact) 0)]
+    (for [i 0 (len (load artifacts))]
+      (let [artifact (get (load artifacts) i)]
+        (when (= (.name artifact) name) (set! result artifact) 0))
+      0)
+    (load result)))
+
+(defn m-new-suite [(a (dyn Allocator)) (name (slice u8)) (ln i64)]
+  (-> (ptr ManifestSuite))
+  (let [s (box! a ManifestSuite (zeroed ManifestSuite))]
+    (set! (.name s) name)
+    (set! (.roots s)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.suffixes s)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.is-default s) true)
+    (set! (.roots-declared s) false)
+    (set! (.line s) ln)
+    s))
+
+; The suite with this name, or null. Suite counts are tiny (a handful at most), so a
+; linear scan is the whole lookup structure.
+(defn m-find-suite [(suites (ptr (ArrayList (ptr ManifestSuite))))
+                    (name (slice u8))] (-> (ptr ManifestSuite))
+  (let [(mut r) (primitive/cast (ptr ManifestSuite) 0)
+        (mut i) 0]
+    (loop (if (>= (load i) (len (load suites)))
+              (break)
+              (let [s (get (load suites) (load i))]
+                (if (= (.name s) name)
+                    (do (set! r s) (break))
+                    (set! i (primitive/iadd (load i) 1))))))
+    (load r)))
+
+; Append `v` unless it is already present. Used to fold every suite's suffixes into the
+; one list `lint` consults to decide whether a path is a test file.
+(defn m-push-unique! [(dst (ptr (ArrayList (slice u8)))) (v (slice u8))]
+  (-> i64)
+  (let [(mut found) false
+        (mut i) 0]
+    (loop (if (>= (load i) (len (load dst)))
+              (break)
+              (if (= (get (load dst) (load i)) v)
+                  (do (set! found true) (break))
+                  (set! i (primitive/iadd (load i) 1)))))
+    (unless (load found) (push! [(slice u8)] dst v) 0)
+    0))
+
+;; ---- build profiles ---------------------------------------------------------
+;; `[profile.NAME]` names a build configuration: `optimization`, `debug` (DWARF),
+;; `debug-checks`, the metaprograms it adds with `use`, and the profile it starts
+;; from with `inherits`. `release` (the default) and `debug` (`--debug`) are built in;
+;; a section with either name adds to the built-in one. A command selects one
+;; profile and m-select-profile! writes its settings into the manifest's own
+;; fields, so every path that reads them builds with it; its output goes to
+;; build/<profile>/. Only the root package's profiles apply.
+(defstruct ManifestProfile
+  [(name (slice u8))
+   (inherits (slice u8))  ; "" when it names none
+   (optimization (slice u8))  ; "" when unset
+   (debug i64)  ; -1 unset, else 0 or 1
+   (debug-checks i64)  ; -1 unset, else 0 or 1
+   (jit (slice u8))  ; "" when unset, else "llvm" or "tpde"
+   (uses (ptr (ArrayList (slice u8))))
+   (line i64)])
+
+(defn m-profile-section? [(s (slice u8))] (-> bool)
+  (starts-with s "profile."))
+
+(defn m-profile-section-name [(s (slice u8))] (-> (slice u8))
+  (subslice [u8] s 8 (len s)))
+
+(defn m-find-profile [(m (ptr Manifest)) (name (slice u8))]
+  (-> (ptr ManifestProfile))
+  (let [(mut found) (primitive/cast (ptr ManifestProfile) 0)]
+    (for [i 0 (len (load (field m profiles)))]
+      (let [p (get (load (field m profiles)) i)]
+        (when (= (.name p) name) (set! found p) 0))
+      0)
+    (load found)))
+
+(defn m-new-profile! [(a (dyn Allocator))
+                      (m (ptr Manifest))
+                      (name (slice u8))
+                      (ln i64)] (-> (ptr ManifestProfile))
+  (unless (m-dep-name? name)
+    (m-err a ln (cat3-d a "invalid profile name '" (cat3-d a name "'"))))
+  (unless (= (primitive/cast i64 (m-find-profile m name)) 0)
+    (m-err a ln (cat3-d a "duplicate profile [profile." (cat3-d a name "]"))))
+  (let [p (box! a ManifestProfile (zeroed ManifestProfile))]
+    (set! (.name p) name)
+    (set! (.inherits p) "")
+    (set! (.optimization p) "")
+    (set! (.debug p) -1)
+    (set! (.debug-checks p) -1)
+    (set! (.jit p) "")
+    (set! (.uses p) (m-new-strings a))
+    (set! (.line p) ln)
+    (push! [(ptr ManifestProfile)] (load (field m profiles)) p)
+    p))
+
+;;; `[build] jit`: which implementation of coil.jit the package links.
+(defn m-jit-key! [(a (dyn Allocator))
+                  (m (ptr Manifest))
+                  (section (slice u8))
+                  (val (slice u8))
+                  (ln i64)] (-> i64)
+  (match (m-jit-name (m-unquote val))
+    (Some [_] (do (set! (.jit m) (m-unquote val)) 0))
+    (None []
+          (m-err a ln (cat3-d a section " jit must be \"llvm\" or \"tpde\"")))))
+
+(defn m-bool-key [(a (dyn Allocator))
+                  (ln i64)
+                  (key (slice u8))
+                  (val (slice u8))] (-> i64)
+  (cond (= val "true") 1
+        (= val "false") 0
+        :else
+          (m-err a
+                 ln
+                 (cat3-d a "[profile] " (cat3-d a key " must be true or false")))))
+
+(defn m-profile-key! [(a (dyn Allocator))
+                      (p (ptr ManifestProfile))
+                      (key (slice u8))
+                      (val (slice u8))
+                      (ln i64)] (-> i64)
+  (cond (= key "inherits") (do (set! (.inherits p) (m-unquote val)) 0)
+        (= key "optimization")
+          (if (or (= val "0") (= val "1") (= val "2") (= val "3"))
+              (do (set! (.optimization p) val) 0)
+              (m-err a ln "[profile] optimization must be 0, 1, 2, or 3"))
+        (= key "debug") (do (set! (.debug p) (m-bool-key a ln key val)) 0)
+        (= key "debug-checks")
+          (do (set! (.debug-checks p) (m-bool-key a ln key val)) 0)
+        (= key "jit")
+          (match (m-jit-name (m-unquote val))
+            (Some [_] (do (set! (.jit p) (m-unquote val)) 0))
+            (None [] (m-err a ln "[profile] jit must be \"llvm\" or \"tpde\"")))
+        (= key "use") (do (m-parse-array a val (.uses p)) 0)
+        :else (m-bad-key a ln (cat3-d a "profile." (.name p)) key)))
+
+(defstruct Manifest
+  [(name (slice u8))
+   (entry (slice u8))
+   (language-stdlib bool)
+   ; `full`, `hermetic`, or `none`. The bool remains as the bootstrap-compatible
+   ; question "is the bundled universe enabled?" while this field selects its
+   ; profile and built-in core providers.
+   (language-stdlib-profile (slice u8))
+   (language-prelude (slice u8))
+   ; Modules explicitly activated by the root compilation as contributors to the
+   ; one logical ambient `coil.core` namespace. Merely depending on a module that
+   ; contains `(provide-core ...)` never activates it.
+   (language-core-providers (ptr (ArrayList (slice u8))))
+   (out (slice u8))
+   (target (slice u8))
+   (has-target bool)
+   (optimization (slice u8))
+   (debug bool)
+   ; `--debug-checks` for the selected profile (m-select-profile!)
+   (debug-checks bool)
+   ; `--jit=` for the selected profile: [build] jit, under the profile's own; ""
+   ; when neither says, for the compiler's default
+   (jit (slice u8))
+   ; The selected profile: its name is the build/<profile>/ output directory.
+   (profile (slice u8))
+   ; Whether a profile has been applied; one command may reach the manifest twice.
+   (profile-applied bool)
+   ; `[profile.NAME]` sections, in file order.
+   (profiles (ptr (ArrayList (ptr ManifestProfile))))
+   (source-roots (ptr (ArrayList (slice u8))))
+   (exclude (ptr (ArrayList (slice u8))))
+   (frameworks (ptr (ArrayList (slice u8))))
+   (libs (ptr (ArrayList (slice u8))))
+   (flags (ptr (ArrayList (slice u8))))
+   (search-paths (ptr (ArrayList (slice u8))))
+   (objects (ptr (ArrayList (slice u8))))
+   (rargs (ptr (ArrayList (slice u8))))
+   (sources (ptr (ArrayList (slice u8))))
+   (include-dirs (ptr (ArrayList (slice u8))))
+   (ccflags (ptr (ArrayList (slice u8))))
+   ; line of `[test].roots`, so the synthesized "default" suite can locate its errors
+   (test-roots-line i64)
+   (test-roots (ptr (ArrayList (slice u8))))
+   (test-suffixes (ptr (ArrayList (slice u8))))
+   (suites (ptr (ArrayList (ptr ManifestSuite))))
+   (artifacts (ptr (ArrayList (ptr ManifestArtifact))))
+   ; Root `[native-dependencies]` entries selected by an executable artifact. They
+   ; belong to those artifacts and are removed from `native-deps`, so the package
+   ; executable and its tests never link them.
+   (artifact-native-deps (ptr (ArrayList ManifestNativeDep)))
+   ; Link inputs contributed by dependency packages, one record per package. They
+   ; are kept apart from the root lists above: the root package's `[link]`, `[cc]`
+   ; and `[native-dependencies]` are author intent and always apply, while a
+   ; dependency's inputs apply only to a target that loads its code.
+   (dep-packages (ptr (ArrayList (ptr ManifestDepPackage))))
+   (lint-rules (ptr (ArrayList (slice u8))))
+   ; `[metaprograms] use` — namespaces loaded ahead of the entry file for every
+   ; command that COMPILES this project, exactly as `--use` does on the command
+   ; line. A dependency's resolved root is already on COIL_NAMESPACE_ROOTS
+   ; (m-emit-dep-env), so a library can ship a transform and a consumer switches
+   ; it on with one manifest line.
+   (metaprograms (ptr (ArrayList (slice u8))))
+   ; `[readers]`: extension -> ordinary Coil module containing one reader-provider.
+   ; `[modules]`: namespace -> project-relative source path. These are exported to
+   ; loader.coil because namespace discovery must happen before guest bytes are read.
+   (readers (ptr (ArrayList ManifestMapping)))
+   (modules (ptr (ArrayList ManifestMapping)))
+   ; `[manifest.providers]`: arbitrary top-level section root -> the Coil
+   ; metaprogram that owns its syntax. `custom-sections` remembers every such
+   ; section for strict post-parse validation; Coil never interprets its keys.
+   (manifest-providers (ptr (ArrayList ManifestMapping)))
+   (custom-sections (ptr (ArrayList ManifestMapping)))
+   (native-deps (ptr (ArrayList ManifestNativeDep)))
+   (deps (ptr (ArrayList ManifestDep)))
+   ; `[workspace]` — a root that owns member packages and no code of its own.
+   ; `ws-name` is the first segment of every member's namespace; `ws-members`
+   ; are directory globs, each naming a directory with its own Coil.toml.
+   (ws-name (slice u8))
+   (ws-members (ptr (ArrayList (slice u8))))
+   ; the Coil.toml line of `members`, which locates every error about a member
+   (ws-members-line i64)
+   ; `[package] casefold` — files that IMPORT this package get their identifiers
+   ; ASCII case-folded before any index or hygiene context sees them. Declared by
+   ; the package that defines a case-insensitive language, so the loader no longer
+   ; needs a namespace spelling compiled into it.
+   (casefold (slice u8))
+   ; `[project] path` -- this Coil.toml only says that the project for its directory
+   ; is the one in `path`. enter-project! follows it before any command reads a
+   ; manifest; nothing else in the file is allowed.
+   (project-path (slice u8))
+   (project-line i64)])
+
+(defn parse-manifest [(a (dyn Allocator)) (text (slice u8))] (-> (ptr Manifest))
+  (let [m (box! a Manifest (zeroed Manifest))]
+    (set! (.name m) "")
+    (set! (.entry m) "")
+    (set! (.language-stdlib m) true)
+    (set! (.language-stdlib-profile m) "full")
+    (set! (.language-prelude m) "")
+    (set! (.language-core-providers m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.out m) "")
+    (set! (.target m) "")
+    (set! (.has-target m) false)
+    (set! (.optimization m) "")
+    (set! (.debug m) false)
+    (set! (.debug-checks m) false)
+    (set! (.jit m) "")
+    (set! (.profile m) "release")
+    (set! (.profiles m)
+          (box! a
+                (ArrayList (ptr ManifestProfile))
+                (ArrayList::new [(ptr ManifestProfile)] a)))
+    (set! (.source-roots m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.exclude m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.frameworks m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.libs m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.flags m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.search-paths m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.objects m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.rargs m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.sources m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.include-dirs m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.ccflags m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.ws-name m) "")
+    (set! (.casefold m) "")
+    (set! (.project-path m) "")
+    (set! (.ws-members m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.test-roots m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.test-suffixes m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.suites m)
+          (box! a
+                (ArrayList (ptr ManifestSuite))
+                (ArrayList::new [(ptr ManifestSuite)] a)))
+    (set! (.artifacts m)
+          (box! a
+                (ArrayList (ptr ManifestArtifact))
+                (ArrayList::new [(ptr ManifestArtifact)] a)))
+    (set! (.artifact-native-deps m)
+          (box! a
+                (ArrayList ManifestNativeDep)
+                (ArrayList::new [ManifestNativeDep] a)))
+    (set! (.dep-packages m)
+          (box! a
+                (ArrayList (ptr ManifestDepPackage))
+                (ArrayList::new [(ptr ManifestDepPackage)] a)))
+    (set! (.lint-rules m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.metaprograms m)
+          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+    (set! (.readers m)
+          (box! a
+                (ArrayList ManifestMapping)
+                (ArrayList::new [ManifestMapping] a)))
+    (set! (.modules m)
+          (box! a
+                (ArrayList ManifestMapping)
+                (ArrayList::new [ManifestMapping] a)))
+    (set! (.manifest-providers m)
+          (box! a
+                (ArrayList ManifestMapping)
+                (ArrayList::new [ManifestMapping] a)))
+    (set! (.custom-sections m)
+          (box! a
+                (ArrayList ManifestMapping)
+                (ArrayList::new [ManifestMapping] a)))
+    (set! (.native-deps m)
+          (box! a
+                (ArrayList ManifestNativeDep)
+                (ArrayList::new [ManifestNativeDep] a)))
+    (set! (.deps m)
+          (box! a (ArrayList ManifestDep) (ArrayList::new [ManifestDep] a)))
+    (let [lines (m-lines a text)
+          (mut section) ""
+          (mut suite) (primitive/cast (ptr ManifestSuite) 0)
+          (mut artifact) (primitive/cast (ptr ManifestArtifact) 0)
+          (mut profile) (primitive/cast (ptr ManifestProfile) 0)
+          ; the first section other than [project], which a [project] file may not have
+          (mut other-section-line) 0
+          (mut i) 0
+          n (len (load lines))]
+      (loop (if (or (>= (load i) n) (manifest-failed?))
+                (break)
+                (let [line
+                        (m-trim (m-without-comment (get (load lines) (load i))))]
+                  (unless (or (= (len line) 0)
+                              (= (get line 0) (: 35 u8)))
+                    ; blank/#
+                    (if (= (get line 0) (: 91 u8))  ; [section]
+                        (let [sec
+                                (m-trim (subslice [u8]
+                                                  line
+                                                  1
+                                                  (primitive/isub (len line) 1)))
+                              ln (primitive/iadd (load i) 1)]
+                          (if (= sec "project")
+                              (do (store! (field m project-line) ln) 0)
+                              (do
+                                (when (= (load other-section-line) 0)
+                                  (set! other-section-line ln))
+                                0))
+                          ; Unknown sections are retained, not interpreted. Once
+                          ; the complete file has been read, each must have an
+                          ; owner in `[manifest.providers]`; misspellings remain
+                          ; hard errors instead of becoming silently ignored data.
+                          (when (and (not (m-known-section? sec))
+                                     (and (not (m-suite-section? sec))
+                                          (and (not (m-artifact-section? sec))
+                                               (not (m-profile-section? sec)))))
+                            (m-add-mapping! a
+                                            (load (field m custom-sections))
+                                            "custom manifest sections"
+                                            sec
+                                            (m-section-root sec)
+                                            ln)
+                            0)
+                          (set! profile
+                                (primitive/cast (ptr ManifestProfile) 0))
+                          (if (m-profile-section? sec)
+                              (do
+                                (set! profile
+                                      (m-new-profile! a
+                                                      m
+                                                      (m-profile-section-name sec)
+                                                      ln))
+                                (set! suite
+                                      (primitive/cast (ptr ManifestSuite) 0))
+                                (set! artifact
+                                      (primitive/cast (ptr ManifestArtifact) 0))
+                                0)
+                              (if (m-artifact-section? sec)
+                                  (let [aname (m-artifact-section-name sec)]
+                                    (unless (m-dep-name? aname)
+                                      (m-err a
+                                             ln
+                                             (cat3-d a
+                                                     "invalid artifact name '"
+                                                     (cat3-d a aname "'"))))
+                                    (unless (= (primitive/cast i64
+                                                               (m-find-artifact (load (field m
+                                                                                             artifacts))
+                                                                                aname))
+                                               0)
+                                      (m-err a
+                                             ln
+                                             (cat3-d a
+                                                     "duplicate artifact [artifacts."
+                                                     (cat3-d a aname "]"))))
+                                    (let [item
+                                            (box! a
+                                                  ManifestArtifact
+                                                  (zeroed ManifestArtifact))]
+                                      (set! (.name item) aname)
+                                      (set! (.kind item) "")
+                                      (set! (.entry item) "")
+                                      (set! (.out item) "")
+                                      (set! (.optimization item) "")
+                                      (set! (.link item) (m-new-link-set a))
+                                      (set! (.native-dep-names item)
+                                            (m-new-strings a))
+                                      (set! (.native-deps item)
+                                            (box! a
+                                                  (ArrayList ManifestNativeDep)
+                                                  (ArrayList::new [ManifestNativeDep]
+                                                                  a)))
+                                      (set! (.link-key item) "")
+                                      (set! (.line item) ln)
+                                      (push! [(ptr ManifestArtifact)]
+                                             (load (field m artifacts))
+                                             item)
+                                      (set! artifact item))
+                                    (set! suite
+                                          (primitive/cast (ptr ManifestSuite) 0))
+                                    0)
+                                  (if (m-suite-section? sec)
+                                      (let [sname (m-suite-section-name sec)]
+                                        (unless (m-suite-name? sname)
+                                          (m-err a
+                                                 ln
+                                                 (cat3-d a
+                                                         "invalid test suite name '"
+                                                         (cat3-d a
+                                                                 sname
+                                                                 "' (letters, digits, '-' and '_' only)"))))
+                                        ; `--suite all` means every suite, so a suite may not claim the word.
+                                        (when (= sname "all")
+                                          (m-err a
+                                                 ln
+                                                 "test suite name 'all' is reserved for `coil test --suite all`"))
+                                        (when (= sname "default")
+                                          (m-err a
+                                                 ln
+                                                 "test suite name 'default' is reserved for the bare [test] section"))
+                                        (unless (= (primitive/cast i64
+                                                                   (m-find-suite (load (field m
+                                                                                              suites))
+                                                                                 sname))
+                                                   0)
+                                          (m-err a
+                                                 ln
+                                                 (cat3-d a
+                                                         "duplicate test suite [test.suites."
+                                                         (cat3-d a sname "]"))))
+                                        (let [s (m-new-suite a sname ln)]
+                                          (push! [(ptr ManifestSuite)]
+                                                 (load (field m suites))
+                                                 s)
+                                          (set! suite s))
+                                        (set! artifact
+                                              (primitive/cast (ptr ManifestArtifact)
+                                                              0))
+                                        0)
+                                      (do
+                                        (set! suite
+                                              (primitive/cast (ptr ManifestSuite)
+                                                              0))
+                                        (set! artifact
+                                              (primitive/cast (ptr ManifestArtifact)
+                                                              0))
+                                        0))))
+                          (set! section sec)
+                          0)
+                        (let [eq (m-index line (: 61 u8))]  ; key = value
+                          (unless (< eq 0)
+                            (let [key (m-trim (subslice [u8] line 0 eq))
+                                  ln (primitive/iadd (load i) 1)
+                                  initial
+                                    (m-trim (subslice [u8]
+                                                      line
+                                                      (primitive/iadd eq 1)
+                                                      (len line)))
+                                  val
+                                    (m-logical-value a lines (mut i) initial ln)]
+                              (cond (= (load section) "project")
+                                      (if (= key "path")
+                                          (do
+                                            (set! (.project-path m)
+                                                  (m-unquote val))
+                                            0)
+                                          (m-bad-key a ln (load section) key))
+                                    (= (load section) "workspace")
+                                      (cond (= key "name")
+                                              (do
+                                                (set! (.ws-name m)
+                                                      (m-unquote val))
+                                                0)
+                                            (= key "members")
+                                              (do
+                                                (m-parse-array a
+                                                               val
+                                                               (load (field m
+                                                                            ws-members)))
+                                                (store! (field m
+                                                               ws-members-line)
+                                                        ln)
+                                                0)
+                                            :else
+                                              (m-bad-key a
+                                                         ln
+                                                         (load section)
+                                                         key))
+                                    (= (load section) "package")
+                                      (if (= key "casefold")
+                                          (do
+                                            ; The value is the module whose IMPORT turns ASCII
+                                            ; identifier folding on for the importing file --
+                                            ; the package's public entry, not the package as a
+                                            ; whole. Package-wide would fold the dialect's own
+                                            ; implementation, whose files import each other.
+                                            (set! (.casefold m) (m-unquote val))
+                                            0)
+                                          (if (= key "name")
+                                              (do
+                                                (set! (.name m) (m-unquote val))
+                                                0)
+                                              (if (= key "entry")
+                                                  (do
+                                                    (set! (.entry m)
+                                                          (m-unquote val))
+                                                    0)
+                                                  (if (= key "source-roots")
+                                                      (do
+                                                        (m-parse-array a
+                                                                       val
+                                                                       (load (field m
+                                                                                    source-roots)))
+                                                        0)
+                                                      (if (= key "exclude")
+                                                          (do
+                                                            (m-parse-array a
+                                                                           val
+                                                                           (load (field m
+                                                                                        exclude)))
+                                                            0)
+                                                          (m-bad-key a
+                                                                     ln
+                                                                     (load section)
+                                                                     key))))))
+                                    (= (load section) "language")
+                                      (cond (= key "stdlib")
+                                              (cond (= val "true")
+                                                      (do
+                                                        (set! (.language-stdlib m)
+                                                              true)
+                                                        (set! (.language-stdlib-profile m)
+                                                              "full")
+                                                        0)
+                                                    (= val "false")
+                                                      (do
+                                                        (set! (.language-stdlib m)
+                                                              false)
+                                                        (set! (.language-stdlib-profile m)
+                                                              "none")
+                                                        0)
+                                                    (= (m-unquote val) "full")
+                                                      (do
+                                                        (set! (.language-stdlib m)
+                                                              true)
+                                                        (set! (.language-stdlib-profile m)
+                                                              "full")
+                                                        0)
+                                                    (= (m-unquote val)
+                                                       "hermetic")
+                                                      (do
+                                                        (set! (.language-stdlib m)
+                                                              true)
+                                                        (set! (.language-stdlib-profile m)
+                                                              "hermetic")
+                                                        0)
+                                                    :else
+                                                      (m-err a
+                                                             ln
+                                                             "[language] stdlib must be true, false, \"full\", or \"hermetic\""))
+                                            (= key "prelude")
+                                              (do
+                                                (set! (.language-prelude m)
+                                                      (m-unquote val))
+                                                0)
+                                            (= key "core-providers")
+                                              (do
+                                                (m-parse-array a
+                                                               val
+                                                               (load (field m
+                                                                            language-core-providers)))
+                                                0)
+                                            :else
+                                              (m-bad-key a
+                                                         ln
+                                                         (load section)
+                                                         key))
+                                    (= (load section) "dependencies")
+                                      (m-parse-dep a
+                                                   (load (field m deps))
+                                                   key
+                                                   val
+                                                   ln)
+                                    (= (load section) "native-dependencies")
+                                      (m-parse-native-dep a
+                                                          (load (field m
+                                                                       native-deps))
+                                                          key
+                                                          val
+                                                          ln)
+                                    (= (load section) "build")
+                                      (cond (= key "out")
+                                              (do
+                                                (set! (.out m) (m-unquote val))
+                                                0)
+                                            (= key "target")
+                                              (do
+                                                (set! (.target m)
+                                                      (m-unquote val))
+                                                (set! (.has-target m) true)
+                                                0)
+                                            (= key "optimization")
+                                              (if (or (= val "0")
+                                                      (= val "1")
+                                                      (= val "2")
+                                                      (= val "3"))
+                                                  (do
+                                                    (set! (.optimization m) val)
+                                                    0)
+                                                  (m-err a
+                                                         ln
+                                                         "[build] optimization must be 0, 1, 2, or 3"))
+                                            (= key "debug")
+                                              (do
+                                                (set! (.debug m) (= val "true"))
+                                                0)
+                                            (= key "jit")
+                                              (m-jit-key! a m "[build]" val ln)
+                                            :else
+                                              (m-bad-key a
+                                                         ln
+                                                         (load section)
+                                                         key))
+                                    (= (load section) "link")
+                                      (cond (= key "frameworks")
+                                              (do
+                                                (m-parse-array a
+                                                               val
+                                                               (load (field m
+                                                                            frameworks)))
+                                                0)
+                                            (= key "libs")
+                                              (do
+                                                (m-parse-array a
+                                                               val
+                                                               (load (field m
+                                                                            libs)))
+                                                0)
+                                            (= key "search-paths")
+                                              (do
+                                                (m-parse-array a
+                                                               val
+                                                               (load (field m
+                                                                            search-paths)))
+                                                0)
+                                            (= key "objects")
+                                              (do
+                                                (m-parse-array a
+                                                               val
+                                                               (load (field m
+                                                                            objects)))
+                                                0)
+                                            (= key "flags")
+                                              (do
+                                                (m-parse-array a
+                                                               val
+                                                               (load (field m
+                                                                            flags)))
+                                                0)
+                                            :else
+                                              (m-bad-key a
+                                                         ln
+                                                         (load section)
+                                                         key))
+                                    (= (load section) "cc")
+                                      (if (= key "sources")
+                                          (do
+                                            (m-parse-array a
+                                                           val
+                                                           (load (field m
+                                                                        sources)))
+                                            0)
+                                          (if (= key "flags")
+                                              (do
+                                                (m-parse-array a
+                                                               val
+                                                               (load (field m
+                                                                            ccflags)))
+                                                0)
+                                              (if (= key "include-dirs")
+                                                  (do
+                                                    (m-parse-array a
+                                                                   val
+                                                                   (load (field m
+                                                                                include-dirs)))
+                                                    0)
+                                                  (m-bad-key a
+                                                             ln
+                                                             (load section)
+                                                             key))))
+                                    (= (load section) "run")
+                                      (if (= key "args")
+                                          (do
+                                            (m-parse-array a
+                                                           val
+                                                           (load (field m rargs)))
+                                            0)
+                                          (m-bad-key a ln (load section) key))
+                                    (= (load section) "test")
+                                      (cond (= key "roots")
+                                              (do
+                                                (m-parse-array a
+                                                               val
+                                                               (load (field m
+                                                                            test-roots)))
+                                                (set! (.test-roots-line m) ln)
+                                                0)
+                                            (= key "suffixes")
+                                              (do
+                                                (m-parse-array a
+                                                               val
+                                                               (load (field m
+                                                                            test-suffixes)))
+                                                0)
+                                            :else
+                                              (m-bad-key a
+                                                         ln
+                                                         (load section)
+                                                         key))
+                                    (m-suite-section? (load section))
+                                      (let [s (load suite)]
+                                        (cond (= key "roots")
+                                                (do
+                                                  (m-parse-array a
+                                                                 val
+                                                                 (load (field s
+                                                                              roots)))
+                                                  (set! (.roots-declared s)
+                                                        true)
+                                                  ; relocate the suite to its roots key: a
+                                                  ; bad root is reported where it is written,
+                                                  ; not at the section header above it.
+                                                  (set! (.line s) ln)
+                                                  0)
+                                              (= key "suffixes")
+                                                (do
+                                                  (m-parse-array a
+                                                                 val
+                                                                 (load (field s
+                                                                              suffixes)))
+                                                  0)
+                                              (= key "default")
+                                                (do
+                                                  (unless (or (= val "true")
+                                                              (= val "false"))
+                                                    (m-err a
+                                                           ln
+                                                           (cat3-d a
+                                                                   "test suite '"
+                                                                   (cat3-d a
+                                                                           (.name s)
+                                                                           (cat3-d a
+                                                                                   "': default must be true or false, got '"
+                                                                                   (cat3-d a
+                                                                                           val
+                                                                                           "'"))))))
+                                                  (set! (.is-default s)
+                                                        (= val "true"))
+                                                  0)
+                                              :else
+                                                (m-bad-key a
+                                                           ln
+                                                           (load section)
+                                                           key)))
+                                    (m-profile-section? (load section))
+                                      (m-profile-key! a
+                                                      (load profile)
+                                                      key
+                                                      val
+                                                      ln)
+                                    (m-artifact-section? (load section))
+                                      (let [item (load artifact)]
+                                        (cond (= key "kind")
+                                                (do
+                                                  (set! (.kind item)
+                                                        (m-unquote val))
+                                                  0)
+                                              (= key "entry")
+                                                (do
+                                                  (set! (.entry item)
+                                                        (m-unquote val))
+                                                  0)
+                                              (= key "out")
+                                                (do
+                                                  (set! (.out item)
+                                                        (m-unquote val))
+                                                  0)
+                                              (= key "optimization")
+                                                (if (or (= val "0")
+                                                        (= val "1")
+                                                        (= val "2")
+                                                        (= val "3"))
+                                                    (do
+                                                      (set! (.optimization item)
+                                                            val)
+                                                      0)
+                                                    (m-err a
+                                                           ln
+                                                           "artifact optimization must be 0, 1, 2, or 3"))
+                                              (= key "native-dependencies")
+                                                (do
+                                                  (m-parse-array a
+                                                                 val
+                                                                 (.native-dep-names item))
+                                                  (set! (.native-deps-line item)
+                                                        ln)
+                                                  (m-artifact-link-key! item
+                                                                        key
+                                                                        ln))
+                                              (= key "frameworks")
+                                                (do
+                                                  (m-parse-array a
+                                                                 val
+                                                                 (.frameworks (.link item)))
+                                                  (m-artifact-link-key! item
+                                                                        key
+                                                                        ln))
+                                              (= key "libs")
+                                                (do
+                                                  (m-parse-array a
+                                                                 val
+                                                                 (.libs (.link item)))
+                                                  (m-artifact-link-key! item
+                                                                        key
+                                                                        ln))
+                                              (= key "search-paths")
+                                                (do
+                                                  (m-parse-array a
+                                                                 val
+                                                                 (.search-paths (.link item)))
+                                                  (m-artifact-link-key! item
+                                                                        key
+                                                                        ln))
+                                              (= key "objects")
+                                                (do
+                                                  (m-parse-array a
+                                                                 val
+                                                                 (.objects (.link item)))
+                                                  (m-artifact-link-key! item
+                                                                        key
+                                                                        ln))
+                                              (= key "flags")
+                                                (do
+                                                  (m-parse-array a
+                                                                 val
+                                                                 (.flags (.link item)))
+                                                  (m-artifact-link-key! item
+                                                                        key
+                                                                        ln))
+                                              :else
+                                                (m-bad-key a
+                                                           ln
+                                                           (load section)
+                                                           key)))
+                                    (= (load section) "lint")
+                                      (if (= key "rules")
+                                          (do
+                                            (m-parse-array a
+                                                           val
+                                                           (load (field m
+                                                                        lint-rules)))
+                                            0)
+                                          (m-bad-key a ln (load section) key))
+                                    (= (load section) "metaprograms")
+                                      (if (= key "use")
+                                          (do
+                                            (m-parse-array a
+                                                           val
+                                                           (load (field m
+                                                                        metaprograms)))
+                                            0)
+                                          (m-bad-key a ln (load section) key))
+                                    (= (load section) "readers")
+                                      (m-add-mapping! a
+                                                      (load (field m readers))
+                                                      "readers"
+                                                      key
+                                                      val
+                                                      ln)
+                                    (= (load section) "modules")
+                                      (m-add-mapping! a
+                                                      (load (field m modules))
+                                                      "modules"
+                                                      key
+                                                      val
+                                                      ln)
+                                    (= (load section) "manifest.providers")
+                                      (m-add-mapping! a
+                                                      (load (field m
+                                                                   manifest-providers))
+                                                      "manifest.providers"
+                                                      key
+                                                      val
+                                                      ln)
+                                    (> (len (m-provider-for (load (field m
+                                                                         manifest-providers))
+                                                            (load section)))
+                                       0)
+                                      0
+                                    (and (not (m-known-section? (load section)))
+                                         (not (m-artifact-section? (load section))))
+                                      ; A provider may be declared later in the
+                                      ; file, so defer ownership validation.
+                                      0
+                                    :else
+                                      (m-err a
+                                             ln
+                                             (cat3-d a
+                                                     "key '"
+                                                     (cat3-d a
+                                                             key
+                                                             "' appears before any [section] header")))))))))
+                  (set! i (primitive/iadd (load i) 1)))))
+      (when (> (.project-line m) 0)
+        (when (= (len (.project-path m)) 0)
+          (m-err a
+                 (.project-line m)
+                 "[project] needs a path: the directory whose Coil.toml is this directory's project")
+          0)
+        (when (> (load other-section-line) 0)
+          (m-err a
+                 (load other-section-line)
+                 "a Coil.toml with [project] only points at another directory and can have no other section")
+          0)
+        0)
+      (m-resolve-suites a m)
+      (let [custom (load (field m custom-sections))]
+        (for [ci 0 (len custom)]
+          (let [s (elem custom ci)]
+            (when (= (len (m-provider-for (load (field m manifest-providers))
+                                          (.key s)))
+                     0)
+              (m-err a
+                     (.line s)
+                     (cat3-d a
+                             "unknown section ["
+                             (cat3-d a
+                                     (.key s)
+                                     "] (register its root under [manifest.providers])")))
+              0))
+          0)
+        0)
+      (when (and (not (.language-stdlib m))
+                 (= (len (.language-prelude m))
+                    0))
+        (m-err a
+               1
+               "[language] stdlib = false requires prelude = \"dependency.module\"")
+        0)
+      (when (and (.language-stdlib m)
+                 (> (len (.language-prelude m))
+                    0))
+        (m-err a 1 "[language] prelude requires stdlib = false")
+        0)
+      (when (= (.language-stdlib-profile m) "hermetic")
+        (when (> (len (load (field m native-deps))) 0)
+          (m-err a
+                 1
+                 "[native-dependencies] is unavailable under [language] stdlib = \"hermetic\"")
+          0)
+        (when (or (> (len (load (field m frameworks))) 0)
+                  (> (len (load (field m libs))) 0)
+                  (> (len (load (field m flags)))
+                     0)
+                  (> (len (load (field m search-paths)))
+                     0)
+                  (> (len (load (field m objects)))
+                     0))
+          (m-err a
+                 1
+                 "[link] inputs are unavailable under [language] stdlib = \"hermetic\"")
+          0)
+        0)
+      (m-validate-artifacts! a m)
+      m)))
+
+; Fold the manifest's test configuration into the final suite list.
+;
+;   * a bare [test] section becomes the suite named "default" — that is what keeps every
+;     existing manifest working unchanged;
+;   * a manifest with NO test configuration at all still gets that default suite, so
+;     `coil test` keeps discovering tests/*_test.coil without any manifest opt-in;
+;   * a manifest that declares only named suites gets exactly those.
+;
+; Every suite is then filled in with the defaults the bare runner used to apply at
+; discovery time, so nothing downstream has to ask "was this configured?" again. The
+; union of all suffixes is republished into test-suffixes because `lint` uses that list
+; to recognize a test file, and a file in a non-default suite is still a test file.
+(defn m-resolve-suites [(a (dyn Allocator)) (m (ptr Manifest))] (-> i64)
+  (let [named (load (field m suites))
+        n-roots (len (load (field m test-roots)))
+        n-suffixes (len (load (field m test-suffixes)))
+        resolved
+          (box! a
+                (ArrayList (ptr ManifestSuite))
+                (zeroed (ArrayList (ptr ManifestSuite))))]
+    (set! resolved (ArrayList::new [(ptr ManifestSuite)] a))
+    (when (or (> n-roots 0)
+              (> n-suffixes 0)
+              (= (len (load named)) 0))
+      (let [d (m-new-suite a "default" (.test-roots-line m))
+            (mut i) 0
+            (mut j) 0]
+        (set! (.roots-declared d) (> n-roots 0))
+        (loop (if (>= (load i) n-roots)
+                  (break)
+                  (do
+                    (push! [(slice u8)]
+                           (load (field d roots))
+                           (get (load (field m test-roots)) (load i)))
+                    (set! i (primitive/iadd (load i) 1)))))
+        (loop (if (>= (load j) n-suffixes)
+                  (break)
+                  (do
+                    (push! [(slice u8)]
+                           (load (field d suffixes))
+                           (get (load (field m test-suffixes)) (load j)))
+                    (set! j (primitive/iadd (load j) 1)))))
+        (push! [(ptr ManifestSuite)] resolved d))
+      0)
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (len (load named)))
+                (break)
+                (do
+                  (push! [(ptr ManifestSuite)]
+                         resolved
+                         (get (load named) (load i)))
+                  (set! i (primitive/iadd (load i) 1))))))
+    (set! (.suites m) resolved)
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (len (load resolved)))
+                (break)
+                (let [s (get (load resolved) (load i))
+                      (mut j) 0]
+                  (when (= (len (load (field s roots))) 0)
+                    (push! [(slice u8)] (load (field s roots)) "tests")
+                    0)
+                  (when (= (len (load (field s suffixes)))
+                           0)
+                    (push! [(slice u8)] (load (field s suffixes)) "_test.coil")
+                    0)
+                  (loop (if (>= (load j) (len (load (field s suffixes))))
+                            (break)
+                            (do
+                              (m-push-unique! (load (field m test-suffixes))
+                                              (get (load (field s suffixes))
+                                                   (load j)))
+                              (set! j (primitive/iadd (load j) 1)))))
+                  (set! i (primitive/iadd (load i) 1))))))
+    0))
+
+(defn m-index [(s (slice u8)) (b u8)] (-> i64)
+  (let [n (len s)
+        (mut i) 0
+        (mut r) -1]
+    (loop (if (>= (load i) n)
+              (break)
+              (if (= (get s (load i)) b)
+                  (do (set! r (load i)) (break))
+                  (set! i (primitive/iadd (load i) 1)))))
+    (load r)))
+
+; A `[workspace] members` entry is a relative directory path, or a pattern when it
+; holds `*`. It is limited to letters, digits and `/ - _ . *`, so a member path is
+; always plain text wherever it is later spelled out.
+(defn m-member-glob-ok? [(s (slice u8))] (-> bool)
+  (let [n (len s)
+        (mut ok) (> n 0)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (primitive/cast i64 (get s (load i)))]
+                (unless (or (and (>= c 97) (<= c 122))
+                            (and (>= c 65) (<= c 90))
+                            (and (>= c 48) (<= c 57))
+                            (= c 47)
+                            (= c 45)
+                            (= c 95)
+                            (= c 46)
+                            (= c 42))
+                  (set! ok false)
+                  (break))
+                (set! i (primitive/iadd (load i) 1)))))
+    (load ok)))
+
+;;; Does the member pattern segment PAT match all of NAME? `*` matches any run of
+;;; bytes, including none; every other byte matches itself.
+(defn m-glob-match? [(pat (slice u8)) (name (slice u8))] (-> bool)
+  (let [pn (len pat)
+        nn (len name)
+        (mut p) 0
+        (mut n) 0
+        (mut star) -1
+        (mut mark) 0]
+    (block :match
+      (while (< n nn)
+        (cond (and (< p pn) (= (get pat p) (: 42 u8)))
+                (do (set! star p) (set! mark n) (set! p (+ p 1)))
+              (and (< p pn) (= (get pat p) (get name n)))
+                (do (set! p (+ p 1)) (set! n (+ n 1)))
+              (>= star 0)
+                (do (set! p (+ star 1)) (set! mark (+ mark 1)) (set! n mark))
+              :else (break :match false)))
+      (while (and (< p pn) (= (get pat p) (: 42 u8))) (set! p (+ p 1)))
+      (= p pn))))
+
+;;; NAME inside directory BASE, where "" is the workspace root.
+(defn m-path-under [(a (dyn Allocator)) (base (slice u8)) (name (slice u8))]
+  (-> (slice u8))
+  (if (= (len base) 0) name (sconcat3 a base "/" name)))
+
+;;; Every directory the member pattern SEGS[k..] names below BASE ("" is the
+;;; workspace root), pushed onto OUT. A segment holding `*` is matched against the
+;;; entries of the directory reached so far, skipping dot-entries as a shell glob
+;;; does; any other segment is a path component.
+(defn m-glob-expand! [(a (dyn Allocator))
+                      (base (slice u8))
+                      (segs (ArrayList (slice u8)))
+                      (k i64)
+                      (line i64)
+                      (out (mut (ArrayList (slice u8))))] (-> void)
+  (if (>= k (len segs))
+      (push! (mut out) base)
+      (let [seg (get segs k)]
+        (if (< (m-index seg (: 42 u8)) 0)
+            (let [next (m-path-under a base seg)]
+              (when (dir? (to-cstr a next))
+                (m-glob-expand! a next segs (+ k 1) line (mut out))))
+            (let [here (if (= (len base) 0) "." base)]
+              (match (fs/Directory::list a here)
+                ; a directory that cannot be listed would silently drop its members
+                (Err [_]
+                     (do
+                       (m-err a
+                              line
+                              (cat3-d a
+                                      "[workspace] members: cannot list the directory '"
+                                      (cat3-d a here "'")))
+                       0))
+                (Ok [names]
+                    (for name names
+                      (when (and (not (starts-with name "."))
+                                 (m-glob-match? seg name))
+                        (let [next (m-path-under a base name)]
+                          (when (dir? (to-cstr a next))
+                            (m-glob-expand! a next segs (+ k 1) line (mut out)))))))))))))
+
+;;; The member directories, one per line, sorted and without repeats. `members` lists
+;;; paths relative to the workspace root, and a path holding `*` is a pattern:
+;;;
+;;; - a pattern takes every directory it matches that is a package (has a
+;;;   Coil.toml) and silently skips the rest, so a `data/` or `docs/` beside the
+;;;   packages does not break `members = ["*"]`;
+;;; - a path without `*` names one member, so a missing directory or one without a
+;;;   Coil.toml is an error at the `members` line, naming it.
+(defn m-member-dirs [(a (dyn Allocator)) (m (ptr Manifest))] (-> (slice u8))
+  (let [globs (load (field m ws-members))
+        line (.ws-members-line m)
+        (mut found) (ArrayList::new [(slice u8)] a)]
+    (for g (load globs)
+      (unless (m-member-glob-ok? g)
+        (m-err a
+               line
+               "[workspace] members: a member path may contain only letters, digits and / - _ . *"))
+      (let [(mut segs) (ArrayList::new [(slice u8)] a)]
+        (for part (split a g "/")
+          (when (> (len part) 0) (push! (mut segs) part)))
+        (if (>= (m-index g (: 42 u8)) 0)
+            (let [(mut dirs) (ArrayList::new [(slice u8)] a)]
+              (m-glob-expand! a "" segs 0 line (mut dirs))
+              (for d dirs
+                (when (= (access (to-cstr a (sconcat a d "/Coil.toml"))
+                                 (: 0 i32))
+                         (: 0 i32))
+                  (push! (mut found) d))))
+            (let [d
+                    (block
+                      :joined
+                        (let [(mut path) ""]
+                          (for part segs (set! path (m-path-under a path part)))
+                          path))]
+              (cond (not (dir? (to-cstr a d)))
+                      (m-err a
+                             line
+                             (cat3-d a
+                                     "[workspace] members: '"
+                                     (cat3-d a g "' is not a directory")))
+                    (!= (access (to-cstr a (sconcat a d "/Coil.toml"))
+                                (: 0 i32))
+                        (: 0 i32))
+                      (m-err a
+                             line
+                             (cat3-d a
+                                     "[workspace] members: '"
+                                     (cat3-d a
+                                             g
+                                             "' has no Coil.toml; a member is a package directory")))
+                    :else (push! (mut found) d))))))
+    (let [(mut sorted) found
+          (mut out) (StrBuf::new a)]
+      (for i (range 1 (len sorted))
+        (let [(mut j) i]
+          (while (and (> j 0) (slice-lt? (get sorted j) (get sorted (- j 1))))
+            (let [t (get sorted j)]
+              (set! (mut sorted) j (get sorted (- j 1)))
+              (set! (mut sorted) (- j 1) t))
+            (set! j (- j 1)))))
+      (for i (range 0 (len sorted))
+        (unless (and (> i 0) (= (get sorted i) (get sorted (- i 1))))
+          (push-str! (mut out) (get sorted i))
+          (push! (mut out) (: 10 u8))))
+      (str (load out)))))
+
+; "<prefix>=<dir>" per member, newline separated: the workspace name, the member's
+; own `[package] name`, and where it lives. This is the whole workspace contract --
+; every module in that directory must be named `<prefix>.something`, and the loader
+; resolves and validates from it. A member whose package has no name is a
+; configuration error rather than a silent skip.
+(defn m-workspace-packages [(a (dyn Allocator)) (m (ptr Manifest))]
+  (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)]
+    (for dir (split a (m-member-dirs a m) "\n")
+      (when (> (len dir) 0)
+        ; m-member-dirs yields only directories holding a Coil.toml
+        (let [mm
+                (parse-manifest a
+                                (m-read-text a
+                                             (to-cstr a
+                                                      (sconcat a
+                                                               dir
+                                                               "/Coil.toml"))))]
+          (when (= (len (.name mm)) 0)
+            (m-err a
+                   (.ws-members-line m)
+                   (cat3-d a
+                           "[workspace] members: '"
+                           (cat3-d a dir "' has no [package] name"))))
+          (push-str! (mut out) (.ws-name m))
+          (push! (mut out) (: 46 u8))
+          (push-str! (mut out) (.name mm))
+          ; The fully-qualified module whose import folds its importer, when the
+          ; package declares one. The loader compares against this exactly, so no
+          ; namespace spelling of its own is ever needed.
+          (when (> (len (.casefold mm)) 0)
+            (push! (mut out) (: 33 u8))
+            (push-str! (mut out) (.ws-name m))
+            (push! (mut out) (: 46 u8))
+            (push-str! (mut out) (.name mm))
+            (push! (mut out) (: 46 u8))
+            (push-str! (mut out) (.casefold mm)))
+          (push! (mut out) (: 61 u8))
+          (match (m-realpath a dir)
+            (Some [rp] (push-str! (mut out) rp))
+            (None [] (push-str! (mut out) dir)))
+          (push! (mut out) (: 10 u8)))))
+    (str (load out))))
+
+; The member directories as a roots list, for m-namespace-roots. Parsed back out of
+; the same "<prefix>=<dir>" text the loader is given, so the two can never disagree
+; about which directories the workspace consists of.
+(defn m-workspace-member-roots [(a (dyn Allocator)) (m (ptr Manifest))]
+  (-> (ptr (ArrayList (slice u8))))
+  (let [text (m-workspace-packages a m)
+        n (len text)
+        g
+          (box! a
+                (ArrayList (slice u8))
+                (zeroed (ArrayList (slice u8))))
+        (mut lo) 0
+        (mut i) 0]
+    (set! g (ArrayList::new [(slice u8)] a))
+    ; The workspace's own `tests` directory, when it has one. It is NOT a package --
+    ; nothing there is validated against a prefix -- but test programs have to be able
+    ; to import the members they exercise, and member directories alone would leave
+    ; the whole directory unreachable.
+    (when (dir? (to-cstr a "tests")) (push! g "tests") 0)
+    (loop (if (> (load i) n)
+              (break)
+              (if (or (= (load i) n)
+                      (= (primitive/cast i64 (get text (load i)))
+                         10))
+                  (do
+                    (when (> (load i) (load lo))
+                      (let [line (subslice [u8] text (load lo) (load i))
+                            eq (m-index line (: 61 u8))]
+                        (when (>= eq 0)
+                          (push! g
+                                 (subslice [u8]
+                                           line
+                                           (primitive/iadd eq 1)
+                                           (len line)))
+                          0)))
+                    (set! lo (primitive/iadd (load i) 1))
+                    (set! i (primitive/iadd (load i) 1))
+                    0)
+                  (set! i (primitive/iadd (load i) 1)))))
+    g))
+
+(defn m-workspace? [(m (ptr Manifest))] (-> bool)
+  (> (len (.ws-name m)) 0))
+
+(defn m-realpath [(a (dyn Allocator)) (path (slice u8))]
+  (-> (Option (slice u8)))
+  (let [buf
+          (primitive/cast (ptr i8)
+                          (data (match (alloc-bytes a 4096 1)
+                                  (Some [s] s)
+                                  (None []
+                                        (do
+                                          (oom-at c"compiler allocation"
+                                                  4096)
+                                          (slice::new (primitive/cast (ptr u8)
+                                                                      0)
+                                                      0))))))
+        r (realpath-rooted (to-cstr a path) buf)]
+    (if (= (primitive/cast i64 r) 0)
+        (None [(slice u8)])
+        (Some (from-cstr buf)))))
+
+; Prefix the recursive build/run command with exact environment mappings consumed
+; by loader.coil. `env 'NAME=value'` also supports dependency names containing '-'.
+; The COIL_NAMESPACE_ROOTS value for this manifest: the configured source roots
+; (default `src:tests`), then every resolved dependency root. Shared by the
+; subprocess path (m-emit-dep-env, which passes it through `env`) and the direct
+; path (apply-project-manifest!, which setenv's it), so a dependency namespace
+; resolves identically whether you typed `coil build` or `coil build src/main.coil`.
+; Roots that do not exist are OMITTED. The namespace index shells a `find` over this
+; list, and a project without a tests/ directory — or one whose entry sits beside
+; Coil.toml rather than under src/ — made that `find` print
+; `find: tests: No such file or directory` on every single command. A missing root
+; contributes nothing to the index either way, and the entry file's own directory is
+; appended by namespace-index-build! regardless, so nothing becomes unreachable.
+;;; The directories (and uncovered entry file) this manifest's own code lives in.
+;;; A workspace root holds no code; its members do. Their directories ARE the
+;;; source roots, which is what lets one member refer to another with no
+;;; dependency declaration between them -- the workspace compiles as one
+;;; program, the way `src` and `tests` already do for a single package.
+(defn m-configured-roots [(a (dyn Allocator)) (m (ptr Manifest))]
+  (-> (ptr (ArrayList (slice u8))))
+  (if (m-workspace? m)
+      (m-workspace-member-roots a m)
+      (m-effective-roots a m ".")))
+
+; One line per entry: a canonical path (a file, or a directory and everything
+; below it), or a glob pattern whose literal directory prefix is canonical so it
+; matches the canonical paths the namespace index walks (`/tmp` versus
+; `/private/tmp`).
+(defn m-excludes-env-at [(a (dyn Allocator))
+                         (m (ptr Manifest))
+                         (base (slice u8))] (-> (slice u8))
+  (let [xs (.exclude m)
+        (mut out) (StrBuf::new a)]
+    (for [i 0 (len xs)]
+      (let [x (get (load xs) i)
+            star (m-index x (: 42 u8))
+            qmark (m-index x (: 63 u8))
+            wild
+              (if (< star 0)
+                  qmark
+                  (if (< qmark 0)
+                      star
+                      (if (< star qmark) star qmark)))]
+        (if (< wild 0)
+            (let [joined (path-join a base x)]
+              (match (m-realpath a joined)
+                (Some [p] (push-str! (mut out) p))
+                (None [] (push-str! (mut out) joined))))
+            (let [(mut cut) wild]
+              (loop (if (and (> (load cut) 0)
+                             (!= (primitive/cast i64
+                                                 (get x
+                                                      (primitive/isub (load cut)
+                                                                      1)))
+                                 47))
+                        (set! cut (primitive/isub (load cut) 1))
+                        (break)))
+              (let [prefix (subslice [u8] x 0 (load cut))
+                    rest (subslice [u8] x (load cut) (len x))
+                    joined (path-join a base prefix)
+                    canon
+                      (match (m-realpath a joined)
+                        (Some [p] p)
+                        (None [] joined))]
+                (push-str! (mut out) canon)
+                (unless (d-ends-with? canon "/") (push-str! (mut out) "/") 0)
+                (push-str! (mut out) rest))))
+        (push! (mut out) (: 10 u8))
+        0)
+      0)
+    (str (load out))))
+
+(defn m-workspace-excludes-env [(a (dyn Allocator)) (m (ptr Manifest))]
+  (-> (slice u8))
+  (let [dirs (m-member-dirs a m)
+        n (len dirs)
+        (mut out) (StrBuf::new a)
+        (mut lo) 0]
+    (for [i 0 (primitive/iadd n 1)]
+      (when (or (= i n) (= (primitive/cast i64 (get dirs i)) 10))
+        (when (> i (load lo))
+          (let [dir (subslice dirs (load lo) i)
+                mm
+                  (parse-manifest a
+                                  (m-read-text a
+                                               (to-cstr a
+                                                        (path-join a
+                                                                   dir
+                                                                   "Coil.toml"))))]
+            (push-str! (mut out) (m-excludes-env-at a mm dir))))
+        (set! lo (primitive/iadd i 1)))
+      0)
+    (str (load out))))
+
+(defn m-excludes-env [(a (dyn Allocator)) (m (ptr Manifest))] (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)
+        own
+          (if (m-workspace? m)
+              (m-workspace-excludes-env a m)
+              (m-excludes-env-at a m (cwd-slice a)))
+        deps (load (field m deps))]
+    (push-str! (mut out) own)
+    (for [i 0 (len (load deps))]
+      (let [xs (.excludes (elem deps i))]
+        (for [j 0 (len (load xs))]
+          (push-str! (mut out) (get (load xs) j))
+          (push! (mut out) (: 10 u8))
+          0))
+      0)
+    (str (load out))))
+
+(defn d-ends-with? [(s (slice u8)) (suffix (slice u8))] (-> bool)
+  (let [n (len s)
+        m (len suffix)]
+    (and (>= n m) (= (subslice [u8] s (primitive/isub n m) n) suffix))))
+
+;;; The roots this project's sources live under, relative to the package directory
+;;; BASE: the manifest's `source-roots`, or by default `src` and `tests`, or the
+;;; package directory itself when it has neither. A flat package (`main.coil` beside
+;;; `Coil.toml`, its modules beside it) is source throughout, so every command that
+;;; walks the roots (lint, fmt, the migration, the namespace index) sees all of it,
+;;; not the entry alone. A package entry outside the roots is also source:
+;;; `entry = "main.coil"` with a `tests/` directory and no `src/` must not make
+;;; project lint inspect only the tests.
+(defn m-effective-roots [(a (dyn Allocator))
+                         (m (ptr Manifest))
+                         (base (slice u8))] (-> (ptr (ArrayList (slice u8))))
+  (let [declared (load (field m source-roots))
+        g (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a))
+        entry (.entry m)
+        (mut covered) false
+        (mut i) 0]
+    (if (> (len declared) 0)
+        (loop (if (>= (load i) (len declared))
+                  (break)
+                  (do
+                    (push! g (get declared (load i)))
+                    (set! i (primitive/iadd (load i) 1)))))
+        (let [src? (dir? (to-cstr a (path-join a base "src")))
+              tests? (dir? (to-cstr a (path-join a base "tests")))]
+          (cond (or src? tests?) (do (push! g "src") (push! g "tests"))
+                :else (push! g "."))
+          0))
+    (set! i 0)
+    (loop (if (>= (load i) (len g))
+              (break)
+              (let [root (get g (load i))]
+                (when (or (= root ".")
+                          (= entry root)
+                          (starts-with entry (sconcat a root "/")))
+                  (set! covered true)
+                  (break)
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (when (and (> (len entry) 0) (not (load covered)))
+      (push! g entry)
+      0)
+    g))
+
+(defn slice-lt? [(x (slice u8)) (y (slice u8))] (-> bool)
+  (let [n (if (< (len x) (len y)) (len x) (len y))
+        (mut i) 0
+        (mut r) 0]
+    (loop (if (or (>= (load i) n) (!= (load r) 0))
+              (break)
+              (do
+                (when (< (get x (load i)) (get y (load i))) (set! r -1) 0)
+                (when (> (get x (load i)) (get y (load i))) (set! r 1) 0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (if (= (load r) 0)
+        (< (len x) (len y))
+        (< (load r) 0))))
+
+; small local concat (avoid depending on cimport's cat3).
+;;; X then Y. Running out of memory is fatal: returning X alone truncated messages
+;;; and generated text silently.
+(defn cat3-d [(a (dyn Allocator)) (x (slice u8)) (y (slice u8))] (-> (slice u8))
+  (match (concat a x y)
+    (Some [s] s)
+    (None [] (oom-at c"driver text" (+ (len x) (len y))))))
+
+;;; Is PATH one of the lines of EXCLUDES, the text m-excludes-env builds?
+(defn m-excluded? [(excludes (slice u8)) (path (slice u8))] (-> bool)
+  (let [n (len excludes)
+        (mut lo) 0
+        (mut i) 0
+        (mut hit) false]
+    (loop (if (or (> (load i) n) (load hit))
+              (break)
+              (do
+                (when (or (= (load i) n)
+                          (= (primitive/cast i64 (get excludes (load i))) 10))
+                  (when (> (load i) (load lo))
+                    (when (exclude-entry-matches? (subslice excludes
+                                                            (load lo)
+                                                            (load i))
+                                                  path)
+                      (set! hit true)
+                      0)
+                    0)
+                  (set! lo (primitive/iadd (load i) 1))
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (load hit)))
+
+;;; Add the Coil sources below DIR to OUT: no hidden directories, no symlinks, and
+;;; nothing EXCLUDES names. This is the namespace index's walk (loader.coil).
+(defn m-source-walk! [(a (dyn Allocator))
+                      (dir (slice u8))
+                      (excludes (slice u8))
+                      (out (ptr (ArrayList (slice u8))))] (-> i64)
+  (match (fs/Directory::open a dir)
+    (Err [_] 0)
+    (Ok [opened]
+        (let [(mut d) opened]
+          (loop (match (fs/Directory::next! (mut d))
+                  (Err [_] (break))
+                  (Ok [next]
+                      (match next
+                        (None [] (break))
+                        (Some [entry]
+                              (let [name (.name entry)
+                                    path (path-join a dir (sconcat a name ""))]
+                                (match (.kind entry)
+                                  (fs/EntryDirectory []
+                                                     (unless (= (primitive/cast i64
+                                                                                (get name
+                                                                                     0))
+                                                                46)
+                                                       (m-source-walk! a
+                                                                       path
+                                                                       excludes
+                                                                       out)
+                                                       0))
+                                  (fs/EntryRegular []
+                                                   (when (and (d-ends-with? name
+                                                                            ".coil")
+                                                              (not (m-excluded? excludes
+                                                                                path)))
+                                                     (push! out path)
+                                                     0))
+                                  (_ 0))
+                                0))))))
+          (fs/Directory::close! (mut d))
+          0))))
+
+;;; Every Coil source M owns, spelled relative to the working directory when below it,
+;;; in a stable order: what `coil fmt` visits with no file named.
+(defn project-source-paths [(a (dyn Allocator)) (m (ptr Manifest))]
+  (-> (ptr (ArrayList (slice u8))))
+  (let [roots (m-configured-roots a m)
+        excludes (m-excludes-env a m)
+        full (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a))
+        out (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a))
+        prefix (sconcat a (cwd-slice a) "/")]
+    (for [i 0 (len (load roots))]
+      (match (m-realpath a (get (load roots) i))
+        (None [] 0)
+        (Some [root]
+              (if (dir? (to-cstr a root))
+                  (m-source-walk! a root excludes full)
+                  (do (push! full root) 0))))
+      0)
+    (for [i 0 (len (load full))]
+      (let [path (get (load full) i)
+            p
+              (if (starts-with path prefix)
+                  (subslice [u8] path (len prefix) (len path))
+                  path)
+            (mut j) (len (load out))
+            (mut dup) false]
+        (for [k 0 (len (load out))]
+          (when (= (get (load out) k) p) (set! dup true) 0)
+          0)
+        (unless (load dup)
+          (push! out p)
+          (loop (if (and (> (load j) 0)
+                         (slice-lt? p
+                                    (get (load out) (primitive/isub (load j) 1))))
+                    (do
+                      (set! out
+                            (load j)
+                            (get (load out) (primitive/isub (load j) 1)))
+                      (set! j (primitive/isub (load j) 1)))
+                    (break)))
+          (set! out (load j) p)
+          0))
+      0)
+    out))
+
+; Read only the lexical module header. Namespace discovery must not invoke read-all:
+; doing so after the entry file is parsed mutates reader-global node identities and
+; can corrupt later staged-macro bookkeeping.
+;;; Byte offset of the `(module …)` header's opening paren, or -1: the first
+;;; top-level form that is one. Forms may precede it (they keep bare names), but text
+;;; inside a string, a comment, a character literal or another form is never a
+;;; header, nor is a quoted `'(module …)`.
+(defn module-header-offset [(text (slice u8))] (-> i64)
+  (let [n (len text)
+        (mut i) 0
+        (mut depth) 0
+        ; the last byte outside whitespace and comments, to tell a quoted list
+        (mut prev) 0]
+    (block :found
+      (loop (if (>= (load i) n)
+                (break)
+                (let [c (primitive/cast i64 (get text (load i)))]
+                  (cond (= c 59)  ; `;` runs to the end of the line
+                          (loop (if (or (>= (load i) n)
+                                        (= (primitive/cast i64
+                                                           (get text (load i)))
+                                           10))
+                                    (break)
+                                    (set! i (+ (load i) 1))))
+                        (= c 34)  ; a string, with its escapes
+                          (do
+                            (set! i (+ (load i) 1))
+                            (loop (if (>= (load i) n)
+                                      (break)
+                                      (let [d
+                                              (primitive/cast i64
+                                                              (get text
+                                                                   (load i)))]
+                                        (cond (= d 92) (set! i (+ (load i) 2))
+                                              (= d 34)
+                                                (do
+                                                  (set! i (+ (load i) 1))
+                                                  (break))
+                                              :else (set! i (+ (load i) 1))))))
+                            (set! prev c))
+                        (or (= c 32) (= c 9) (= c 10) (= c 13))
+                          (set! i (+ (load i) 1))
+                        ; a character literal: `\(` is a byte, not a paren
+                        (= c 92)
+                          (do
+                            (set! i (char-literal-end text (load i)))
+                            (set! prev c))
+                        :else
+                          (do
+                            (when (and (= c 40)
+                                       (= (load depth) 0)
+                                       (not (or (= (load prev) 39)
+                                                (= (load prev) 96)))
+                                       (starts-with (subslice text (load i) n)
+                                                    "(module "))
+                              (break :found (load i)))
+                            (cond (or (= c 40) (= c 91))
+                                    (set! depth (+ (load depth) 1))
+                                  (or (= c 41) (= c 93))
+                                    (when (> (load depth) 0)
+                                      (set! depth (- (load depth) 1))
+                                      0)
+                                  :else 0)
+                            (set! prev c)
+                            (set! i (+ (load i) 1)))))))
+      -1)))
+
+(defn namespace-declared-module [(text (slice u8))] (-> (Option (slice u8)))
+  (let [n (len text)
+        at (module-header-offset text)
+        (mut out) (None [(slice u8)])]
+    (when (>= at 0)
+      (let [lo (primitive/iadd at 8)
+            (mut hi) (primitive/iadd at 8)]
+        (loop (if (>= (load hi) n)
+                  (break)
+                  (let [d
+                          (primitive/cast i64
+                                          (get text (load hi)))]
+                    (if (or (= d 41)
+                            (or (= d 32)
+                                (or (= d
+                                       9)
+                                    (or (= d
+                                           10)
+                                        (= d
+                                           13)))))
+                        (break)
+                        (store! hi
+                                (primitive/iadd (load hi) 1))))))
+        (when (> (load hi) lo)
+          (store! out (Some (subslice text lo (load hi))))
+          0)
+        0)
+      0)
+    (load out)))

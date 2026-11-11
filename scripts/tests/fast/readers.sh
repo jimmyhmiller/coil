@@ -6,7 +6,11 @@
 #   * a project maps file suffixes to three readers and explicit module names to
 #     guest files, and imports across them;
 #   * two providers for one input is an error, not last-wins;
-#   * an error raised inside a provider names the file and the reader;
+#   * an error raised inside a provider names the file and the reader, and a
+#     provider that does not compile is located in the provider;
+#   * a cross build compiles its readers for the host;
+#   * readers that do not reflect on their program release its compilation, one
+#     that does keeps it, and a precompiled provider may not reflect;
 #   * a precompiled provider artifact is reused, invalidated and checked
 #     (scripts/tests/provider-artifacts.py).
 #
@@ -52,9 +56,37 @@ expect "brainfuck: a reader error is located in the input" 1 \
 # [readers] maps .json, .guest and .kv to three providers; [modules] names guest
 # files explicitly; one guest file declares its module on its first line. The
 # entry imports all of them: 48 is their sum.
-out=$(cd $R/json_project && "$COIL" run 2>&1); rc=$?
+# None of the three reflects on its program, so the unit they are compiled in is
+# released once their engine is built.
+out=$(cd $R/json_project && COIL_TRACE=1 "$COIL" run 2>&1); rc=$?
 [ "$rc" = 48 ] && ok "project: suffix readers and mapped guest modules import each other" \
   || bad "project: suffix readers and mapped guest modules import each other" "exit $rc, want 48: $out"
+case "$out" in
+  *"coil-trace count reader.unit.released 1"*) ok "project: readers that do not reflect release their compilation" ;;
+  *) bad "project: readers that do not reflect release their compilation" "$(printf '%s\n' "$out" | grep 'reader\.')" ;;
+esac
+
+# A reader's code runs in the compiler, so a cross build compiles it for the host:
+# rd.kv uses coil.meta, which only compiler code has.
+out=$(cd $R/json_project && "$COIL" check --target wasm32-unknown-unknown 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "project: a cross build reads with readers compiled for the host" \
+  || bad "project: a cross build reads with readers compiled for the host" "exit $rc: $out"
+
+# A source provider may reflect on its own program: rd.shape counts a struct's
+# fields, so its compilation stays, and 7 is 4 fields plus the file's 3. A
+# precompiled provider may not.
+out=$(cd $R/reflect_project && COIL_TRACE=1 "$COIL" run 2>&1); rc=$?
+case "$rc|$out" in
+  "7|"*"coil-trace count reader.unit.kept 1"*) ok "project: a reader that reflects keeps its program" ;;
+  *) bad "project: a reader that reflects keeps its program" "exit $rc, want 7: $(printf '%s\n' "$out" | grep -v '^coil-')" ;;
+esac
+mkdir -p "$WORK/reflect-artifact"
+out=$(cd $R/reflect_project && "$COIL" build-provider rd.shape read-shape -o "$WORK/reflect-artifact" 2>&1); rc=$?
+case "$rc|$out" in
+  "1|"*"precompiled syntax reader cannot use semantic reflection (code operation code-field-count)"*"shape_reader.coil:"*)
+    ok "a precompiled provider may not reflect" ;;
+  *) bad "a precompiled provider may not reflect" "exit $rc: $out" ;;
+esac
 
 expect "two reader providers for one input is an error" 1 \
   "more than one --use module declares a reader provider" \
@@ -79,6 +111,30 @@ case "$rc|$out" in
   "1|"*"data.bad' with reader 'rdr.reader'"*"got a float"*)
     ok "a provider's error names the file, the reader and the bad part" ;;
   *) bad "a provider's error names the file, the reader and the bad part" "exit $rc: $out" ;;
+esac
+
+# A provider that does not compile is reported where the provider is wrong, for
+# the file that needed it.
+mkdir -p "$WORK/rdc/src"
+printf '[package]\nname = "rdc"\nentry = "src/main.coil"\n\n[readers]\n".bad" = "rdc.reader"\n\n[modules]\n"rdc.data" = "src/data.bad"\n' \
+  > "$WORK/rdc/Coil.toml"
+cat > "$WORK/rdc/src/reader.coil" <<'EOF'
+(module rdc.reader)
+(import "coil.primitive" :as p)
+(reader-provider "rdc.reader" read-bad)
+(defn helper [(n i64)] (-> i64)
+  (+ n "not a number"))
+(defn read-bad [(context Code)] (-> Code)
+  (p/code-read (p/code-nth context 2) `(reader-config)))
+EOF
+echo "(def value 1)" > "$WORK/rdc/src/data.bad"
+printf '(module rdc.main)\n(import "rdc.data" :as d)\n(defn main [] (-> i64) d/value)\n' > "$WORK/rdc/src/main.coil"
+line=$(grep -n '"not a number"' "$WORK/rdc/src/reader.coil" | cut -d: -f1)
+out=$(cd "$WORK/rdc" && "$COIL" check 2>&1); rc=$?
+case "$rc|$out" in
+  "1|"*"data.bad' with reader 'rdc.reader'"*"has type (slice u8) but expected i64"*"src/reader.coil:$line:"*)
+    ok "a provider that does not compile is located in the provider" ;;
+  *) bad "a provider that does not compile is located in the provider" "exit $rc: $out" ;;
 esac
 
 # ---- a precompiled provider -------------------------------------------------------

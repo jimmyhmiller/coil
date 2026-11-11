@@ -28,9 +28,8 @@
         [diverges? exprs-diverge? operand-pure? operand-statement
          hoist-diverging-operand])
 (import "coil.compiler.astdump" :use *)
-(import "coil.compiler.comptime" :use *)
+(import "coil.compiler.metastate" :use *)
 (import "coil.compiler.closure" :use *)
-(import "coil.compiler.fold" :use *)
 (import "coil.compiler.loader" :use *)
 (import "coil.compiler.parser" :use *)
 (import "coil.compiler.resolve" :use *)
@@ -39,7 +38,6 @@
 (import "coil.avec" :use *)
 (import "coil.amap" :use *)
 (import "coil.compiler.trace" :as tr)
-(import "coil.compiler.api_renames" :use [api-rename-hint])  ; what replaced a removed stdlib name
 
 ; the last `.`-separated component of a qualified name (the link/C symbol).
 ; Lives here (not in codegen.coil) so check has no codegen/LLVM dependency and
@@ -143,7 +141,7 @@
    ; its `pending-break-count`, which orders it among the others
    (seq i64)])
 
-; `bid` is the local-binding identity (see comptime.coil binding-map): a fresh id
+; `bid` is the local-binding identity (see metastate.coil binding-map): a fresh id
 ; per let-binding / parameter, so `(primitive/binding-of REF)` distinguishes shadows.
 (defstruct EnvEntry [(name (slice u8)) (ty Type) (bid i64)])
 
@@ -161,6 +159,51 @@
 ; A bucket of impl positions. A checker's buckets live in its persistent indexes
 ; and are replaced, not edited, unless this checker made them (`cx-bucket-add!`).
 (defstruct ImplBucket [(items (AVec i64))])
+
+;;; Where a definition names a declaration it depends on: in its own declaration
+;;; (a function's signature, a struct's or variant's fields, a constant's type),
+;;; in its body (a function's body, a constant's value), or both.
+(defstruct DepUse [(declaration bool) (body bool)])
+
+;;; What a declaration a definition depends on is. A method is the function the
+;;; checker made of it; an extern is a function; a `def` is a constant.
+(defsum DepKind
+  (DepFunction)
+  (DepStruct)
+  (DepSum)
+  (DepVariant)
+  (DepConst)
+  (DepTrait))
+
+;;; How a definition uses one qualified name: for each kind of declaration that
+;;; name is, where the definition names it. A name is rarely more than one kind.
+(defstruct DepUses
+  [(as_function DepUse)
+   (as_struct DepUse)
+   (as_sum DepUse)
+   (as_variant DepUse)
+   (as_const DepUse)
+   (as_trait DepUse)])
+
+;;; What one definition looked up while it was checked: by qualified name, how
+;;; it uses each declaration (`edges`), and the struct fields it reads, writes or
+;;; takes the offset of, each under `STRUCT FIELD` (`fields`).
+(defstruct DepSet
+  [(edges (AMap (slice u8) DepUses))
+   (fields (AMap (slice u8) DepUse))])
+
+;;; The definitions that looked one name up, and how each uses it.
+(defstruct DepOwners [(owners (AMap (slice u8) DepUses))])
+
+;;; The definitions that use one struct field, and where.
+(defstruct DepFieldOwners [(owners (AMap (slice u8) DepUse))])
+
+;;; A lookup the definition being checked has already recorded: the address and
+;;; length of the declaration's name, which name it alone while its record
+;;; lives, and one bit for each kind and place it was recorded under
+;;; (`dep-seen-bit`). A definition looks the same few declarations up again and
+;;; again; this answers those without hashing a name.
+(defstruct DepSeen [(data i64) (count i64) (bits i64)])
 
 (defstruct Cx
   [(a (dyn Allocator))
@@ -224,9 +267,6 @@
    ; Expressions typed TError by recovery so far. A failure while this grows is a
    ; consequence of an earlier error and is not reported again.
    (error_count i64)
-   ; Nesting depth of `(comptime …)` being checked. Comptime folds a generic
-   ; template once, so a value parameter has no value there. Appended field.
-   (comptime_depth i64)
    ; Set while a loop proposes a type for break values that wait for one
    ; (`pending-break-type`): a variant whose type arguments its arguments leave
    ; open types with inference holes there instead of failing, and nothing is
@@ -273,7 +313,32 @@
    (base_consts i64)
    ; How many of the program's externs the base registered (its checked
    ; program's, in front of the program's own). Appended field.
-   (base_externs i64)])
+   (base_externs i64)
+   ; Dependency facts: for each definition checked here or in a state this
+   ; builds on, the declarations the checker looked up while checking it
+   ; (`deps`, by the definition's name); and the other way round, the
+   ; definitions that looked a name up (`dependents`) or use a struct's field
+   ; (`field_dependents`, by `STRUCT FIELD`). Persistent, as the tables above.
+   ; Appended fields.
+   (deps (AMap (slice u8) (ptr DepSet)))
+   (dependents (AMap (slice u8) (ptr DepOwners)))
+   (field_dependents (AMap (slice u8) (ptr DepFieldOwners)))
+   ; Whether this check records them: its facts can be read, by a metaprogram
+   ; it runs or by a compile that builds on the state it leaves
+   ; (`dependency-facts-wanted?`). Appended field.
+   (dep_recording bool)
+   ; The definition being checked and its set, null outside one, and whether
+   ; what it looks up now is named in its declaration or its body
+   ; (`dep-owner-enter!`). Appended fields.
+   (dep_owner (slice u8))
+   (dep_set (ptr DepSet))
+   (dep_in_body bool)
+   ; The buffer a field's key is built in: a field the definition already uses
+   ; allocates nothing. Appended field.
+   (dep_probe StrBuf)
+   ; The lookups the definition being checked has recorded most recently, by
+   ; the address of the name (`dep-seen-slot`). Appended field.
+   (dep_seen (array DepSeen 64))])
 
 (defn mk-evalpair [(e Expr) (t Type)] (-> EvalPair)
   (let [p (primitive/alloc-stack EvalPair)]
@@ -426,6 +491,263 @@
         0)))
   0)
 
+; ---- dependency facts --------------------------------------------------------
+; A definition depends on every declaration the checker looked up while checking
+; it. The lookups below (`sig-find-local`, `struct-find`, `sum-find`, `vts-find`,
+; `trait-find`, `const-find`) are the only way the checker reads a declaration,
+; so recording there misses none. What is recorded is what was found: a name the
+; resolver settled before the checker ran (an alias, a macro, a name that would
+; resolve differently if a new one appeared) is not a lookup and leaves no fact.
+
+;;; The use of KIND in USES.
+(defn dep-kind-use [(uses (ptr DepUses)) (kind DepKind)] (-> (ptr DepUse))
+  (match kind
+    (DepFunction [] (field uses as_function))
+    (DepStruct [] (field uses as_struct))
+    (DepSum [] (field uses as_sum))
+    (DepVariant [] (field uses as_variant))
+    (DepConst [] (field uses as_const))
+    (DepTrait [] (field uses as_trait))))
+
+;;; The bit of KIND, named where IN-BODY says, in a `DepSeen`.
+(defn dep-seen-bit [(kind DepKind) (in-body bool)] (-> i64)
+  (primitive/ishl 1
+                  (+ (* 2
+                        (match kind
+                          (DepFunction [] 0)
+                          (DepStruct [] 1)
+                          (DepSum [] 2)
+                          (DepVariant [] 3)
+                          (DepConst [] 4)
+                          (DepTrait [] 5)))
+                     (if in-body 1 0))))
+
+;;; Where NAME's lookups are remembered among CX's recent ones.
+(defn dep-seen-slot [(cx (ptr Cx)) (name (slice u8))] (-> (ptr DepSeen))
+  (primitive/index (field cx dep_seen)
+                   (primitive/iand (primitive/ishr (primitive/cast i64 (data name))
+                                                   4)
+                                   63)))
+
+;;; Forget the recent lookups: they were another definition's.
+(defn dep-seen-clear! [(cx (ptr Cx))] (-> i64)
+  (for [i 0 64]
+    (set! (.data (primitive/index (field cx dep_seen) i)) 0))
+  0)
+
+;;; Whether USE says the definition names the declaration where IN-BODY says.
+(defn dep-used? [(use (ptr DepUse)) (in-body bool)] (-> bool)
+  (if in-body (.body use) (.declaration use)))
+
+(defn dep-use! [(use (ptr DepUse)) (in-body bool)] (-> i64)
+  (if in-body (set! (.body use) true) (set! (.declaration use) true))
+  0)
+
+;;; The owners of NAME, to change: this check's own record, a copy of one a state
+;;; it builds on left, or a new one.
+(defn dep-owners-own! [(cx (ptr Cx)) (name (slice u8))] (-> (ptr DepOwners))
+  (let [tag (.edit_tag cx)
+        a (.a cx)
+        prior (get (.dependents cx) name)
+        mine
+          (match prior
+            (Some [owners] (= (.tag (.owners owners)) tag))
+            (None [] false))]
+    (match (if mine prior (None [(ptr DepOwners)]))
+      (Some [owners] owners)
+      (None []
+            (let [made
+                    (box! a
+                          DepOwners
+                          (DepOwners
+                            :owners
+                              (amap-retag (match prior
+                                            (Some [owners] (.owners owners))
+                                            (None []
+                                                  (amap-new [(slice u8) DepUses]
+                                                            (keyops)
+                                                            a)))
+                                          tag
+                                          a)))]
+              (set! (mut (.dependents cx)) name made)
+              made)))))
+
+;;; As `dep-owners-own!`, for the field KEY (`STRUCT FIELD`).
+(defn dep-field-owners-own! [(cx (ptr Cx)) (key (slice u8))]
+  (-> (ptr DepFieldOwners))
+  (let [tag (.edit_tag cx)
+        a (.a cx)
+        prior (get (.field_dependents cx) key)
+        mine
+          (match prior
+            (Some [owners] (= (.tag (.owners owners)) tag))
+            (None [] false))]
+    (match (if mine prior (None [(ptr DepFieldOwners)]))
+      (Some [owners] owners)
+      (None []
+            (let [made
+                    (box! a
+                          DepFieldOwners
+                          (DepFieldOwners
+                            :owners
+                              (amap-retag (match prior
+                                            (Some [owners] (.owners owners))
+                                            (None []
+                                                  (amap-new [(slice u8) DepUse]
+                                                            (keyops)
+                                                            a)))
+                                          tag
+                                          a)))]
+              (set! (mut (.field_dependents cx)) key made)
+              made)))))
+
+;;; The definition being checked looked up the declaration NAME of KIND. NAME is
+;;; the declaration's own record's, which lives as long as the tables do: it is
+;;; kept as the key. Nothing is recorded outside a definition, or for a
+;;; definition's lookup of itself.
+(defn dep-read! [(cx (ptr Cx)) (kind DepKind) (name (slice u8))] (-> i64)
+  (let [set (.dep_set cx)]
+    (unless (= (primitive/cast i64 set) 0)
+      (let [in-body (.dep_in_body cx)
+            seen (dep-seen-slot cx name)
+            bit (dep-seen-bit kind in-body)
+            same
+              (and (= (.data seen) (primitive/cast i64 (data name)))
+                   (= (.count seen) (len name)))]
+        (unless (and same (!= (primitive/iand (.bits seen) bit) 0))
+          (let [uses (primitive/alloc-stack DepUses)]
+            (set! uses
+                  (match (get (.edges set) name)
+                    (Some [known] known)
+                    (None [] (primitive/zeroed DepUses))))
+            (unless (or (dep-used? (dep-kind-use uses kind) in-body)
+                        (= name (.dep_owner cx)))
+              (dep-use! (dep-kind-use uses kind) in-body)
+              (set! (mut (.edges set)) name (load uses))
+              (set! (mut (.owners (dep-owners-own! cx name)))
+                    (.dep_owner cx)
+                    (load uses))
+              0)
+            (set! (.bits seen) (if same (primitive/ior (.bits seen) bit) bit))
+            (set! (.data seen) (primitive/cast i64 (data name)))
+            (set! (.count seen) (len name))
+            0))
+        0)))
+  0)
+
+;;; The definition being checked reads, writes or takes the offset of the field
+;;; FNAME of the struct SNAME.
+(defn dep-read-field! [(cx (ptr Cx)) (sname (slice u8)) (fname (slice u8))]
+  (-> i64)
+  (let [set (.dep_set cx)]
+    (unless (= (primitive/cast i64 set) 0)
+      (set! (.len (field (field cx dep_probe) bytes)) 0)
+      (push-str! (mut (.dep_probe cx)) sname)
+      (push-str! (mut (.dep_probe cx)) " ")
+      (push-str! (mut (.dep_probe cx)) fname)
+      (let [probe (str (.dep_probe cx))
+            in-body (.dep_in_body cx)
+            use (primitive/alloc-stack DepUse)]
+        (set! use
+              (match (get (.fields set) probe)
+                (Some [known] known)
+                (None [] (primitive/zeroed DepUse))))
+        (unless (dep-used? use in-body)
+          (let [key (sconcat (.a cx) probe "")]
+            (dep-use! use in-body)
+            (set! (mut (.fields set)) key (load use))
+            (set! (mut (.owners (dep-field-owners-own! cx key)))
+                  (.dep_owner cx)
+                  (load use))
+            0))
+        0)))
+  0)
+
+;;; Forget what OWNER looked up: it is no longer a dependent of anything.
+(defn dep-owner-forget! [(cx (ptr Cx)) (owner (slice u8))] (-> i64)
+  (match (get (.deps cx) owner)
+    (None [] 0)
+    (Some [set]
+          (let [edges (amap-entries (field set edges) (.a cx))
+                fields (amap-entries (field set fields) (.a cx))]
+            (for [i 0 (len edges)]
+              (let [name (.key (get edges i))]
+                (when (contains? (.dependents cx) name)
+                  (remove! (mut (.owners (dep-owners-own! cx name))) owner)
+                  0)))
+            (for [i 0 (len fields)]
+              (let [key (.key (get fields i))]
+                (when (contains? (.field_dependents cx) key)
+                  (remove! (mut (.owners (dep-field-owners-own! cx key))) owner)
+                  0)))
+            (remove! (mut (.deps cx)) owner)
+            0)))
+  0)
+
+;;; What `dep-owner-enter!` replaced, for `dep-owner-leave!` to put back.
+(defstruct DepScope [(owner (slice u8)) (set (ptr DepSet)) (in_body bool)])
+
+;;; A set with EDGES and FIELDS under CX's tag, its edits CX's.
+(defn dep-set-own [(cx (ptr Cx))
+                   (edges (ref (AMap (slice u8) DepUses)))
+                   (fields (ref (AMap (slice u8) DepUse)))] (-> (ptr DepSet))
+  (box! (.a cx)
+        DepSet
+        (DepSet
+          :edges (amap-retag edges (.edit_tag cx) (.a cx))
+          :fields (amap-retag fields (.edit_tag cx) (.a cx)))))
+
+;;; Record what the checker looks up from here on as the definition OWNER's, named
+;;; in its body when IN-BODY and in its declaration otherwise; with no OWNER, or
+;;; in a check that records no facts, record nothing. The set recorded into is
+;;; this check's own: a new one, or a copy of the one a state it builds on left
+;;; for OWNER, which is never written. Only retiring a definition forgets what it
+;;; looked up (`dep-owner-forget!`).
+(defn dep-owner-enter! [(cx (ptr Cx)) (owner (slice u8)) (in-body bool)]
+  (-> DepScope)
+  (let [prior
+          (DepScope
+            :owner (.dep_owner cx)
+            :set (.dep_set cx)
+            :in_body (.dep_in_body cx))
+        set
+          (if (or (= (len owner) 0) (not (.dep_recording cx)))
+              (primitive/cast (ptr DepSet) 0)
+              (match (get (.deps cx) owner)
+                (Some [set]
+                      (if (= (.tag (.edges set)) (.edit_tag cx))
+                          set
+                          (let [mine
+                                  (dep-set-own cx
+                                               (field set edges)
+                                               (field set fields))]
+                            (set! (mut (.deps cx)) owner mine)
+                            mine)))
+                (None []
+                      (let [a (.a cx)
+                            mine
+                              (dep-set-own cx
+                                           (amap-new [(slice u8) DepUses]
+                                                     (keyops)
+                                                     a)
+                                           (amap-new [(slice u8) DepUse]
+                                                     (keyops)
+                                                     a))]
+                        (set! (mut (.deps cx)) owner mine)
+                        mine))))]
+    (set! (.dep_owner cx) owner)
+    (set! (.dep_set cx) set)
+    (set! (.dep_in_body cx) in-body)
+    (dep-seen-clear! cx)
+    prior))
+
+(defn dep-owner-leave! [(cx (ptr Cx)) (prior DepScope)] (-> i64)
+  (set! (.dep_owner cx) (.owner prior))
+  (set! (.dep_set cx) (.set prior))
+  (set! (.dep_in_body cx) (.in_body prior))
+  (dep-seen-clear! cx)
+  0)
+
 ; ---- Cx table lookups (return a live (ptr T) or null) ----------------------
 ; Record that the signature just appended is the one `name` now resolves to. Overwriting
 ; is the point: on a duplicate name the LAST one declared wins, which is exactly what a
@@ -458,7 +780,10 @@
 (defn sig-find-local [(cx (ptr Cx)) (name (slice u8))] (-> (ptr Sig))
   (match (get (field cx sigidx) name)
     (None [] (primitive/cast (ptr Sig) 0))
-    (Some [i] (avec-at (field cx sigs) i))))
+    (Some [i]
+          (let [sig (avec-at (field cx sigs) i)]
+            (dep-read! cx (DepFunction) (.name sig))
+            sig))))
 
 (defn sig-find [(cx (ptr Cx)) (name (slice u8))] (-> (ptr Sig))
   (let [found (sig-find-built-on cx name)]
@@ -669,8 +994,7 @@
 
 ;;; What a diagnostic about the unknown NAME written in the function FNAME (a
 ;;; qualified name, or "" outside any function, which reads it through no module's
-;;; imports) adds: `unknown-name-hint`, the removed-name hint or the modules that
-;;; define and export NAME, the loaded ones read from this checker's tables.
+;;; imports) adds: `unknown-name-hint`, the modules that define and export NAME, the loaded ones read from this checker's tables.
 (defn fn-unknown-hint [(a (dyn Allocator))
                        (cx (ptr Cx))
                        (fname (slice u8))
@@ -766,19 +1090,44 @@
     (None [] (primitive/cast (ptr T) 0))))
 
 (defn struct-find [(cx (ptr Cx)) (name (slice u8))] (-> (ptr StructInfo))
-  (cx-table-find [StructInfo] (field cx structs) (field cx struct_idx) name))
+  (let [found
+          (cx-table-find [StructInfo]
+                         (field cx structs)
+                         (field cx struct_idx)
+                         name)]
+    (unless (= (primitive/cast i64 found) 0)
+      (dep-read! cx (DepStruct) (.name found))
+      0)
+    found))
 
 (defn sum-find [(cx (ptr Cx)) (name (slice u8))] (-> (ptr SumInfo))
-  (cx-table-find [SumInfo] (field cx sums) (field cx sum_idx) name))
+  (let [found (cx-table-find [SumInfo] (field cx sums) (field cx sum_idx) name)]
+    (unless (= (primitive/cast i64 found) 0)
+      (dep-read! cx (DepSum) (.name found))
+      0)
+    found))
 
 (defn vts-find [(cx (ptr Cx)) (variant (slice u8))] (-> (ptr VtoS))
-  (cx-table-find [VtoS]
-                 (field cx variant_to_sum)
-                 (field cx variant_idx)
-                 variant))
+  (let [found
+          (cx-table-find [VtoS]
+                         (field cx variant_to_sum)
+                         (field cx variant_idx)
+                         variant)]
+    (unless (= (primitive/cast i64 found) 0)
+      (dep-read! cx (DepVariant) (.variant found))
+      0)
+    found))
 
 (defn trait-find [(cx (ptr Cx)) (name (slice u8))] (-> (ptr TraitDef))
-  (cx-table-find [TraitDef] (field cx trait_defs) (field cx trait_idx) name))
+  (let [found
+          (cx-table-find [TraitDef]
+                         (field cx trait_defs)
+                         (field cx trait_idx)
+                         name)]
+    (unless (= (primitive/cast i64 found) 0)
+      (dep-read! cx (DepTrait) (.name found))
+      0)
+    found))
 
 (defn cx-struct-add! [(cx (ptr Cx)) (info StructInfo)] (-> i64)
   (set! (mut (.struct_idx cx)) (.name info) (len (.structs cx)))
@@ -882,7 +1231,10 @@
 (defn const-find [(cx (ptr Cx)) (name (slice u8))] (-> (ptr ConstEntry))
   (match (get (field cx constidx) name)
     (None [] (primitive/cast (ptr ConstEntry) 0))
-    (Some [i] (avec-at (field cx consts) i))))
+    (Some [i]
+          (let [entry (avec-at (field cx consts) i)]
+            (dep-read! cx (DepConst) (.name entry))
+            entry))))
 
 ;;; Whether NAME's constant is one this check registered, not its base's.
 (defn const-registered-here? [(cx (ptr Cx)) (name (slice u8))] (-> bool)
@@ -2102,12 +2454,12 @@
                                             " type arguments, got 0")))))
                   ; No function is at hand to say which module's imports to read.
                   (Err [i64 Diag]
-                       (derr (with-removed-hint a
-                                                (sconcat3 a
-                                                          "unknown type '"
-                                                          name
-                                                          "'")
-                                                (fn-unknown-hint a cx "" name))))))))))
+                       (derr (with-hint a
+                                        (sconcat3 a
+                                                  "unknown type '"
+                                                  name
+                                                  "'")
+                                        (fn-unknown-hint a cx "" name))))))))))
 
 ; index of `nm` in a name list, or -1.
 (defn name-index [(lst (ptr (ArrayList (slice u8)))) (nm (slice u8))] (-> i64)
@@ -2811,7 +3163,19 @@
     (set! (.inherent_name_idx cx)
           (amap-retag (amap-new [(slice u8) (ptr ImplBucket)] (keyops) a) tag a))
     (set! (.method_idx cx)
-          (amap-retag (amap-new [(slice u8) (ptr ImplBucket)] (keyops) a) tag a)))
+          (amap-retag (amap-new [(slice u8) (ptr ImplBucket)] (keyops) a) tag a))
+    (set! (.deps cx)
+          (amap-retag (amap-new [(slice u8) (ptr DepSet)] (keyops) a) tag a))
+    (set! (.dependents cx)
+          (amap-retag (amap-new [(slice u8) (ptr DepOwners)] (keyops) a) tag a))
+    (set! (.field_dependents cx)
+          (amap-retag (amap-new [(slice u8) (ptr DepFieldOwners)] (keyops) a)
+                      tag
+                      a)))
+  (set! (.dep_owner cx) "")
+  (set! (.dep_set cx) (primitive/cast (ptr DepSet) 0))
+  (set! (.dep_in_body cx) false)
+  (set! (.dep_probe cx) (StrBuf::new a))
   (set! (.cur_bounds cx) (ArrayList::new [Bound] a))
   (set! (.loops cx) (ArrayList::new [LoopFrame] a))
   0)
@@ -2871,8 +3235,8 @@
               (do
                 (let [sp (elem fs (load i))
                       nm (.name sp)]
-                  (cond (!= (primitive/cast i64 (sum-find cx nm))
-                            0)
+                  (cond (or (!= (primitive/cast i64 (sum-find cx nm)) 0)
+                            (!= (primitive/cast i64 (struct-find cx nm)) 0))
                           (do
                             (set! err
                                   (derr (sconcat3 a
@@ -3820,12 +4184,12 @@
                  (break
                    :try
                      (Err [i64 Diag]
-                          (derr (with-removed-hint a
-                                                   (sconcat3 a
-                                                             "impl: unknown trait '"
-                                                             tr
-                                                             "'")
-                                                   (fn-unknown-hint a cx "" tr))))))
+                          (derr (with-hint a
+                                           (sconcat3 a
+                                                     "impl: unknown trait '"
+                                                     tr
+                                                     "'")
+                                           (fn-unknown-hint a cx "" tr))))))
                ; Several impls may share a dispatch key — `(Pair A B)` and `(Pair i64 i64)` both
                ; key to "Pair" — so a key clash is no longer a duplicate. Only two impls with the
                ; SAME PATTERN (each matching the other) are. Overlaps that are neither disjoint
@@ -4363,14 +4727,27 @@
         ; address (`alloc-static`, `fnptr-of`, `fn`, a C string)?
         linked (expr-names-link-address? a (field cp value) true)]
     (set! (.const_value_depth u) (+ saved 1))
+    ; A def's array is laid out in the def, element by element, not copied from a
+    ; table of its own.
+    (when (.runtime cp) (set! (.static_init_depth u) (+ (.static_init_depth u) 1)) 0)
     (let [r (compute-const-entry-value a cx cp)]
+      (when (.runtime cp) (set! (.static_init_depth u) (- (.static_init_depth u) 1)) 0)
       (set! (.const_value_depth u) saved)
       (if (.declared cp)
           r
           (try (let [ev (try! r)
                      owned (try! (ownership-check-const-value a cx cp ev))]
                  (if (not (.runtime cp))
-                     (Ok owned)
+                     (let [run (const-code-run a cx (box-expr a (.e owned)) false)]
+                       (if (= (primitive/cast i64 run) 0)
+                           (Ok owned)
+                           (Err (derr-at-src (.source run)
+                                             (.lo run)
+                                             (.hi run)
+                                             (sconcat3 a
+                                                       "constant '"
+                                                       (display-ident (.name cp))
+                                                       "': this part of its value runs code; write the value as (comptime …)")))))
                      (let [value
                              (try! (def-initializer a
                                                     cx
@@ -4471,9 +4848,16 @@
 
 ;;; The first part of a checked initializer that is not a link-time constant,
 ;;; or null when all of it is one: the shapes every backend lays into a
-;;; static's data. Literals, sums of them, function and static addresses, and
-;;; aggregates built field by field or element by element.
+;;; static's data. Numbers no code computes (static-scalar-constant?), function
+;;; and static addresses, and aggregates built field by field or element by
+;;; element.
 (defn static-unlinkable-part [(cx (ptr Cx)) (e (ptr Expr))] (-> (ptr Expr))
+  (let [none (primitive/cast (ptr Expr) 0)]
+    (if (static-scalar-constant? e)
+        none
+        (static-unlinkable-shape cx e))))
+
+(defn static-unlinkable-shape [(cx (ptr Cx)) (e (ptr Expr))] (-> (ptr Expr))
   (let [none (primitive/cast (ptr Expr) 0)]
     (match (.kind e)
       (EInt [_] none)
@@ -4485,8 +4869,6 @@
       (ERecordInit [_] none)
       (EFnPtrOf [_] none)
       (EFnPtrInst [_ _] none)
-      ; computed at compile time, before any backend sees it
-      (EComptime [_] none)
       (EConstruct [_ _ args] (static-unlinkable-in cx args))
       ; a variant's constructor, which checking leaves a call
       (ECall [func _ args]
@@ -4509,8 +4891,6 @@
                       (EFnPtrOf [_] none)
                       (EFnPtrInst [_ _] none)
                       (_ (if (static-address? inner) none e))))
-               (TInt [_ _] (if (integer-literal-shape? inner) none e))
-               (TFloat [_] (match (.kind inner) (EFloat [_] none) (_ e)))
                (_ e)))
       (ELet [_ body]
             (let [n (len (load body))]
@@ -4545,6 +4925,60 @@
                     0))
                 none)))
       (_ e))))
+
+;;; Is `e` a number a def's value holds that no code computes: a literal, a
+;;; question about a type, a numeric cast, and the operators on primitive types,
+;;; comparisons and `if`s over them. Mono inlines the operators and each backend
+;;; folds the rest with the target's layout (layoutdb const-eval), so `sizeof`
+;;; answers for the target. An integer wider than 64 bits is laid out only as a
+;;; literal.
+(defn static-scalar-constant? [(e (ptr Expr))] (-> bool)
+  (match (.kind e)
+    (EInt [_] true)
+    (EWideInt [_ _ _ _ _] true)
+    (EFloat [_] true)
+    (EBool [_] true)
+    (ESizeOf [_] true)
+    (EAlignOf [_] true)
+    (EOffsetOf [_ _] true)
+    (ECast [ty inner]
+           (match ty
+             (TInt [bits _]
+                   (if (> bits 64)
+                       (integer-literal-shape? inner)
+                       (static-scalar-constant? inner)))
+             (TFloat [_] (static-scalar-constant? inner))
+             (_ false)))
+    (EIntUnary [_ inner]
+               (or (integer-literal-shape? e) (static-scalar-constant? inner)))
+    (EBin [_ l r] (and (static-scalar-constant? l) (static-scalar-constant? r)))
+    (ECmp [_ l r] (and (static-scalar-constant? l) (static-scalar-constant? r)))
+    (EIf [c t f]
+         (and (static-scalar-constant? c)
+              (static-scalar-constant? t)
+              (static-scalar-constant? f)))
+    ; an operand an operator takes by reference, `!=`'s
+    (ESpillRef [inner] (static-scalar-constant? inner))
+    (ECall [func _ args]
+           (and (static-operator? func)
+                (block :all
+                  (for [i 0 (len (load args))]
+                    (unless (static-scalar-constant? (elem args i))
+                      (break :all false)))
+                  true)))
+    (_ false)))
+
+;;; Is FUNC an operator on a primitive type no wider than 64 bits, as the checker
+;;; names the impl it selected (`coil.core.Add$i64$+`), or one written over its
+;;; operand's (`coil.core.!=`)?
+(defn static-operator? [(func (slice u8))] (-> bool)
+  (let [leaf (after-last-dollar func)]
+    (and (starts-with func "coil.core.")
+         (ce-operator-spelling? (if (has-dot leaf) (after-last-dot leaf) leaf))
+         (operator-on-primitive? func)
+         (match (operator-impl-key func)
+           (Some [key] (not (or (= key "i128") (= key "u128"))))
+           (None [] true)))))
 
 ;;; Is `e` an integer literal as the checker leaves one: a literal, under integer
 ;;; casts, or the complement a negative literal wider than 128 bits is
@@ -4585,20 +5019,15 @@
                  (match (.kind index) (EInt [_] true) (_ false))))
     (_ false)))
 
-;;; A `def`'s initializer as its storage is laid out: a link-time constant as
-;;; it stands; otherwise its value computed at compile time. When the value
-;;; holds addresses -- `linked` says the source asked for one -- they stay for
-;;; the linker, and each part between them that is not yet a constant is
-;;; computed at compile time on its own.
+;;; A `def`'s initializer as its storage is laid out, a link-time constant. When the value
+;;; holds addresses they stay for the linker.
 (defn def-initializer [(a (dyn Allocator))
                        (cx (ptr Cx))
                        (e (ptr Expr))
                        (t (ptr Type))
                        (linked bool)] (-> (Result Expr Diag))
   (try (let [value
-               (try! (if (or linked (expr-names-link-address? a e false))
-                         (static-link-parts a cx e)
-                         (Ok [Expr Diag] (computed-at-compile-time a cx e))))]
+               (try! (static-link-parts a cx e))]
          ; Built field by field or element by element, the value must be a
          ; struct or an array: a let yielding anything else (a pointer to the
          ; storage it binds) is not laid out from its stores.
@@ -4615,21 +5044,82 @@
     (ELoad [inner] (static-value-core (load inner)))
     (_ e)))
 
-;;; `e` as a constant: itself when it is one, and otherwise its value
-;;; computed at compile time.
-(defn computed-at-compile-time [(a (dyn Allocator))
-                                (cx (ptr Cx))
-                                (e (ptr Expr))] (-> Expr)
-  (if (= (primitive/cast i64 (static-unlinkable-part cx e)) 0)
-      (load e)
-      (mk-expr (EComptime e) (.lo e) (.hi e) (.source e) (.ctxt e))))
+;;; A store of a value to a place, as an array's literal lays out its elements.
+(defstruct StaticElementStore [(place (ptr Expr)) (value (ptr Expr))])
+
+(defn static-element-store [(item (ptr Expr))] (-> (Option StaticElementStore))
+  (match (.kind item)
+    (EStore [place value] (Some (StaticElementStore :place place :value value)))
+    (EInitStore [place value] (Some (StaticElementStore :place place :value value)))
+    (_ (None [StaticElementStore]))))
+
+;;; The slice an array literal checked against a slice type comes to, its elements
+;;; stored into the storage the let binds and the slice its last form: as a def's
+;;; value, that storage is static and laid out element by element. None for any
+;;; other let.
+(defn static-slice-literal [(a (dyn Allocator))
+                            (cx (ptr Cx))
+                            (e (ptr Expr))
+                            (body (ptr (ArrayList Expr)))]
+  (-> (Result (Option Expr) Diag))
+  (try (let [n (len (load body))]
+         (match (if (> n 0) (.kind (elem body (- n 1))) (EInt 0))
+           (EMakeSlice [_ element count]
+                 (let [(mut indices) (ArrayList::new [i64] a)
+                       (mut items) (ArrayList::new [Expr] a)
+                       (mut laid-out) true]
+                   (for [i 0 (- n 1)]
+                     (match (static-element-store (elem body i))
+                       (Some [store]
+                             (match (.kind (.place store))
+                               (EIndex [_ at]
+                                       (match (.kind at)
+                                         (EInt [k]
+                                               (do
+                                                 (push! (mut indices) k)
+                                                 (push! (mut items)
+                                                        (try! (static-link-parts a
+                                                                                 cx
+                                                                                 (.value store))))
+                                                 0))
+                                         (_ (do (set! laid-out false) 0))))
+                               ; the whole array cleared first
+                               (_ (match (.kind (.value store))
+                                    (EZeroed [_] 0)
+                                    (_ (do (set! laid-out false) 0))))))
+                       (None [] (do (set! laid-out false) 0))))
+                   (if (not (load laid-out))
+                       (Ok [(Option Expr) Diag] (None [Expr]))
+                       (let [table
+                               (mk-expr (EStaticArray
+                                          (box-al [i64] a (load indices))
+                                          (box-al [Expr] a (load items)))
+                                        (.lo e)
+                                        (.hi e)
+                                        (.source e)
+                                        (.ctxt e))
+                             storage
+                               (mk-expr (EAlloc
+                                          :symbol (None)
+                                          :storage 1
+                                          :ty (TArray (box-type a element) count)
+                                          :init (box-expr a table))
+                                        (.lo e)
+                                        (.hi e)
+                                        (.source e)
+                                        (.ctxt e))]
+                         (Ok [(Option Expr) Diag]
+                             (Some (mk-expr (EMakeSlice (box-expr a storage) element count)
+                                            (.lo e)
+                                            (.hi e)
+                                            (.source e)
+                                            (.ctxt e))))))))
+           (_ (Ok [(Option Expr) Diag] (None [Expr])))))))
 
 (defn static-link-parts [(a (dyn Allocator)) (cx (ptr Cx)) (e (ptr Expr))]
   (-> (Result Expr Diag))
   (try (cond (= (primitive/cast i64 (static-unlinkable-part cx e)) 0)
                (Ok (load e))
-             (not (expr-names-link-address? a e false))
-               (Ok (computed-at-compile-time a cx e))
              :else
                (let [rebuilt (box-expr a (load e))]
                  (match (.kind e)
@@ -4641,12 +5131,12 @@
                                                                          cx
                                                                          args)))))
                    (ECall [func targs args]
-                          (if (= (primitive/cast i64 (vts-find cx func)) 0)
-                              (break :try (Err (static-link-diag a e)))
-                              (set! (.kind rebuilt)
-                                    (ECall func
-                                           targs
-                                           (try! (static-link-list a cx args))))))
+                         (if (= (primitive/cast i64 (vts-find cx func)) 0)
+                             (break :try (Err (static-link-diag a e)))
+                             (set! (.kind rebuilt)
+                                   (ECall func
+                                          targs
+                                          (try! (static-link-list a cx args))))))
                    (EStaticArray [indices items]
                                  (set! (.kind rebuilt)
                                        (EStaticArray indices
@@ -4667,9 +5157,7 @@
                    (EMakeSlice [data elem n]
                                (set! (.kind rebuilt)
                                      (EMakeSlice (box-expr a
-                                                           (try! (static-link-parts a
-                                                                                    cx
-                                                                                    data)))
+                                                           (try! (static-link-parts a cx data)))
                                                  elem
                                                  n)))
                    (ELoad [inner]
@@ -4686,7 +5174,10 @@
                                                                           cx
                                                                           inner))))))
                    (ELet [binds body]
-                         (if (named-args-let? binds body)
+                         (match (try! (static-slice-literal a cx e body))
+                           (Some [slice] (set! (.kind rebuilt) (.kind slice)))
+                           (None []
+                                 (if (named-args-let? binds body)
                              ; A constructor whose arguments were bound in source
                              ; order: at link time there is no order, so each value
                              ; goes straight into the store that reads it.
@@ -4734,7 +5225,7 @@
                                                                                        item)))))
                                             (_ (load item))))))
                                (set! (.kind rebuilt)
-                                     (ELet binds (box-al [Expr] a (load out)))))))
+                                     (ELet binds (box-al [Expr] a (load out)))))))))
                    (_ (break :try (Err (static-link-diag a e)))))
                  ; what is left must now be laid out by the linker
                  (let [part (static-unlinkable-part cx rebuilt)]
@@ -4855,7 +5346,7 @@
         (derr-at-src (.source part)
                      (.lo part)
                      (.hi part)
-                     "a def's value is laid out when the program is linked, because it holds an address (a function, a C string or static storage); this part of it is neither a constant nor computable on its own at compile time"))))
+                     "a def's value is laid out when the program is linked, with no code run to compute it, and this part of it is not a constant; (comptime …) computes one"))))
 
 ;;; The first reference to a def inside `e`, or null.
 (defn first-static-ref [(a (dyn Allocator)) (e (ptr Expr))] (-> (ptr Expr))
@@ -4870,18 +5361,89 @@
                0))
            (primitive/cast (ptr Expr) 0))))))
 
+;;; Is FUNC a call a constant's value may hold: an operator on the primitive types,
+;;; or a variant's constructor, which checking leaves a call?
+(defn const-value-call? [(cx (ptr Cx)) (func (slice u8))] (-> bool)
+  (or (!= (primitive/cast i64 (vts-find cx func)) 0)
+      (= func "coil.math.min")
+      (= func "coil.math.max")
+      (let [leaf (after-last-dollar func)]
+        (and (ce-operator-spelling? (if (has-dot leaf) (after-last-dot leaf) leaf))
+             (starts-with func "coil.core.")
+             (operator-on-primitive? func)))))
+
+(defn after-last-dollar [(name (slice u8))] (-> (slice u8))
+  (let [(mut at) 0]
+    (for [i 0 (len name)]
+      (when (= (get name i) (: 36 u8)) (set! at (+ i 1)) 0))
+    (subslice name (load at) (len name))))
+
+;;; Whether the implementation FUNC is the operator of a primitive type: the impl
+;;; key between its `$`s is `i64`, say, and not a user's type. A name without a `$`
+;;; is the operator itself, `!=` over its operand's `=`.
+(defn operator-on-primitive? [(func (slice u8))] (-> bool)
+  (match (operator-impl-key func)
+    (None [] true)
+    (Some [key]
+          (or (= key "bool")
+              (= key "f32")
+              (= key "f64")
+              (= key "usize")
+              (= key "isize")
+              (= key "i8")
+              (= key "i16")
+              (= key "i32")
+              (= key "i64")
+              (= key "i128")
+              (= key "u8")
+              (= key "u16")
+              (= key "u32")
+              (= key "u64")
+              (= key "u128")))))
+
+;;; The impl key between the first and the last `$` of the operator implementation
+;;; FUNC, `i64` in `coil.core.Add$i64$+`; None for a name without one.
+(defn operator-impl-key [(func (slice u8))] (-> (Option (slice u8)))
+  (let [(mut first) -1
+        (mut last) -1]
+    (for [i 0 (len func)]
+      (when (= (get func i) (: 36 u8))
+        (when (< (load first) 0) (set! first i) 0)
+        (set! last i)
+        0))
+    (if (< (load first) 0)
+        (None [(slice u8)])
+        (Some (subslice func (+ (load first) 1) (load last))))))
+
+;;; The first expression in E whose value takes running code, or null: what a
+;;; constant, which is a named expression, cannot hold. `comptime` makes the value
+;;; of such an expression a literal before this is asked.
+;;; CHECKED says a safety check counts as the operation it checks: code the safety
+;;; transform has been over, which a constant's value never is.
+(defn const-code-run [(a (dyn Allocator)) (cx (ptr Cx)) (e (ptr Expr)) (checked bool)]
+  (-> (ptr Expr))
+  (if (match (.kind e)
+        (ECall [func _ _]
+               (not (or (const-value-call? cx func)
+                        (and checked (starts-with func "coil.safety.runtime.")))))
+        (ECallPtr [_ _] true)
+        (ETraitCall [tn _ _ _] (not (starts-with tn "coil.core.")))
+        (ECodeOp [_ _] true)
+        (EQuote [_] true)
+        (EQuasi [_] true)
+        (_ false))
+      e
+      (let [(mut kids) (ArrayList::new [(ptr Expr)] a)]
+        (expr-children! e (mut kids))
+        (block :found
+          (for [i 0 (len kids)]
+            (let [found (const-code-run a cx (get kids i) checked)]
+              (unless (= (primitive/cast i64 found) 0) (break :found found))))
+          (primitive/cast (ptr Expr) 0)))))
+
 (defn compute-const-entry-value [(a (dyn Allocator))
                                  (cx (ptr Cx))
                                  (cp (ptr Const))] (-> (Result EvalPair Diag))
-  ; A const is already evaluated at compile time, so `(const X (comptime E))`
-  ; means `(const X E)`. Kept, the `EComptime` each use wraps around the value
-  ; nested a second one that no fold reached. A runtime `def` keeps it: there the
-  ; comptime is what makes the initializer a link-time constant.
-  (unless (.runtime cp)
-    (loop (match (.kind (field cp value))
-            (EComptime [inner] (set! (.value cp) (load inner)))
-            (_ (break))))
-    0)
   (cond ; Storage another unit defines: its declared type is all there is to check.
         (.declared cp)
           (match (.ty cp)
@@ -4915,6 +5477,7 @@
                           (box-type a (opt-type-val (field cp ty)))
                           (null-type)))]
             (match (let [prior (with-caller-module cx (module-prefix nm))
+                         scope (dep-owner-enter! cx nm true)
                          r
                            (do-synth a
                                      (field cp value)
@@ -4923,6 +5486,7 @@
                                      cx
                                      tps
                                      (sconcat a "const " nm))]
+                     (dep-owner-leave! cx scope)
                      (set! (.caller_module cx) prior)
                      r)
               (Err [d] (Err [EvalPair Diag] d))
@@ -5256,25 +5820,6 @@
                                               (set! (.value cp) (load checked)))
                                             (set! (.ty cp) (Some (.t ep)))
                                             0)
-                                          ; An aggregate-typed const used to be classified as a
-                                          ; STATIC, and a reference to one elaborated to
-                                          ; `EStaticRef` — which NO backend can lower, because not
-                                          ; one of the four ever pushes to `cg.statics`. Statics
-                                          ; were a half-built representation with no consumer.
-                                          ;
-                                          ; Drop the classification entirely and let an aggregate
-                                          ; const take the path a non-literal const already takes:
-                                          ; `EComptime` of its value, materialized by the comptime
-                                          ; engine at each use. That machinery already handles
-                                          ; structs, sums and arrays, so the feature falls out of a
-                                          ; DELETION rather than four backends learning to emit
-                                          ; constant-initialized globals with each aggregate's
-                                          ; exact layout.
-                                          ;
-                                          ; The trade is that the value is materialized per use
-                                          ; rather than referenced once. That is what every other
-                                          ; non-literal const already does, and correctness before
-                                          ; a shared global for a `const`.
                                           (let [ce
                                                   (primitive/alloc-stack ConstEntry)]
                                             (set! (.name ce) nm)
@@ -5313,10 +5858,23 @@
                                                     (const-accepted-entry parent
                                                                           cp))
                                     0)))
-                    (match (validate-type (box-type a
-                                                    (opt-type-val (field cp ty)))
-                                          cx
-                                          (empty-strs a))
+                    (match (let [scope
+                                   (dep-owner-enter! cx
+                                                     (if (= (primitive/cast i64
+                                                                            (const-accepted-entry parent
+                                                                                                  cp))
+                                                            0)
+                                                         nm
+                                                         "")
+                                                     false)
+                                 r
+                                   (validate-type (box-type a
+                                                            (opt-type-val (field cp
+                                                                                 ty)))
+                                                  cx
+                                                  (empty-strs a))]
+                             (dep-owner-leave! cx scope)
+                             r)
                       (Err [d]
                            (do
                              (store! err
@@ -5499,10 +6057,19 @@
     (loop (if (>= (load i) n)
               (break)
               (do
-                (match (validate-one-struct-fields a
-                                                   cx
-                                                   (elem fs
-                                                         (load i)))
+                (match (let [scope
+                               (dep-owner-enter! cx
+                                                 (if (>= (load i)
+                                                         (.base_structs cx))
+                                                     (.name (elem fs (load i)))
+                                                     "")
+                                                 false)
+                             r
+                               (validate-one-struct-fields a
+                                                           cx
+                                                           (elem fs (load i)))]
+                         (dep-owner-leave! cx scope)
+                         r)
                   (Err [d]
                        (let [sp (elem fs (load i))]
                          (set! err
@@ -5615,9 +6182,19 @@
     (loop (if (>= (load i) n)
               (break)
               (do
-                (match (validate-one-sum-fields a
-                                                cx
-                                                (elem fs (load i)))
+                (match (let [scope
+                               (dep-owner-enter! cx
+                                                 (if (>= (load i)
+                                                         (.base_sums cx))
+                                                     (.name (elem fs (load i)))
+                                                     "")
+                                                 false)
+                             r
+                               (validate-one-sum-fields a
+                                                        cx
+                                                        (elem fs (load i)))]
+                         (dep-owner-leave! cx scope)
+                         r)
                   (Err [d]
                        (let [sp (elem fs (load i))]
                          (set! err
@@ -5979,7 +6556,11 @@
       (set! (.inherent_name_idx cx)
             (amap-retag (field base inherent_name_idx) tag (.a cx)))
       (set! (.method_idx cx) (amap-retag (field base method_idx) tag (.a cx)))
-      0))
+      0)
+    (set! (.deps cx) (amap-retag (field base deps) tag (.a cx)))
+    (set! (.dependents cx) (amap-retag (field base dependents) tag (.a cx)))
+    (set! (.field_dependents cx)
+          (amap-retag (field base field_dependents) tag (.a cx))))
   (setup-forget-retired! cx prog)
   0)
 
@@ -5993,6 +6574,9 @@
       (for [i 0 (len (load rs))]
         (let [r (elem rs i)
               q (qualify-in-module a (.module r) (.name r))]
+          ; a retired definition is no longer a dependent of anything; what
+          ; depended on it still says so, having been checked against it
+          (dep-owner-forget! cx q)
           (cond (= (.kind r) 4) (do (remove! (mut (.sigidx cx)) q) 0)
                 (or (= (.kind r) 7) (= (.kind r) 8))
                   (do (remove! (mut (.constidx cx)) q) 0)
@@ -6003,6 +6587,7 @@
       0)
     (unless (= (primitive/cast i64 fs) 0)
       (for [i 0 (len (load fs))]
+        (dep-owner-forget! cx (get (load fs) i))
         (remove! (mut (.sigidx cx)) (get (load fs) i)))
       0))
   0)
@@ -6049,7 +6634,7 @@
          ; checked for the SECOND time, not redefining anything. Metaprogram
          ; staging is exactly that case — it copies `annotation_defs` from an
          ; already-checked program into the sub-program it builds
-         ; (comptime.coil:3768, metalower.coil:894) and checks that — and without
+         ; (metastate.coil:3768, metalower.coil:894) and checks that — and without
          ; this the second pass tripped the redefinition guard below, reported as
          ; "macro 'coil.control.when' could not be compiled into the metaprogram
          ; engine: annotation ':inline' is compiler-defined and cannot be
@@ -6464,15 +7049,19 @@
                                (Ok [e] e))
                            np (primitive/alloc-stack Annotation)]
                        (store! (field np key) key)
-                       ; Annotation values use the full expression language but
-                       ; are declaration-time data, never runtime work. Mark the
-                       ; checked expression for the ordinary comptime fold.
-                       (store! (field np value)
-                               (mk-expr (EComptime (box-expr a checked))
-                                        (load (field (field ap value) lo))
-                                        (load (field (field ap value) hi))
-                                        (load (field (field ap value) source))
-                                        (load (field (field ap value) ctxt))))
+                       ; Annotation values are declaration-time data, never
+                       ; runtime work, so nothing here may need code run.
+                       (when (!= (primitive/cast i64 (const-code-run a cx (box-expr a checked) false)) 0)
+                         (break
+                           :try
+                             (Err [(ptr (ArrayList Annotation)) Diag]
+                                  (annotation-located
+                                    ap
+                                    (derr (sconcat3 a
+                                                    "annotation '"
+                                                    key
+                                                    "': the value runs code, which an annotation cannot do at run time; write it as (comptime …)"))))))
+                       (store! (field np value) checked)
                        (push! (mut out) (load np)))
                      (store! i (primitive/iadd (load i) 1)))))
          (Ok (box-al [Annotation] a (load out))))))
@@ -6551,7 +7140,10 @@
 (defn check-func [(a (dyn Allocator)) (cx (ptr Cx)) (fp (ptr Func))]
   (-> (Result Func Diag))
   (match (let [prior (with-caller-module cx (func-caller-module fp))
+               scope
+                 (dep-owner-enter! cx (context-definition-name (.name fp)) false)
                r (check-func-unlocated a cx fp)]
+           (dep-owner-leave! cx scope)
            (set! (.caller_module cx) prior)
            r)
     ; the declaration as written: not the `defn` macro's expansion it came out of
@@ -6738,6 +7330,8 @@
                                                     fnm
                                                     "' return type: ")))))
                (Ok [_] 0)))
+           ; the signature is validated: what is looked up from here is the body's
+           (set! (.dep_in_body cx) true)
            (let [env (build-param-env a cx (load (field fp params)) tps)
                  body (load (field fp body))
                  bn (len (load body))]
@@ -6915,14 +7509,6 @@
                 (y (slice u8))
                 (z (slice u8))] (-> (slice u8))
   (sconcat3 a (sconcat a w x) y z))
-
-(defn sconcat5 [(a (dyn Allocator))
-                (v (slice u8))
-                (w (slice u8))
-                (x (slice u8))
-                (y (slice u8))
-                (z (slice u8))] (-> (slice u8))
-  (sconcat3 a (sconcat3 a v w x) y z))
 
 ; Scoped resolver keys are internal. User diagnostics retain the identifier's
 ; source spelling and never expose deterministic-but-unstable scope numbers.
@@ -11526,12 +12112,12 @@
                                               "': make-dyn: unknown trait '"
                                               (sconcat a
                                                        trait_name
-                                                       (with-removed-hint a
-                                                                          "'"
-                                                                          (fn-unknown-hint a
-                                                                                           cx
-                                                                                           fname
-                                                                                           trait_name)))))))
+                                                       (with-hint a
+                                                                  "'"
+                                                                  (fn-unknown-hint a
+                                                                                   cx
+                                                                                   fname
+                                                                                   trait_name)))))))
         (if (not (type-is-ptr inner_ty))
             (Err [SynPair Diag]
                  (derr-at-src src
@@ -12192,7 +12778,6 @@
     (ESizeOf [_] true)
     (EAlignOf [_] true)
     (EOffsetOf [_ _] true)
-    (EComptime [_] true)
     (EConstruct [_ _ args] (all-effect-free? cx args))
     ; a variant's constructor, which checking leaves a call
     (ECall [func _ args]
@@ -12696,14 +13281,14 @@
                                                   "in '"
                                                   fname
                                                   "': named arguments require a struct or sum constructor; '")
-                                        (with-removed-hint a
-                                                           (sconcat a
-                                                                    variant
-                                                                    "' is not one")
-                                                           (fn-unknown-hint a
-                                                                            cx
-                                                                            fname
-                                                                            variant))))))))))
+                                        (with-hint a
+                                                   (sconcat a
+                                                            variant
+                                                            "' is not one")
+                                                   (fn-unknown-hint a
+                                                                    cx
+                                                                    fname
+                                                                    variant))))))))))
 
 ; Replace the declaration-ordered checked arguments with temporaries whose
 ; initializers occur in source order. The inner call remains positional, so every
@@ -12969,14 +13554,14 @@
                                                      "in '"
                                                      fname
                                                      "': named arguments require a function, a struct or sum constructor, or a def annotated with :params; '")
-                                           (with-removed-hint a
-                                                              (sconcat a
-                                                                       func
-                                                                       "' is not one")
-                                                              (fn-unknown-hint a
-                                                                               cx
-                                                                               fname
-                                                                               func)))))))
+                                           (with-hint a
+                                                      (sconcat a
+                                                               func
+                                                               "' is not one")
+                                                      (fn-unknown-hint a
+                                                                       cx
+                                                                       fname
+                                                                       func)))))))
             (if (or (.is_extern sig) (.variadic sig))
                 (err-ep (derr (sconcat3 a
                                         "named arguments are not supported for extern or variadic function '"
@@ -15484,14 +16069,14 @@
                                                   "': unknown type '"
                                                   qual
                                                   "' in '")
-                                        (with-removed-hint a
-                                                           (sconcat a
-                                                                    func
-                                                                    "'; import the module that declares it")
-                                                           (fn-unknown-hint a
-                                                                            cx
-                                                                            fname
-                                                                            qual)))))))
+                                        (with-hint a
+                                                   (sconcat a
+                                                            func
+                                                            "'; import the module that declares it")
+                                                   (fn-unknown-hint a
+                                                                    cx
+                                                                    fname
+                                                                    qual)))))))
            ; An unresolved template identifier keeps its scoped key for lexical
            ; lookup. Once local values have been handled above, an inherent call
            ; can use its definition-site spelling for receiver-based dispatch.
@@ -16862,7 +17447,11 @@
                             ; no name to `covered` and binds nothing — which also keeps
                             ; the (null) `v` below out of reach, since the bind loop
                             ; that reads its fields runs zero times.
-                            (unless wild (push! [(slice u8)] covered av))
+                            (unless wild
+                              (push! [(slice u8)] covered av)
+                              ; an arm names its variant without looking it up
+                              (dep-read! cx (DepVariant) (.name v))
+                              0)
                             (let [saved (len (load env))
                                   nbn (len (load abinds))
                                   (mut runtime-binds)
@@ -18486,6 +19075,87 @@
 ; OTHER code op takes finished Code, so a builder anywhere else is an error
 ; that names the fix. This lives here rather than in a general signature table
 ; because the builder is the one code-op type that must not unify with Code.
+;;; A Code operation, by its specification.
+(defn synth-codeop [(a (dyn Allocator))
+                    (e (ptr Expr))
+                    (op CodeOp)
+                    (args (ptr (ArrayList Expr)))
+                    (env (ptr (ArrayList EnvEntry)))
+                    (cx (ptr Cx))
+                    (tps (ptr (ArrayList (slice u8))))
+                    (fname (slice u8))] (-> (Result EvalPair Diag))
+  (let [elo (.lo e)
+        ehi (.hi e)
+        esrc (.source e)
+        ectxt (.ctxt e)]
+    (match (synth-codeop-args a op args env cx tps fname)
+      (Err [d] (err-ep d))
+      (Ok [na]
+          (match (codeop-answer-problem a cx op)
+            (Some [msg] (err-ep (derr-at-src esrc elo ehi msg)))
+            (None []
+                  (ok-ep (mk-expr (ECodeOp op na) elo ehi esrc ectxt)
+                         (codeop-rty op))))))))
+
+;;; `(code-known-value VALUE)` stands for VALUE, which must be what a constant may
+;;; hold: `comptime` reads the local initialized from it, and running what the program
+;;; would run later is not what it was asked for.
+(defn synth-known-value [(a (dyn Allocator))
+                         (args (ptr (ArrayList Expr)))
+                         (expected (ptr Type))
+                         (env (ptr (ArrayList EnvEntry)))
+                         (cx (ptr Cx))
+                         (tps (ptr (ArrayList (slice u8))))
+                         (fname (slice u8))] (-> (Result EvalPair Diag))
+  (match (synth a (elem args 0) expected env cx tps fname)
+    (Err [d] (err-ep d))
+    (Ok [pair]
+        (let [typed (box-expr a (.e pair))
+              run (const-code-run a cx typed true)]
+          (if (= (primitive/cast i64 run) 0)
+              (Ok [EvalPair Diag] pair)
+              (err-ep (derr-at-src (.source run)
+                                   (.lo run)
+                                   (.hi run)
+                                   "a local `comptime` reads must be known while the program compiles, and this part of its value runs code; write the value as (comptime …)")))))))
+
+;;; `(code-specialized-value MODULE PARAM… (quote FORM) VALUE)`, with MODULE the
+;;; resolver's, has VALUE's type, and comes to what FORM does in each instance. VALUE has
+;;; done its work once it is typed, so what stays is the type, as `(zeroed T)`, and each
+;;; PARAM as its name.
+(defn synth-specialized-value [(a (dyn Allocator))
+                               (e (ptr Expr))
+                               (op CodeOp)
+                               (args (ptr (ArrayList Expr)))
+                               (expected (ptr Type))
+                               (env (ptr (ArrayList EnvEntry)))
+                               (cx (ptr Cx))
+                               (tps (ptr (ArrayList (slice u8))))
+                               (fname (slice u8))] (-> (Result EvalPair Diag))
+  (let [last (- (len (load args)) 1)]
+    (match (synth a (elem args last) expected env cx tps fname)
+      (Err [d] (err-ep d))
+      (Ok [pair]
+          ; a constructor's type is a reference to its storage; this is a value
+          (let [(mut kept) (ArrayList::new [Expr] a)
+                value-type (match (.t pair) (TRef [_ inner] (load inner)) (_ (.t pair)))]
+            (for [i 0 last]
+              (let [arg (elem args i)]
+                (match (.kind arg)
+                  (EVar [name]
+                        (push! (mut kept)
+                               (mk-expr (EStr name) (.lo arg) (.hi arg) (.source arg) (.ctxt arg)))
+                        0)
+                  (_ (push! (mut kept) (load arg)) 0))))
+            (push! (mut kept)
+                   (mk-expr (EZeroed value-type) (.lo e) (.hi e) (.source e) (.ctxt e)))
+            (ok-ep (mk-expr (ECodeOp op (box-al [Expr] a (load kept)))
+                            (.lo e)
+                            (.hi e)
+                            (.source e)
+                            (.ctxt e))
+                   value-type))))))
+
 (defn synth-codeop-args [(a (dyn Allocator))
                          (op CodeOp)
                          (args (ptr (ArrayList Expr)))
@@ -19281,6 +19951,9 @@
                ; a type parameter names no struct: its field is filed under `_`
                (source-field-use! (if (= (primitive/cast i64 si) 0) "_" sname)
                                   ffld)
+               (unless (= (primitive/cast i64 si) 0)
+                 (dep-read-field! cx (.name si) ffld)
+                 0)
                (when (and (!= (primitive/cast i64 si) 0)
                           (load (field si is_bits)))
                  (break
@@ -20047,6 +20720,7 @@
            (err-ep (prefix-diag a d (sconcat3 a "in '" fname "': offsetof: "))))
       (Ok [_]
           (try (let [_use (source-field-use! (struct-name tp) ffld)
+                     _dep (dep-read-field! cx (struct-name tp) ffld)
                      fs
                        (try-or! (struct-fields a tp cx)
                                 (err-ep (derr (sconcat a
@@ -20099,12 +20773,12 @@
                                              fname
                                              "': fnptr-of unknown function '"
                                              name)
-                                   (with-removed-hint a
-                                                      "'"
-                                                      (fn-unknown-hint a
-                                                                       cx
-                                                                       fname
-                                                                       name)))))
+                                   (with-hint a
+                                              "'"
+                                              (fn-unknown-hint a
+                                                               cx
+                                                               fname
+                                                               name)))))
           (> (len (load (field sig type_params))) 0)
             (err-ep (derr (sconcat a
                                    (sconcat4 a
@@ -21107,20 +21781,12 @@
                   ; module constants and globals.
                   (match (scope-value-type cx tps name)
                     (Some [vt]
-                          (if (> (.comptime_depth cx) 0)
-                              (err-ep (derr (sconcat a
-                                                     (sconcat4 a
-                                                               "in '"
-                                                               fname
-                                                               "': value parameter '"
-                                                               (display-ident name))
-                                                     "' is not known inside comptime: comptime evaluates the generic definition once, before specialization")))
-                              (ok-ep (mk-expr (EConstParam name vt)
+                          (ok-ep (mk-expr (EConstParam name vt)
                                               elo
                                               ehi
                                               esrc
                                               ectxt)
-                                     vt)))
+                                     vt))
                     (None []
                           (let [outer (load (field cx anon_outer_env))]
                             (if (and (!= (primitive/cast i64 outer)
@@ -21190,26 +21856,16 @@
                                                                                 esrc
                                                                                 ectxt)
                                                        (.ty ce)))
-                                              ; The fold rewrites the nodes of the expression it
-                                              ; evaluates in place. The constant's value belongs to
-                                              ; the constant, which a later submission may share, so
-                                              ; each use folds a copy.
-                                              (let [folded
-                                                      (mk-expr (EComptime (semantic-clone-expr-ptr a
-                                                                                                   (field ce
-                                                                                                          value)))
-                                                               elo
-                                                               ehi
-                                                               esrc
-                                                               ectxt)]
-                                                (ok-ep (const-use-preserve-type a
-                                                                                folded
+                                              ; A constant is a named expression: each use is a copy of its value, since the
+; value belongs to the constant, which a later submission may share.
+(ok-ep (const-use-preserve-type a
+                                                                                (load (semantic-clone-expr-ptr a (field ce value)))
                                                                                 (.ty ce)
                                                                                 elo
                                                                                 ehi
                                                                                 esrc
                                                                                 ectxt)
-                                                       (.ty ce)))))
+                                                       (.ty ce))))
                                       (if (unscoped-datum-ident? name)
                                           (err-ep (derr (sconcat a
                                                                  (sconcat4 a
@@ -21251,12 +21907,12 @@
                                                                                    fname
                                                                                    "': unbound variable '"
                                                                                    (display-ident name))
-                                                                         (with-removed-hint a
-                                                                                            "'"
-                                                                                            (fn-unknown-hint a
-                                                                                                             cx
-                                                                                                             fname
-                                                                                                             (display-ident name))))))))))))))))))
+                                                                         (with-hint a
+                                                                                    "'"
+                                                                                    (fn-unknown-hint a
+                                                                                                     cx
+                                                                                                     fname
+                                                                                                     (display-ident name))))))))))))))))))
       (EVector [op result _ args]
                (synth-vector a
                              op
@@ -21395,24 +22051,6 @@
                                       (ok-ep (load e) ret)))))))))
       (ECleanup [_ _]
                 (err-ep (derr "internal: cleanup region appeared before ownership elaboration")))
-      (EComptime [inner]
-                 (match (do
-                          (set! (.comptime_depth cx) (+ (.comptime_depth cx) 1))
-                          (let [r (do-synth a inner expected env cx tps fname)]
-                            (set! (.comptime_depth cx)
-                                  (- (.comptime_depth cx) 1))
-                            r))
-                   (Err [d] (err-ep d))
-                   (Ok [sp0]
-                       ; A constructor synthesizes to the place it builds, but
-                       ; the compile-time result is that place's value.
-                       (let [value (place-as-value a sp0)]
-                         (ok-ep (mk-expr (EComptime (box-expr a (.e value)))
-                                         elo
-                                         ehi
-                                         esrc
-                                         ectxt)
-                                (.t value))))))
       ; Type ascription `(: value type)`: check `inner` against `ty` (so a stranded type
       ; arg can be supplied and any legal coercion applies), then LOWER it away — the
       ; result is the coerced inner value at `ty`, so no EAscribe node reaches mono/codegen.
@@ -21531,14 +22169,44 @@
                   (Ok [nq]
                       (ok-ep (mk-expr (EQuasi nq) elo ehi esrc ectxt) (TCode))))))
       (ECodeOp [op args]
-               (match (synth-codeop-args a op args env cx tps fname)
-                 (Err [d] (err-ep d))
-                 (Ok [na]
-                     (match (codeop-answer-problem a cx op)
-                       (Some [msg] (err-ep (derr-at-src esrc elo ehi msg)))
-                       (None []
-                             (ok-ep (mk-expr (ECodeOp op na) elo ehi esrc ectxt)
-                                    (codeop-rty op)))))))
+               (match op
+                 (ExpansionOps [o]
+                               (match o
+                                 (WithoutLocals []
+                                                (match (.kind (elem args 0))
+                                                  ; what the resolver left of a read it hides
+                                                  (EStr [name]
+                                                        (if (= (len (load args)) 1)
+                                                            (err-ep (derr-at-src
+                                                                      esrc
+                                                                      elo
+                                                                      ehi
+                                                                      (sconcat3 a
+                                                                                "'"
+                                                                                (display-ident name)
+                                                                                "' is a local of the code around this `comptime`, and has no value until that code runs")))
+                                                            (err-ep (derr-at-src esrc elo ehi "code-without-locals: the names must be identifiers"))))
+                                                  (_ (synth a
+                                                            (elem args (- (len (load args)) 1))
+                                                            expected
+                                                            env
+                                                            cx
+                                                            tps
+                                                            fname))))
+                                 (KnownValue []
+                                             (synth-known-value a args expected env cx tps fname))
+                                 (SpecializedValue []
+                                                   (synth-specialized-value a
+                                                                            e
+                                                                            op
+                                                                            args
+                                                                            expected
+                                                                            env
+                                                                            cx
+                                                                            tps
+                                                                            fname))
+                                 (_ (synth-codeop a e op args env cx tps fname))))
+                 (_ (synth-codeop a e op args env cx tps fname))))
       (EFieldIndex [ty name]
                    (let [tp (box-type a ty)]
                      (match (validate-type tp cx tps)
@@ -22229,12 +22897,12 @@
         rv)))
 
 ; ============================ finish (Phase 3) =====================
-; Static-assert conditions are synth'd + is-cond-checked. The comptime fold
-; (comptime::fold_program), aggregate-const statics, (meta …) elaboration, and
-; export-c symbol resolution are a separate unported subsystem: finish passes
+; Static-assert conditions are synth'd + is-cond-checked. The metaprogram
+; (comptime::fold_program), aggregate-const statics and export-c symbol
+; resolution are a separate unported subsystem: finish passes
 ; funcs through unchanged (a no-op fold for comptime-free programs — any program
 ; that actually USES comptime will then mismatch the reference and fail the gate,
-; never silently pass), and hard-errors on (meta …)/(export-c …) which the dump
+; never silently pass), and hard-errors on (export-c …), which the dump
 ; would otherwise misrepresent. Aggregate-const statics do not affect the dump
 ; (the dumper hardcodes an empty (statics) section).
 (defn finish-asserts [(a (dyn Allocator)) (cx (ptr Cx)) (prog (ptr Program))]
@@ -22294,7 +22962,7 @@
         (Err [(ptr (ArrayList StaticAssert)) Diag] (load err))
         (Ok (box-al [StaticAssert] a (load out))))))
 
-; ---- finish: (meta …) elaboration + (export-c …) symbol resolution ----
+; ---- finish: (export-c …) symbol resolution ----
 ; display_name: strip the auto-referred prelude prefix (`coil.core.`) in diagnostics.
 (defn display-name [(n (slice u8))] (-> (slice u8))
   (let [pfx (sconcat (unit-allocator) (unit-prelude-name) ".")
@@ -22517,12 +23185,12 @@
                                  (sconcat3 a
                                            "export-c: unknown function '"
                                            dn
-                                           (with-removed-hint a
-                                                              "'"
-                                                              (fn-unknown-hint a
-                                                                               cx
-                                                                               ""
-                                                                               dn)))))))
+                                           (with-hint a
+                                                      "'"
+                                                      (fn-unknown-hint a
+                                                                       cx
+                                                                       ""
+                                                                       dn)))))))
          (when (> (len (load (field f type_params))) 0)
            (break
              :try
@@ -22603,43 +23271,6 @@
              (store! (field ec source) (load (field ep source)))
              (store! (field ec ctxt) (load (field ep ctxt)))
              (Ok [ExportC Diag] (load ec)))))))
-
-(defn finish-metas [(a (dyn Allocator)) (cx (ptr Cx)) (prog (ptr Program))]
-  (-> (Result (ptr (ArrayList Expr)) Diag))
-  (let [ms (load (field prog metas))
-        n (len (load ms))
-        (mut out) (ArrayList::new [Expr] a)
-        (mut i) 0
-        (mut err) (primitive/zeroed Diag)
-        (mut failed) false
-        empty-tps (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (let [mp (elem ms (load i))
-                      env (env-new a)]
-                  (match (do-synth a mp (null-type) env cx empty-tps "meta")
-                    (Err [d] (do (set! err d) (set! failed true) (break)))
-                    (Ok [sp0]
-                        (let [sp (primitive/alloc-stack SynPair)]
-                          (set! sp sp0)
-                          (if (not (= (type-tag (load (field sp t)))
-                                      13))
-                              (do
-                                (set! err
-                                      (derr (sconcat a
-                                                     "meta: expression must produce Code, got "
-                                                     (ty-str a
-                                                             (load (field sp t))))))
-                                (set! failed true)
-                                (break))
-                              (do
-                                (push! (mut out) (load (load (field sp e))))
-                                0))))))
-                (set! i (primitive/iadd (load i) 1)))))
-    (if (load failed)
-        (Err [(ptr (ArrayList Expr)) Diag] (load err))
-        (Ok (box-al [Expr] a (load out))))))
 
 ;;; The function of this program whose own symbol is SYM ("" when none): a Coil
 ;;; function is emitted under its name, which is a C identifier only for `main`
@@ -22806,10 +23437,7 @@
   (match (finish-asserts a cx prog)
     (Err [d] (Err [(ptr Program) Diag] d))
     (Ok [asserts]
-        (match (finish-metas a cx prog)
-          (Err [d] (Err [(ptr Program) Diag] d))
-          (Ok [metas]
-              (match (finish-exports a cx prog s)
+        (match (finish-exports a cx prog s)
                 (Err [d] (Err [(ptr Program) Diag] d))
                 (Ok [exports]
                     (let [out (box! a Program (primitive/zeroed Program))
@@ -22829,7 +23457,6 @@
                       (set! (.consts out) (load (field prog consts)))
                       (set! (.traits out) (load (field prog traits)))
                       (set! (.impls out) (load (field prog impls)))
-                      (set! (.metas out) metas)
                       (set! (.exports out)
                             (let [(mut all) (ArrayList::new [ExportC] a)]
                               (for [ei 0 (len (load exports))]
@@ -22877,19 +23504,10 @@
                       (set! (.aliases out) (load (field prog aliases)))
                       (set! (.retirements out) (.retirements prog))
                       (set! (.retired_functions out) (.retired_functions prog))
-                      ; Phase 3 comptime fold: replace every
+                      ; Phase 3 metaprogram: replace every
                       ; `(comptime …)` in a function body / static-assert with its literal.
                       ; A no-op for comptime-free programs (bootstrap + IR corpus unaffected).
-                      ; A provisional check -- the model a semantic transform reads --
-                      ; elaborates no ownership, so its code cannot run: a comptime
-                      ; thunk's `defer` reached a backend unlowered and aborted the
-                      ; compiler. It keeps its (comptime …) forms; the authoritative
-                      ; check after the transforms folds them.
-                      (if (not (.validate_anon_ownership cx))
-                          (Ok out)
-                          (match (fold-program out (load (field out asserts)) a)
-                            (Err [d] (Err [(ptr Program) Diag] d))
-                            (Ok [_] (Ok out))))))))))))
+                      (Ok out)))))))
 
 ; ============================ the check pass ===================
 ; check-program: setup (Phase 1, fail-fast) ->
@@ -23955,7 +24573,6 @@
             (let [qp (primitive/alloc-stack Quasi)]
               (set! qp q)
               (EQuasi (ownership-clone-quasi a qp))))
-    (EComptime [x] (EComptime (ownership-clone a x)))
     (EAscribe [t x] (EAscribe t (ownership-clone a x)))
     (EArrayLit [items] (EArrayLit (ownership-clone-list a items)))
     (ESpillRef [x] (ESpillRef (ownership-clone a x)))
@@ -25911,8 +26528,6 @@
                         (ownership-walk-expr a cx name states loops fname false))
            (ECodeOp [_ args]
                     (ownership-walk-list a cx args states loops fname false))
-           (EComptime [inner]
-                      (ownership-walk-expr a cx inner states loops fname false))
            (EPattern [_ _ inner _]
                      (ownership-walk-expr a
                                           cx
@@ -26522,7 +27137,6 @@
                 (if (= (len (load body)) 1)
                     (ce-eval st (elem body 0) owner)
                     (Err [CeVal Diag] (ce-unsupported st e owner))))
-           (EComptime [inner] (ce-eval st inner owner))
            (ECmp [op l r]
                  (let [x (try! (ce-int st l owner))
                        y (try! (ce-int st r owner))]
@@ -26555,7 +27169,14 @@
            (ECall [func _ args]
                   (let [op (ce-operator st func owner)
                         n (len (load args))]
-                    (cond (= op "")
+                    (cond (and (= op "") (ce-operator-spelling? func))
+                            (Err [CeVal Diag]
+                                 (ce-expr-diag e
+                                               (sconcat3 a
+                                                         "trait method '"
+                                                         func
+                                                         "' is not in scope here")))
+                          (= op "")
                             (Err [CeVal Diag] (ce-unsupported st e owner))
                           (= op "not")
                             (Ok [CeVal Diag]
@@ -27053,242 +27674,6 @@
     (set! (.check_diag_owners s) (box-al [(slice u8)] a (load owners)))
     (Err [(ptr Program) Diag] d)))
 
-;;; Every name E binds inside itself -- `let` bindings, match-arm bindings and
-;;; `fn` parameters -- into BOUND. Scope is ignored: a name bound anywhere in E
-;;; counts as bound everywhere in it, which can only find fewer names unbound.
-(defn value-binders! [(a (dyn Allocator))
-                      (e (ptr Expr))
-                      (bound (mut (HashMap (slice u8) i64)))] (-> i64)
-  (match (.kind e)
-    (ELet [binds _]
-          (for [i 0 (len (load binds))]
-            (set! (mut bound) (.name (elem binds i)) 0)))
-    (EMatch [_ arms]
-            (for [i 0 (len (load arms))]
-              (let [binds (.binds (elem arms i))]
-                (for [k 0 (len (load binds))]
-                  (set! (mut bound) (get (load binds) k) 0)))))
-    (EAnonFn [params _]
-             (for [i 0 (len (load params))]
-               (set! (mut bound) (get (load params) i) 0)))
-    (_ 0))
-  (let [(mut kids) (ArrayList::new [(ptr Expr)] a)]
-    (expr-children! e (mut kids))
-    (for [i 0 (len kids)] (value-binders! a (get kids i) (mut bound))))
-  0)
-
-;;; Is FUNC a macro by KNOWN (`without-undeclared-value-dependents` maps a
-;;; function returning Code to 1)? A call to one not yet expanded holds syntax,
-;;; whose names its expansion binds, not values.
-(defn known-macro? [(known (ptr (HashMap (slice u8) i64))) (func (slice u8))]
-  (-> bool)
-  (match (get (load known) func) (Some [k] (= k 1)) (None [] false)))
-
-;;; The first variable E reads that it does not bind (BOUND) and the program does
-;;; not declare (KNOWN), or "". Every declared name E reads or calls goes into REFS.
-(defn value-name-undeclared [(a (dyn Allocator))
-                             (e (ptr Expr))
-                             (known (ptr (HashMap (slice u8) i64)))
-                             (bound (ptr (HashMap (slice u8) i64)))
-                             (refs (mut (ArrayList (slice u8))))]
-  (-> (slice u8))
-  (match (.kind e)
-    (EVar [name]
-          (cond (contains? (load bound) name) ""
-                (contains? (load known) name) (do (push! (mut refs) name) "")
-                :else name))
-    (ECall [func _ _]
-           (if (known-macro? known func)
-               ""
-               (do
-                 (push! (mut refs) func)
-                 (value-children-undeclared a e known bound (mut refs)))))
-    (ENamedCall [func _ _ _]
-                (if (known-macro? known func)
-                    ""
-                    (do
-                      (push! (mut refs) func)
-                      (value-children-undeclared a e known bound (mut refs)))))
-    (EFnPtrOf [name] (do (push! (mut refs) name) ""))
-    (_ (value-children-undeclared a e known bound (mut refs)))))
-
-(defn value-children-undeclared [(a (dyn Allocator))
-                                 (e (ptr Expr))
-                                 (known (ptr (HashMap (slice u8) i64)))
-                                 (bound (ptr (HashMap (slice u8) i64)))
-                                 (refs (mut (ArrayList (slice u8))))]
-  (-> (slice u8))
-  (let [(mut kids) (ArrayList::new [(ptr Expr)] a)
-        _ (expr-children! e (mut kids))
-        found
-          (block :found
-            (for [i 0 (len kids)]
-              (let [n
-                      (value-name-undeclared a
-                                             (get kids i)
-                                             known
-                                             bound
-                                             (mut refs))]
-                (when (> (len n) 0) (break :found n))))
-            "")]
-    (free! (mut kids))
-    found))
-
-;;; The first name the expressions ES read that neither they nor PARAMS bind and
-;;; KNOWN does not declare, or "". Every declared name they read or call goes
-;;; into REFS.
-(defn exprs-name-undeclared [(a (dyn Allocator))
-                             (es (ptr (ArrayList Expr)))
-                             (params (ptr (ArrayList Param)))
-                             (known (ptr (HashMap (slice u8) i64)))
-                             (refs (mut (ArrayList (slice u8))))]
-  (-> (slice u8))
-  (let [(mut bound) (HashMap::new [(slice u8) i64] a (keyops-borrowed))]
-    (unless (= (primitive/cast i64 params) 0)
-      (for [i 0 (len (load params))]
-        (set! (mut bound) (.name (elem params i)) 0)))
-    (for [i 0 (len (load es))] (value-binders! a (elem es i) (mut bound)))
-    (let [found
-            (block :found
-              (for [i 0 (len (load es))]
-                (let [n
-                        (value-name-undeclared a
-                                               (elem es i)
-                                               known
-                                               (mut bound)
-                                               (mut refs))]
-                  (when (> (len n) 0) (break :found n))))
-              "")]
-      (free! (mut bound))
-      found)))
-
-;;; What the program P's compile-time code is checked against, for
-;;; `without-undeclared-value-dependents`: KNOWN maps every declared value name
-;;; (to 1 for a macro), CONSTS and FUNCS index the compile-time constants and the
-;;; functions by name, and MEMO holds each one's answer once known.
-(defstruct ValueWaits
-  [(known (HashMap (slice u8) i64))
-   (consts (HashMap (slice u8) i64))
-   (funcs (HashMap (slice u8) i64))
-   (memo (HashMap (slice u8) (slice u8)))])
-
-;;; The first undeclared name the constant or function NAME reads, directly or
-;;; through the constants and functions it reads and calls, or "". A name being
-;;; answered counts as clean, which ends a cycle.
-(defn value-waits [(a (dyn Allocator))
-                   (p (ptr Program))
-                   (w (ptr ValueWaits))
-                   (name (slice u8))]
-  (-> (slice u8))
-  (match (get (.memo w) name)
-    (Some [answer] answer)
-    (None []
-          (do
-            (set! (mut (.memo w)) name "")
-            (let [(mut refs) (ArrayList::new [(slice u8)] a)
-                  own
-                    (match (get (.consts w) name)
-                      (Some [ci]
-                            (let [cp (elem (.consts p) ci)
-                                  (mut one) (ArrayList::new [Expr] a)]
-                              (push! (mut one) (load (field cp value)))
-                              (exprs-name-undeclared a
-                                                     (box-al [Expr]
-                                                             a
-                                                             (load one))
-                                                     (primitive/cast (ptr (ArrayList Param))
-                                                                     0)
-                                                     (field w known)
-                                                     (mut refs))))
-                      (None []
-                            (match (get (.funcs w) name)
-                              (Some [fi]
-                                    (let [fp (elem (.funcs p) fi)]
-                                      (if (lazy-body-force! fp)
-                                          (exprs-name-undeclared a
-                                                                 (.body fp)
-                                                                 (.params fp)
-                                                                 (field w known)
-                                                                 (mut refs))
-                                          "")))
-                              (None [] ""))))
-                  answer
-                    (if (> (len own) 0)
-                        own
-                        (block :found
-                          (for [i 0 (len refs)]
-                            (let [r (value-waits a p w (get refs i))]
-                              (when (> (len r) 0) (break :found r))))
-                          ""))]
-              (free! (mut refs))
-              (set! (mut (.memo w)) name answer)
-              answer)))))
-
-;;; P for a closure built before the program's `(meta …)` generators have run,
-;;; which lacks what they declare: without each compile-time constant that reads
-;;; such a name, directly -- `(const V (+ K 1))` with K generated -- or through
-;;; the constants and functions it reads and calls (coil.fs's read-file reads the
-;;; generated O_CLOEXEC). Kept, the constant fails the closure's check before any
-;;; generator has run to declare the name, so no generator could ever run. It is
-;;; left out as a struct naming an undeclared type is
-;;; (`drop-undeclared-type-dependents!`); code in the closure that really reads it
-;;; still fails its own check, and the program's final check, which sees every
-;;; generated declaration, reports a name nothing declares. A call to a macro not
-;;; yet expanded is syntax and is not looked into, and a function reached only
-;;; through trait dispatch is not followed. P itself is returned when it has no
-;;; generator left to run.
-(defn without-undeclared-value-dependents [(a (dyn Allocator))
-                                           (p (ptr Program))] (-> (ptr Program))
-  (if (or (= (primitive/cast i64 (.metas p)) 0) (= (len (load (.metas p))) 0))
-      p
-      (let [cs (.consts p)
-            w
-              (box! a
-                    ValueWaits
-                    (ValueWaits
-                      :known (HashMap::new [(slice u8) i64] a (keyops-borrowed))
-                      :consts
-                        (HashMap::new [(slice u8) i64] a (keyops-borrowed))
-                      :funcs (HashMap::new [(slice u8) i64] a (keyops-borrowed))
-                      :memo
-                        (HashMap::new [(slice u8) (slice u8)]
-                                      a
-                                      (keyops-borrowed))))
-            (mut dropped) false]
-        (for [i 0 (len (load cs))]
-          (let [cp (elem cs i)]
-            (set! (mut (.known w)) (.name cp) 0)
-            (unless (or (.runtime cp) (.declared cp))
-              (set! (mut (.consts w)) (.name cp) i)
-              0)))
-        (for [i 0 (len (load (.funcs p)))]
-          (let [f (elem (.funcs p) i)]
-            (set! (mut (.known w))
-                  (.name f)
-                  (match (.ret f) (TCode [] 1) (_ 0)))
-            (set! (mut (.funcs w)) (.name f) i)))
-        (for ip (iter (load (.impls p)))
-          (for f (iter (load (.methods ip)))
-            (set! (mut (.known w)) (.name f) 0)))
-        (for e (iter (load (.externs p))) (set! (mut (.known w)) (.name e) 0))
-        (for s (iter (load (.structs p))) (set! (mut (.known w)) (.name s) 0))
-        (for u (iter (load (.sums p)))
-          (set! (mut (.known w)) (.name u) 0)
-          (for v (iter (load (.variants u)))
-            (set! (mut (.known w)) (.name v) 0)))
-        (let [(mut kept) (ArrayList::new [Const] a)]
-          (for [i 0 (len (load cs))]
-            (let [cp (elem cs i)]
-              (if (and (not (or (.runtime cp) (.declared cp)))
-                       (> (len (value-waits a p w (.name cp))) 0))
-                  (do (set! dropped true) 0)
-                  (do (push! (mut kept) (load cp)) 0))))
-          (if (load dropped)
-              (let [q (box! a Program (load p))]
-                (set! (.consts q) (box-al [Const] a (load kept)))
-                q)
-              p)))))
-
 ;;; P for a metaprogram's closure, its lengths put in place where their
 ;;; constants fold.
 (defn constant-lengths-for-closure [(a (dyn Allocator)) (p (ptr Program))]
@@ -27363,6 +27748,7 @@
     (set! (.recover_statements cx) (not validate-ownership))
     (set! (.replaces_meta_consts cx) replaces-meta-consts)
     (set! (.trait_uses cx) (ArrayList::new [MonoTraitUse] a))
+    (set! (.dep_recording cx) (dependency-facts-wanted?))
     (set! impb (.imports s))
     (set! expb (.exports s))
     (let [setup-span (tr/span-begin "frontend.check.setup")

@@ -45,6 +45,11 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "compiler"))
+import project_config  # noqa: E402
+
+project_config.clear()
+
 ROOT = Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "tests" / "corpus"
 DIAG = ROOT / "tests" / "diag"
@@ -254,6 +259,9 @@ def normalize(output: bytes, scratch: Path) -> bytes:
     # A diagnostic inside the library names wherever this toolchain keeps it.
     text = re.sub(r"\S*/lib/coil/stdlib/", "<stdlib>/", text)
     text = text.replace("src/stdlib/", "<stdlib>/")
+    # An inline-IR function is numbered by how many the build emitted before it,
+    # which follows the library, not the program under test.
+    text = re.sub(r"__coil_llvm_ir_\d+", "__coil_llvm_ir_N", text)
     # The platform linker's own prose varies; Coil's line about it does not.
     marker = "error: linker/ar failed with exit status:"
     at = text.find(marker)

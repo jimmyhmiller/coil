@@ -143,7 +143,7 @@ nothing else heavy is running: the build steps peak near 10 GB.
 | `compile-errors` | `coil.test.compile` suites (they link the in-process compiler) |
 | `installed/*` | the prefix layout and PATH resolution, every stdlib namespace from the install, the coil.jit SDK in a user program, the REPL |
 | `jit/*`, `generated/modules`, `memory/*` | coil.jit sessions, generated units, and their memory bounds at full size |
-| `extern-prototypes`, `aggregates`, `memory/self-build` | whole-compiler checks: C prototypes, no first-class aggregates over 64 bytes in IR, self-build expansion memory |
+| `extern-prototypes`, `aggregates` | whole-compiler checks: C prototypes, no first-class aggregates over 64 bytes in IR |
 | `wasm/self-host`, `bootstrap-imports`, `install-pairing` | the wasm-hosted compiler, the wasm32 bootstrap runtime, install pairing |
 | `corpus/*-all`, `corpus/opt3` | every corpus program under `coil.safety`, `-O3` and the interpreted engine |
 | `guide-demos` | every `src/examples` demo builds and exits as `tests/demos.txt` says |

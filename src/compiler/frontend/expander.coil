@@ -14,7 +14,6 @@
    (arena_mode EmArenaMode)
    (stages StageBox)
    (checkers CheckerRegBox)
-   (elaboration_id i64)
    ; Every qualified name the program being expanded declares, so a bare macro
    ; head can yield to a module's own function of that name. Set by run-expand.
    (declared DeclaredNames)
@@ -73,7 +72,8 @@
 
 (import "coil.compiler.astdump" :use *)
 (import "coil.compiler.check" :use *)
-(import "coil.compiler.comptime" :use *)
+(import "coil.compiler.metastate" :use *)
+(import "coil.compiler.expr_children" :use [expr-children!])
 (import "coil.compiler.closure" :use *)
 (import "coil.compiler.diag" :use *)
 (import "coil.compiler.loader" :use *)
@@ -81,6 +81,7 @@
 (import "coil.reader" :use *)
 (import "coil.compiler.resolve" :use *)
 (import "coil.compiler.metaengine" :use *)
+(import "coil.compiler.mono_core" :use [InstanceExpansion])
 (import "coil.hashmap" :use *)
 (import "coil.amap" :use *)  ; the macro-name index (macros-has?)
 
@@ -162,13 +163,13 @@
       0))
   0)
 
-(defn is-comptime-defn [(f (ptr Sexp))
+(defn is-metaprogram-defn [(f (ptr Sexp))
                         (module (Option (slice u8)))
-                        (comptime (ptr (ArrayList (slice u8))))
+                        (metaprograms (ptr (ArrayList (slice u8))))
                         (a (dyn Allocator))] (-> bool)
   (match (defn-name-of f)
     (None [] false)
-    (Some [n] (set-contains comptime (qualify-name a n module)))))
+    (Some [n] (set-contains metaprograms (qualify-name a n module)))))
 
 ; ── the macro-name index ─────────────────────────────────────────────────────
 ; `resolve-macro` asks "is this head a macro?" for EVERY list head in the program, and
@@ -965,7 +966,7 @@
 ;;; Staging is NOT inside the arena: stage-one-macro! allocates from the global
 ;;; stage-box, so engine entries and the quote registry keep their own lifetime.
 ;;; Warnings/reports/fixes recorded from inside an expansion are owned at their
-;;; sinks (ct-own-str / ct-own-sexp in comptime.coil).
+;;; sinks (ct-own-str / ct-own-sexp in metastate.coil).
 (defstruct EmArenaMode [(v i64) (init i64)])
 
 (defstruct EmArenaPool
@@ -1160,7 +1161,12 @@
 ;;; Besides the macro it expands, a call reads the name it spelled, qualified in
 ;;; the MODULE the head resolved in: an alias of that name is what led to the
 ;;; macro, and a definition of it in that module would capture the call.
+;;; SCOPE is what is bound around NODE, for `code-call-scope`: read while the macro
+;;; runs, and not kept past it.
 (defn expand-macro-at [(node Sexp)
+                       (scope (ptr (ArrayList ScopeEntry)))
+                       (scope-open bool)
+                       (site-module (Option (slice u8)))
                        (sub (ptr Program))
                        (fn-name (slice u8))
                        (module (Option (slice u8)))
@@ -1174,7 +1180,7 @@
                        (code-session-state (ptr i8))
                        (expansions (ptr (AVec Expansion)))]
   (-> (Result Sexp Diag))
-  (let [site (macro-call-site-enter! node)
+  (let [site (macro-call-site-enter! node site-module scope scope-open)
         result
           (expand-macro sub
                         fn-name
@@ -1359,7 +1365,6 @@
     (set! (.qexports cx) expb)
     (set! (.all_imports cx) impb)
     (set! (.all_exports cx) expb)
-    (set! (.prog cx) (primitive/cast (ptr Program) 0))  ; macro context: no comptime fold here
     (set! (.code_session_state cx) code-session-state)
     (set! (.expansions cx) expansions)
     (if (= (primitive/cast i64 callee) 0)
@@ -1479,7 +1484,101 @@
           ; is about the macro's own pruned closure, so it names the real problem; without
           ; it the user gets an opaque line pointing at an innocent call site in a module
           ; that has nothing to do with the cause.
-          (Some [d] (Err [Sexp Diag] (stage-fail-diag a d fn-name)))))))
+          (Some [d]
+                (Err [Sexp Diag]
+                     (match (macro-self-use a fn-name)
+                       (Some [cycle] cycle)
+                       (None []
+                             (if (hoisted-name? fn-name)
+                                 (hoisted-fail-diag a d)
+                                 (stage-fail-diag a d fn-name))))))))))
+
+;;; Whether Q names a definition a macro hoisted, a name the program never wrote.
+(defn hoisted-name? [(q (slice u8))] (-> bool)
+  (>= (text-index q ".hoisted$") 0))
+
+;;; Where NEEDLE first occurs in TEXT, or -1.
+(defn text-index [(text (slice u8)) (needle (slice u8))] (-> i64)
+  (block :found
+    (for [i 0 (+ (- (len text) (len needle)) 1)]
+      (when (= (subslice text i (+ i (len needle))) needle) (break :found i)))
+    -1))
+
+;;; A failure compiling what `comptime` hoisted is a failure of what it was given,
+;;; located there; the name the compiler gave the definition means nothing to anyone.
+(defn hoisted-fail-diag [(a (dyn Allocator)) (d Diag)] (-> Diag)
+  (let [dp (primitive/alloc-stack Diag)
+        msg (.msg d)
+        at (text-index msg "': ")]
+    (set! dp d)
+    (when (and (>= at 0) (>= (text-index msg "hoisted$") 0))
+      (set! (.msg dp) (subslice msg (+ at 3) (len msg)))
+      0)
+    (load dp)))
+
+;;; The error for a macro whose own code needs its expansion: a function it runs
+;;; uses the macro, so running the macro needs the macro's result. None when no
+;;; function in its closure does. A macro calling itself as a function, on Code
+;;; values, is ordinary recursion and is not this.
+(defn macro-self-use [(a (dyn Allocator)) (q (slice u8))] (-> (Option Diag))
+  (let [mctx (stage-box-mctx)]
+    (if (= (primitive/cast i64 mctx) 0)
+        (None [Diag])
+        (let [(mut seedl) (ArrayList::new [(slice u8)] a)]
+          (push! (mut seedl) q)
+          (let [wanted
+                  (closure-funcs-pruned mctx
+                                        (stage-box-mctx-names mctx)
+                                        (meta-shim-seeds a
+                                                         mctx
+                                                         (box-al [(slice u8)] a (load seedl)))
+                                        a)
+                sub (closure-subprogram-pruned mctx wanted a)]
+            (block :found
+              (for [i 0 (len (load (.funcs sub)))]
+                (let [f (elem (.funcs sub) i)]
+                  (unless (type-is-code (field f ret))
+                    (for [k 0 (len (load (.body f)))]
+                      (let [use (macro-use-in a (elem (.body f) k) q)]
+                        (unless (= (primitive/cast i64 use) 0)
+                          (break :found
+                            (Some (derr-at-src (.source use)
+                                               (.lo use)
+                                               (.hi use)
+                                               (sconcat3 a
+                                                         "this compile-time value depends on itself: computing it runs '"
+                                                         (.name f)
+                                                         "', which uses that value")))))))
+                    0)
+                  0))
+              ; a constant the code reads, whose value is that same computation
+              (for [i 0 (len (load (.consts sub)))]
+                (let [c (elem (.consts sub) i)
+                      use (macro-use-in a (field c value) q)
+                      pending (macro-use-in a (field c value) "coil.core.comptime")
+                      at (if (= (primitive/cast i64 use) 0) pending use)]
+                  (unless (= (primitive/cast i64 at) 0)
+                    (break :found
+                      (Some (derr-at-src (.source at)
+                                         (.lo at)
+                                         (.hi at)
+                                         (sconcat3 a
+                                                   "this compile-time value depends on itself: computing it reads the constant '"
+                                                   (.name c)
+                                                   "', which needs that value")))))))
+              (None [Diag])))))))
+
+;;; The call of Q below E, or null.
+(defn macro-use-in [(a (dyn Allocator)) (e (ptr Expr)) (q (slice u8))] (-> (ptr Expr))
+  (if (match (.kind e) (ECall [func _ _] (= func q)) (_ false))
+      e
+      (let [(mut kids) (ArrayList::new [(ptr Expr)] a)]
+        (expr-children! e (mut kids))
+        (block :found
+          (for [i 0 (len kids)]
+            (let [use (macro-use-in a (get kids i) q)]
+              (unless (= (primitive/cast i64 use) 0) (break :found use))))
+          (primitive/cast (ptr Expr) 0)))))
 
 ; The staging failure with its inner reason attached, keeping the inner diagnostic's own
 ; span when it has one — that span points into the macro's closure, which is where the fix
@@ -1524,14 +1623,14 @@
 
 (defstruct ExpEnv
   [(macros (ptr (ArrayList (slice u8))))
-   (comptime (ptr (ArrayList (slice u8))))
+   (metaprograms (ptr (ArrayList (slice u8))))
    (sub (ptr Program))
    (impb (ptr (AVec ImpEntry)))
    (expb (ptr (AVec ExpEntry)))
    ; THE SYNTACTIC ENVIRONMENT: names bound at this point in the walk, innermost
    ; last. Used as a stack — a scope records the length on entry and truncates back
    ; to it on exit, so no allocation per scope and no scope-tree to maintain.
-   (bound (ptr (ArrayList (slice u8))))
+   (bound (ptr (ArrayList ScopeEntry)))
    (a (dyn Allocator))])
 
 ; Is `nm` bound by an enclosing binding form? Scanned from the END so an inner
@@ -1544,15 +1643,11 @@
               (break)
               (do
                 (set! i (primitive/isub (load i) 1))
-                (when (= (get (load xs) (load i)) nm) (store! found true) 0))))
+                (when (= (.name (elem xs (load i))) nm) (store! found true) 0))))
     (load found)))
 
 (defn benv-mark [(env (ptr ExpEnv))] (-> i64)
   (len (load (field env bound))))
-
-(defn benv-push! [(env (ptr ExpEnv)) (nm (slice u8))] (-> i64)
-  (push! (load (field env bound)) nm)
-  0)
 
 (defn benv-reset! [(env (ptr ExpEnv)) (mark i64)] (-> i64)
   (set! (.len (load (field env bound))) mark)
@@ -1561,41 +1656,149 @@
 ; The lexical identity a binder establishes, including its hygiene scope.
 ; `(mut x)` and `(x Type)` name x; non-binder syntax returns an empty key.
 (defn binder-name [(a (dyn Allocator)) (bp Sexp)] (-> (slice u8))
-  (let [tg (sx-tag bp)]
-    (if (= tg 2)
-        (lexical-name a bp)
-        (if (= tg 6)
-            (let [it (sx-items bp)]
-              (if (and (>= (sx-len it) 1)
-                       (= (sx-tag (sx-at it 0)) 2))
-                  (let [h (sx-sval (sx-at it 0))]
-                    (if (and (= h "mut")
-                             (>= (sx-len it) 2))
-                        (binder-name a (sx-at it 1))
-                        (lexical-name a (sx-at it 0))))
-                  ""))
-            ""))))
+  (match (binder-identifier bp)
+    (Some [identifier] (lexical-name a identifier))
+    (None [] "")))
 
-; Bind every name a `[…]` binder vector introduces. `kind` 0 = a `let`-shaped vector
-; (NAME INIT NAME INIT …), so only even positions bind; 1 = a parameter/field vector,
-; where every element binds.
-(defn benv-bind-vec! [(env (ptr ExpEnv))
-                      (items (ptr (ArrayList Sexp)))
-                      (kind i64)] (-> i64)
-  (let [n (sx-len items)
-        (mut i) 0]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (when (or (= kind 1)
-                          (= (primitive/irem (load i) 2) 0))
-                  (let [nm (binder-name (.a env) (sx-at items (load i)))]
-                    (when (> (len nm) 0)
-                      (benv-push! env nm)
-                      0))
-                  0)
-                (set! i (primitive/iadd (load i) 1)))))
+;;; What BINDER binds to BINDING, for a scope; None for syntax that binds nothing.
+(defn scope-entry-of [(a (dyn Allocator)) (binder Sexp) (binding ScopeBinding)]
+  (-> (Option ScopeEntry))
+  (match (binder-identifier binder)
+    (Some [identifier]
+          (Some (ScopeEntry
+                  :name (lexical-name a identifier)
+                  :identifier identifier
+                  :binding binding)))
+    (None [] (None [ScopeEntry]))))
+
+;;; What a `let*` binder binds: a plain name its value, `(mut x)` only what the code
+;;; will have put there when it runs.
+(defn let-binding-of [(binder Sexp) (init Sexp)] (-> ScopeBinding)
+  (if (and (= (sx-tag binder) 6)
+           (>= (sx-len (sx-items binder)) 1)
+           (= (sx-head-name (sx-items binder)) "mut"))
+      (ScopeLocal binder)
+      (ScopeLet binder init)))
+
+;;; What a form is to the form around it, for what it binds. Most forms bind by their
+;;; head; the vector of a `let`, an arm of a `match` and a member of a `defsum`,
+;;; `deftrait` or `impl` bind by where they stand.
+(defsum ScopeRole
+  (PlainForm)
+  (LetVector)
+  (MatchArm)
+  (MemberForm))
+
+;;; Add to OUT what BINDER binds to BINDING.
+(defn scope-push! [(a (dyn Allocator))
+                   (out (ptr (ArrayList ScopeEntry)))
+                   (binder Sexp)
+                   (binding ScopeBinding)] (-> i64)
+  (match (scope-entry-of a binder binding)
+    (Some [entry]
+          (when (> (len (.name entry)) 0)
+            (push! out entry)
+            0))
+    (None [] 0))
+  0)
+
+;;; Whether a form headed HEAD binds names with vectors among its children: a
+;;; definition, or a `defn` or `fn` whose macro has not made it one yet.
+(defn scope-definition-head? [(head (slice u8))] (-> bool)
+  (or (def-form-head? head) (= head "defn") (= head "fn")))
+
+;;; The role of child INDEX of the list ITEMS, which has ROLE.
+(defn scope-child-role [(items (ptr (ArrayList Sexp))) (role ScopeRole) (index i64)]
+  (-> ScopeRole)
+  (match role
+    (PlainForm []
+               (let [head (sx-head-name items)]
+                 (cond (and (or (= head "let*") (= head "let")) (= index 1)) (LetVector)
+                       (and (= head "match") (>= index 2)) (MatchArm)
+                       (and (def-member-head? head) (> index 0)) (MemberForm)
+                       :else (PlainForm))))
+    (_ (PlainForm))))
+
+;;; Add to OUT what the vector at child INDEX - 1 of the definition ITEMS binds: a
+;;; vector of parameters, fields or generics binds for the children after it.
+(defn scope-step-vector! [(a (dyn Allocator))
+                          (out (ptr (ArrayList ScopeEntry)))
+                          (items (ptr (ArrayList Sexp)))
+                          (index i64)] (-> i64)
+  (let [at (- index 1)]
+    (when (and (> at 0)
+               (< at (sx-len items))
+               (= (sx-tag (sx-at items at)) 7))
+      (let [generic (generic-params-at? items at)
+            ps (sx-items (sx-at items at))]
+        (for [k 0 (sx-len ps)]
+          (scope-push! a
+                       out
+                       (sx-at ps k)
+                       (if generic
+                           (ScopeGeneric (sx-at ps k))
+                           (ScopeLocal (sx-at ps k))))))
+      0)
     0))
+
+;;; Add to OUT what the form ITEMS, which has ROLE, binds for its child INDEX beyond
+;;; what it binds for child INDEX - 1. A walk through the children in order adds this
+;;; before each; what child INDEX sees is all of it from 1 to INDEX. This is the one
+;;; place that knows what binds a name, for every walk that keeps a scope.
+(defn scope-step-binds! [(a (dyn Allocator))
+                         (out (ptr (ArrayList ScopeEntry)))
+                         (items (ptr (ArrayList Sexp)))
+                         (role ScopeRole)
+                         (index i64)] (-> i64)
+  (match role
+    ; a binder binds from the pair after its own: `(let* [x (f x)] …)` reads the x
+    ; around it
+    (LetVector []
+               (when (and (>= index 2)
+                          (= (primitive/irem index 2) 0)
+                          (<= index (sx-len items)))
+                 (let [binder (sx-at items (- index 2))]
+                   (scope-push! a out binder (let-binding-of binder (sx-at items (- index 1)))))
+                 0))
+    (MatchArm []
+              (when (and (= index 2)
+                         (not (= (sx-head-name items) "_"))
+                         (>= (sx-len items) 2)
+                         (= (sx-tag (sx-at items 1)) 7))
+                (let [binders (sx-items (sx-at items 1))]
+                  (for [k 0 (sx-len binders)]
+                    (scope-push! a out (sx-at binders k) (ScopeLocal (sx-at binders k)))))
+                0))
+    (MemberForm [] (scope-step-vector! a out items index))
+    (PlainForm []
+               (let [head (sx-head-name items)]
+                 (cond (or (= head "let*") (= head "let"))
+                         (when (and (= index 2)
+                                    (>= (sx-len items) 2)
+                                    (= (sx-tag (sx-at items 1)) 7))
+                           (let [pairs (sx-items (sx-at items 1))
+                                 n (sx-len pairs)]
+                             (for [k 0 n]
+                               (when (= (primitive/irem k 2) 0)
+                                 (let [binder (sx-at pairs k)]
+                                   (scope-push! a
+                                                out
+                                                binder
+                                                (if (< (+ k 1) n)
+                                                    (let-binding-of binder (sx-at pairs (+ k 1)))
+                                                    (ScopeLocal binder))))
+                                 0)))
+                           0)
+                       (scope-definition-head? head) (scope-step-vector! a out items index)
+                       :else 0))))
+  0)
+
+;;; Whether the vector at index I of the definition ITEMS declares its generic
+;;; parameters, not its value parameters or fields: `(defn f [T] [(x T)] …)` has both,
+;;; and an `impl`'s only vector is its generics.
+(defn generic-params-at? [(items (ptr (ArrayList Sexp))) (i i64)] (-> bool)
+  (or (= (sx-head-name items) "impl")
+      (and (< (+ i 1) (sx-len items)) (= (sx-tag (sx-at items (+ i 1))) 7))))
 
 ; Heads whose own children include binder vectors.
 (defn def-form-head? [(h (slice u8))] (-> bool)
@@ -1615,10 +1818,10 @@
       ""))
 
 ; Copy a definition form's children, leaving every binder vector byte-identical and
-; expanding everything else. `member` walks one extra level for defsum variants and
-; trait/impl methods.
+; expanding everything else. A definition whose children are members (defsum
+; variants, trait/impl methods) walks one extra level, with ROLE MemberForm.
 (defn expand-def-list [(items (ptr (ArrayList Sexp)))
-                       (member bool)
+                       (role ScopeRole)
                        (module (Option (slice u8)))
                        (env (ptr ExpEnv))
                        (allfns (ptr (ArrayList (slice u8))))
@@ -1631,22 +1834,26 @@
         ; the parameter scope ENDS with the definition; without this the params of one
         ; defn would still be bound while walking the next one
         mark (benv-mark env)
+        member
+          (match role
+            (PlainForm [] (def-member-head? (sx-head-name items)))
+            (_ false))
         (mut out) (ArrayList::new [Sexp] a)
         (mut i) 0
         (mut errf) (None [Diag])]
     (loop (if (or (diag-some? (load errf)) (>= (load i) n))
               (break)
               (do
+                ; a binder vector's names bind for everything after it, so a parameter
+                ; named after a macro wins in the body too, not just inside the vector
+                (scope-step-binds! a (load (field env bound)) items role (load i))
                 (let [child (elem items (load i))
                       tg (sx-tag (load child))]
-                  (cond ; a binder vector: verbatim, never expanded — and its names bind
-                        ; for everything after it, so a parameter named after a macro wins
-                        ; in the body too, not just inside the vector.
+                  (cond ; a binder vector: verbatim, never expanded
                         (and (> (load i) 0)
                              (= tg 7))
                           (do
                             (push! (mut out) (load child))
-                            (benv-bind-vec! env (sx-items (load child)) 1)
                             0)
                         ; Methods use the same library parameter normalizer as defn.
                         ; A temporary primitive declaration supplies binder traversal;
@@ -1683,7 +1890,7 @@
                         (and (and member (> (load i) 0))
                              (= tg 6))
                           (match (expand-def-list (sx-items (load child))
-                                                  false
+                                                  (MemberForm)
                                                   module
                                                   env
                                                   allfns
@@ -1849,9 +2056,11 @@
                                           (mut j) 0]
                                       (push! (mut aout) (sx-at nit 0))
                                       (push! (mut aout) (sx-at nit 1))
-                                      (benv-bind-vec! env
-                                                      (sx-items (sx-at nit 1))
-                                                      1)
+                                      (scope-step-binds! a
+                                                         (load (field env bound))
+                                                         nit
+                                                         (MatchArm)
+                                                         2)
                                       (set! j 2)
                                       (loop (if (or (diag-some? (load errf))
                                                     (>= (load j) an))
@@ -1897,7 +2106,9 @@
     (set! (.kind out) kind)
     (load out)))
 
-; Primitive bindings are sequential. Binder syntax is never a call.
+; Primitive bindings are sequential. Binder syntax is never a call. What each
+; initializer sees bound is gone once the vector is walked: the body's comes from the
+; `let*` itself (`expand-let-form`).
 (defn expand-let-bindings [(node (ptr Sexp))
                            (module (Option (slice u8)))
                            (env (ptr ExpEnv))
@@ -1909,27 +2120,29 @@
   (try (let [a (.a env)
              pairs (sx-items (load node))
              n (sx-len pairs)
-             (mut out) (ArrayList::new [Sexp] a)
+             mark (benv-mark env)
+             out (box-al [Sexp] a (ArrayList::new [Sexp] a))
              (mut i) 0]
          (loop (if (>= (load i) n)
                    (break)
                    (do
-                     (push! (mut out) (sx-at pairs (load i)))
+                     ; the walk so far is OUT: the binders and expanded initializers
+                     (scope-step-binds! a (load (field env bound)) out (LetVector) (load i))
+                     (push! out (sx-at pairs (load i)))
                      (when (< (+ (load i) 1) n)
-                       (push! (mut out)
-                              (try! (expand-calls (elem pairs
-                                                        (+ (load i) 1))
+                       (push! out
+                              (try! (expand-calls (elem pairs (+ (load i) 1))
                                                   module
                                                   env
                                                   allfns
                                                   gs
                                                   gu
                                                   depth
-                                                  (mut ls)))))
-                     (let [name (binder-name a (sx-at pairs (load i)))]
-                       (when (> (len name) 0) (benv-push! env name)))
+                                                  (mut ls))))
+                       0)
                      (set! i (+ (load i) 2)))))
-         (Ok (traversed-sexp (KVec (box-al [Sexp] a (load out))) node)))))
+         (benv-reset! env mark)
+         (Ok (traversed-sexp (KVec out) node)))))
 
 (defn expand-let-form [(items (ptr (ArrayList Sexp)))
                        (module (Option (slice u8)))
@@ -1941,13 +2154,15 @@
                        (ls (mut LS))] (-> (Result (ptr (ArrayList Sexp)) Diag))
   (try (let [a (.a env)
              n (sx-len items)
-             (mut out) (ArrayList::new [Sexp] a)
+             out (box-al [Sexp] a (ArrayList::new [Sexp] a))
              (mut i) 0]
          (loop (if (>= (load i) n)
                    (break)
                    (do
+                     ; the walk so far is OUT, with the vector's initializers expanded
+                     (scope-step-binds! a (load (field env bound)) out (PlainForm) (load i))
                      (let [child (elem items (load i))]
-                       (push! (mut out)
+                       (push! out
                               (try! (if (and (= (load i) 1)
                                              (= (sx-tag (load child)) 7))
                                         (expand-let-bindings child
@@ -1967,7 +2182,7 @@
                                                       depth
                                                       (mut ls))))))
                      (set! i (+ (load i) 1)))))
-         (Ok (box-al [Sexp] a (load out))))))
+         (Ok out))))
 
 (defn expand-calls-list [(items (ptr (ArrayList Sexp)))
                          (module (Option (slice u8)))
@@ -2149,7 +2364,7 @@
                                       gu
                                       depth
                                       (mut ls)))))
-      (when (is-comptime-defn (load cur) module (.comptime env) a)
+      (when (is-metaprogram-defn (load cur) module (.metaprograms env) a)
         (break (Ok [Sexp Diag] (load (load cur)))))
       (let [tg (sx-tag (load (load cur)))]
         (if (= tg 6)
@@ -2220,6 +2435,9 @@
                                                                                                         (load chain-depth))))))
                                                            (load (load cur)))))
                               (match (expand-macro-at (load (load cur))
+                                                      (load (field env bound))
+                                                      false
+                                                      module
                                                       (load (field env sub))
                                                       q
                                                       (macro-module-of hp
@@ -2350,7 +2568,7 @@
                                                                          (load cur))))))
                                         (if (def-form-head? hn)
                                             (break (match (expand-def-list items
-                                                                           (def-member-head? hn)
+                                                                           (PlainForm)
                                                                            module
                                                                            env
                                                                            allfns
@@ -2421,7 +2639,6 @@
         (= head "export") true
         (= head "reader-provider") true
         (= head "impl") true
-        (= head "meta") true
         :else false))
 
 ;;; The error for the first authored struct, sum or trait definition that takes
@@ -2467,11 +2684,10 @@
                        (gu (ptr (ArrayList SumDef)))
                        (depth (ptr i64))
                        (ls (mut LS))] (-> (Result Sexp Diag))
-  (if (or (is-meta-form f)
-          (is-comptime-defn f
-                            module
-                            (load (field env comptime))
-                            (.a env)))
+  (if (is-metaprogram-defn f
+                        module
+                        (load (field env metaprograms))
+                        (.a env))
       (Ok [Sexp Diag] (load f))
       ; A macro call in definition position must fail while it is still syntax.
       ; Leaving an out-of-scope macro untouched hands it to parse-program, which
@@ -2665,10 +2881,13 @@
               (break)
               (do
                 (let [fp (elem fs (load i))]
+                  ; A generic one has no entry until something names its arguments: it
+                  ; is a helper a macro calls, and a seed of the closure all the same.
                   (when (and (not (set-contains excluded (load (field fp name))))
                              (and (not (contains? methods (.name fp)))
-                                  (and (type-is-code (field fp ret))
-                                       (all-params-code (load (field fp params))))))
+                                  (and (= (len (load (.type_params fp))) 0)
+                                       (and (type-is-code (field fp ret))
+                                            (all-params-code (load (field fp params)))))))
                     (push! (mut out) (load (field fp name)))
                     0))
                 (set! i (primitive/iadd (load i) 1)))))
@@ -2847,6 +3066,10 @@
 ; another macro use does not judge the outer call; that use expands first (see
 ; `written-calls`). A program whose sub-check passes first try (all
 ; previously-valid programs) pays nothing.
+;;; One step down from a top-level form to the node the tower is at: the INDEXth
+;;; child of NODE.
+(defstruct TowerPathStep [(node (ptr Sexp)) (index i64)])
+
 (defstruct TowerCx
   [(a (dyn Allocator))
    (dlo i64)
@@ -2860,22 +3083,76 @@
    (module (Option (slice u8)))
    (hit i64)
    (depth i64)
+   ; Whether the form being rewritten is as it was parsed, so that a node's span
+   ; encloses its children's (`tower-disjoint-from-diag?`).
+   (as_parsed bool)
    ; Structs and sums declared by forms this tower has walked so far. A later
    ; sibling -- `(derive … T)` after the `(defsum T …)` of the same `(do …)` a
    ; macro produced -- reflects on them; the tolerant context skipped that whole
    ; `do`, which does not parse until its macro calls are expanded.
    (gen_structs (ptr (ArrayList StructDef)))
-   (gen_sums (ptr (ArrayList SumDef)))])
+   (gen_sums (ptr (ArrayList SumDef)))
+   ; The way down to the node being rewritten: what a macro called there can see
+   ; around it (`tower-scope`).
+   (path (ptr (ArrayList TowerPathStep)))
+   ; How many macro calls around the node are undecided (`tower-rewrite-undecided`):
+   ; each may yet be expanded, over its arguments as written, and bind what it likes.
+   (undecided i64)])
+
+;;; What is bound at the node the tower is at, outermost first: what the walk
+;;; `expand-calls` does would have bound by then, read off the way down.
+(defn tower-scope [(tc (ptr TowerCx))] (-> (ptr (ArrayList ScopeEntry)))
+  (let [a (.a tc)
+        out (box-al [ScopeEntry] a (ArrayList::new [ScopeEntry] a))
+        path (.path tc)
+        (mut depth) 0
+        ; the role of this step's node, which its parent decides
+        (mut role) (PlainForm)]
+    (for [i 0 (len (load path))]
+      (let [step (elem path i)
+            node (.node step)
+            at (.index step)
+            items (sx-items (load node))
+            list? (= (sx-tag (load node)) 6)
+            head (if list? (sx-head-name items) "")
+            here (load role)
+            let-vector? (match here (LetVector [] true) (_ false))]
+        (set! role (PlainForm))
+        (cond (= head "quasiquote") (set! depth (+ (load depth) 1))
+              (or (= head "unquote") (= head "unquote-splicing"))
+                (set! depth (- (load depth) 1))
+              (= head "quote") (set! depth (+ (load depth) 1))
+              :else 0)
+        (when (and (= (load depth) 0) (or list? let-vector?))
+          (for [j 1 (+ at 1)]
+            (scope-step-binds! a out items here j))
+          (when list?
+            (set! role (scope-child-role items here at)))
+          0)
+        0))
+    out))
+
+;;; The tower goes down into the INDEXth child of NODE, and comes back with `tower-leave!`.
+(defn tower-enter! [(tc (ptr TowerCx)) (node (ptr Sexp)) (index i64)] (-> i64)
+  (push! (.path tc) (TowerPathStep :node node :index index))
+  0)
+
+(defn tower-leave! [(tc (ptr TowerCx))] (-> i64)
+  (set! (.len (.path tc)) (- (len (load (.path tc))) 1))
+  0)
 
 ; A parsed parent span encloses every parsed child span from the same source.
 ; Diagnostic-directed tower recovery can therefore skip a disjoint subtree
 ; without walking it. Generated parents with absent/cross-source spans remain
-; conservative and are traversed normally.
+; conservative and are traversed normally. A form a macro has rewritten holds its
+; template's nodes, at their own spans in the macro's file, under a parent spanning
+; the call: when that is the same file the spans say nothing, so it is walked too.
 (defn tower-disjoint-from-diag? [(tc (ptr TowerCx)) (node (ptr Sexp))] (-> bool)
   (let [source (sx-source (load node))
         lo (sx-lo (load node))
         hi (sx-hi (load node))]
-    (and (= source (.dsrc tc))
+    (and (.as_parsed tc)
+         (= source (.dsrc tc))
          (and (>= lo 0)
               (or (< hi (.dlo tc))
                   (> lo (.dhi tc)))))))
@@ -3005,6 +3282,9 @@
     (let [expand-span (tr/span-begin q)
           expand-result
             (expand-macro-at (load node)
+                             (tower-scope tc)
+                             (> (.undecided tc) 0)
+                             (load (field tc module))
                              (load (field tc macroctx))
                              q
                              (macro-module-of (sx-at items 0)
@@ -3079,6 +3359,7 @@
                    (mut changed) false]
                (for [i 0 (sx-len items)]
                  (set! (.hit tc) 0)
+                 (tower-enter! tc node i)
                  (let [child (elem items i)
                        next
                          (try! (if (and escape (= depth 1) (> i 0))
@@ -3090,6 +3371,7 @@
                                                            child
                                                            next-depth
                                                            parse-only)))]
+                   (tower-leave! tc)
                    (if (!= (.hit tc) 0)
                        (do
                          (unless (load changed)
@@ -3130,6 +3412,19 @@
             (tower-template-rewrite tc (mut s) node 0 false)
             (tower-rewrite-code tc (mut s) node)))))
 
+;;; In a form a macro rewrote, is the diagnostic at one of NODE's arguments? A call
+;;; from a template is stamped with the span of the macro call it replaced, while
+;;; its literal arguments keep their span in the template, so the call's span does
+;;; not contain them.
+(defn tower-holds-diag-argument? [(tc (ptr TowerCx)) (node (ptr Sexp))] (-> bool)
+  (and (not (.as_parsed tc))
+       (= (sx-tag (load node)) 6)
+       (let [items (sx-items (load node))]
+         (block :held
+           (for [i 1 (sx-len items)]
+             (when (tower-spans-diag? tc (elem items i)) (break :held true)))
+           false))))
+
 (defn tower-rewrite-code [(tc (ptr TowerCx)) (s (mut LS)) (node (ptr Sexp))]
   (-> (Result Sexp Diag))
   (try (do
@@ -3143,6 +3438,7 @@
                    (let [items (sx-items (load node))
                          n (sx-len items)
                          contains
+                           (or (tower-holds-diag-argument? tc node)
                            (and (= (sx-source (load node))
                                    (load (field tc dsrc)))
                                 (and (>= (sx-lo (load node))
@@ -3150,7 +3446,7 @@
                                      (and (<= (sx-lo (load node))
                                               (load (field tc dlo)))
                                           (>= (sx-hi (load node))
-                                              (load (field tc dhi))))))
+                                              (load (field tc dhi)))))))
                          headq
                            (if (and contains
                                     (and (= tg 6)
@@ -3181,12 +3477,20 @@
                                (q (slice u8))] (-> (Result Sexp Diag))
   (if (not (tower-defer-call! (.a tc) node))
       (tower-expand-call tc (mut s) node q)
-      (match (tower-rewrite-kids tc (mut s) node)
-        (Ok [r]
-            (if (= (.hit tc) 0)
-                (tower-expand-call tc (mut s) node q)
-                (Ok [Sexp Diag] r)))
-        (Err [_] (do (set! (.hit tc) 0) (tower-expand-call tc (mut s) node q))))))
+      (let [mark (len (load (.path tc)))
+            _inside (set! (.undecided tc) (+ (.undecided tc) 1))
+            attempt (tower-rewrite-kids tc (mut s) node)]
+        (set! (.undecided tc) (- (.undecided tc) 1))
+        (match attempt
+          (Ok [r]
+              (if (= (.hit tc) 0)
+                  (tower-expand-call tc (mut s) node q)
+                  (Ok [Sexp Diag] r)))
+          (Err [_]
+               (do
+                 (set! (.len (.path tc)) mark)
+                 (set! (.hit tc) 0)
+                 (tower-expand-call tc (mut s) node q)))))))
 
 (defn tower-rewrite-kids [(tc (ptr TowerCx)) (s (mut LS)) (node (ptr Sexp))]
   (-> (Result Sexp Diag))
@@ -3198,7 +3502,9 @@
              (mut xs) (primitive/zeroed (ArrayList Sexp))]
          (for [i 0 n]
            (set! (.hit tc) 0)
+           (tower-enter! tc node i)
            (let [r (try! (tower-rewrite tc (mut s) (elem items i)))]
+             (tower-leave! tc)
              (if (!= (.hit tc) 0)
                  (do
                    (unless any
@@ -3309,13 +3615,13 @@
              depth (primitive/alloc-stack i64)
              items (sx-items (load node))]
          (set! (.macros env) (load (field tc quals)))
-         (set! (.comptime env)
+         (set! (.metaprograms env)
                (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a)))
          (set! (.sub env) (load (field tc macroctx)))
          (set! (.impb env) (load (field tc impb)))
          (set! (.expb env) (load (field tc expb)))
          (set! (.bound env)
-               (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a)))
+               (box-al [ScopeEntry] a (ArrayList::new [ScopeEntry] a)))
          (set! (.a env) a)
          (store! depth (.depth tc))
          (if (match-has-refutable-arm? items)
@@ -3414,12 +3720,20 @@
                              (q (slice u8))] (-> (Result Sexp Diag))
   (if (not (tower-defer-call! (.a tc) node))
       (tower-expand-call tc (mut s) node q)
-      (match (tower-parse-kids tc (mut s) node)
-        (Ok [r]
-            (if (= (.hit tc) 0)
-                (tower-expand-call tc (mut s) node q)
-                (Ok [Sexp Diag] r)))
-        (Err [_] (do (set! (.hit tc) 0) (tower-expand-call tc (mut s) node q))))))
+      (let [mark (len (load (.path tc)))
+            _inside (set! (.undecided tc) (+ (.undecided tc) 1))
+            attempt (tower-parse-kids tc (mut s) node)]
+        (set! (.undecided tc) (- (.undecided tc) 1))
+        (match attempt
+          (Ok [r]
+              (if (= (.hit tc) 0)
+                  (tower-expand-call tc (mut s) node q)
+                  (Ok [Sexp Diag] r)))
+          (Err [_]
+               (do
+                 (set! (.len (.path tc)) mark)
+                 (set! (.hit tc) 0)
+                 (tower-expand-call tc (mut s) node q)))))))
 
 (defn tower-parse-kids [(tc (ptr TowerCx)) (s (mut LS)) (node (ptr Sexp))]
   (-> (Result Sexp Diag))
@@ -3435,11 +3749,13 @@
                      (break)
                      (do
                        (store! (field tc hit) 0)
+                       (tower-enter! tc node (load i))
                        (let [r
                                (try! (tower-parse-rewrite tc
                                                           (mut s)
                                                           (elem items
                                                                 (load i))))]
+                         (tower-leave! tc)
                          (if (!= (load (field tc hit)) 0)
                              (do
                                (unless (load any)
@@ -3837,6 +4153,7 @@
     (set! impb (.imports s))
     (set! expb (.exports s))
     (set! (.a tc) a)
+    (set! (.path tc) (box-al [TowerPathStep] a (ArrayList::new [TowerPathStep] a)))
     (set! (.dlo tc) dlo)
     (set! (.dhi tc) dhi)
     (set! (.dsrc tc) dsrc)
@@ -3890,7 +4207,14 @@
                                       (.expb tc)
                                       a)
                 (set! i (+ (load i) 1)))))
-    (tower-parse-pass tc (mut s) sub-forms macroctx declarations-only)))
+    ; A macro a declaration uses could not be compiled: what its code misses may be a
+    ; declaration a top-level macro has yet to make.
+    (match (tower-parse-pass tc (mut s) sub-forms macroctx declarations-only)
+      (Ok [hit] (Ok [i64 Diag] hit))
+      (Err [d]
+           (if (tower-expand-top-level-macros! (mut s) sub-forms macroctx quals a)
+               (Ok [i64 Diag] 1)
+               (Err [i64 Diag] d))))))
 
 (defn tower-pass [(tc (ptr TowerCx))
                   (s (mut LS))
@@ -3899,25 +4223,48 @@
   (try (do
          (let [n (len (load sub-forms))
                (mut any) false
+               (mut failure) (None [Diag])
                (mut i) 0]
            (loop (if (>= (load i) n)
                      (break)
                      (do
                        (let [tf (elem sub-forms (load i))]
-                         (store! (field tc module) (load (field tf module)))
-                         (store! (field tc hit) 0)
-                         (let [nf
-                                 (try! (tower-rewrite tc
-                                                      (mut s)
-                                                      (field tf form)))]
-                           (when (!= (load (field tc hit))
-                                     0)
-                             (store! any true)
-                             (tagged-rewrite! tf nf)
-                             0)))
+                         (tower-pass-form! tc (mut s) tf (mut any) (mut failure)))
                        (store! i (primitive/iadd (load i) 1)))))
-           (store! (field tc hit) (if (load any) 1 0))
-           (Ok [i64 Diag] (load (field tc hit)))))))
+           (tower-pass-outcome tc (load any) (load failure))))))
+
+;;; Rewrite the form TF at the diagnostic in TC. A template's nodes all have its spans,
+;;; so the diagnostic can name a call in another form as well, one whose macro cannot be
+;;; staged until the call it was about is expanded: failing to expand one is not
+;;; failing, while another form holds what the diagnostic meant.
+(defn tower-pass-form! [(tc (ptr TowerCx))
+                        (s (mut LS))
+                        (tf (ptr TaggedForm))
+                        (any (mut bool))
+                        (failure (mut (Option Diag)))] (-> i64)
+  (store! (field tc module) (load (field tf module)))
+  (store! (field tc hit) 0)
+  (set! (.as_parsed tc) (= (.revision tf) 0))
+  (set! (.len (.path tc)) 0)
+  (match (tower-rewrite tc (mut s) (field tf form))
+    (Ok [nf]
+        (when (!= (load (field tc hit)) 0)
+          (store! any true)
+          (tagged-rewrite! tf nf)
+          0))
+    (Err [d]
+         (when (none? (load failure)) (store! failure (Some d)) 0)
+         0))
+  0)
+
+;;; What a pass over the forms came to: whether it rewrote any, and otherwise the error
+;;; it stopped at, if any.
+(defn tower-pass-outcome [(tc (ptr TowerCx)) (any bool) (failure (Option Diag))]
+  (-> (Result i64 Diag))
+  (store! (field tc hit) (if any 1 0))
+  (match failure
+    (Some [d] (if any (Ok [i64 Diag] 1) (Err [i64 Diag] d)))
+    (None [] (Ok [i64 Diag] (if any 1 0)))))
 
 ; Diagnostic recovery used to traverse every syntax node once per diagnostic.
 ; Large generated modules make that O(nodes × diagnostics), even though a source
@@ -3996,6 +4343,7 @@
          (let [n (len (load index))
                (mut i) 0
                (mut any) false
+               (mut failure) (None [Diag])
                (mut candidates) 0]
            (loop (if (>= (load i) n)
                      (break)
@@ -4008,24 +4356,12 @@
                                          (load (field entry form-index)))]
                              (store! candidates
                                      (primitive/iadd (load candidates) 1))
-                             (store! (field tc module) (load (field tf module)))
-                             (store! (field tc hit) 0)
-                             (let [nf
-                                     (try! (tower-rewrite tc
-                                                          (mut s)
-                                                          (field tf form)))]
-                               (when (!= (load (field tc hit))
-                                         0)
-                                 (store! any true)
-                                 (tagged-rewrite! tf nf)
-                                 0)))
+                             (tower-pass-form! tc (mut s) tf (mut any) (mut failure)))
                            0))
                        (store! i (primitive/iadd (load i) 1)))))
            (if (= (load candidates) 0)
                (tower-pass tc (mut s) sub-forms)
-               (do
-                 (store! (field tc hit) (if (load any) 1 0))
-                 (Ok [i64 Diag] (load (field tc hit)))))))))
+               (tower-pass-outcome tc (load any) (load failure)))))))
 
 ;;; A failed sub-program check can report many independent macro-headed call
 ;;; sites. Expand all of them against this generation's resolved macro context
@@ -4156,13 +4492,55 @@
                            (Err [_] (do (set! failure (Some d)) 0))))))
                 (set! i (primitive/iadd (load i) 1)))))
     (let [result
-            (if (load any)
-                (Ok [i64 Diag] 1)
-                (match (load failure)
-                  (Some [d] (Err [i64 Diag] d))
-                  (None [] (Ok [i64 Diag] 0))))]
+            (cond (load any) (Ok [i64 Diag] 1)
+                  ; Nothing the diagnostics point at can be expanded, but what they
+                  ; miss may be a declaration a top-level macro has yet to make: a
+                  ; function a compile-time value calls may read a constant its
+                  ; module generates.
+                  (tower-expand-top-level-macros! (mut s) sub-forms macroctx quals a)
+                    (Ok [i64 Diag] 1)
+                  :else
+                    (match (load failure)
+                      (Some [d] (Err [i64 Diag] d))
+                      (None [] (Ok [i64 Diag] 0))))]
       (close! index-work)
       result)))
+
+;;; Expand each top-level macro call whose macro can be compiled yet, and say whether
+;;; any was. One that cannot stays for a later round, or for the error it comes to.
+;;; The binding macros are left alone: they declare nothing a check could be missing,
+;;; only the form they rewrite.
+(defn tower-expand-top-level-macros! [(s (mut LS))
+                                      (sub-forms (ptr (ArrayList TaggedForm)))
+                                      (macroctx (ptr Program))
+                                      (quals (ptr (ArrayList (slice u8))))
+                                      (a (dyn Allocator))] (-> bool)
+  (let [tc (mk-tower-cx (mut s) sub-forms macroctx quals a a -2 -2 -2)
+        (mut any) false]
+    (for [i 0 (len (load sub-forms))]
+      (let [tf (elem sub-forms i)
+            node (field tf form)]
+        (store! (field tc module) (load (field tf module)))
+        (when (and (= (sx-tag (load node)) 6) (> (sx-len (sx-items (load node))) 0))
+          (let [head (sx-at (sx-items (load node)) 0)]
+            (when (= (sx-tag head) 2)
+              (match (resolve-macro-head head
+                                         (.module tc)
+                                         (.quals tc)
+                                         (.impb tc)
+                                         (.expb tc)
+                                         a)
+                (Some [q]
+                      (unless (starts-with q "coil.binding.")
+                        (match (tower-expand-call tc (mut s) node q)
+                          (Ok [out] (do (tagged-rewrite! tf out) (set! any true) 0))
+                          (Err [_] 0))
+                        0))
+                (None [] 0))
+              0)
+            0)
+          0)))
+    (load any)))
 
 ; ---- LAZY per-qual macro STAGING (interp deletion step 5, Phase B) ----------------
 ; The engine is grown ON DEMAND: stage3-round only RECORDS the round's sub-forms in
@@ -4202,10 +4580,308 @@
    ; and why it could not expand.
    (deferred_names (ArrayList (slice u8)))
    (deferred_diags (ArrayList Diag))
-   (parent (ptr LS))])
+   (parent (ptr LS))
+   ; The generation's bare-ok names, for resolving a form against what it declared.
+   (bareok (ptr (ArrayList (slice u8))))])
 
 (defn stage-box [] (-> (ptr StageBox))
   (field (expander-unit-state) stages))
+
+;;; A context for resolving a single form against what the generation declared.
+(defn stage-resolve-ls [(a (dyn Allocator)) (ls (mut LS))] (-> i64)
+  (let [b (stage-box)]
+    (ls-init! (mut ls) a)
+    (set! (.imports ls) (.imports b))
+    (set! (.exports ls) (.exports b))
+    (set! (.primitive_defs ls) (.primitive_defs b))
+    (set! (.primitive_aliases ls) (.primitive_aliases b))
+    (set! (.semantic_workspace ls) (.semantic_workspace b))
+    (set! (.semantic_audit ls) (.semantic_audit b))
+    (set! (.parent ls) (.parent b))
+    0))
+
+;;; FORM, a form of MODULE, with its macros expanded against the program the engine
+;;; stages from, as the tower would have: a definition a macro in it hoists joins that
+;;; program first, so the call the macro left expands too. QUALS names the macros.
+(defn expand-hoisting [(a (dyn Allocator))
+                       (form Sexp)
+                       (module (Option (slice u8)))
+                       (quals (ptr (ArrayList (slice u8))))] (-> (Result Sexp Diag))
+  (let [b (stage-box)
+        mctx (stage-box-mctx)
+        table (hoisted-forms)
+        ls (primitive/alloc-stack LS)
+        env (primitive/alloc-stack ExpEnv)
+        depth (primitive/alloc-stack i64)
+        (mut current) form
+        (mut no-structs) (ArrayList::new [StructDef] a)
+        (mut no-sums) (ArrayList::new [SumDef] a)]
+    (stage-resolve-ls a (mut ls))
+    (store! depth 0)
+    (set! (.macros env) quals)
+    (set! (.metaprograms env) (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a)))
+    (set! (.sub env) mctx)
+    (set! (.impb env) (box! a (AVec ImpEntry) (.imports b)))
+    (set! (.expb env) (box! a (AVec ExpEntry) (.exports b)))
+    (set! (.bound env) (box-al [ScopeEntry] a (ArrayList::new [ScopeEntry] a)))
+    (set! (.a env) a)
+    (block :expanded
+      (loop
+        (match (expand-top-form (box-sexp a (load current))
+                                module
+                                env
+                                (field (all-defn-names-memo (.sub-forms b)) items)
+                                (box-al [StructDef] a (load no-structs))
+                                (box-al [SumDef] a (load no-sums))
+                                depth
+                                (mut ls))
+          (Err [d] (break :expanded (Err [Sexp Diag] d)))
+          (Ok [out] (set! current out)))
+        (unless (hoist-pending?) (break))
+        (for [i 0 (len (load table))]
+          (let [e (elem table i)]
+            (when (.pending e)
+              (set! (.pending e) false)
+              (match (hoisted-form-add! a (.form e) (.module e) quals)
+                (Some [d] (break :expanded (Err [Sexp Diag] d)))
+                (None []
+                      (when (= (len (load (.type_params
+                                            (find-func-ptr mctx (qualify-name a (.name e) (.module e))))))
+                               0)
+                        (push! quals (qualify-name a (.name e) (.module e)))
+                        0)
+                      0))))))
+      (Ok [Sexp Diag] (load current)))))
+
+;;; Add FORM, a definition of MODULE a macro hoisted, to the program the engine stages
+;;; from, expanded (`expand-hoisting`).
+(defn hoisted-form-add! [(a (dyn Allocator))
+                         (form Sexp)
+                         (module (Option (slice u8)))
+                         (quals (ptr (ArrayList (slice u8))))] (-> (Option Diag))
+  (let [b (stage-box)
+        mctx (stage-box-mctx)
+        ls (primitive/alloc-stack LS)]
+    (stage-resolve-ls a (mut ls))
+    (match (expand-hoisting a form module quals)
+      (Err [d] (Some d))
+      (Ok [expanded]
+          (match (resolve-form-probe a
+                                     (mut ls)
+                                     (box-sexp a expanded)
+                                     module
+                                     (.bareok b)
+                                     (probe-bindings-new a))
+            (Err [d] (Some d))
+            (Ok [probe]
+                (do
+                  (push! (load (field mctx funcs))
+                         (get (load (load (field probe funcs))) 0))
+                  (set! (.mctx_names b) (primitive/cast (ptr FnNames) 0))
+                  (None [Diag]))))))))
+
+;;; The generic parameters an instance's form reads, the arguments that replace them,
+;;; and what is bound at the node being rewritten (`instance-form`).
+(defstruct InstanceArguments
+  [(params (ptr (ArrayList (slice u8))))
+   (arguments (ptr (ArrayList Sexp)))
+   (bound (ptr (ArrayList ScopeEntry)))])
+
+;;; The items of the list or vector NODE, a view among them.
+(defn instance-items [(a (dyn Allocator)) (node Sexp)] (-> (ptr (ArrayList Sexp)))
+  (let [(mut items) (ArrayList::new [Sexp] a)]
+    (for [k 0 (code-node-len node)]
+      (push! (mut items) (code-node-at node k)))
+    (box-al [Sexp] a (load items))))
+
+;;; The identifier NODE, or the argument it stands for: one of the parameters, read
+;;; where nothing in the form binds its name again. The argument takes its place in the
+;;; source, so what goes wrong with it is reported there.
+(defn instance-identifier [(a (dyn Allocator)) (args (ptr InstanceArguments)) (node Sexp)]
+  (-> Sexp)
+  (let [name (lexical-name a node)
+        params (.params args)
+        bound (.bound args)
+        (mut found) -1]
+    (for [k 0 (len (load params))]
+      (when (and (< (load found) 0) (= (get (load params) k) name))
+        (set! found k)
+        0))
+    (for [k 0 (len (load bound))]
+      (when (= (.name (elem bound k)) name)
+        (set! found -1)
+        0))
+    (if (< (load found) 0)
+        node
+        (let [out (primitive/alloc-stack Sexp)]
+          (set! out (get (load (.arguments args)) (load found)))
+          (set! (.lo out) (.lo node))
+          (set! (.hi out) (.hi node))
+          (set! (.source out) (.source node))
+          (set! (.ctxt out) (.ctxt node))
+          (load out)))))
+
+;;; The binder BINDER, with what it reads replaced (a type, a bound) and the identifier
+;;; it binds kept (`binder-identifier`).
+(defn instance-binder [(a (dyn Allocator)) (args (ptr InstanceArguments)) (binder Sexp)]
+  (-> Sexp)
+  (if (!= (sx-tag binder) 6)
+      binder
+      (let [items (instance-items a binder)
+            head (sx-head-name items)
+            kept (if (and (or (= head "mut") (= head "const")) (>= (sx-len items) 2)) 1 0)
+            (mut out) (ArrayList::new [Sexp] a)]
+        (for [k 0 (sx-len items)]
+          (push! (mut out)
+                 (cond (and (= kept 1) (= k 0)) (sx-at items k)
+                       (= k kept) (instance-binder a args (sx-at items k))
+                       :else (instance-node a args (sx-at items k) (PlainForm) 0))))
+        (traversed-sexp (KList (box-al [Sexp] a (load out))) (box-sexp a binder)))))
+
+;;; Whether child INDEX of ITEMS, which has ROLE, is binders: 1 for a binder, 2 for a
+;;; vector of them, 0 for neither.
+(defn instance-binder-slot [(items (ptr (ArrayList Sexp))) (role ScopeRole) (index i64)]
+  (-> i64)
+  (let [vector? (= (sx-tag (sx-at items index)) 7)]
+    (match role
+      (LetVector [] (if (= (primitive/irem index 2) 0) 1 0))
+      (MatchArm [] (if (and (= index 1) vector? (not (= (sx-head-name items) "_"))) 2 0))
+      (MemberForm [] (if (and (> index 0) vector?) 2 0))
+      (PlainForm []
+                 (if (and (> index 0) vector? (scope-definition-head? (sx-head-name items)))
+                     2
+                     0)))))
+
+;;; NODE, which has ROLE at quotation DEPTH, with each read of a generic parameter
+;;; replaced by its argument (`instance-form`).
+(defn instance-node [(a (dyn Allocator))
+                     (args (ptr InstanceArguments))
+                     (node Sexp)
+                     (role ScopeRole)
+                     (depth i64)] (-> Sexp)
+  (let [tag (sx-tag node)]
+    (cond (= tag 2) (instance-identifier a args node)
+          (or (= tag 6) (= tag 7) (= tag 8))
+            (let [items (instance-items a node)
+                  list? (!= tag 7)
+                  head (if list? (sx-head-name items) "")
+                  inner
+                    (cond (or (= head "quasiquote") (= head "quote")) (+ depth 1)
+                          (or (= head "unquote") (= head "unquote-splicing")) (- depth 1)
+                          :else depth)
+                  binds
+                    (and (= inner 0)
+                         (or list? (match role (LetVector [] true) (_ false))))
+                  bound (.bound args)
+                  mark (len (load bound))
+                  (mut out) (ArrayList::new [Sexp] a)]
+              (for [i 0 (sx-len items)]
+                (let [child (sx-at items i)
+                      slot (if binds (instance-binder-slot items role i) 0)]
+                  (when binds
+                    (scope-step-binds! a bound items role i)
+                    0)
+                  (push! (mut out)
+                         (cond (= slot 1) (instance-binder a args child)
+                               (= slot 2)
+                                 (let [binders (instance-items a child)
+                                       (mut kept) (ArrayList::new [Sexp] a)]
+                                   (for [k 0 (sx-len binders)]
+                                     (push! (mut kept) (instance-binder a args (sx-at binders k))))
+                                   (traversed-sexp (KVec (box-al [Sexp] a (load kept)))
+                                                   (box-sexp a child)))
+                               :else
+                                 (instance-node a
+                                                args
+                                                child
+                                                (if (and binds list?)
+                                                    (scope-child-role items role i)
+                                                    (PlainForm))
+                                                inner)))))
+              (set! (.len bound) mark)
+              (traversed-sexp (if list?
+                                  (KList (box-al [Sexp] a (load out)))
+                                  (KVec (box-al [Sexp] a (load out))))
+                              (box-sexp a node)))
+          :else node)))
+
+;;; FORM with each read of a generic parameter among PARAMS replaced by the argument at
+;;; the same place in ARGUMENTS: a type by its source spelling, a constant as its
+;;; literal. A name FORM binds again is not the parameter where that binding is seen, as
+;;; for every walk that keeps a scope (`scope-step-binds!`); a binding a macro in FORM
+;;; makes is not seen until it is expanded.
+(defn instance-form [(a (dyn Allocator))
+                     (form Sexp)
+                     (params (ptr (ArrayList (slice u8))))
+                     (arguments (ptr (ArrayList Sexp)))] (-> Sexp)
+  (let [args (primitive/alloc-stack InstanceArguments)]
+    (set! (.params args) params)
+    (set! (.arguments args) arguments)
+    (set! (.bound args) (box-al [ScopeEntry] a (ArrayList::new [ScopeEntry] a)))
+    (instance-node a args form (PlainForm) 0)))
+
+;;; FORM, an expression of MODULE, expanded and resolved against the program the engine
+;;; stages from: what a form in the program would be by the time it is checked. This is
+;;; what `code-specialized-value` comes to in an instance of a generic, with the
+;;; instance's ARGUMENTS for its PARAMS (`instance-form`).
+(defn instance-form-value [(a (dyn Allocator))
+                           (generic-form Sexp)
+                           (params (ptr (ArrayList (slice u8))))
+                           (arguments (ptr (ArrayList Sexp)))
+                           (module (Option (slice u8)))] (-> (Result (ptr Expr) Diag))
+  (let [b (stage-box)
+        mctx (stage-box-mctx)
+        ls (primitive/alloc-stack LS)
+        form (instance-form a generic-form params arguments)
+        (mut items) (ArrayList::new [Sexp] a)
+        (mut no-params) (ArrayList::new [Sexp] a)
+        (mut ret) (ArrayList::new [Sexp] a)]
+    (if (= (primitive/cast i64 mctx) 0)
+        (Err [(ptr Expr) Diag]
+             (derr "an instance of a generic was specialized with no program to expand its forms in (compiler bug)"))
+        (do
+          (stage-resolve-ls a (mut ls))
+          (push! (mut ret) (sx-sym "->"))
+          (push! (mut ret) (sx-sym "i64"))
+          (push! (mut items) (sx-sym "defn*"))
+          (push! (mut items) (sx-sym (sconcat a "instance$value$" (i64->str a (next-gensym)))))
+          (push! (mut items) (mk-sexp (KVec (box-al [Sexp] a (load no-params))) -1 -1))
+          (push! (mut items) (sx-mklist (box-al [Sexp] a (load ret))))
+          (push! (mut items) form)
+          (match (expand-hoisting a
+                                  (sx-mklist (box-al [Sexp] a (load items)))
+                                  module
+                                  (code-sig-funcs mctx a))
+            (Err [d] (Err [(ptr Expr) Diag] d))
+            (Ok [expanded]
+                (match (resolve-form-probe a
+                                           (mut ls)
+                                           (box-sexp a expanded)
+                                           module
+                                           (.bareok b)
+                                           (probe-bindings-new a))
+                  (Err [d] (Err [(ptr Expr) Diag] d))
+                  (Ok [probe]
+                      (Ok [(ptr Expr) Diag]
+                          (elem (.body (elem (load (field probe funcs)) 0)) 0))))))))))
+
+;;; The expander, as what specialization asks of it (`InstanceExpansion`): it expands
+;;; against the program the generation stages from.
+(defstruct StagedInstances [])
+
+(impl InstanceExpansion StagedInstances
+  (expand-for-instance [(self (ptr StagedInstances))
+                        (a (dyn Allocator))
+                        (form Sexp)
+                        (params (ptr (ArrayList (slice u8))))
+                        (arguments (ptr (ArrayList Sexp)))
+                        (module (Option (slice u8)))]
+                       (-> (Result (ptr Expr) Diag))
+    (instance-form-value a form params arguments module)))
+
+;;; What specialization asks to expand a form for an instance of a generic.
+(defn staged-instances [] (-> (dyn InstanceExpansion))
+  (primitive/alloc-static StagedInstances))
 
 (defn stage-box-set! [(s (mut LS))
                       (sub-forms (ptr (ArrayList TaggedForm)))
@@ -4412,7 +5088,34 @@
               (close! work)
               (Some (load owned)))))))
 
+;;; A closure the check below may rewrite. An accepted function it read through to
+;;; stays that function, the same body: the check knows such a body by its address,
+;;; and would otherwise check a second time what was already checked.
+(defn clone-closure-keeping-accepted [(a (dyn Allocator)) (sub (ptr Program))]
+  (-> (ptr Program))
+  (let [out (semantic-clone-program a sub)
+        from (load (field sub funcs))
+        to (load (field out funcs))]
+    (for [i 0 (len (load from))]
+      (let [f (elem from i)]
+        (when (closure-base-accepted? f)
+          (set! (elem to i) (load f))
+          0)))
+    out))
+
+;;; Compile macro Q into the engine, from the smallest closure that may do, which
+;;; leaves out trait impls and constants its code does not name. When that does not
+;;; check, a dynamic dispatch needing an impl, say, the whole closure may.
 (defn stage-one-macro-work! [(q (slice u8)) (a (dyn Allocator))]
+  (-> (Option Diag))
+  (match (stage-one-macro-closure! q a false)
+    (None [] (None [Diag]))
+    (Some [d]
+          (match (stage-one-macro-closure! q a true)
+            (None [] (None [Diag]))
+            (Some [_] (Some d))))))
+
+(defn stage-one-macro-closure! [(q (slice u8)) (a (dyn Allocator)) (whole bool)]
   (-> (Option Diag))
   (let [b (stage-box)
         excluded (load (field b excluded))]
@@ -4432,17 +5135,21 @@
                                          mctx
                                          (box-al [(slice u8)] a (load seedl)))
                       wanted
-                        (closure-funcs-pruned mctx
-                                              (stage-box-mctx-names mctx)
-                                              seeds
-                                              a)
+                        (if whole
+                            (closure-funcs mctx seeds a)
+                            (closure-funcs-pruned mctx
+                                                  (stage-box-mctx-names mctx)
+                                                  seeds
+                                                  a))
                       ; Checking may rewrite expressions and parameter storage.
                       ; Never let a failed scratch check mutate the source context.
                       sub
-                        (semantic-clone-program a
-                                                (closure-subprogram-pruned mctx
-                                                                           wanted
-                                                                           a))
+                        (clone-closure-keeping-accepted a
+                                                        (if whole
+                                                            (closure-subprogram mctx wanted a)
+                                                            (closure-subprogram-pruned mctx
+                                                                                       wanted
+                                                                                       a)))
                       checkls (primitive/alloc-stack LS)
                       (mut squal) (ArrayList::new [(slice u8)] a)]
                   (push! (mut squal) q)
@@ -4500,7 +5207,8 @@
                                                              checked
                                                              (box-al [(slice u8)]
                                                                      a
-                                                                     (load squal)))]
+                                                                     (load squal))
+                                                             (staged-instances))]
                                     (match setup
                                       (Some [d] (Some d))
                                       (None [] (None [Diag])))))
@@ -4784,7 +5492,6 @@
                             (tower-snapshot-shallow a
                                                     out-forms
                                                     (len (load out-forms)))
-                          original-metas (tower-meta-snapshot a out-forms)
                           _snapshot-end (tr/span-end snapshot-span)
                           subforms-span
                             (tr/span-begin "frontend.expand.meta-subforms")
@@ -4814,7 +5521,6 @@
                                                   0
                                                   (len (load out-forms))
                                                   authored
-                                                  original-metas
                                                   excluded
                                                   exclude-closure
                                                   resumed)
@@ -4822,7 +5528,7 @@
                               result))))))))))
 
 ; ── the host stage of a cross build ───────────────────────────────────────────
-; Code that runs inside the compiler -- macros, `(meta …)` generators, transforms
+; Code that runs inside the compiler -- macros and transforms
 ; and checkers -- runs on the host. When the target is the host's own platform,
 ; one expansion serves both it and the program. In a cross build every target
 ; question (`target-os`, `target-arch`, the width of `usize`) has two answers,
@@ -5781,7 +6487,7 @@
                                a)
               (Err [d] (Err [i64 Diag] d))
               (Ok [expanded]
-                  (if (= expanded 2)
+                  (if (or (= expanded 2) (generated-imports-loaded! (mut s)))
                       (stage3-restart! (mut s)
                                        excluded
                                        exclude-closure
@@ -5789,8 +6495,76 @@
                                        normalized)
                       (Ok [i64 Diag] 0)))))))
 
+;;; Process each import the program's expansion produced, for the program's own
+;;; tables: the twin saw them when its tower expanded the macro, the program has only
+;;; just met them. Whether one loaded a module the program did not have, whose forms
+;;; then need expanding in their turn.
+(defn generated-imports-loaded! [(s (mut LS))] (-> bool)
+  (let [before (len (.out s))]
+    (for [i 0 before]
+      (let [tf (elem (mut (.out s)) i)
+            f (field tf form)]
+        (when (and (!= (sx-ctxt (load f)) 0)
+                   (= (sx-tag (load f)) 6)
+                   (> (sx-len (sx-items (load f))) 0)
+                   (= (sx-tag (sx-at (sx-items (load f)) 0)) 2)
+                   (= (sx-sval (sx-at (sx-items (load f)) 0)) "import"))
+          (rebuild-top-level! (mut s) f (.module tf) "import")
+          0)))
+    (> (len (.out s)) before)))
+
+;;; Put the forms macros hoisted since the last time into the tower's working list,
+;;; after its first NMAIN forms, which are the program's; how many there were.
+(defn hoisted-into-tower! [(sub-forms (ptr (ArrayList TaggedForm))) (nmain i64)] (-> i64)
+  (let [table (hoisted-forms)
+        (mut added) (ArrayList::new [TaggedForm] (unit-allocator))]
+    (for [i 0 (len (load table))]
+      (let [e (elem table i)]
+        (when (.pending e)
+          (set! (.pending e) false)
+          (set! (last-introduced-macro) (.name e))
+          ; A macro made it: its spans are its parts', not a parsed form's nesting.
+          (let [tf (primitive/alloc-stack TaggedForm)]
+            (store! tf (mk-tagged (.form e) (.module e)))
+            (tagged-rewrite! tf (.form e))
+            (push! (mut added) (load tf)))
+          0)))
+    (let [n (len added)]
+      (when (> n 0)
+        (for [i 0 n] (push! sub-forms (get added i)))
+        ; what stood after the program's forms moves up past them
+        (let [total (len (load sub-forms))]
+          (for [k 0 (- total nmain n)]
+            (let [from (- total n k 1)
+                  to (- total k 1)]
+              (set! (elem sub-forms to) (load (elem sub-forms from)))))
+          (for [i 0 n]
+            (set! (elem sub-forms (+ nmain i)) (get added i))))
+        0)
+      n)))
+
+;;; Add to the forms a rebuilt expansion starts from each one a macro hoisted: those
+;;; that wait, and those the macro tower took, which joined only the generation it
+;;; rebuilds; whether any waited.
+(defn hoisted-into-program! [(s (mut LS))] (-> bool)
+  (let [table (hoisted-forms)
+        (mut any) false]
+    (for [i 0 (len (load table))]
+      (let [e (elem table i)]
+        (when (.pending e)
+          (set! (.pending e) false)
+          (set! any true)
+          (set! (last-introduced-macro) (.name e))
+          0)
+        (unless (.authored e)
+          (set! (.authored e) true)
+          (push-checked-form! (mut s) (.form e) (.module e))
+          (let [(mut out) (.out s)]
+            (tagged-rewrite! (elem (mut out) (- (len out) 1)) (.form e))))))
+    (load any)))
+
 ;;; Rebuild stage 3 over a program a before-expand transform rewrote, or that
-;;; (meta …) output extended, resuming from the abandoned generation's authored
+;;; a top-level macro extended, resuming from the abandoned generation's authored
 ;;; snapshot and working copy. Bounded: a transform that keeps introducing new
 ;;; compile-time functions is an error.
 (defn stage3-restart! [(s (mut LS))
@@ -5801,10 +6575,10 @@
   (-> (Result i64 Diag))
   (let [cell (stage3-restart-count)
         a (.a s)]
-    (if (>= (load cell) 8)
+    (if (>= (load cell) 32)
         (Err [i64 Diag]
              (derr (sconcat a
-                            "before-expand transforms kept introducing compile-time definitions; last: "
+                            "compile-time definitions kept being introduced; last: "
                             (load (last-introduced-macro)))))
         (do
           (store! cell (+ (load cell) 1))
@@ -5921,81 +6695,6 @@
       0)
     (box-al [TaggedForm] a (load out))))
 
-(defn tower-meta-snapshot [(a (dyn Allocator))
-                           (forms (ptr (ArrayList TaggedForm)))]
-  (-> (ptr (ArrayList TaggedForm)))
-  (let [(mut out) (ArrayList::new [TaggedForm] a)
-        n (len (load forms))
-        (mut i) 0]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (let [src (elem forms (load i))]
-                  (when (is-meta-form (field src form))
-                    (let [dst (primitive/alloc-stack TaggedForm)]
-                      (store! (field dst form)
-                              (tower-clone-sexp a (field src form)))
-                      (store! (field dst module) (load (field src module)))
-                      (store! (field dst form_id) (load (field src form_id)))
-                      (store! (field dst revision) (load (field src revision)))
-                      (store! (field dst cached_shape)
-                              (load (field src cached_shape)))
-                      (push! (mut out) (load dst)))
-                    0))
-                (set! i (primitive/iadd (load i) 1)))))
-    (box-al [TaggedForm] a (load out))))
-
-(defn tower-capture-metas! [(a (dyn Allocator))
-                            (forms (ptr (ArrayList TaggedForm)))
-                            (metas (ptr (ArrayList TaggedForm)))] (-> i64)
-  (when (= (len (load metas)) 0)
-    (let [n (len (load forms))
-          (mut i) 0]
-      (loop (if (>= (load i) n)
-                (break)
-                (do
-                  (let [src (elem forms (load i))]
-                    (when (is-meta-form (field src form))
-                      (let [dst (primitive/alloc-stack TaggedForm)]
-                        (store! (field dst form)
-                                (tower-clone-sexp a (field src form)))
-                        (store! (field dst module) (load (field src module)))
-                        (store! (field dst form_id) (load (field src form_id)))
-                        (store! (field dst revision)
-                                (load (field src revision)))
-                        (store! (field dst cached_shape)
-                                (load (field src cached_shape)))
-                        (push! [TaggedForm] metas (load dst)))
-                      0))
-                  (store! i (primitive/iadd (load i) 1))))))
-    0)
-  0)
-
-(defn tower-restore-metas! [(s (mut LS))
-                            (metas (ptr (ArrayList TaggedForm)))] (-> i64)
-  (let [a (.a s)
-        old (box-al [TaggedForm] a (.out s))
-        (mut out) (ArrayList::new [TaggedForm] a)
-        no (len (load old))
-        (mut j) 0
-        n (len (load metas))
-        (mut i) 0]
-    (loop (if (>= (load j) no)
-              (break)
-              (do
-                (let [tf (elem old (load j))]
-                  (unless (is-meta-form (field tf form))
-                    (push! (mut out) (load tf))
-                    0))
-                (set! j (primitive/iadd (load j) 1)))))
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (push! (mut out) (get (load metas) (load i)))
-                (set! i (primitive/iadd (load i) 1)))))
-    (set! (.out s) (load out))
-    0))
-
 ; ── LOCAL convergence of one rejected function ──────────────────────────────
 ; A rejected macro call is expanded outermost-first, so a function whose generated
 ; code nests N macro layers used to need N whole generations: every one resolved and
@@ -6044,7 +6743,6 @@
        (tower-list-empty? [StaticAssert] (load (field p asserts)))
        (tower-list-empty? [Const] (load (field p consts)))
        (tower-list-empty? [TraitDef] (load (field p traits)))
-       (tower-list-empty? [Expr] (load (field p metas)))
        (tower-list-empty? [ExportC] (load (field p exports)))))
 
 ;;; The single function a probed form declares, or null when it declares anything
@@ -6479,8 +7177,7 @@
                      (primitive/cast (ptr scratch/ScratchArena) raw))
   (close! (primitive/cast (ptr scratch/ScratchArena) raw)))
 
-;;; The whole-program resolve of the macro tower and of the program's generators,
-;;; which read only what their compile-time code reaches. Function bodies stay
+;;; The whole-program resolve of the macro tower, which reads only what their compile-time code reaches. Function bodies stay
 ;;; unparsed until the closure walk reaches them (resolve.coil, LazyBody), except
 ;;; where something reads them all: a lint analysis records facts about every
 ;;; authored node as it is qualified, and the interpreter engine runs from the
@@ -6520,15 +7217,32 @@
                     (round i64)
                     (nmain i64)
                     (authored (ptr (ArrayList TaggedForm)))
-                    (original-metas (ptr (ArrayList TaggedForm)))
+                    (excluded (ptr (ArrayList (slice u8))))
+                    (exclude-closure bool)
+                    (resumed bool)] (-> (Result i64 Diag))
+  ; A macro the last round ran added a definition. The next round resolves the
+  ; forms afresh, so it only has to join them, among the program's own.
+  (stage3-round-work (mut s)
+                     sub-forms
+                     a
+                     round
+                     (+ nmain (hoisted-into-tower! sub-forms nmain))
+                     authored
+                     excluded
+                     exclude-closure
+                     resumed))
+
+(defn stage3-round-work [(s (mut LS))
+                    (sub-forms (ptr (ArrayList TaggedForm)))
+                    (a (dyn Allocator))
+                    (round i64)
+                    (nmain i64)
+                    (authored (ptr (ArrayList TaggedForm)))
                     (excluded (ptr (ArrayList (slice u8))))
                     (exclude-closure bool)
                     ; SUB-FORMS started from a previous generation's rewrites
                     ; (`tower-resume-forms!`), so even round 0 differs from s.out.
                     (resumed bool)] (-> (Result i64 Diag))
-  (let [capture-span (tr/span-begin "frontend.expand.round.capture-metas")]
-    (tower-capture-metas! a sub-forms original-metas)
-    (tr/span-end capture-span))
   ; Each failed tower generation builds a complete tolerant Program and checked
   ; closure. Those are generation-local. Keeping them in the compiler's root arena
   ; retained every failed generation until process exit. A segmented scratch arena
@@ -6578,10 +7292,10 @@
       (match resolve-result
         (Err [d] (Err [i64 Diag] d))
         (Ok [macroctx]
-            ; A later-phase entry owns its transitive helper closure. Otherwise a
-            ; Code-signed helper in a reader-provider body is selected as an ordinary
-            ; definition-time macro and executes against the body's syntax (`context`)
-            ; rather than the invocation-time Code value supplied by the reader.
+            ; A `stage` declaration owns its transitive helper closure: it is
+            ; compiled on its own, later, and nothing here may stage it. A reader
+            ; entry is excluded by name alone. It is not a macro, since no call site
+            ; runs it, but its body is still metaprogram code.
             (let [phase-owned
                     (if exclude-closure
                         (closure-module-funcs-pruned macroctx excluded wa)
@@ -6597,7 +7311,9 @@
                                 sub-forms
                                 (persist-names phase-owned a)
                                 macroctx
-                                a))
+                                a)
+                (set! (.bareok (stage-box)) (load bareok-slot))
+                0)
               (if (= (len (load quals)) 0)
                   (if (.host_role s)
                       (host-stage-record! (mut s)
@@ -6643,7 +7359,6 @@
                                                         (primitive/iadd round 1)
                                                         nmain
                                                         authored
-                                                        original-metas
                                                         excluded
                                                         exclude-closure
                                                         resumed)]
@@ -6655,7 +7370,12 @@
                                     compile-time
                                       (compile-time-seeds macroctx
                                                           quals
-                                                          phase-owned
+                                                          (if exclude-closure
+                                                              phase-owned
+                                                              (box-al [(slice u8)]
+                                                                      wa
+                                                                      (ArrayList::new [(slice u8)]
+                                                                                      wa)))
                                                           wa)
                                     seeds
                                       (if (meta-compiled?)
@@ -6759,7 +7479,6 @@
                                                                          1)
                                                                       nmain
                                                                       authored
-                                                                      original-metas
                                                                       excluded
                                                                       exclude-closure
                                                                       resumed)))
@@ -6784,7 +7503,8 @@
                                                             (if (meta-compiled?)
                                                                 (meta-engine-setup a
                                                                                    checked
-                                                                                   quals)
+                                                                                   quals
+                                                                                   (staged-instances))
                                                                 (None [Diag]))
                                                           _setup-end
                                                             (tr/span-end setup-span)]
@@ -6831,15 +7551,7 @@
                                                                                                  exclude-closure
                                                                                                  authored
                                                                                                  tower-out)
-                                                                                (do
-                                                                                  (let [restore-span
-                                                                                          (tr/span-begin "frontend.expand.round.restore-metas")]
-                                                                                    (tower-restore-metas! (mut s)
-                                                                                                          original-metas)
-                                                                                    (tr/span-end restore-span))
-                                                                                  (Ok [i64
-                                                                                       Diag]
-                                                                                      0))))))))))))))))
+                                                                                (Ok [i64 Diag] 0)))))))))))))))
                                     (Err [d]
                                          ; the tower: if the check rejected the sub-program AT a
                                          ; macro-headed call form, expand that call and go again; if it
@@ -6878,31 +7590,8 @@
                                                  (Ok [hit]
                                                      (if (= hit
                                                             0)
-                                                         ; A real error — unless the program's own (meta …)
-                                                         ; forms would declare what the closure is missing: a
-                                                         ; library function a macro calls may read a constant
-                                                         ; its module generates (coil.fs's O_CREAT). Run those
-                                                         ; generators now and expand again; if they cannot run
-                                                         ; yet, the original error stands.
-                                                         (if (> (len (load original-metas))
-                                                                0)
-                                                             (match (elaborate-metas-from-tower! a
-                                                                                                 (mut s)
-                                                                                                 sub-forms)
-                                                               (Err [_]
-                                                                    (Err [i64
-                                                                          Diag]
-                                                                         (stage3-stuck-diag sub-forms
-                                                                                            d)))
-                                                               (Ok [_]
-                                                                   (stage3-restart! (mut s)
-                                                                                    excluded
-                                                                                    exclude-closure
-                                                                                    authored
-                                                                                    sub-forms)))
-                                                             (Err [i64 Diag]
-                                                                  (stage3-stuck-diag sub-forms
-                                                                                     d)))
+                                                         (Err [i64 Diag]
+     (stage3-stuck-diag sub-forms d))
                                                          ; the let defeats self-tail-call elimination (musttail
                                                          ; rejects this frame); depth is bounded by stage3-max-rounds (64 plus a
                                                          ; round per sub-form, at most 4096), each a frame on the compiler's deep stack
@@ -6947,7 +7636,6 @@
                                                                                                1)
                                                                                nmain
                                                                                authored
-                                                                               original-metas
                                                                                excluded
                                                                                exclude-closure
                                                                                resumed)]
@@ -7149,7 +7837,7 @@
 
 ; Both inputs are already qualified and checked. Merge declarations only; doing a
 ; source-level resolve here would throw away declarations produced by top-level
-; metas, while rechecking the settled Program is invalid after checking has
+; macros, while rechecking the settled Program is invalid after checking has
 ; normalized its function signatures.
 (defn merge-checked-read-programs [(a (dyn Allocator))
                                    (settled (ptr Program))
@@ -7171,23 +7859,29 @@
 (defstruct PreparedReadProgram
   [(program (ptr Program)) (maps (ptr SemMapsSnap))])
 
+;;; Why NAME cannot be a provider entry of AUTHORITATIVE, if it cannot.
+(defn read-entry-problem [(a (dyn Allocator))
+                          (authoritative (ptr Program))
+                          (name (slice u8))] (-> (Option Diag))
+  (let [entry (prog-fn-find authoritative name)]
+    (cond (= (primitive/cast i64 entry) 0)
+            (Some (derr (sconcat3 a
+                                  "read phase: provider '"
+                                  name
+                                  "' is absent from the settled program")))
+          (not (and (type-is-code (field entry ret))
+                    (all-params-code (load (field entry params)))))
+            (Some (derr "read phase: provider must take only Code parameters and return Code"))
+          :else (None [Diag]))))
+
 (defn prepare-read-program [(a (dyn Allocator))
                             (s (mut LS))
                             (authoritative (ptr Program))
                             (name (slice u8))]
   (-> (Result PreparedReadProgram Diag))
-  (let [entry (prog-fn-find authoritative name)]
-    (if (= (primitive/cast i64 entry) 0)
-        (Err [PreparedReadProgram Diag]
-             (derr (sconcat3 a
-                             "read phase: provider '"
-                             name
-                             "' is absent from the settled program")))
-        (if (not (and (type-is-code (field entry ret))
-                      (all-params-code (load (field entry params)))))
-            (Err [PreparedReadProgram Diag]
-                 (derr "read phase: provider must take only Code parameters and return Code"))
-            (prepare-meta-program a (mut s) authoritative)))))
+  (match (read-entry-problem a authoritative name)
+    (Some [d] (Err [PreparedReadProgram Diag] d))
+    (None [] (prepare-meta-program a (mut s) authoritative))))
 
 ;;; AUTHORITATIVE, a settled checked program, merged with a separately checked
 ;;; metashim, and the semantic maps of both: what metalower compiles a native
@@ -7273,25 +7967,54 @@
 
 ; Source readers keep their existing setup behavior. Artifact builders consume
 ; the same prepared program/maps without first constructing a transient image.
+;;; One engine holding the entries QUALS (null for NAME alone), of which NAME is
+;;; the one about to be called.
 (defn prepare-read-entry [(a (dyn Allocator))
                           (s (mut LS))
                           (authoritative (ptr Program))
-                          (name (slice u8))] (-> (Result (ptr Program) Diag))
-  (match (prepare-read-program a (mut s) authoritative name)
+                          (name (slice u8))
+                          (together (ptr (ArrayList (slice u8))))]
+  (-> (Result (ptr Program) Diag))
+  (let [(mut quals) (ArrayList::new [(slice u8)] a)
+        (mut problem) (None [Diag])]
+    (push! (mut quals) name)
+    (unless (= (primitive/cast i64 together) 0)
+      (for [i 0 (len (load together))]
+        (let [q (get (load together) i)]
+          (when (!= q name) (push! (mut quals) q) 0))
+        0)
+      0)
+    (for [i 0 (len (load quals))]
+      (match (load problem)
+        (Some [_] 0)
+        (None []
+              (do
+                (set! problem
+                      (read-entry-problem a authoritative (get (load quals) i)))
+                0))))
+    (match (load problem)
+      (Some [d] (Err [(ptr Program) Diag] d))
+      (None [] (prepare-read-engine a (mut s) authoritative (load quals))))))
+
+(defn prepare-read-engine [(a (dyn Allocator))
+                           (s (mut LS))
+                           (authoritative (ptr Program))
+                           (quals (ArrayList (slice u8)))]
+  (-> (Result (ptr Program) Diag))
+  (match (prepare-meta-program a (mut s) authoritative)
     (Err [d] (Err [(ptr Program) Diag] d))
     (Ok [prepared]
         (let [entry prepared
-              saved (primitive/alloc-stack SemMapsSnap)
-              (mut quals) (ArrayList::new [(slice u8)] a)]
+              saved (primitive/alloc-stack SemMapsSnap)]
           (sem-maps-save saved)
           (sem-maps-restore (.maps entry))
-          (push! (mut quals) name)
           (let [setup
                   (meta-engine-setup-replace a
                                              (.program entry)
                                              (box-al [(slice u8)]
                                                      a
-                                                     (load quals)))]
+                                                     (load quals))
+                                             (staged-instances))]
             (sem-maps-restore saved)
             (match setup
               (Some [d] (Err [(ptr Program) Diag] d))
@@ -7316,7 +8039,7 @@
     (let [cache (load (reader-engine-cache-cell))
           cached
             (and (!= (primitive/cast i64 cache) 0)
-                 (and (.valid cache) (= (.name cache) name)))
+                 (reader-engine-cache-serves? cache name))
           result
             (match (if cached
                        ; The provider was compiled once, by an earlier read in
@@ -7325,7 +8048,19 @@
                          (reader-engine-cache-install! cache)
                          (tr/count "reader.engine-reuses" 1)
                          (Ok [(ptr Program) Diag] checked))
-                       (prepare-read-entry a (mut s) checked name))
+                       ; compiled for the host, which runs it
+                       (let [target (host-target-enter!)
+                             prepared
+                               (prepare-read-entry a
+                                                   (mut s)
+                                                   checked
+                                                   name
+                                                   (if (= (primitive/cast i64 cache) 0)
+                                                       (primitive/cast (ptr (ArrayList (slice u8)))
+                                                                       0)
+                                                       (.together cache)))]
+                         (target-cell-swap! target)
+                         prepared))
               (Err [d]
                    (do
                      (meta-engine-scope-leave! scope)
@@ -7500,11 +8235,6 @@
                 (set! i (primitive/iadd (load i) 1))))))
   0)
 
-;;; Set while the program is expanded again after meta elaboration
-;;; (resolve-meta-output), when the registered checkers have already run.
-(defn checkers-quiet [] (-> (ptr bool))
-  (primitive/alloc-static bool))
-
 ;;; `syntax-phase` is what separates the two checker registries: `(checker FN :phase
 ;;; (phase/BeforeExpand))` runs against the untouched authored forms, plain `(checker FN)`
 ;;; runs after expansion. Only the syntax phase is shown the import/export
@@ -7525,7 +8255,7 @@
                     (code-session-state (ptr i8))
                     (expansions (ptr (AVec Expansion)))] (-> (Option Diag))
   (let [nc (len (load checkers))]
-    (if (or (= nc 0) (load (checkers-quiet)))
+    (if (= nc 0)
         (None [Diag])
         ; hand the checker the program as a LIST OF MODULES: ((name form…) …) — it owns
         ; the loop and decides which modules to look at.
@@ -7571,7 +8301,7 @@
    (checkers (ptr (ArrayList (slice u8))))
    (semtx-once (ptr (ArrayList (slice u8))))
    (semtx (ptr (ArrayList (slice u8))))
-   ; The `:phase (phase/AfterExpand)` transforms, which meta output passes through too.
+   ; The `:phase (phase/AfterExpand)` transforms.
    (posttx (ptr (ArrayList (slice u8))))
    ; Whether a registration reads every module, the library's among them (no
    ; `:modules (phase/OwnModules)`): a compile on the library state cannot run it.
@@ -7580,7 +8310,7 @@
    ; Exact definition-time environment retained by run-expand for later meta
    ; output. Recomputing it from checked would promote phase-owned helpers.
    (macros (ptr (ArrayList (slice u8))))
-   (comptime (ptr (ArrayList (slice u8))))
+   (metaprograms (ptr (ArrayList (slice u8))))
    (expanded (ArrayList TaggedForm))
    (allfns (ptr SBox))
    (gs (ptr SBoxStruct))
@@ -8103,737 +8833,11 @@
     (set! (load (field s check_diags)) (load out))
     0))
 
-; ---- (meta …) on the COMPILED engine (interp deletion step 4) ---------------------
-; Mirrors comptime.coil::elaborate-metas / run-metas, but the generator sub-program
-; is built at the PRE-CHECK form level — metashim forms injected via meta-sub-forms,
-; exactly like the macro engine — and each meta expression is wrapped as a synthetic
-; zero-parameter Code-returning entry (`coil.meta.<elaboration>.<i>`) that meta-engine-setup
-; compiles and meta-engine-run-env executes as native code. Result handling (splice
-; a returned `(do …)`, else push the form) and the final splice + strict re-resolve
-; + check are byte-for-byte the interpreter path's semantics.
-(defn meta-elaboration-id [] (-> i64)
-  (let [p (field (expander-unit-state) elaboration_id)
-        n (primitive/iadd (load p) 1)]
-    (set! p n)
-    n))
-
-;;; Run the program's (meta …) generators and splice what they produce in place
-;;; of them, without resolving or checking the result.
-;;;
-;;; They run as one program, checked before any of them runs. That check fails
-;;; when one generator's code reads what another generates: a generator calling
-;;; `coil.fs`'s `write-file` needs the `O_CREAT` that coil.fs's own generator
-;;; writes. Then every generator that checks on its own runs first, the program is
-;;; expanded again with their output, and the rest are tried again; the first
-;;; error stands when none can run. The macro tower does the same when a macro's
-;;; code needs a generator's output (`elaborate-metas-from-tower!`).
-(defn elaborate-metas-into! [(a (dyn Allocator)) (s (mut LS))]
-  (-> (Result i64 Diag))
-  (let [ran (primitive/alloc-stack bool)
-        none (primitive/cast (ptr (ArrayList TaggedForm)) 0)]
-    (store! ran false)
-    (match (elaborate-metas-attempt! a
-                                     (mut s)
-                                     none
-                                     -1
-                                     ran
-                                     (primitive/cast (ptr MetaOutput) 0))
-      (Ok [r] (Ok [i64 Diag] r))
-      (Err [d]
-           (if (load ran)
-               (Err [i64 Diag] d)
-               (match (elaborate-metas-runnable! a (mut s) none)
-                 (Err [d2] (Err [i64 Diag] d2))
-                 (Ok [progressed]
-                     (if (not progressed)
-                         (Err [i64 Diag] d)
-                         (let [registry (load (checker-reg-box))
-                               quiet (checkers-quiet)
-                               was-quiet (load quiet)
-                               _quiet (store! quiet true)
-                               expanded (expand-stage3 (mut s))]
-                           (store! quiet was-quiet)
-                           (store! (checker-reg-box) registry)
-                           (match expanded
-                             (Err [d3] (Err [i64 Diag] d3))
-                             (Ok [_] (elaborate-metas-into! a (mut s)))))))))))))
-
-;;; The macro tower's run of the program's generators over its working copy
-;;; SUB-FORMS, whose definitions it has expanded. When they do not check as one,
-;;; the ones that check on their own run, and the tower starts again.
-(defn elaborate-metas-from-tower! [(a (dyn Allocator))
-                                   (s (mut LS))
-                                   (sub-forms (ptr (ArrayList TaggedForm)))]
-  (-> (Result i64 Diag))
-  (let [ran (primitive/alloc-stack bool)]
-    (store! ran false)
-    (match (elaborate-metas-attempt! a
-                                     (mut s)
-                                     sub-forms
-                                     -1
-                                     ran
-                                     (primitive/cast (ptr MetaOutput) 0))
-      (Ok [r] (Ok [i64 Diag] r))
-      (Err [d]
-           (if (load ran)
-               (Err [i64 Diag] d)
-               (match (elaborate-metas-runnable! a (mut s) sub-forms)
-                 (Err [d2] (Err [i64 Diag] d2))
-                 (Ok [progressed]
-                     (if progressed (Ok [i64 Diag] 0) (Err [i64 Diag] d)))))))))
-
-;;; What generators produced, held back to be spliced together.
-(defstruct MetaOutput
-  [(gen (ArrayList Sexp))
-   (genmods (ArrayList (Option (slice u8))))
-   (picked (ArrayList i64))])
-
-;;; Run, one at a time, every generator whose code checks on its own, over
-;;; SUB-FORMS (the program's own forms when null), then splice what they produced
-;;; in place of them. True when any ran; an error when one failed while running.
-(defn elaborate-metas-runnable! [(a (dyn Allocator))
-                                 (s (mut LS))
-                                 (sub-forms (ptr (ArrayList TaggedForm)))]
-  (-> (Result bool Diag))
-  (let [(mut n) 0
-        out
-          (box! a
-                MetaOutput
-                (MetaOutput
-                  :gen (ArrayList::new [Sexp] a)
-                  :genmods (ArrayList::new [(Option (slice u8))] a)
-                  :picked (ArrayList::new [i64] a)))]
-    (for [i 0 (len (.out s))]
-      (when (is-meta-form (field (elem (field s out) i) form))
-        (set! n (+ (load n) 1))
-        0))
-    (block :done
-      (for [k 0 (load n)]
-        (let [ran (primitive/alloc-stack bool)]
-          (store! ran false)
-          (match (elaborate-metas-attempt! a (mut s) sub-forms k ran out)
-            (Ok [_] 0)
-            (Err [d] (do (when (load ran) (break :done (Err [bool Diag] d))) 0)))))
-      (splice-metas (mut s)
-                    (box-al [Sexp] a (.gen out))
-                    (box-al [(Option (slice u8))] a (.genmods out))
-                    (box-al [i64] a (.picked out))
-                    a)
-      (Ok [bool Diag] (> (len (.picked out)) 0)))))
-
-;;; One elaboration of generator ONLY, or of all of them when it is -1, over
-;;; SUB-FORMS or, when null, the program's own forms. With COLLECT, the output is
-;;; added to it instead of spliced.
-(defn elaborate-metas-attempt! [(a (dyn Allocator))
-                                (s (mut LS))
-                                (sub-forms (ptr (ArrayList TaggedForm)))
-                                (only i64)
-                                (ran (ptr bool))
-                                (collect (ptr MetaOutput))]
-  (-> (Result i64 Diag))
-  (cond (!= (primitive/cast i64 sub-forms) 0)
-          (elaborate-metas-select! a
-                                   (mut s)
-                                   sub-forms
-                                   (primitive/cast (ptr HostStage) 0)
-                                   (primitive/zeroed TargetArchCell)
-                                   only
-                                   ran
-                                   collect)
-        (and (cross-build?) (!= (primitive/cast i64 (.host_stage s)) 0))
-          (elaborate-metas-cross! a (mut s) only ran collect)
-        :else
-          (match (meta-sub-forms-sharing a
-                                         (mut s)
-                                         (box-al [TaggedForm]
-                                                 a
-                                                 (load (field s out))))
-            (Err [d] (Err [i64 Diag] d))
-            (Ok [own]
-                (elaborate-metas-select! a
-                                         (mut s)
-                                         own
-                                         (primitive/cast (ptr HostStage) 0)
-                                         (primitive/zeroed TargetArchCell)
-                                         only
-                                         ran
-                                         collect)))))
-
-;;; A cross build's generators are compiler code, so they are built from the host
-;;; twin's view of the program, which holds everything compile-time code reaches,
-;;; expanded, resolved and checked for the host, including what the program left to
-;;; the host and the output of any generator the twin's own macros needed. The
-;;; program's `(meta …)` forms take the place of the twin's. Each generator produces
-;;; the program's definitions, so it RUNS with target questions answering for the
-;;; target.
-(defn elaborate-metas-cross! [(a (dyn Allocator))
-                              (s (mut LS))
-                              (only i64)
-                              (ran (ptr bool))
-                              (collect (ptr MetaOutput))] (-> (Result i64 Diag))
-  (let [hs (primitive/cast (ptr HostStage) (.host_stage s))
-        program
-          (tower-snapshot a (box-al [TaggedForm] a (.out s)) (len (.out s)))
-        generators
-          (if (= (primitive/cast i64 (.normalized hs)) 0)
-              program
-              (let [(mut forms) (ArrayList::new [TaggedForm] a)
-                    twin
-                      (tower-snapshot a
-                                      (.normalized hs)
-                                      (len (load (.normalized hs))))]
-                (for [i 0 (len (load twin))]
-                  (unless (is-meta-form (field (elem twin i) form))
-                    (push! (mut forms) (get (load twin) i))
-                    0))
-                (for [i 0 (len (load program))]
-                  (when (is-meta-form (field (elem program i) form))
-                    (push! (mut forms) (get (load program) i))
-                    0))
-                (box-al [TaggedForm] a (load forms))))
-        target (target-cell-swap! (host-target-cell))
-        result
-          (match (meta-sub-forms a (mut s) generators)
-            (Err [d] (Err [i64 Diag] d))
-            (Ok [sub-forms]
-                (elaborate-metas-select! a
-                                         (mut s)
-                                         sub-forms
-                                         hs
-                                         target
-                                         only
-                                         ran
-                                         collect)))]
-    (target-cell-swap! target)
-    result))
-
-;;; Run the program's generators over a generator program already assembled (the
-;;; program's forms plus the metashim), such as the macro tower's working copy, and
-;;; splice what they produce in place of them. With HOST, the program is resolved
-;;; in the host stage's workspace and each generator runs with target questions
-;;; answering for RUN-AS. ONLY picks one generator (an index among the program's
-;;; `(meta …)` forms; -1 runs them all), and with COLLECT the output is added to it
-;;; instead of spliced. RAN is set once a generator starts running: a failure
-;;; before that changed nothing.
-(defn elaborate-metas-select! [(a (dyn Allocator))
-                               (s (mut LS))
-                               (sub-forms (ptr (ArrayList TaggedForm)))
-                               (host (ptr HostStage))
-                               (run-as TargetArchCell)
-                               (only i64)
-                               (ran (ptr bool))
-                               (collect (ptr MetaOutput))]
-  (-> (Result i64 Diag))
-  (try (do
-         (let [subls (primitive/alloc-stack LS)]
-           (ls-init! (mut subls) a)
-           (store! (field subls out) (load sub-forms))
-           (store! (field subls imports)
-                   (if (= (primitive/cast i64 host) 0)
-                       (avec-edit (field s imports) a)
-                       (host-imports (mut s) host)))
-           (store! (field subls exports)
-                   (if (= (primitive/cast i64 host) 0)
-                       (avec-edit (field s exports) a)
-                       (host-exports (mut s) host)))
-           (store! (field subls primitive_defs)
-                   (avec-edit (field s primitive_defs) a))
-           (store! (field subls primitive_aliases)
-                   (avec-edit (field s primitive_aliases) a))
-           (ls-borrow-semantics! (mut subls) (mut s))
-           ; A workspace serves one evolving program; these forms are the
-           ; program's, compiled for the host, so they get one of their own.
-           (when (!= (primitive/cast i64 host) 0)
-             (set! (.semantic_workspace subls) (host-workspace-slot (mut s)))
-             (set! (.semantic_audit subls)
-                   (box! a SemanticAudit (primitive/zeroed SemanticAudit)))
-             0)
-           (set! (.parent subls) (ls-phase-parent (mut s) a))
-           (match (stage3-resolve a
-                                  (mut subls)
-                                  (primitive/cast (ptr (ptr (ArrayList (slice u8))))
-                                                  0))
-             (Err [d] (Err [i64 Diag] d))
-             (Ok [mctx]
-                 (let [ms (load (field mctx metas))
-                       nmet (len (load ms))
-                       eid (meta-elaboration-id)
-                       (mut names) (ArrayList::new [(slice u8)] a)
-                       (mut picked) (ArrayList::new [i64] a)
-                       (mut i) 0]
-                   ; one synthetic entry per (meta …) expression
-                   (loop (if (>= (load i) nmet)
-                             (break)
-                             (do
-                               (when (or (< only 0) (= (load i) only))
-                                 (let [f (primitive/alloc-stack Func)
-                                       fname
-                                         (sconcat3 a
-                                                   "coil.meta."
-                                                   (i64->str a eid)
-                                                   (sconcat a
-                                                            "."
-                                                            (i64->str a
-                                                                      (load i))))]
-                                   (store! (field f name) fname)
-                                   (store! (field f type_params)
-                                           (box-al [(slice u8)]
-                                                   a
-                                                   (ArrayList::new [(slice u8)]
-                                                                   a)))
-                                   (store! (field f bounds)
-                                           (box-al [Bound]
-                                                   a
-                                                   (ArrayList::new [Bound] a)))
-                                   (store! (field f cc) (cc-c))
-                                   (store! (field f annotations)
-                                           (box-al [Annotation]
-                                                   a
-                                                   (ArrayList::new [Annotation]
-                                                                   a)))
-                                   (store! (field f params)
-                                           (box-al [Param]
-                                                   a
-                                                   (ArrayList::new [Param] a)))
-                                   (store! (field f ret) (TCode))
-                                   (let [(mut bl) (ArrayList::new [Expr] a)]
-                                     (push! (mut bl) (get (load ms) (load i)))
-                                     (store! (field f body)
-                                             (box-al [Expr] a (load bl))))
-                                   (store! (field f macro_variadic) false)
-                                   (store! (field f lo) -1)
-                                   (store! (field f hi) -1)
-                                   (store! (field f source) -1)
-                                   (store! (field f ctxt) 0)
-                                   (store! (field f declared) false)
-                                   (store! (field f lazy)
-                                           (primitive/cast (ptr i8) 0))
-                                   (push! (mut (load (field mctx funcs)))
-                                          (load f))
-                                   (push! (mut names) fname)
-                                   (push! (mut picked) (load i)))
-                                 0)
-                               (store! i (primitive/iadd (load i) 1)))))
-                   (let [qb (box-al [(slice u8)] a (load names))
-                         seeds (meta-shim-seeds a mctx qb)
-                         closure-ctx (with-constant-lengths a mctx)
-                         wanted (closure-funcs closure-ctx seeds a)
-                         sub (closure-subprogram closure-ctx wanted a)
-                         checkls (primitive/alloc-stack LS)]
-                     (ls-init! (mut checkls) a)
-                     (set! (.parent checkls) (.parent subls))
-                     (store! (field checkls out)
-                             (ArrayList::new [TaggedForm] a))
-                     ; The closure's code is the program's, and its trait methods
-                     ; are in scope as the program's imports refer them.
-                     (store! (field checkls imports)
-                             (avec-edit (field s imports) a))
-                     (store! (field checkls exports)
-                             (avec-edit (field s exports) a))
-                     (store! (field checkls primitive_defs)
-                             (avec-new [PrimitiveDef] a))
-                     (store! (field checkls primitive_aliases)
-                             (avec-new [PrimitiveAlias] a))
-                     (store! (field checkls check_diags)
-                             (box-al [Diag] a (ArrayList::new [Diag] a)))
-                     (store! (field checkls resolve_diags)
-                             (primitive/cast (ptr (ArrayList Diag)) 0))
-                     (store! (field checkls resolve_poisoned)
-                             (primitive/cast (ptr (ArrayList (slice u8))) 0))
-                     (let [checked (try! (check-program a sub (mut checkls)))]
-                       (match (meta-engine-setup a checked qb)
-                         (Some [d] (Err [i64 Diag] d))
-                         (None []
-                               ; run each entry; cx mirrors run-metas' (the metahost shims read it)
-                               (let [cx (primitive/alloc-stack CtCtx)
-                                     meta-modules (meta-form-modules (mut s) a)
-                                     meta-forms (meta-form-syntax (mut s) a)
-                                     (mut gen) (ArrayList::new [Sexp] a)
-                                     (mut genmods)
-                                       (ArrayList::new [(Option (slice u8))] a)
-                                     (mut j) 0
-                                     (mut errf) (None [Diag])]
-                                 (store! cx (primitive/zeroed CtCtx))
-                                 (store! (field cx a) a)
-                                 (store! (field cx fns)
-                                         (load (field checked funcs)))
-                                 (store! (field cx structs)
-                                         (load (field checked structs)))
-                                 (store! (field cx sums)
-                                         (load (field checked sums)))
-                                 (store! (field cx traits)
-                                         (load (field checked traits)))
-                                 (store! (field cx fuel) 50000000)
-                                 (store! (field cx depth) 0)
-                                 (store! (field cx gensym) 0)
-                                 (store! (field cx qmodule) (None [(slice u8)]))
-                                 (store! (field cx module_fns)
-                                         (primitive/cast (ptr (ArrayList (slice u8)))
-                                                         0))
-                                 (store! (field cx qimports)
-                                         (primitive/cast (ptr ModImports) 0))
-                                 (store! (field cx qexports)
-                                         (primitive/cast (ptr (AVec ExpEntry))
-                                                         0))
-                                 (store! (field cx prog) checked)
-                                 ; A generator reflects on the program's names as
-                                 ; their modules see them.
-                                 (store! (field cx all_imports)
-                                         (primitive/cast (ptr (AVec ImpEntry))
-                                                         (field s imports)))
-                                 (store! (field cx all_exports)
-                                         (primitive/cast (ptr (AVec ExpEntry))
-                                                         (field s exports)))
-                                 (store! (field cx code_session_state)
-                                         (load (field s code_session_state)))
-                                 (store! (field cx expansions)
-                                         (primitive/cast (ptr (AVec Expansion))
-                                                         (field s expansions)))
-                                 (store! ran true)
-                                 (loop (if (or (diag-some? (load errf))
-                                               (>= (load j) (len (load picked))))
-                                           (break)
-                                           (do
-                                             (let [md
-                                                     (get (load meta-modules)
-                                                          (get (load picked)
-                                                               (load j)))
-                                                   _qm
-                                                     (store! (field cx qmodule)
-                                                             md)
-                                                   e
-                                                     (meta-engine-entry (get (load qb)
-                                                                             (load j)))]
-                                               (if (= (primitive/cast i64 e)
-                                                      0)
-                                                   (do
-                                                     (store! errf
-                                                             (Some (derr "meta: entry missing from the metaprogram engine (compiler bug)")))
-                                                     0)
-                                                   (match (meta-run-as host
-                                                                       run-as
-                                                                       a
-                                                                       e
-                                                                       cx
-                                                                       (box-al [EnvBind]
-                                                                               a
-                                                                               (ArrayList::new [EnvBind]
-                                                                                               a)))
-                                                     (Err [d]
-                                                          (do
-                                                            (store! errf
-                                                                    (Some d))
-                                                            0))
-                                                     (Ok [sexp]
-                                                         (let [sp
-                                                                 (box-sexp a
-                                                                           sexp)
-                                                               ; generated syntax with no span of its
-                                                               ; own is located at the (meta …) form
-                                                               mf
-                                                                 (get (load meta-forms)
-                                                                      (get (load picked)
-                                                                           (load j)))
-                                                               _stamp
-                                                                 (stamp-expansion sp
-                                                                                  (sx-source mf)
-                                                                                  (sx-lo mf)
-                                                                                  (sx-hi mf)
-                                                                                  0)
-                                                               sexp (load sp)]
-                                                           ; a returned `(do …)` splices its items — TRANSITIVELY, since a
-                                                           ; generator built out of macros bundles at each layer
-                                                           (if (do-bundle? sp)
-                                                               (let [(mut flat)
-                                                                       (ArrayList::new [Sexp]
-                                                                                       a)
-                                                                     md
-                                                                       (get (load meta-modules)
-                                                                            (get (load picked)
-                                                                                 (load j)))
-                                                                     (mut k) 0]
-                                                                 (splice-do-into! (mut flat)
-                                                                                  sp)
-                                                                 (let [m
-                                                                         (len (load flat))]
-                                                                   (loop (if (>= (load k)
-                                                                                 m)
-                                                                             (break)
-                                                                             (do
-                                                                               (push! (mut gen)
-                                                                                      (get (load flat)
-                                                                                           (load k)))
-                                                                               (push! (mut genmods)
-                                                                                      md)
-                                                                               (store! k
-                                                                                       (primitive/iadd (load k)
-                                                                                                       1))))))
-                                                                 0)
-                                                               (do
-                                                                 (push! (mut gen)
-                                                                        sexp)
-                                                                 (push! (mut genmods)
-                                                                        (get (load meta-modules)
-                                                                             (get (load picked)
-                                                                                  (load j))))
-                                                                 0)))))))
-                                             (store! j
-                                                     (primitive/iadd (load j) 1)))))
-                                 (match (load errf)
-                                   (Some [d] (Err [i64 Diag] d))
-                                   (None []
-                                         (do
-                                           (if (= (primitive/cast i64 collect)
-                                                  0)
-                                               (splice-metas (mut s)
-                                                             (box-al [Sexp]
-                                                                     a
-                                                                     (load gen))
-                                                             (box-al [(Option (slice u8))]
-                                                                     a
-                                                                     (load genmods))
-                                                             (box-al [i64]
-                                                                     a
-                                                                     (load picked))
-                                                             a)
-                                               (do
-                                                 (for [g 0 (len (load gen))]
-                                                   (push! (mut (.gen collect))
-                                                          (get (load gen) g))
-                                                   (push! (mut (.genmods collect))
-                                                          (get (load genmods) g)))
-                                                 (for [g 0 (len (load picked))]
-                                                   (push! (mut (.picked collect))
-                                                          (get (load picked) g)))
-                                                 0))
-                                           (Ok [i64 Diag] 0))))))))))))))))
-
-;;; Run meta entry E, with target questions answering for RUN-AS when HOST is set.
-(defn meta-run-as [(host (ptr HostStage))
-                   (run-as TargetArchCell)
-                   (a (dyn Allocator))
-                   (e (ptr MEEntry))
-                   (cx (ptr CtCtx))
-                   (env (ptr (ArrayList EnvBind)))] (-> (Result Sexp Diag))
-  (if (= (primitive/cast i64 host) 0)
-      (meta-engine-run-env a e cx env)
-      (let [prior (target-cell-swap! run-as)
-            result (meta-engine-run-env a e cx env)]
-        (target-cell-swap! prior)
-        result)))
-
-;;; The program's (meta …) forms, in the order meta-form-modules lists them.
-(defn meta-form-syntax [(s (mut LS)) (a (dyn Allocator))]
-  (-> (ptr (ArrayList Sexp)))
-  (let [(mut out) (ArrayList::new [Sexp] a)]
-    (for [i 0 (len (.out s))]
-      (let [tf (elem (field s out) i)]
-        (when (is-meta-form (field tf form))
-          (push! (mut out) (load (field tf form)))
-          0)))
-    (box-al [Sexp] a (load out))))
-
-;;; Elaborate the metas, then the authoritative strict resolve and check.
-(defn elaborate-metas-compiled [(a (dyn Allocator)) (s (mut LS))]
-  (-> (Result (ptr Program) Diag))
-  (let [prefix (meta-output-prefix (mut s))]
-    (match (elaborate-metas-into! a (mut s))
-      (Err [d] (Err [(ptr Program) Diag] d))
-      (Ok [_]
-          (match (resolve-meta-output a (mut s) prefix)
-            (Err [d] (Err [(ptr Program) Diag] d))
-            (Ok [prog2] (check-strict-resolved a (mut s) prog2)))))))
-
-; splice-metas retains all non-meta forms as a prefix and appends generated
-; syntax. Remember that boundary before elaboration, including an empty suffix.
-(defn meta-output-prefix [(s (mut LS))] (-> i64)
-  (let [(mut n) 0]
-    (for [i 0 (len (.out s))]
-      (unless (is-meta-form (field (elem (field s out) i) form))
-        (set! n (+ (load n) 1))))
-    (load n)))
-
-; These declarations can be expanded using an existing macro environment. Other
-; forms may alter imports, registrations or the definition-time tower itself.
-; A struct or sum is a declaration like a constant: the expansion records it as
-; a sibling for the generated forms after it (do-produced), so a macro there can
-; reflect on it. A static assertion declares nothing. One that may involve Code
-; is the tower's business and is not local: any symbol naming a Code type makes
-; it so, which is conservative (a parameter merely named `Code` counts too).
-(defn meta-output-local-form? [(f (ptr Sexp))] (-> bool)
-  (match (l-list-head f)
-    (Some [h]
-          (and (or (= h "const")
-                   (or (= h "extern")
-                       (or (= h "def")
-                           (or (= h "defn")
-                               (or (= h "defn*")
-                                   (or (= h "defstruct")
-                                       (or (= h "defsum") (= h "static-assert"))))))))
-               (not (mentions-code-type-name? f))))
-    (None [] false)))
-
-; Reuse the completed expansion's checked closure for ordinary generated
-; declarations. Unaffected forms never enter a snapshot, tower or syntax walk.
-; The full path remains authoritative when the macro universe or syntax-phase
-; pipeline changes; it must see the whole program in those cases. It is also the
-; only source of diagnostics: a suffix that fails to expand here falls back, so
-; an error is never reported from this shortcut's older compile-time context.
-(defn expand-meta-suffix [(a (dyn Allocator)) (s (mut LS)) (prefix i64)]
-  (-> bool)
-  (let [b (checker-reg-box)
-        r (field b reg)
-        forms (box-al [TaggedForm] a (.out s))]
-    (if (or (= (.init b) 0) (= (.active r) 0))
-        false
-        (block :fallback
-          ; The checked closure belongs to this exact expansion generation. A
-          ; semantic rewrite, or an earlier wave that added definitions, can
-          ; change helpers and constants even without adding a Code signature.
-          ; Keep only a shallow list of identity/revision witnesses, never a
-          ; whole-program syntax clone.
-          (let [(mut kept) 0]
-            (for [i 0 (len (.expanded r))]
-              (let [old (elem (field r expanded) i)]
-                (unless (is-meta-form (field old form))
-                  (when (>= (load kept) prefix)
-                    (break :fallback false))
-                  (let [current (elem forms (load kept))]
-                    (unless (and (primitive-module-eq? (.module old)
-                                                       (.module current))
-                                 (and (= (.revision old) (.revision current))
-                                      (= (sx-node-id (.form old))
-                                         (sx-node-id (.form current)))))
-                      (break :fallback false)))
-                  (set! kept (+ (load kept) 1)))))
-            (unless (= (load kept) prefix)
-              (break :fallback false)))
-          ; A before-expand transform rewrites unexpanded syntax, so meta output
-          ; would have to go through it again before expansion. An after-expand
-          ; transform runs over the expanded program, meta output included, below.
-          (let [impb (box! a (AVec ImpEntry) (.imports s))
-                expb (box! a (AVec ExpEntry) (.exports s))]
-            (for [i 0 (len (.pipeline_forms s))]
-              (let [tf (elem (field s pipeline_forms) i)]
-                (when (registration-in-phase? (field tf form)
-                                              (.module tf)
-                                              impb
-                                              expb
-                                              a
-                                              (phase/BeforeExpand))
-                  (break :fallback false)))))
-          (for [i prefix (len (load forms))]
-            (unless (meta-output-local-form? (field (elem forms i) form))
-              (break :fallback false)))
-          (let [macros (.macros r)
-                allfns (all-defn-names forms a)
-                gs (box! a SBoxStruct (load (.gs r)))
-                gu (box! a SBoxSum (load (.gu r)))
-                result (box! a SBoxTF (primitive/zeroed SBoxTF))
-                env (primitive/alloc-stack ExpEnv)
-                (mut depth) 0
-                (mut errf) (None [Diag])]
-            ; Sibling declarations are appended while expanding. Keep a failed
-            ; attempt from mutating the retained registry's ArrayList buffers.
-            (set! (.items gs) (ls-copy-list [StructDef] a (.items gs)))
-            (set! (.items gu) (ls-copy-list [SumDef] a (.items gu)))
-            (set! (.items result) (ArrayList::new [TaggedForm] a))
-            (set! (.macros env) macros)
-            (set! (.comptime env) (.comptime r))
-            (set! (.sub env) (.checked r))
-            (set! (.impb env) (box! a (AVec ImpEntry) (.imports s)))
-            (set! (.expb env) (box! a (AVec ExpEntry) (.exports s)))
-            (set! (.bound env)
-                  (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a)))
-            (set! (.a env) a)
-            (macros-index-reset!)
-            (declared-names-set! allfns a)
-            (declared-traits-collect! (mut s) forms)
-            (for [i 0 prefix]
-              (push! (mut (.items result)) (get (load forms) i)))
-            (for [i prefix (len (load forms))]
-              (let [tf (elem forms i)]
-                ; the expansion budget is each top-level form's (expand-calls)
-                (set! depth 0)
-                (match (expand-top-form (field tf form)
-                                        (.module tf)
-                                        env
-                                        (field allfns items)
-                                        (field gs items)
-                                        (field gu items)
-                                        (mut depth)
-                                        (mut s))
-                  (Err [_] (break :fallback false))
-                  (Ok [out]
-                      (do-produced (box-sexp a out)
-                                   (.module tf)
-                                   tf
-                                   result
-                                   gs
-                                   gu
-                                   allfns
-                                   macros
-                                   (.impb env)
-                                   (.expb env)
-                                   a
-                                   (mut errf)))))
-              (match (load errf)
-                (Some [_] (break :fallback false))
-                (None [] 0)))
-            ; A declaration macro can emit new compile-time definitions or pipeline
-            ; forms. Restart from the untouched input rather than accepting those
-            ; with an engine that predates them.
-            (for [i prefix (len (.items result))]
-              (unless (meta-output-local-form? (field (elem (field result items)
-                                                            i)
-                                                      form))
-                (break :fallback false)))
-            ; What the full re-expansion would do last: the after-expand
-            ; transforms, over the whole program with the meta output expanded
-            ; (they are idempotent, so the part they already rewrote stays as it
-            ; is). run-after-expand sets the program to their output.
-            (when (= (primitive/cast i64 (.posttx r)) 0)
-              (break :fallback false))
-            (match (run-after-expand (.posttx r)
-                                     (.checked r)
-                                     (box-al [TaggedForm] a (.items result))
-                                     allfns
-                                     gs
-                                     gu
-                                     (.impb env)
-                                     (.expb env)
-                                     (mut s)
-                                     a)
-              (Err [_] (break :fallback false))
-              (Ok [_] true)))))))
-
-; Generated meta output is source syntax and can contain declaration/binding
-; macros. Normalize it before authoritative parsing, retaining the pipeline.
-; The checkers already ran over the authored program in the first expansion, and
-; meta output is generated syntax they do not judge: running them again in the
-; full re-expansion reported every finding twice in any program with a `(meta …)`
-; form. The suffix shortcut runs no checkers.
-(defn resolve-meta-output [(a (dyn Allocator)) (s (mut LS)) (prefix i64)]
-  (-> (Result (ptr Program) Diag))
-  (if (expand-meta-suffix a (mut s) prefix)
-      (resolve-program a (mut s) true false)
-      (let [registry (load (checker-reg-box))
-            quiet (checkers-quiet)
-            was-quiet (load quiet)
-            _quiet (store! quiet true)
-            result (expand-stage3 (mut s))]
-        (store! quiet was-quiet)
-        (store! (checker-reg-box) registry)
-        (match result
-          (Err [d] (Err [(ptr Program) Diag] d))
-          (Ok [_] (resolve-program a (mut s) true false))))))
-
 ; Finish an authoritative strict resolve. Body-resolution errors are recoverable so
 ; resolve-program can diagnose several functions in one pass; it marks those bodies
 ; poisoned and records their diagnostics in LS. Every strict entry path must merge
-; that sink after checking. The meta-elaboration path used to call check-program
-; directly and silently discarded it, allowing callers of a poisoned/omitted helper
-; to reach codegen as `unknown callable`.
+; that sink after checking; discarding it allows callers of a poisoned/omitted
+; helper to reach codegen as `unknown callable`.
 (defn check-strict-resolved [(a (dyn Allocator))
                              (s (mut LS))
                              (prog (ptr Program))]
@@ -8851,22 +8855,13 @@
 
 (defn strict-resolve-check [(a (dyn Allocator)) (s (mut LS))]
   (-> (Result (ptr Program) Diag))
-  ; Meta elaboration performs its own tolerant resolve to build the generator
-  ; context, then an authoritative strict resolve after splicing. Do not resolve
-  ; the whole program once before that merely to rediscover the metas the loader
-  ; has already recorded.
-  (if (ls-has-meta (mut s))
-      (let [meta-span (tr/span-begin "frontend.check.meta-elaboration")
-            result (elaborate-metas-compiled a (mut s))
-            _meta-end (tr/span-end meta-span)]
-        result)
-      (let [resolve-span (tr/span-begin "frontend.check.resolve")
-            resolved (resolve-program a (mut s) true false)
-            _resolve-end (tr/span-end resolve-span)]
-        (match resolved
-          ; a FATAL resolve error (parse / signature / struct / sum) aborts as before.
-          (Err [d] (Err [(ptr Program) Diag] d))
-          (Ok [prog] (check-strict-resolved a (mut s) prog))))))
+  (let [resolve-span (tr/span-begin "frontend.check.resolve")
+        resolved (resolve-program a (mut s) true false)
+        _resolve-end (tr/span-end resolve-span)]
+    (match resolved
+      ; a FATAL resolve error (parse / signature / struct / sum) aborts as before.
+      (Err [d] (Err [(ptr Program) Diag] d))
+      (Ok [prog] (check-strict-resolved a (mut s) prog)))))
 
 ; Best-effort resolve+check for the model: swallow errors, returning None on failure.
 ; Reset the collected check diagnostics so a failed attempt never pollutes the final
@@ -8905,35 +8900,12 @@
   ; through ordinary resolution/type synthesis only. The final path below the
   ; transform fixpoint still calls strict-resolve-check and therefore reruns every
   ; semantic map plus affine validation and drop elaboration from scratch.
-  (let [had-meta (ls-has-meta (mut s))
-        prefix (meta-output-prefix (mut s))
-        ; Meta elaboration splices its output into the program as it goes. A
-        ; provisional attempt that fails must leave the program as it found it:
-        ; kept, the half-elaborated forms (metas gone, their output unexpanded)
-        ; reached the authoritative check, which reported that instead of the
-        ; real error.
-        before (box-al [TaggedForm] a (.out s))
-        provisional
-          (if had-meta
-              ; Meta output must be spliced and expanded before the provisional
-              ; check. Its strict check would reject a field that a semantic
-              ; transform is about to lower, leaving type-of with an empty map.
-              (match (elaborate-metas-into! a (mut s))
-                (Err [d] (Err [(ptr Program) Diag] d))
-                (Ok [_]
-                    (match (resolve-meta-output a (mut s) prefix)
-                      (Err [d] (Err [(ptr Program) Diag] d))
-                      (Ok [prog]
-                          (check-transform-model-resolved a (mut s) prog)))))
-              (match (resolve-program a (mut s) true false)
-                (Err [d] (Err [(ptr Program) Diag] d))
-                (Ok [prog] (check-transform-model-resolved a (mut s) prog))))]
-    (match provisional
-      (Err [d]
-           (do
-             (when had-meta (set! (.out s) (load before)) 0)
-             (None [(ptr Program)])))
-      (Ok [cp] (Some cp)))))
+  (match (resolve-program a (mut s) true false)
+    (Err [_] (None [(ptr Program)]))
+    (Ok [prog]
+        (match (check-transform-model-resolved a (mut s) prog)
+          (Err [_] (None [(ptr Program)]))
+          (Ok [cp] (Some cp))))))
 
 ;;; A transform that runs on the expanded program (no `:phase`, or `:phase
 ;;; (phase/AfterExpand)`) returns forms that are never expanded again, so each must be a
@@ -9473,9 +9445,8 @@
 ;;; input (syntax-carried-identical?) takes that input form's place, with its form
 ;;; id and revision, so resolution reuses the parse it already holds for it.
 ;;; Without this every transform made the whole program new source: each later
-;;; resolve re-parsed all of it, and meta output could not be expanded on its own
-;;; (expand-meta-suffix compares identities). Each input form lends its identity
-;;; to one returned form at most.
+;;; resolve re-parsed all of it. Each input form lends its identity to one returned
+;;; form at most.
 (defn adopt-unchanged-transform-forms! [(a (dyn Allocator))
                                         (out (ptr (ArrayList TaggedForm)))
                                         (input (ptr (ArrayList TaggedForm)))]
@@ -9822,7 +9793,6 @@
     (set! (.consts out) (.consts base))
     (set! (.traits out) (.traits base))
     (set! (.impls out) (.impls base))
-    (set! (.metas out) (.metas base))
     (set! (.exports out) (.exports base))
     (set! (.function_abis out) (.function_abis base))
     (set! (.mono_origins out) (.mono_origins base))
@@ -10118,7 +10088,8 @@
                                             (let [setup
                                                     (meta-engine-setup stable-a
                                                                        checked
-                                                                       quals)]
+                                                                       quals
+                                                                       (staged-instances))]
                                               (sem-maps-restore snap)
                                               (match setup
                                                 (Some [d]
@@ -10265,7 +10236,10 @@
                                                (stamp-call-site (derr "stage invocation expansion did not terminate")
                                                                 (load form)))
                                           (match (let [site
-                                                         (macro-call-site-enter! (load form))
+                                                         (macro-call-site-enter! (load form)
+                                                                                 module
+                                                                                 (primitive/cast (ptr (ArrayList ScopeEntry)) 0)
+                                                                                 false)
                                                        r
                                                          (expand-macro phasectx
                                                                        entry
@@ -10427,7 +10401,15 @@
                          (s (mut LS))
                          (a (dyn Allocator))]
   (-> (Result (ptr (ArrayList TaggedForm)) Diag))
-  (clear-sem-model)
+  ; Nothing of this compilation is checked yet. In a session the program a
+  ; before-expand metaprogram can ask about is the one the session accepted,
+  ; which this compilation builds on; anywhere else there is none.
+  (let [built-on (.parent s)]
+    (if (and (!= (primitive/cast i64 (load (field s code_session_state))) 0)
+             (!= (primitive/cast i64 built-on) 0)
+             (!= (primitive/cast i64 (.checked built-on)) 0))
+        (set-sem-model-from-loader! (load built-on) (.checked built-on))
+        (clear-sem-model)))
   (let [(mut cur) forms
         phasectx (stage-expansion-context checked a)
         (mut stage-quals) (ArrayList::new [(slice u8)] a)
@@ -10926,7 +10908,7 @@
                   (authored (ptr (ArrayList TaggedForm)))
                   (normalized (ptr (ArrayList TaggedForm)))
                   (macros (ptr (ArrayList (slice u8))))
-                  (comptime (ptr (ArrayList (slice u8))))
+                  (metaprograms (ptr (ArrayList (slice u8))))
                   (checked (ptr Program))
                   (a (dyn Allocator))] (-> (Result i64 Diag))
   (macros-index-reset!)  ; a new run may not inherit the last one's index
@@ -10957,17 +10939,15 @@
     (set! (.items gu) (ArrayList::new [SumDef] a))
     (set! (.items result) (ArrayList::new [TaggedForm] a))
     (set! (.macros env) macros)
-    (set! (.comptime env) comptime)
+    (set! (.metaprograms env) metaprograms)
     (set! (.sub env) checked)
     (set! (.impb env) impb)
     (set! (.expb env) expb)
     (set! (.bound env)
-          (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+          (box! a (ArrayList ScopeEntry) (ArrayList::new [ScopeEntry] a)))
     (set! (.a env) a)
     ; Keep pipeline declarations as session metadata. Only new source forms
     ; enter expansion; accepted checker/transform registrations remain in scope.
-    ; A loader can enter expansion again after meta output is spliced. Its
-    ; registrations have already been consumed from source at that point.
     ; Seed an empty candidate from its parent once, then retain declarations
     ; across expansion waves. Form identity prevents duplicate registration.
     (when (and (= (len (.pipeline_forms s)) 0)
@@ -11100,21 +11080,26 @@
     (match (load errf)
       (Some [d] (Err [i64 Diag] d))
       (None []
-            (match (run-before-expand (box-al [(slice u8)]
-                                              a
-                                              (load pre-transformers))
-                                      (box-al [(slice u8)]
-                                              a
-                                              (load pre-checkers))
-                                      checked
-                                      (load out-forms)
-                                      allfns
-                                      gs
-                                      gu
-                                      impb
-                                      expb
-                                      (mut s)
-                                      a)
+            (match (let [ran
+                           (run-before-expand (box-al [(slice u8)]
+                                                      a
+                                                      (load pre-transformers))
+                                              (box-al [(slice u8)]
+                                                      a
+                                                      (load pre-checkers))
+                                              checked
+                                              (load out-forms)
+                                              allfns
+                                              gs
+                                              gu
+                                              impb
+                                              expb
+                                              (mut s)
+                                              a)]
+                     ; what expands next is not a before-expand metaprogram:
+                     ; it has no program to ask about until this one is checked
+                     (clear-sem-model)
+                     ran)
               (Err [d] (do (drain-warnings (mut s)) (Err [i64 Diag] d)))
               (Ok [raw]
                   (if (transform-introduced-macros? raw authored macros a)
@@ -11147,7 +11132,7 @@
                             ; An import the transform added loaded a module nothing had
                             ; loaded, and its forms joined the program after the tower was
                             ; built: its compile-time definitions were never compiled and
-                            ; its (meta …) forms never ran. Rebuild the tower over the
+                            ; its top-level macros never ran. Rebuild the tower over the
                             ; program that now holds it, as for a transform that
                             ; introduced macros; the module is loaded from then on, so
                             ; the next generation's rebuild adds nothing.
@@ -11248,6 +11233,14 @@
                                                                          a
                                                                          (mut errf))))))))))
                                         (set! i (primitive/iadd (load i) 1)))))
+                            ; A macro hoisted a definition this expansion's output
+                            ; calls. Nothing past here means anything until the
+                            ; program holds it, and an error may only be its absence,
+                            ; so build again over the program with it.
+                            (when (hoist-pending?)
+                              (set! (.out s) (load raw))
+                              (hoisted-into-program! (mut s))
+                              (return-from :restart (Ok [i64 Diag] 2)))
                             ; Every trait the expansion generates is declared by now.
                             (match (match (load errf)
                                      (Some [d] (Some d))
@@ -11300,8 +11293,8 @@
                                                           (load post-transformers)))
                                             (set! (.macros (.reg (checker-reg-box)))
                                                   (persist-names macros a))
-                                            (set! (.comptime (.reg (checker-reg-box)))
-                                                  (persist-names comptime a))
+                                            (set! (.metaprograms (.reg (checker-reg-box)))
+                                                  (persist-names metaprograms a))
                                             (set! (.expanded (.reg (checker-reg-box)))
                                                   (ls-copy-list [TaggedForm]
                                                                 a
@@ -11587,12 +11580,10 @@
 ;;; constants replaced by the value, as the checker does, so a closure cut from
 ;;; P keeps a struct such as `(array u8 MAX-LEN)` without the constant. A
 ;;; constant whose value needs code run is not computed here; the types that
-;;; wait on one, and the constants that would need such a type, are left out,
-;;; as are those that read a name a pending generator may declare
-;;; (`without-undeclared-value-dependents`).
+;;; wait on one, and the constants that would need such a type, are left out.
 (defn with-constant-lengths [(a (dyn Allocator)) (p (ptr Program))]
   (-> (ptr Program))
-  (constant-lengths-for-closure a (without-undeclared-value-dependents a p)))
+  (constant-lengths-for-closure a p))
 
 ;;; Normalize the arm once, then let expand-match-form establish its binders
 ;;; before traversing the returned body. Expanding the whole result as an ordinary
@@ -12884,7 +12875,7 @@
 ; expressions; nested quasiquotes require the same depth discipline as expansion.
 ;
 ; The one walk of the authored program the view makes. Every fact it finds is filed
-; in the source index under the key a query asks with (comptime.coil, SourceIndex):
+; in the source index under the key a query asks with (metastate.coil, SourceIndex):
 ; a reference under its module, its target and the import it went through, and the
 ; form it heads (PARENT, when the reference is element 0 of it); a `let` binder
 ; under its module.
@@ -12940,7 +12931,7 @@
         (let [key (source-view-key (mut keys) node)]
           (match (get (.locals (source-facts)) key)
             (Some [id]
-                  (set! (mut (.source_occurrences (comptime-unit-state)))
+                  (set! (mut (.source_occurrences (metastate-unit-state)))
                         key
                         (SourceOccurrence
                           :binding
@@ -12998,7 +12989,7 @@
                       (mut record) (ArrayList::new [Sexp] a)
                       _sized
                         (reserve! (mut record) (if (> (len through) 0) 6 4))
-                      index (field (comptime-unit-state) source_index)]
+                      index (field (metastate-unit-state) source_index)]
                   ; `(reference MODULE NODE ROLE)`, then the import's target and the
                   ; name it exports when the occurrence resolved through an import
                   ; (meta/reference-import). How it binds is code-source-binding's.
@@ -13015,7 +13006,7 @@
                     (None [] 0))
                   (let [reference (sx-mklist (box-al [Sexp] a (load record)))]
                     (let [at (len (load refs))]
-                      (set! (mut (.source_occurrences (comptime-unit-state)))
+                      (set! (mut (.source_occurrences (metastate-unit-state)))
                             key
                             (SourceOccurrence :binding binding :reference at))
                       (push! (mut refs) reference)
@@ -13077,7 +13068,7 @@
                           (none? (get (.primitive_roles (source-facts)) key))
                           (none? (get (.roles (source-facts)) key)))))
           (source-index-add! a
-                             (mut (.by_head (field (comptime-unit-state)
+                             (mut (.by_head (field (metastate-unit-state)
                                                    source_index)))
                              (sconcat3 a module " " (sx-sval head))
                              form)
@@ -13135,7 +13126,7 @@
                             (module (slice u8))
                             (keys (mut StrBuf))] (-> i64)
   (let [n (sx-len items)
-        index (field (comptime-unit-state) source_index)]
+        index (field (metastate-unit-state) source_index)]
     (for [p 0 (/ n 2)]
       (let [form (sx-at items (* p 2))
             name
@@ -13162,7 +13153,7 @@
 (defn source-view-publish! [(a (dyn Allocator))
                             (s (mut LS))
                             (authored (ptr (ArrayList TaggedForm)))] (-> i64)
-  (let [state (comptime-unit-state)
+  (let [state (metastate-unit-state)
         (mut imports) (ArrayList::new [Sexp] a)]
     (source-view-discard!)
     (for definition (.primitive_defs s)
@@ -13232,7 +13223,7 @@
   (let [pending (primitive/cast (ptr SourceViewPending) raw)
         a (.a pending)
         authored (.authored pending)
-        state (comptime-unit-state)
+        state (metastate-unit-state)
         (mut refs) (ArrayList::new [Sexp] a)]
     (set! (.source_occurrences state)
           (HashMap::new [(slice u8) SourceOccurrence] a (keyops)))

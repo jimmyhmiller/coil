@@ -177,30 +177,27 @@ because of staged macros.
 
 ### Why two resolve passes
 
-`(meta …)` runs Coil code at compile time and **splices the definitions it returns
-into the program**:
+A macro called at top level **splices the definitions it returns into the program**:
 
 ```lisp
-(defn gen [] (-> Code) `(defn answer [] (-> i64) 42))
-(meta (gen))                       ; produces (defn answer …) at compile time
+(defn gen [] (-> Code) `(defn ~(primitive/syntax->datum `answer) [] (-> i64) 42))
+(gen)                              ; produces (defn answer …) at compile time
 (defn main [] (-> i64) (answer))   ; refers to a name that doesn't exist yet
 ```
 
-When the resolver first walks `main`, `answer` does not exist — it only appears once
+When the resolver first walks `main`, `answer` does not exist: it only appears once
 `gen` *runs*. But to run `gen`, you must resolve + check it (it's a real function).
-Chicken-and-egg → resolution is staged:
+Chicken-and-egg, so resolution is staged:
 
-1. **Intermediate resolve** (`strict = false`): produce a well-formed `program` so
-   the generators can be found and checked. The program still references
-   not-yet-generated names, so the undefined check is **off** here.
-2. **Run the metas**: `gen` executes → `(defn answer …)`.
-3. **Final resolve** (`strict = true`): re-resolve
-   `tagged2 = original forms − meta forms + generated forms`. Now `answer` exists and
-   resolves; `totally-undefined` is correctly rejected.
+1. **Tolerant resolve** (`strict = false`): produce a well-formed `program` so the macros
+   can be found and checked. The program still references not-yet-generated names, so the
+   undefined check is **off** here.
+2. **Run the macros**: `gen` executes, giving `(defn answer …)`.
+3. **Final resolve** (`strict = true`): resolve the program with what they produced. Now
+   `answer` exists and resolves; `totally-undefined` is correctly rejected.
 
-`strict` is also `false` for the macro-detection subset (an intentionally
-incomplete program). It is `true` whenever the program is final:
-`!has_metas` for the no-meta path, and the `program2` resolve for the meta path.
+`strict` is `false` for the macro context (an intentionally incomplete program) and
+`true` whenever the program is final.
 
 **Soundness:** `program2` is a superset of all real runtime forms, so every name
 still undefined after generation is caught. Proven by

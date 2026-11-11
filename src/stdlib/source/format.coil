@@ -1,0 +1,988 @@
+; src/stdlib/source/format.coil — lower a CST into a Doc, applying Clojure-style layout.
+;
+; The one distinction that drives Lisp layout (per the Clojure style guide):
+;   * function calls    → arguments align under the FIRST argument
+;                           (some-fn arg1
+;                                    arg2)
+;   * macros / bodies   → a fixed 2-space body indent
+;                           (when test
+;                             body)
+; Both are the same shape: keep K leading elements on the head line, then put the
+; rest one-per-line at some indentation. K and the indentation are all that differ,
+; so one `layout` handles lists, vectors, calls, blocks, and defn.
+(module coil.source.format)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.reader" :as rd)
+(import "coil.source.cst" :use *)
+(import "coil.source.doc" :use *)
+
+; ---- rule table ------------------------------------------------------------
+; style: 0 = CALL (align under first arg), 1 = BLOCK n, 2 = DEFN
+(defstruct Rule [(style i64) (n i64)])
+
+(defn mk-rule [(style i64) (n i64)] (-> Rule)
+  (let [p (primitive/alloc-stack Rule)]
+    (set! (.style p) style)
+    (set! (.n p) n)
+    (load p)))
+
+(defn is [(h (slice u8)) (lit (slice u8))] (-> bool)
+  (= h lit))
+
+; The def* family: name stays on the head line, body indents +2 (Clojure's
+; :inner-0 shape). When a parameter vector is present it (and an optional (-> …)
+; return) join the head line too — see the DEFN branch of list->doc.
+(defn is-def-family [(h (slice u8))] (-> bool)
+  (or (is h "defn")
+      (is h "defn*")
+      (is h "defn-")
+      (is h "defmacro")
+      (is h "defmethod")
+      (is h "def")
+      (is h "defonce")
+      (is h "defmulti")
+      ; a test is a named body; a property has a parameter vector like a defn
+      (is h "deftest")
+      (is h "defprop")))
+
+; Look up the layout rule for a list whose head symbol is `h`.
+(defn list-rule [(h (slice u8))] (-> Rule)
+  (cond (is-def-family h) (mk-rule 2 0)
+        (is h "do") (mk-rule 1 0)
+        (or (is h "let") (or (is h "loop") (or (is h "binding") (is h "let*"))))
+          (mk-rule 1 1)
+        (or (is h "when")
+            (or (is h "when-not")
+                (or (is h "unless") (or (is h "while") (is h "when-let")))))
+          (mk-rule 1 1)
+        ; the expectation on the head line, the forms that must not compile +2
+        (is h "assert-compile-error") (mk-rule 1 1)
+        (is h "if") (mk-rule 0 0)
+        ; align then/else under the condition
+        (or (is h "fn") (is h "fn*")) (mk-rule 1 1)
+        (or (is h "cond") (or (is h "case") (is h "condp"))) (mk-rule 3 0)
+        (is h "match") (mk-rule 1 1)
+        :else (mk-rule 0 0)))  ; default: function call
+
+; (defstruct/defsum/deftrait/defenum/impl are dispatched ahead of this table, in
+;  list->doc — their head line depends on the shape of the form, not just the head
+;  symbol, so a fixed Rule cannot express them. Each admits an optional leading
+;  [type-params] vector, which shifts every later element by one.)
+
+; ---- predicates over a node ------------------------------------------------
+(defn any-child-multiline [(n (ptr Node))] (-> bool)
+  (let [c (node-count n)
+        (mut i) 1
+        (mut f) false]  ; child 0 (head) nl is about the list itself
+    (loop (if (>= (load i) c)
+              (break)
+              (do
+                (when (> (node-nl (node-nth n (load i))) 0)
+                  (store! f true)
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (load f)))
+
+(defn any-child-comment [(n (ptr Node))] (-> bool)
+  (let [c (node-count n)
+        (mut i) 0
+        (mut f) false]
+    (loop (if (>= (load i) c)
+              (break)
+              (do
+                (when (or (node-comment? (node-nth n (load i)))
+                          (leads-with-comment? (node-nth n (load i))))
+                  (store! f true)
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (load f)))
+
+; ---- separators ------------------------------------------------------------
+; The doc placed BEFORE a body child, honoring blank lines and trailing comments.
+(defn body-sep [(a (dyn Allocator)) (child (ptr Node))] (-> (ptr Doc))
+  (if (and (node-comment? child) (= (node-nl child) 0))
+      (d-text a "  ")  ; trailing comment: keep on the line
+      (if (>= (node-nl child) 2)
+          (let [dl (dl-new a)]  ; preserve one blank line
+            (dl-push! dl (d-hardline a))
+            (dl-push! dl (d-line a))
+            (dl-done a dl))
+          (d-line a))))
+
+; The closing delimiter TEXT of N. After a comment it starts a line of its own:
+; written on the comment's line it would be part of the comment, and the form
+; would no longer close.
+(defn closer [(a (dyn Allocator)) (n (ptr Node)) (text (slice u8))]
+  (-> (ptr Doc))
+  (let [cnt (node-count n)]
+    (if (and (> cnt 0) (node-comment? (node-nth n (- cnt 1))))
+        (let [dl (dl-new a)]
+          (dl-push! dl (d-hardline a))
+          (dl-push! dl (d-text a text))
+          (dl-done a dl))
+        (d-text a text))))
+
+; A list whose first element is a comment: list->doc writes that comment in front
+; of the list, so the list cannot start on a line something else is already on.
+(defn leads-with-comment? [(n (ptr Node))] (-> bool)
+  (and (node-list? n)
+       (> (node-count n) 0)
+       (node-comment? (node-nth n 0))))
+
+; ---- core layout -----------------------------------------------------------
+; wrap an assembled child-doc list as a delimited, self-anchoring group.
+(defn seal [(a (dyn Allocator)) (dl (ptr (ArrayList (ptr Doc)))) (forced bool)]
+  (-> (ptr Doc))
+  (let [inner (d-align a 0 (dl-done a dl))]
+    (if forced (d-group-forced a inner) (d-group a inner))))
+
+; push elements [lo, hi) onto dl, each preceded by a single space (stay inline).
+(defn inline-into [(a (dyn Allocator))
+                   (dl (ptr (ArrayList (ptr Doc))))
+                   (n (ptr Node))
+                   (lo i64)
+                   (hi i64)] (-> i64)
+  (let [(mut i) lo]
+    (loop (if (>= (load i) hi)
+              (break)
+              (do
+                (dl-push! dl (d-text a " "))
+                (dl-push! dl (node->doc a (node-nth n (load i))))
+                (set! i (primitive/iadd (load i) 1))))))
+  0)
+
+; the nested body doc for elements [start, cnt): each on its own line when broken.
+(defn body-doc [(a (dyn Allocator)) (n (ptr Node)) (start i64) (nest-amt i64)]
+  (-> (ptr Doc))
+  (let [cnt (node-count n)]
+    (if (>= start cnt)
+        (d-nil a)
+        (let [body (dl-new a)
+              (mut j) start]
+          (loop (if (>= (load j) cnt)
+                    (break)
+                    (do
+                      (dl-push! body (body-sep a (node-nth n (load j))))
+                      (dl-push! body (node->doc a (node-nth n (load j))))
+                      (set! j (primitive/iadd (load j) 1)))))
+          (d-nest a nest-amt (dl-done a body))))))
+
+; The first index in [lo, hi) that is a comment, else hi. Keeps a comment (and
+; everything after it) out of a space-joined inline run, where it would swallow
+; the following code onto its line.
+(defn clamp-before-comment [(n (ptr Node)) (lo i64) (hi i64)] (-> i64)
+  (let [(mut i) lo
+        (mut r) hi]
+    (loop (if (>= (load i) hi)
+              (break)
+              (if (or (node-comment? (node-nth n (load i)))
+                      (leads-with-comment? (node-nth n (load i))))
+                  (do (set! r (load i)) (break))
+                  (set! i (primitive/iadd (load i) 1)))))
+    (load r)))
+
+; open/close: delimiter bytes. inline-n: how many elements after the head stay on
+; the head line. nest-amt: body indentation past the open delimiter. Element 0 is
+; the "head" (a list's operator, or a vector's first element).
+(defn layout [(a (dyn Allocator))
+              (n (ptr Node))
+              (open i64)
+              (close i64)
+              (inline-n i64)
+              (nest-amt i64)
+              (force bool)] (-> (ptr Doc))
+  (let [cnt (node-count n)]
+    (if (<= cnt 0)
+        (d-text a (if (= open 40) "()" "[]"))
+        (let [dl (dl-new a)
+              forced
+                (or force (or (any-child-multiline n) (any-child-comment n)))
+              inline-hi
+                (clamp-before-comment n
+                                      1
+                                      (let [h (primitive/iadd 1 inline-n)]
+                                        (if (> h cnt) cnt h)))]
+          (dl-push! dl (d-text a (if (= open 40) "(" "[")))
+          (dl-push! dl (node->doc a (node-nth n 0)))  ; head
+          (inline-into a dl n 1 inline-hi)
+          (dl-push! dl (body-doc a n inline-hi nest-amt))
+          (dl-push! dl (closer a n (if (= open 40) ")" "]")))
+          (seal a dl forced)))))
+
+; ---- binding-vector layout (let/loop/for/...): elements laid out in PAIRS -----
+; [k1 v1 k2 v2] breaks to
+;   [k1 v1
+;    k2 v2]
+; Comments become their own row; a same-line (trailing) comment sticks to its row.
+(defn layout-binding-vec [(a (dyn Allocator)) (n (ptr Node))] (-> (ptr Doc))
+  (let [cnt (node-count n)]
+    (if (<= cnt 0)
+        (d-text a "[]")
+        (let [rows (build-pair-rows a n 0)
+              ; a binding vector with 2+ rows (pairs) ALWAYS breaks one-per-line — even
+              ; if it would fit flat — so `let`/`loop` bindings line up in a column.
+              forced
+                (or (> (len (load rows)) 1)
+                    (or (any-child-multiline n) (any-child-comment n)))
+              dl (dl-new a)
+              rn (len (load rows))]
+          ; row 0 on the "[" line, the rest each on their own line at +1
+          (dl-push! dl (d-text a "["))
+          (when (> rn 0) (dl-push! dl (get (load rows) 0)))
+          (dl-push! dl (d-nest a 1 (rows-lines a rows 1)))
+          (dl-push! dl (closer a n "]"))
+          (seal a dl forced)))))
+
+; concat of (line row) for rows [start, end) — the "one per line when broken" tail.
+(defn rows-lines [(a (dyn Allocator))
+                  (rows (ptr (ArrayList (ptr Doc))))
+                  (start i64)] (-> (ptr Doc))
+  (let [rn (len (load rows))
+        rest (dl-new a)
+        (mut k) start]
+    (loop (if (>= (load k) rn)
+              (break)
+              (do
+                (dl-push! rest (d-line a))
+                (dl-push! rest (get (load rows) (load k)))
+                (set! k (primitive/iadd (load k) 1)))))
+    (dl-done a rest)))
+
+(defn trailing-comment? [(ch (ptr Node))] (-> bool)
+  (and (node-comment? ch) (= (node-nl ch) 0)))
+
+; One key/value clause as a single row-doc. The value hangs +2 under the key when
+; the clause has a comment between key and value, or when it doesn't fit:
+;   key  ; comment          key value          key
+;     value                                       value   (too long)
+; A comment between key and value forces the hang (nothing may share its line); a
+; comment trailing the value just rides at the end of the line. Comments on lines
+; of their own between key and value (`midcoms`) open the hang, one per line.
+(defn make-pair [(a (dyn Allocator))
+                 (key (ptr Doc))
+                 (keycom (ptr Doc))
+                 (midcoms (ptr (ArrayList (ptr Doc))))
+                 (hasval bool)
+                 (val (ptr Doc))
+                 (valcom (ptr Doc))] (-> (ptr Doc))
+  (let [dl (dl-new a)
+        (mut forced) (> (len (load midcoms)) 0)]
+    (dl-push! dl key)
+    (when (!= (primitive/cast i64 keycom) 0)
+      (dl-push! dl (d-text a "  "))
+      (dl-push! dl keycom)
+      (store! forced
+              true)
+      0)
+    (when (or hasval (> (len (load midcoms)) 0))
+      (let [inner (dl-new a)]
+        (for [i 0 (len (load midcoms))]
+          (dl-push! inner (d-hardline a))
+          (dl-push! inner (get (load midcoms) i)))
+        (when hasval
+          (dl-push! inner (d-line a))
+          (dl-push! inner val))
+        (dl-push! dl (d-nest a 2 (dl-done a inner))))
+      (when (!= (primitive/cast i64 valcom) 0)
+        (dl-push! dl (d-text a "  "))
+        (dl-push! dl valcom)
+        0))
+    (let [body (d-align a 0 (dl-done a dl))]  ; anchor the +2 hang to the key column
+      (if (load forced) (d-group-forced a body) (d-group a body)))))
+
+; Walk elements [start, cnt) into clause rows. Each clause is key + optional
+; same-line comment + any comments on their own lines + value (+ optional same-line
+; comment); a standalone comment before a key is its own row. Comments never shift
+; the key/value cadence: a comment between a key and its value stays in that clause.
+(defn build-pair-rows [(a (dyn Allocator)) (n (ptr Node)) (start i64)]
+  (-> (ptr (ArrayList (ptr Doc))))
+  (let [cnt (node-count n)
+        rows (dl-new a)
+        (mut i) start]
+    (loop (if (>= (load i) cnt)
+              (break)
+              (let [ch (node-nth n (load i))]
+                (if (node-comment? ch)
+                    (do
+                      (dl-push! rows (node->doc a ch))
+                      (set! i (primitive/iadd (load i) 1)))  ; standalone comment row
+                    (let [key (node->doc a ch)
+                          (mut keycom) (primitive/cast (ptr Doc) 0)
+                          midcoms (dl-new a)
+                          (mut val) (primitive/cast (ptr Doc) 0)
+                          (mut hasval) false
+                          (mut valcom) (primitive/cast (ptr Doc) 0)]
+                      (set! i (primitive/iadd (load i) 1))
+                      (when (and (< (load i) cnt)
+                                 (trailing-comment? (node-nth n (load i))))
+                        (store! keycom (node->doc a (node-nth n (load i))))
+                        (store! i (primitive/iadd (load i) 1))
+                        0)
+                      (while (and (< (load i) cnt)
+                                  (node-comment? (node-nth n (load i))))
+                        (dl-push! midcoms (node->doc a (node-nth n (load i))))
+                        (store! i (primitive/iadd (load i) 1)))
+                      (when (and (< (load i) cnt)
+                                 (not (node-comment? (node-nth n (load i)))))
+                        (store! val (node->doc a (node-nth n (load i))))
+                        (store! hasval true)
+                        (store! i (primitive/iadd (load i) 1))
+                        (when (and (< (load i) cnt)
+                                   (trailing-comment? (node-nth n (load i))))
+                          (store! valcom (node->doc a (node-nth n (load i))))
+                          (store! i (primitive/iadd (load i) 1))
+                          0))
+                      (dl-push! rows
+                                (make-pair a
+                                           key
+                                           (load keycom)
+                                           midcoms
+                                           (load hasval)
+                                           (load val)
+                                           (load valcom))))))))
+    rows))
+
+; case: the scrutinee stays on the head line and the clauses follow in PAIRS, one
+; per line at +2, with a trailing default on a line of its own:
+;   (case n
+;     0 "zero"
+;     1 "one"
+;     "many")
+(defn layout-case [(a (dyn Allocator)) (n (ptr Node))] (-> (ptr Doc))
+  (let [cnt (node-count n)]
+    (if (or (<= cnt 2) (node-comment? (node-nth n 1)))
+        (layout a n 40 41 1 2 false)
+        (let [rows (build-pair-rows a n 2)
+              forced (or (any-child-multiline n) (any-child-comment n))
+              dl (dl-new a)]
+          (dl-push! dl (d-text a "("))
+          (dl-push! dl (node->doc a (node-nth n 0)))
+          (dl-push! dl (d-text a " "))
+          (dl-push! dl (node->doc a (node-nth n 1)))
+          (dl-push! dl (d-nest a 2 (rows-lines a rows 0)))
+          (dl-push! dl (closer a n ")"))
+          (seal a dl forced)))))
+
+; cond: clauses laid out in PAIRS, aligned under the first clause.
+;   (cond test1 res1
+;         test2 res2
+;         else)
+(defn layout-clauses [(a (dyn Allocator)) (n (ptr Node))] (-> (ptr Doc))
+  (let [cnt (node-count n)]
+    (if (<= cnt 1)
+        (layout a n 40 41 0 2 false)
+        (let [rows (build-pair-rows a n 1)
+              forced (or (any-child-multiline n) (any-child-comment n))
+              headlen (len (node-raw-flat a (node-nth n 0)))
+              dl (dl-new a)
+              rn (len (load rows))]
+          (dl-push! dl (d-text a "("))
+          (dl-push! dl (node->doc a (node-nth n 0)))  ; head
+          (when (> rn 0)
+            (dl-push! dl (d-text a " "))
+            ; first clause on head line
+            (dl-push! dl (get (load rows) 0)))
+          (dl-push! dl
+                    (d-nest a (primitive/iadd headlen 2) (rows-lines a rows 1)))
+          (dl-push! dl (closer a n ")"))
+          (seal a dl forced)))))
+
+; binding forms: head, a binding vector, then a body indented +2.
+(defn is-binding-form [(h (slice u8))] (-> bool)
+  (or (is h "let")
+      (or (is h "loop")
+          (or (is h "binding")
+              (or (is h "let*")
+                  (or (is h "when-let")
+                      (or (is h "if-let")
+                          (or (is h "while-let")
+                              (or (is h "for") (is h "doseq"))))))))))
+
+(defn layout-binding-form [(a (dyn Allocator)) (n (ptr Node))] (-> (ptr Doc))
+  (let [cnt (node-count n)
+        bv (node-nth n 1)]
+    (if (or (< cnt 2)
+            (not (and (node-list? bv)
+                      (= (node-open bv) 91))))
+        ; no binding vector. `(for PATTERN COLL body…)` keeps the pattern and the
+        ; collection on the head line; anything else keeps one element there.
+        (if (and (is (head-sym n) "for")
+                 (>= cnt 3)
+                 (not (node-comment? (node-nth n 1)))
+                 (not (node-comment? (node-nth n 2))))
+            (layout a n 40 41 2 2 false)
+            (layout a n 40 41 1 2 false))
+        (let [dl (dl-new a)
+              forced (or (any-child-multiline n) (any-child-comment n))]
+          (dl-push! dl (d-text a "("))
+          (dl-push! dl (node->doc a (node-nth n 0)))  ; head (let/loop/…)
+          (dl-push! dl (d-text a " "))
+          ; `for` binds a numeric range [var lo hi] — NOT key/value pairs — so lay it
+          ; out as a plain vector; every other binding form (let/loop/doseq/…) pairs.
+          (dl-push! dl
+                    (if (is (head-sym n) "for")
+                        (node->doc a bv)
+                        (layout-binding-vec a bv)))
+          (dl-push! dl (body-doc a n 2 2))  ; body +2
+          (dl-push! dl (closer a n ")"))
+          (seal a dl forced)))))
+
+; A keyword atom: an NAtom whose text begins with ':' (58). defn signature options
+; like `:cc (cc/C)` are written as such a keyword followed by its value.
+(defn kw-atom? [(n (ptr Node))] (-> bool)
+  (and (node-atom? n)
+       (let [s (node-raw n)]
+         (and (> (len s) 0)
+              (= (primitive/cast i64 (get s 0)) 58)))))
+
+; A named call is syntactically unambiguous: after its callee it consists of
+; `:field value` pairs. Keep each pair together, and put calls with three or more
+; fields into the same readable columnar shape used by binding vectors.
+(defn named-call? [(n (ptr Node))] (-> bool)
+  (let [cnt (node-count n)]
+    (and (>= cnt 3)
+         (and (= (primitive/irem (primitive/isub cnt 1) 2)
+                 0)
+              (named-call-pairs? n 1 cnt)))))
+
+(defn named-call-pairs? [(n (ptr Node)) (i i64) (cnt i64)] (-> bool)
+  (if (>= i cnt)
+      true
+      (and (kw-atom? (node-nth n i))
+           (named-call-pairs? n (primitive/iadd i 2) cnt))))
+
+(defn named-call-has-nested? [(n (ptr Node)) (i i64) (cnt i64)] (-> bool)
+  (if (>= i cnt)
+      false
+      (let [value (node-nth n (primitive/iadd i 1))]
+        (if (and (node-list? value) (named-call? value))
+            true
+            (named-call-has-nested? n (primitive/iadd i 2) cnt)))))
+
+(defn layout-named-call [(a (dyn Allocator)) (n (ptr Node))] (-> (ptr Doc))
+  (let [rows (build-pair-rows a n 1)
+        rn (len (load rows))
+        columnar
+          (or (>= rn 3)
+              (named-call-has-nested? n 1 (node-count n)))
+        forced
+          (or columnar
+              (or (any-child-multiline n) (any-child-comment n)))
+        dl (dl-new a)]
+    (dl-push! dl (d-text a "("))
+    (dl-push! dl (node->doc a (node-nth n 0)))
+    ; Flat when it fits; broken, every pair goes on a line of its own under the
+    ; constructor, so the fields line up whether there are two or twenty.
+    (dl-push! dl (d-nest a 2 (rows-lines a rows 0)))
+    (dl-push! dl (closer a n ")"))
+    (seal a dl forced)))
+
+; A declaration whose name is followed only by `:key value` options, such as
+; `(defcc fast :params [rdi rsi] :ret rax …)`. Each option stays with its value:
+; flat when the whole form fits, otherwise one pair per line under the name.
+; A `[...]` right after the name, such as `defprop-stateful`'s type list, belongs to
+; the declaration's head line too.
+(defn named-options-start [(n (ptr Node))] (-> i64)
+  (if (and (> (node-count n) 2) (vector-node? (node-nth n 2))) 3 2))
+
+(defn named-options? [(n (ptr Node))] (-> bool)
+  (let [cnt (node-count n)
+        start (named-options-start n)]
+    (and (>= cnt (+ start 2))
+         (= (primitive/irem (primitive/isub cnt start) 2) 0)
+         (node-atom? (node-nth n 1))
+         (not (kw-atom? (node-nth n 1)))
+         ; a declared NAME: not a string such as an import's module path
+         (not (= (primitive/cast i64 (get (node-raw (node-nth n 1)) 0)) 34))
+         (named-call-pairs? n start cnt))))
+
+; The same declaration with one plain argument after its options, such as
+; `(defmmio-reg R :address 0x10 :type u32 :access (mmio/ReadOnly) [FIELDS])`.
+; The pairs keep their layout and the last argument takes a line of its own.
+; Only forms that would otherwise get call alignment use it; defstruct, defn and
+; the rest keep their own rules.
+(defn named-options-trailing? [(n (ptr Node))] (-> bool)
+  (let [cnt (node-count n)
+        start (named-options-start n)]
+    (and (>= cnt (+ start 3))
+         (= (primitive/irem (primitive/isub cnt start) 2) 1)
+         (node-atom? (node-nth n 1))
+         (not (kw-atom? (node-nth n 1)))
+         (not (= (primitive/cast i64 (get (node-raw (node-nth n 1)) 0)) 34))
+         (not (kw-atom? (node-nth n (primitive/isub cnt 1))))
+         (named-call-pairs? n start (primitive/isub cnt 1)))))
+
+(defn layout-named-options [(a (dyn Allocator)) (n (ptr Node))] (-> (ptr Doc))
+  (let [start (named-options-start n)
+        rows (build-pair-rows a n start)
+        forced (or (any-child-multiline n) (any-child-comment n))
+        dl (dl-new a)]
+    (dl-push! dl (d-text a "("))
+    (dl-push! dl (node->doc a (node-nth n 0)))
+    (inline-into a dl n 1 start)
+    (dl-push! dl (d-nest a 2 (rows-lines a rows 0)))
+    (dl-push! dl (closer a n ")"))
+    (seal a dl forced)))
+
+(defn vector-node? [(n (ptr Node))] (-> bool)
+  (and (node-list? n) (= (node-open n) 91)))
+
+; The inline element count for a defn signature: how many children after the
+; head (the name) stay on the head line. A defn signature is the name, any leading
+; keyword-option pairs (e.g. `:cc (cc/C)`), the parameter vector(s) — a *generic* defn
+; writes a [type-params] vector before the [params] vector — plus an optional
+; (-> ret). The body starts after that.
+; Returns 0 when there is no leading vector at all (def / defmulti / multi-arity
+; defn), which the caller treats as "name inline, don't force the body".
+(defn defn-sig-end [(n (ptr Node))] (-> i64)
+  (sig-end-from n 2))
+
+; The same, for a signature whose options/parameters start at `start`: a defn's
+; at 2 (after `defn NAME`), a method's or a `fn`'s at 1.
+(defn sig-end-from [(n (ptr Node)) (start i64)] (-> i64)
+  ; First skip leading `:kw value` option pairs (like `:cc (cc/C)`), then consume the
+  ; contiguous leading [...] vectors.
+  (let [cnt (node-count n)
+        (mut base) start]
+    (loop (if (and (< (primitive/iadd (load base) 1) cnt)
+                   (kw-atom? (node-nth n (load base))))
+              (set! base (primitive/iadd (load base) 2))
+              (break)))
+    (let [(mut i) (load base)]
+      (loop (if (>= (load i) cnt)
+                (break)
+                (let [ch (node-nth n (load i))]
+                  (if (and (node-list? ch)
+                           (= (node-open ch) 91))
+                      (set! i (primitive/iadd (load i) 1))
+                      (break)))))
+      (unless (<= (load i) (load base))
+        ; no param vector
+        ; include a trailing (-> ret); else stop at the last vector
+        (if (and (< (load i) cnt) (list-head-is n (load i) "->"))
+            (load i)
+            (primitive/isub (load i) 1))))))
+
+; A method in an impl or a trait, `(name [params] (-> ret) body…)`: a list whose
+; second element is its parameter vector. A type such as `(ptr T)` or
+; `(fnptr (cc/C) [T] R)` never has a vector there.
+(defn method-node? [(n (ptr Node))] (-> bool)
+  (and (node-list? n)
+       (= (node-open n) 40)
+       (>= (node-count n) 2)
+       (node-atom? (node-nth n 0))
+       (vector-node? (node-nth n 1))))
+
+; Is there a comment among children [lo, hi)?
+(defn comment-in? [(n (ptr Node)) (lo i64) (hi i64)] (-> bool)
+  (< (clamp-before-comment n lo hi) hi))
+
+; A callable's layout — a defn, a method, a `fn` — given where its signature
+; ends (`sig-end`, from sig-end-from). The parameter vector(s) stay on the head
+; line; the `(-> ret)` follows them when it fits and otherwise takes a line of its
+; own at +2, as a whole rather than broken inside; the body is at +2. `force-body`
+; keeps the body off the head line even when everything would fit (a defn's
+; signature is never joined with its body).
+(defn layout-callable [(a (dyn Allocator))
+                       (n (ptr Node))
+                       (sig-end i64)
+                       (force-body bool)] (-> (ptr Doc))
+  (let [cnt (node-count n)
+        has-ret (list-head-is n sig-end "->")
+        params-end (if has-ret sig-end (+ sig-end 1))
+        has-body (< (+ sig-end 1) cnt)]
+    (if (comment-in? n 1 (+ sig-end 1))
+        (layout a n 40 41 sig-end 2 (and force-body has-body))
+        (let [dl (dl-new a)
+              forced
+                (or (and force-body has-body)
+                    (or (any-child-multiline n) (any-child-comment n)))]
+          (dl-push! dl (d-text a "("))
+          (dl-push! dl (node->doc a (node-nth n 0)))
+          (inline-into a dl n 1 params-end)
+          (when has-ret
+            (let [ret (node-nth n sig-end)
+                  hang (dl-new a)]
+              (dl-push! hang (d-line a))
+              ; a return type is a type, not code with structure of its own, so it
+              ; reflows: one split by an earlier width is joined again when it fits
+              (dl-push! hang (node->doc a (node-joined a ret)))
+              ; an author who put the return type on its own line keeps it there
+              (dl-push! dl
+                        (if (> (node-nl ret) 0)
+                            (d-group-forced a (d-nest a 2 (dl-done a hang)))
+                            (d-group a (d-nest a 2 (dl-done a hang)))))))
+          (dl-push! dl (body-doc a n (+ sig-end 1) 2))
+          (dl-push! dl (closer a n ")"))
+          (seal a dl forced)))))
+
+; A copy of `n` with every line break inside it removed, so its layout is decided
+; by width alone. A node holding a comment is returned as it is: the comment ends
+; its line.
+(defn node-joined [(a (dyn Allocator)) (n (ptr Node))] (-> (ptr Node))
+  (if (or (not (node-list? n)) (holds-comment? n))
+      n
+      (let [(mut items) (ArrayList::new [(ptr Node)] a)]
+        (for [i 0 (node-count n)]
+          (let [c (node-joined a (node-nth n i))]
+            (push! (mut items)
+                   (box! a Node (Node :kind (node-kind c) :nl-before 0)))))
+        (box! a
+              Node
+              (Node
+                :kind
+                  (NList (node-open n)
+                         (box! a (ArrayList (ptr Node)) (load items)))
+                :nl-before (node-nl n))))))
+
+(defn holds-comment? [(n (ptr Node))] (-> bool)
+  (cond (node-comment? n) true
+        (node-list? n)
+          (block :found
+            (for [i 0 (node-count n)]
+              (when (holds-comment? (node-nth n i)) (return-from :found true)))
+            false)
+        :else false))
+
+; A method inside an impl or a trait is laid out like the defn it is, with its
+; name as the head.
+(defn member->doc [(a (dyn Allocator)) (n (ptr Node))] (-> (ptr Doc))
+  (let [sig-end (sig-end-from n 1)]
+    (if (and (method-node? n) (> sig-end 0))
+        (layout-callable a n sig-end true)
+        (node->doc a n))))
+
+; `layout` for a declaration whose body elements are methods: impl and deftrait.
+(defn layout-members [(a (dyn Allocator)) (n (ptr Node)) (inline-n i64)]
+  (-> (ptr Doc))
+  (let [cnt (node-count n)
+        dl (dl-new a)
+        forced (or (any-child-multiline n) (any-child-comment n))
+        inline-hi
+          (clamp-before-comment n
+                                1
+                                (if (> (+ 1 inline-n) cnt) cnt (+ 1 inline-n)))
+        body (dl-new a)]
+    (dl-push! dl (d-text a "("))
+    (dl-push! dl (node->doc a (node-nth n 0)))
+    (inline-into a dl n 1 inline-hi)
+    (for [j inline-hi cnt]
+      (dl-push! body (body-sep a (node-nth n j)))
+      (dl-push! body (member->doc a (node-nth n j))))
+    (dl-push! dl (d-nest a 2 (dl-done a body)))
+    (dl-push! dl (closer a n ")"))
+    (seal a dl forced)))
+
+; A form whose body follows `header` leading elements — a `block`/`scope` label, or
+; nothing for `try`/`defer`. A single body form hangs on the head line,
+;   (try (let [x (try! (f))]
+;          x))
+; and several go one per line at +2:
+;   (block :found
+;     (for x xs (when (= x 3) (return-from :found 1)))
+;     0)
+(defn layout-body-form [(a (dyn Allocator)) (n (ptr Node)) (header i64)]
+  (-> (ptr Doc))
+  (let [cnt (node-count n)
+        one-body (= cnt (+ header 2))]
+    (if (and one-body (not (comment-in? n 1 cnt)))
+        (layout a n 40 41 (+ header 1) 2 false)
+        (layout a n 40 41 header 2 false))))
+
+; `block` and `scope` take an optional `:label` before their body.
+(defn label-count [(n (ptr Node))] (-> i64)
+  (if (and (> (node-count n) 1) (kw-atom? (node-nth n 1))) 1 0))
+
+; A defstruct's signature — name, optional [type-params], and any :layout/:size/…
+; keyword options — all stay on the head line; only the final field vector is the
+; (breakable) body. So keep every child inline except the last one. Returns the
+; inline count (elements after the head), never below 1.
+(defn defstruct-inline-n [(n (ptr Node))] (-> i64)
+  (let [cnt (node-count n)]
+    (if (< (primitive/isub cnt 2) 1)
+        1
+        (primitive/isub cnt 2))))
+
+; A defsum/deftrait/defenum signature — the name, any `:key value` annotation
+; pairs, and an optional [type-params] vector — stays on the head line; the
+; variants (or trait methods) after it are the body, one per line. Unlike
+; defstruct there may be many body elements, so the count is not "all but the
+; last": it is the name, each annotation pair, and the [...] vector if there is one
+;   (defsum Option [T]        (deftrait Eq [Self]
+;     (None) …)                 (= [(a Self) (b Self)] (-> bool)))
+;   (defsum CtVal
+;     (CInt [(v i64)]) …)
+(defn defsum-inline-n [(n (ptr Node))] (-> i64)
+  (let [cnt (node-count n)
+        (mut i) 2]
+    (while (and (< (+ i 1) cnt) (kw-atom? (node-nth n i)))
+      (set! i (+ i 2)))
+    (when (and (< i cnt)
+               (node-list? (node-nth n i))
+               (= (node-open (node-nth n i)) 91))
+      (set! i (+ i 1)))
+    (- i 1)))
+
+; An impl header — `(impl [type-params]? Trait Type …)` — stays on the head line;
+; the method definitions are the body. Same optional-[type-params] shift as above,
+; one position earlier because impl has no name:
+;   (impl BitOr i64 …)        -> 2   (Trait, Type)
+;   (impl [T] Eq (ptr T) …)   -> 3   ([T], Trait, Type)
+;   (impl Session (new …) …)  -> 1   (an inherent impl: just the Type)
+; The header is everything before the first method.
+(defn impl-inline-n [(n (ptr Node))] (-> i64)
+  (let [cnt (node-count n)
+        (mut i) (if (and (> cnt 1) (vector-node? (node-nth n 1))) 2 1)]
+    (while (and (< i cnt)
+                (not (method-node? (node-nth n i)))
+                (not (node-comment? (node-nth n i))))
+      (set! i (+ i 1)))
+    (if (< i 2) 1 (- i 1))))
+
+; ---- list dispatch ---------------------------------------------------------
+; Every layout reads child 0 as the head and writes the next child after it on
+; the same line. A comment right after the opening delimiter, `(; note` NEWLINE
+; `if …)`, would be that head, and the real head written after it would be inside
+; the comment, which changes the program. Such comments are moved in front of the
+; list, each on its own line (comments are trivia), and the list is laid out from
+; its first real child. A list that holds nothing but comments keeps them inside,
+; one per line, with the closing delimiter on a line of its own.
+(defn leading-comment-count [(n (ptr Node))] (-> i64)
+  (let [(mut k) 0]
+    (while (and (< k (node-count n)) (node-comment? (node-nth n k)))
+      (set! k (+ k 1)))
+    k))
+
+(defn list->doc [(a (dyn Allocator)) (n (ptr Node))] (-> (ptr Doc))
+  (let [k (leading-comment-count n)
+        cnt (node-count n)
+        brackets (= (node-open n) 91)]
+    (cond (= k 0) (list-layout->doc a n)
+          (= k cnt)
+            (let [dl (dl-new a)]
+              (dl-push! dl (d-text a (if brackets "[" "(")))
+              (for [i 0 k]
+                (dl-push! dl (d-text a (node-raw (node-nth n i))))
+                (dl-push! dl (d-hardline a)))
+              (dl-push! dl (d-text a (if brackets "]" ")")))
+              (dl-done a dl))
+          :else
+            (let [dl (dl-new a)
+                  (mut rest) (ArrayList::new [(ptr Node)] a)]
+              (for [i 0 k]
+                (dl-push! dl (d-text a (node-raw (node-nth n i))))
+                (dl-push! dl (d-hardline a)))
+              (for [i k cnt] (push! (mut rest) (node-nth n i)))
+              (dl-push! dl
+                        (list-layout->doc a
+                                          (box! a
+                                                Node
+                                                (Node
+                                                  :kind
+                                                    (NList (node-open n)
+                                                           (box! a
+                                                                 (ArrayList (ptr Node))
+                                                                 (load rest)))
+                                                  :nl-before (node-nl n)))))
+              (dl-done a dl)))))
+
+; A vector of numbers, symbols, keywords or characters — data, not code — fills
+; its lines like a paragraph rather than taking a line per element:
+;   [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28
+;    29 30]
+; Each separator is a group of its own, so it breaks only when the next element
+; does not fit. Strings and lists keep one per line.
+(defn plain-atom? [(n (ptr Node))] (-> bool)
+  (and (node-atom? n)
+       (let [raw (node-raw n)]
+         (and (> (len raw) 0)
+              (!= (get raw 0) (: 34 u8))
+              (not (and (> (len raw) 1)
+                        (= (get raw 0) (: 99 u8))
+                        (= (get raw 1) (: 34 u8))))))))
+
+(defn fill-vector? [(n (ptr Node))] (-> bool)
+  (and (vector-node? n)
+       (> (node-count n) 1)
+       (block :all
+         (for [i 0 (node-count n)]
+           (unless (plain-atom? (node-nth n i)) (return-from :all false)))
+         true)))
+
+(defn layout-fill [(a (dyn Allocator)) (n (ptr Node))] (-> (ptr Doc))
+  (let [dl (dl-new a)
+        rest (dl-new a)]
+    (dl-push! dl (d-text a "["))
+    (dl-push! dl (node->doc a (node-nth n 0)))
+    (for [i 1 (node-count n)]
+      (let [one (dl-new a)]
+        ; a blank line the author left between elements is kept
+        (when (>= (node-nl (node-nth n i)) 2)
+          (dl-push! one (d-hardline a)))
+        (dl-push! one (d-line a))
+        (dl-push! one (node->doc a (node-nth n i)))
+        (dl-push! rest (d-group a (dl-done a one)))))
+    (dl-push! dl (d-nest a 1 (dl-done a rest)))
+    (dl-push! dl (d-text a "]"))
+    (d-align a 0 (dl-done a dl))))
+
+(defn list-layout->doc [(a (dyn Allocator)) (n (ptr Node))] (-> (ptr Doc))
+  (if (= (node-open n) 91)
+      (if (fill-vector? n)
+          (layout-fill a n)
+          (layout a n 91 93 0 1 false))  ; vector: align under first elem
+      (let [cnt (node-count n)]
+        (if (<= cnt 0)
+            (d-text a "()")
+            (let [h (head-sym n)
+                  rp (primitive/alloc-stack Rule)]
+              (set! rp (list-rule h))
+              (let [style (.style rp)
+                    rn (.n rp)]
+                (cond (is-binding-form h) (layout-binding-form a n)
+                      (named-call? n) (layout-named-call a n)
+                      (named-options? n) (layout-named-options a n)
+                      (is h "defstruct")  ; name + [type-params] + :layout/:size/… options inline; field vector body.
+                        (layout a n 40 41 (defstruct-inline-n n) 2 false)
+                      (or (is h "defsum") (is h "defenum"))  ; name + optional [type-params] inline; variants are the body.
+                        (layout a n 40 41 (defsum-inline-n n) 2 false)
+                      (is h "deftrait")  ; name + optional [type-params] inline; method signatures are the body.
+                        (layout-members a n (defsum-inline-n n))
+                      (is h "impl")  ; optional [type-params] + Trait + Type inline; methods are the body.
+                        (layout-members a n (impl-inline-n n))
+                      (or (is h "block") (is h "scope"))
+                        (layout-body-form a n (label-count n))
+                      (or (is h "try") (is h "defer") (is h "compile-errors"))
+                        (layout-body-form a n 0)
+                      (or (is h "fn") (is h "fn*"))
+                        (let [sig-end (sig-end-from n 1)]
+                          (if (= sig-end 0)
+                              (layout a n 40 41 1 2 false)
+                              (layout-callable a n sig-end false)))
+                      (is h "case") (layout-case a n)
+                      (= style 3) (layout-clauses a n)
+                      (and (= style 0) (named-options-trailing? n))
+                        (layout-named-options a n)
+                      (= style 0)  ; CALL: arg1 inline, rest align under it (nest = headlen + 2)
+                        (let [headlen (len (node-raw-flat a (node-nth n 0)))]
+                          (layout a n 40 41 1 (primitive/iadd headlen 2) false))
+                      (= style 2)  ; DEFN: signature = up to the param vector (+ optional (-> ...)), body +2.
+                        ; With no param vector (def, defmulti, multi-arity defn): just the
+                        ; name on the head line, body +2 — never function-call alignment.
+                        (let [sig-end (defn-sig-end n)]
+                          (if (= sig-end 0)
+                              (layout a n 40 41 1 2 false)
+                              ; force the body onto its own line(s): a defn signature is
+                              ; never joined with its body, even when it would fit flat.
+                              (layout-callable a n sig-end true)))
+                      :else  ; BLOCK n
+                        (layout a n 40 41 rn 2 false))))))))
+
+; true if child `i` is a list whose head symbol equals `lit`.
+(defn list-head-is [(n (ptr Node)) (i i64) (lit (slice u8))] (-> bool)
+  (let [ch (node-nth n i)]
+    (if (node-list? ch) (= (head-sym ch) lit) false)))
+
+; A flat-text approximation of a node's head, for computing alignment width.
+(defn node-raw-flat [(a (dyn Allocator)) (n (ptr Node))] (-> (slice u8))
+  (if (node-atom? n) (node-raw n) "x"))  ; non-atom head: nominal width 1
+
+; ---- node dispatch ---------------------------------------------------------
+(defn node->doc [(a (dyn Allocator)) (n (ptr Node))] (-> (ptr Doc))
+  (cond (node-atom? n) (d-text a (node-raw n))
+        (node-comment? n) (d-text a (node-raw n))
+        (node-list? n) (list->doc a n)
+        :else  ; prefix: op glued to inner
+          (match (node-kind n)
+            (NPrefix [op inner]
+                     (let [dl (dl-new a)]
+                       (dl-push! dl (d-text a op))
+                       (dl-push! dl (node->doc a inner))
+                       (dl-done a dl)))
+            (NAtom [_] (d-text a ""))
+            (NList [_ _] (d-text a ""))
+            (NComment [_] (d-text a "")))))
+
+; ---- document (top level) --------------------------------------------------
+; `module` and `import` together form Coil's namespace header. Keep that header
+; compact; unlike Clojure's single `ns` form, Coil spells its imports as separate
+; top-level forms.
+(defn header-form? [(n (ptr Node))] (-> bool)
+  (and (node-list? n)
+       (let [h (head-sym n)] (or (is h "module") (is h "import")))))
+
+; The separator before a top-level node. A standalone comment starts (or
+; continues) the leading comment block for the form after it, so the empty line
+; belongs before the comment block, never between that block and its form.
+; `prev-trails` says `prev` is a comment on the same line as the form before it.
+; It cannot be read off `prev` alone: the file's first node also has no newline
+; before it, and a comment there opens the file's header block.
+(defn top-level-sep [(a (dyn Allocator))
+                     (prev (ptr Node))
+                     (prev-trails bool)
+                     (nd (ptr Node))] (-> (ptr Doc))
+  (if (and (node-comment? nd) (= (node-nl nd) 0))
+      (d-text a "  ")  ; trailing comment: same line
+      (let [blank
+              (cond (node-comment? nd)
+                      (if (node-comment? prev)
+                          (or prev-trails
+                              (>= (node-nl nd) 2))
+                          true)
+                    ; a comment block the author separated from the form below it
+                    ; by a blank line is a section comment, not that form's lead
+                    (node-comment? prev) (or prev-trails (>= (node-nl nd) 2))
+                    (and (header-form? prev) (header-form? nd)) false
+                    :else true)
+            dl (dl-new a)]
+        (dl-push! dl (d-hardline a))
+        (when blank (dl-push! dl (d-hardline a)) 0)
+        (dl-done a dl))))
+
+; The whole file: one empty line between top-level forms, matching the Clojure
+; style guide. Leading comment blocks travel with their form; the namespace
+; header stays compact.
+(defn doc->doc [(a (dyn Allocator)) (nodes (ptr (ArrayList (ptr Node))))]
+  (-> (ptr Doc))
+  (let [cnt (len (load nodes))
+        dl (dl-new a)
+        (mut i) 0]
+    (loop (if (>= (load i) cnt)
+              (break)
+              (do
+                (let [nd (get (load nodes) (load i))]
+                  (when (> (load i) 0)
+                    (let [pi (primitive/isub (load i) 1)
+                          prev (get (load nodes) pi)
+                          prev-trails
+                            (and (> pi 0)
+                                 (node-comment? prev)
+                                 (= (node-nl prev)
+                                    0))]
+                      (dl-push! dl (top-level-sep a prev prev-trails nd))))
+                  (dl-push! dl (node->doc a nd)))
+                (set! i (primitive/iadd (load i) 1)))))
+    (dl-push! dl (d-hardline a))  ; trailing newline
+    (d-group-forced a (dl-done a dl))))
+
+;;; The target width `coil fmt` uses when `--width` is not given. Every producer of
+;;; formatted source reads it from here — the CLI, the standalone formatter binary,
+;;; and `lint --fix`, which promises that what it writes is already `fmt` output. A
+;;; second copy of the number is how a `--fix` write starts failing the `fmt --check`
+;;; that follows it.
+(defn fmt-default-width [] (-> i64)
+  80)
+
+; one-call entry: source text -> formatted source text (width cols), or why the
+; reader refuses it. Formatting only moves whitespace, which needs a program whose
+; extent is known: guessing where an open form ends writes out a different program.
+; Repairing delimiters is `coil balance`, and it says that it did.
+(defn format-src [(a (dyn Allocator)) (src (slice u8)) (width i64)]
+  (-> (Result (slice u8) rd/Diag))
+  (match (rd/read-all a src 0)
+    (Err [d] (Err d))
+    (Ok [_] (Ok (render-doc a (doc->doc a (read-doc a src)) width)))))

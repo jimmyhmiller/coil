@@ -18,6 +18,7 @@
 # The compiler is $COIL (default: `coil` on PATH). Exit status 0 only if every
 # check passes.
 set -uo pipefail
+. "$(dirname "$0")/../../compiler/clear-project-config.sh"
 
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 COIL=${COIL:-coil}
@@ -103,17 +104,8 @@ expect 0 "-9223372036854775807" "a release build wraps on overflow"
 echo "== app: profiles, install"
 run "$APP" "$COIL" build --profile safe
 expect 0 "build/safe/pfapp" "--profile safe builds into build/safe"
-# A build of one named file scans only that file for removed names, not the whole
-# project: a file it never imports is not its business (and scanning every file
-# made each such build in a large project pay for parsing all of it).
-printf '(module pfapp.legacy-note)\n(import "coil.hashmap" :use [hm-len])\n' > "$APP/src/legacy_note.coil"
 run "$APP" "$COIL" build --profile safe src/main.coil
-rm -f "$APP/src/legacy_note.coil"
 expect 0 "wrote build/safe/main" "--profile safe builds a named file into build/safe too"
-case "$OUT" in
-  *"removed library names"*) bad "a named-file build scans only that file for removed names" "$OUT" ;;
-  *) ok "a named-file build scans only that file for removed names" ;;
-esac
 run "$APP" ./build/safe/pfapp overflow
 [ "$RC" -ge 128 ] && case "$OUT" in *"panic: integer overflow"*) true ;; *) false ;; esac \
   && ok "the safe profile's coil.safety traps the overflow" \
@@ -316,7 +308,7 @@ expect 0 "" "the consumer links the unit; state, a def it shares, generic static
 # A module that re-exports another's names builds as a unit, and its consumer sees
 # the re-exported names, under the names the import gives them, and nothing more.
 # With no export list, every name the module declares is public through the unit
-# as from source: one its `meta` generates, a C function, a generic sum's
+# as from source: one its top-level macro generates, a C function, a generic sum's
 # variants, a derive generator, constants, its `main` (an ordinary function in a
 # unit, never a second process entry beside the consumer's), and functions keep
 # their parameter names.
@@ -340,27 +332,11 @@ FLAT="$W/flat"
 mkdir -p "$FLAT"
 printf '[package]\nname = "flat"\nentry = "main.coil"\n' > "$FLAT/Coil.toml"
 printf '(module flat.main)\n(import "flat.util" :use [twice])\n(defn main [] (-> i64) (println "{}" (twice 21)) 0)\n' > "$FLAT/main.coil"
-printf '(module flat.util)\n(import "coil.args" :use [args-count])\n(defn twice [(x i64)] (-> i64) (+ (* x 2) (* 0 (args-count))))\n' > "$FLAT/util.coil"
-# A removed name the migration cannot rewrite stops the whole project: every file
-# is left as it was, the run says why, and it names no file as fixed.
-printf '(module flat.legacy)\n(import "coil.hashmap" :use [hm-get])\n(defn f [] (-> i64) (let [g (fnptr-of hm-get [i64 i64])] 0))\n' > "$FLAT/legacy.coil"
-cp "$FLAT/util.coil" "$W/flat-util.orig"
-run "$FLAT" "$COIL" lint --fix
-if [ "$RC" = 1 ] && cmp -s "$W/flat-util.orig" "$FLAT/util.coil"; then
-  case "$OUT" in
-    *"fixed "*) bad "lint --fix that cannot migrate a file names none as fixed" "$OUT" ;;
-    *"legacy.coil:3: error: "*"error: lint --fix wrote nothing: the uses of removed names reported above as errors"*)
-      ok "lint --fix that cannot migrate a file writes nothing and says why" ;;
-    *) bad "lint --fix that cannot migrate a file writes nothing and says why" "$OUT" ;;
-  esac
-else
-  bad "lint --fix that cannot migrate a file writes nothing and says why" "exit $RC: $OUT $(cat "$FLAT/util.coil")"
-fi
-rm "$FLAT/legacy.coil"
+printf '(module flat.util)\n(import "coil.primitive" :as primitive)\n(defn twice [(x i64)] (-> i64) (if (primitive/icmp-eq x x) (* x 2) 0))\n' > "$FLAT/util.coil"
 run "$FLAT" "$COIL" lint --fix
 case "$(cat "$FLAT/util.coil")" in
-  *args-count*) bad "lint --fix in a flat package migrates a module beside the entry" "$OUT $(cat "$FLAT/util.coil")" ;;
-  *) ok "lint --fix in a flat package migrates a module beside the entry" ;;
+  *primitive/icmp-eq*) bad "lint --fix in a flat package fixes a module beside the entry" "$OUT $(cat "$FLAT/util.coil")" ;;
+  *) ok "lint --fix in a flat package fixes a module beside the entry" ;;
 esac
 case "$OUT" in
   *"fixed main.coil"*) bad "lint --fix names only the files it changed" "$OUT" ;;
@@ -368,20 +344,20 @@ case "$OUT" in
   *) bad "lint --fix names only the files it changed" "$OUT" ;;
 esac
 run "$FLAT" "$COIL" run
-expect 0 "42" "the migrated flat package runs"
+expect 0 "42" "the fixed flat package runs"
 
 echo "== lint --fix on several files"
 # Every file named is linted, not just the last.
 MULTI="$W/multi"
 mkdir -p "$MULTI"
 for m in one two; do
-  printf '(module multi.%s)\n(import "coil.args" :use [args-count])\n(defn main [] (-> i64) (* 0 (args-count)))\n' "$m" > "$MULTI/$m.coil"
+  printf '(module multi.%s)\n(import "coil.primitive" :as primitive)\n(defn main [] (-> i64) (if (primitive/icmp-eq 0 0) 0 1))\n' "$m" > "$MULTI/$m.coil"
 done
 run "$MULTI" "$COIL" lint --fix one.coil two.coil
 case "$RC $(cat "$MULTI/one.coil" "$MULTI/two.coil")" in
-  "0 "*args-count*) bad "lint --fix migrates every file it is given" "exit $RC: $OUT $(cat "$MULTI/one.coil")" ;;
-  "0 "*) ok "lint --fix migrates every file it is given" ;;
-  *) bad "lint --fix migrates every file it is given" "exit $RC: $OUT" ;;
+  "0 "*primitive/icmp-eq*) bad "lint --fix fixes every file it is given" "exit $RC: $OUT $(cat "$MULTI/one.coil")" ;;
+  "0 "*) ok "lint --fix fixes every file it is given" ;;
+  *) bad "lint --fix fixes every file it is given" "exit $RC: $OUT" ;;
 esac
 
 echo "== workspace"

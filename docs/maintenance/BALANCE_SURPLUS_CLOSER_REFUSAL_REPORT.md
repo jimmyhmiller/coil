@@ -60,7 +60,7 @@ was the delimiter defect rather than merely a different parse that happened to r
 
 ## Why the old policy missed it
 
-`src/compiler/formatter/balance.coil::plan-deletes` tracks delimiter depth within a
+`src/stdlib/source/balance.coil::plan-deletes` tracks delimiter depth within a
 region. When it encounters a closer at depth zero, it deletes it only when its column
 is zero. Every indented surplus closer is classified as `surplus-ambiguous` before
 candidate compilation can select among hypotheses.

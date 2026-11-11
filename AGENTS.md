@@ -187,15 +187,11 @@ Use this format:
   it, and the build exports
   `COIL_STRICT_BUNDLE=1` so the in-repo fallback is a hard error instead of a silent
   success.
-- **Renaming a stdlib API?** Add rows to `API-RENAMES` in
-  `src/compiler/migrate/api_renames.coil`, one per removed public name (its header gives
-  the row format). That table is all there is to change: `coil lint --fix` then
-  rewrites code that uses the old names (the preflight in
-  `src/compiler/migrate/api_migration.coil`), `coil build` in such a project points at it,
-  and the resolver's errors name the replacement. Delete any `coil.lint.modernize`
-  rule for a name you remove. Changing a library module's `:reexport` import
-  means rerunning `python3 scripts/compiler/gen-stdlib-manifest.py`, which
-  regenerates the table's `API-REEXPORTS` from the library's imports.
+- `src/tools/*.coil` — commands that are programs of their own. `coil NAME` runs the
+  `coil-NAME` beside the running compiler, then on `PATH`, the way `git NAME` does; dev.py
+  builds them beside every compiler it builds. They import only the standard library, so
+  the code they share lives there: `coil.source.*` (the formatter and delimiter repair),
+  `coil.project` (Coil.toml and a project's files) and `coil.path`.
 - `src/examples/*.coil` — one idea each (`sums`, `hashmap`, `references`, `lisp`, …).
 - Dialects (Scheme, Brainfuck), applications (clox, CHIP-8, Space Invaders, Wasm),
   and research transforms (GC dialects, httptap) live in the separate
@@ -204,14 +200,16 @@ Use this format:
   what stops them from being mistaken for the API surface. `src/examples/*.coil`
   is the exception: those are feature demos the language guide points at.
 - `src/compiler/` — the compiler itself. Entry points sit at its root (`main*.coil`,
-  `driver.coil`, `jit_api.coil` for `coil.jit`, `prelude.coil` for `coil.core`); the
-  rest is grouped by stage: `frontend/` (parser, loader, resolve, expander, check,
-  mono), `comptime/` (compile-time evaluation, the bytecode interpreter), `meta/`
-  (compiled metaprograms), `backend/` (LLVM, arm64, x64, wasm, tpde codegen),
-  `object/` (instruction encoders, Mach-O/ELF/DWARF/wasm writers), `jit/`,
-  `retained/` (state kept between compiler revisions), `artifact/` (units and
-  artifact identity), `migrate/` (API and syntax migrations), `cli/` (`cimport`,
-  `update`, the generated guide), `support/`, `formatter/` and `selftest/`.
+  `driver.coil`, which dispatches commands, `jit_api.coil` for `coil.jit`, `prelude.coil`
+  for `coil.core`), with `pipeline.coil`, what compiling a program takes, shared by every
+  command; the rest is grouped by stage: `frontend/` (parser, loader, resolve, expander, check,
+  mono), `meta/` (the metaprogram engine, the code operations and the bytecode
+  interpreter), `backend/` (LLVM, arm64, x64, wasm, tpde codegen),
+  `object/` (instruction encoders, Mach-O/ELF/DWARF/wasm writers), `jit/` (with `session.coil`,
+  a live session, and `terminal.coil`, the terminal REPL over one), `artifact/` (units and
+  artifact identity), `cli/` (one module per command
+  family, with `project.coil` and `base.coil` beneath them; a command imports nothing above
+  it, and nothing imports a command but `driver.coil`), `support/` and `selftest/`.
   Module names do not follow the folders: a module is found by its declared
   `(module coil.compiler.NAME)`, so moving a file changes no import.
 - `tests/` — what the two test tiers run: `corpus` (the runtime programs), `diag`

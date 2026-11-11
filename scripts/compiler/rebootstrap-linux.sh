@@ -26,6 +26,7 @@
 # A successful verification also installs the artifact as the user-level `coil`
 # selected by `scripts/dev.py install`. No install occurs until every gate passes.
 set -uo pipefail
+. "$(dirname "$0")/./clear-project-config.sh"
 cd "$(dirname "$0")/../.."
 # The library sources this build starts from; recorded beside the result so an
 # install can never pair the compiler with different ones.

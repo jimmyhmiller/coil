@@ -34,10 +34,10 @@
 (import "coil.compiler.parser" :use *)
 (import "coil.compiler.ast" :use *)
 (import "coil.compiler.codeop" :use *)
-(import "coil.compiler.resolve" :use *)
-(import "coil.compiler.comptime" :use *)
+(import "coil.compiler.metastate" :use *)
 (import "coil.compiler.closure" :use *)
 (import "coil.compiler.mono" :use [monomorphize-keeping-code])
+(import "coil.compiler.mono_core" :use [InstanceExpansion])
 (import "coil.compiler.check" :use *)
 (import "coil.compiler.ffi" :use *)
 (import "coil.io" :use [stderr])
@@ -55,7 +55,10 @@
    ; The checked program's sums, and a decoder function per answer sum a code
    ; operation of this program returns (ml-answer-decoder).
    (sums (ptr (ArrayList SumDef)))
-   (answers (ptr (ArrayList Func)))])
+   (answers (ptr (ArrayList Func)))
+   ; For lifting a value into Code (ml-lift-operand).
+   (structs (ptr (ArrayList StructDef)))
+   (origins (ptr (ArrayList MonoOrigin)))])
 
 (defstruct MLRestricted [(name (slice u8)) (target (slice u8)) (diag Diag)])
 
@@ -528,7 +531,7 @@
 
 ;;; ---- answers ------------------------------------------------------------------
 ;;; A code operation whose primitive declares the sum it answers with returns, across
-;;; the boundary, the Code `(K FIELD…)` comptime.coil's answer->sexp encodes: K is the
+;;; the boundary, the Code `(K FIELD…)` metastate.coil's answer->sexp encodes: K is the
 ;;; variant's position in the sum's declaration. The decoder for a sum is a function
 ;;; of this program, generated once from that declaration, that rebuilds the value:
 ;;;   (if (= K 0) (V0 …) (if (= K 1) (V1 (nth 1) …) … error))
@@ -757,6 +760,524 @@
     (ml-mark-introduced! (elem items i)))
   0)
 
+; ---- values becoming Code -----------------------------------------------------------
+; Unquoting a value makes it syntax for that value. A scalar crosses through the
+; shim's unquote calls. An aggregate has a function of its own for each type,
+; generated here and added to the lowered program: it reads the value through the
+; type's fields, as any function does, so it answers the same on every engine and
+; never depends on how a backend laid the value out. The syntax it builds names
+; types and variants by their qualified names, so it means the same in whichever
+; module it lands.
+
+;;; Whether a value of T crosses as one of the unquote scalars.
+(defn ml-liftable-scalar? [(t Type)] (-> bool)
+  (match t
+    (TInt [_ _] true)
+    (TBool [] true)
+    (TFloat [_] true)
+    (TCode [] true)
+    (TCodeBuilder [] true)
+    (TSlice [e]
+            (match (load e) (TInt [b s] (and (= b 8) (not s))) (_ false)))
+    (_ false)))
+
+;;; A symbol, as a quoted form.
+(defn ml-lift-sym [(st (ptr MLS)) (name (slice u8)) (proto (ptr Expr))] (-> Expr)
+  (ml-lift-form st (sx-sym name) proto))
+
+(defn ml-lift-form [(st (ptr MLS)) (form Sexp) (proto (ptr Expr))] (-> Expr)
+  (ml-quoted st (box-sexp (.a st) form) (ml-int st 0 proto) false proto))
+
+;;; The source type a monomorphized record or sum NAME is an instance of, with its
+;;; arguments: `(Pair i64 bool)` for the instance's mangled name.
+(defn ml-instance-origin [(st (ptr MLS)) (name (slice u8))] (-> (ptr MonoOrigin))
+  (block :found
+    (for [i 0 (len (load (.origins st)))]
+      (let [o (elem (.origins st) i)]
+        (when (= (.generated o) name) (break :found o))))
+    (primitive/cast (ptr MonoOrigin) 0)))
+
+;;; T as the syntax that names it in any module.
+(defn ml-type-syntax [(st (ptr MLS)) (t Type)] (-> Sexp)
+  (let [a (.a st)]
+    (match t
+      (TStruct [name]
+               (let [o (ml-instance-origin st name)]
+                 (if (= (primitive/cast i64 o) 0)
+                     (sx-sym name)
+                     (let [(mut items) (ArrayList::new [Sexp] a)]
+                       (push! (mut items) (sx-sym (.source o)))
+                       (for [i 0 (len (load (.args o)))]
+                         (push! (mut items)
+                                (ml-type-syntax st (get (load (.args o)) i))))
+                       (mk-sexp (KList (box-al [Sexp] a (load items))) -1 -1)))))
+      (TPtr [e] (ml-type-syntax-2 st "ptr" (load e)))
+      (TSlice [e] (ml-type-syntax-2 st "slice" (load e)))
+      (TArray [e n]
+              (let [(mut items) (ArrayList::new [Sexp] a)]
+                (push! (mut items) (sx-sym "array"))
+                (push! (mut items) (ml-type-syntax st (load e)))
+                (push! (mut items) (sx-mkint (extent-value n)))
+                (mk-sexp (KList (box-al [Sexp] a (load items))) -1 -1)))
+      (_ (let [tp (primitive/alloc-stack Type)]
+           (store! tp t)
+           (ty->sexp a tp))))))
+
+(defn ml-type-syntax-2 [(st (ptr MLS)) (head (slice u8)) (t Type)] (-> Sexp)
+  (let [a (.a st)
+        (mut items) (ArrayList::new [Sexp] a)]
+    (push! (mut items) (sx-sym head))
+    (push! (mut items) (ml-type-syntax st t))
+    (mk-sexp (KList (box-al [Sexp] a (load items))) -1 -1)))
+
+;;; The `[A B]` a generic instance is constructed with, or None for a plain type.
+(defn ml-type-args-syntax [(st (ptr MLS)) (o (ptr MonoOrigin))] (-> (Option Sexp))
+  (if (or (= (primitive/cast i64 o) 0) (= (len (load (.args o))) 0))
+      (None [Sexp])
+      (let [a (.a st)
+            (mut items) (ArrayList::new [Sexp] a)]
+        (for [i 0 (len (load (.args o)))]
+          (push! (mut items) (ml-type-syntax st (get (load (.args o)) i))))
+        (Some (mk-sexp (KVec (box-al [Sexp] a (load items))) -1 -1)))))
+
+;;; Push ITEM on the builder CHAIN.
+(defn ml-lift-push [(st (ptr MLS)) (chain Expr) (item Expr) (proto (ptr Expr))]
+  (-> Expr)
+  (ml-call2 st "coil.compiler.metashim.mp-qq-push" chain item proto))
+
+;;; `(: VALUE T)`.
+(defn ml-lift-ascribed [(st (ptr MLS)) (value Expr) (t Type) (proto (ptr Expr))]
+  (-> Expr)
+  (let [chain
+          (ml-lift-push st
+                        (ml-call0 st "coil.compiler.metashim.mp-qq-new" proto)
+                        (ml-lift-form st (mk-sexp (KKw "") -1 -1) proto)
+                        proto)
+        chain2 (ml-lift-push st chain value proto)
+        chain3
+          (ml-lift-push st
+                        chain2
+                        (ml-lift-form st (ml-type-syntax st t) proto)
+                        proto)]
+    (ml-call1 st "coil.compiler.metashim.mp-qq-list" chain3 proto)))
+
+;;; Syntax for the scalar VALUE of type T. Each keeps what a bare literal in the
+;;; code it lands in would lose when ASCRIBE: a literal alone takes the type its
+;;; context gives it, or i64 and f64 with none.
+(defn ml-lift-scalar [(st (ptr MLS))
+                      (t Type)
+                      (value Expr)
+                      (ascribe bool)
+                      (proto (ptr Expr))] (-> Expr)
+  (match t
+    (TCode [] value)
+    (TCodeBuilder [] value)
+    (TBool [] (ml-call1 st "coil.compiler.metashim.mp-unq-bool" value proto))
+    (TInt [bits signed]
+          (let [plain
+                  (if (> bits 64)
+                      (ml-lift-wide st t value proto)
+                      (ml-call1 st
+                                "coil.compiler.metashim.mp-unq-int"
+                                (ml-widen-int st t value proto)
+                                proto))]
+            (if (or (> bits 64) (and ascribe (not (and (= bits 64) signed))))
+                (ml-lift-ascribed st plain t proto)
+                plain)))
+    (TFloat [bits]
+            (let [plain
+                    (ml-call1 st
+                              "coil.compiler.metashim.mp-unq-float"
+                              (ml-widen-float st t value proto)
+                              proto)]
+              (if (and ascribe (!= bits 64))
+                  (ml-lift-ascribed st plain t proto)
+                  plain)))
+    (_ (ml-call1 st "coil.compiler.metashim.mp-unq-str" value proto))))
+
+;;; A wide integer's literal, as the two 64-bit halves the reader's hexadecimal
+;;; spelling joins.
+(defn ml-lift-wide [(st (ptr MLS)) (t Type) (value Expr) (proto (ptr Expr))]
+  (-> Expr)
+  (let [a (.a st)
+        low (mk-expr (ECast (TInt 64 false) (box-expr a value))
+                     (.lo proto)
+                     (.hi proto)
+                     (.source proto)
+                     (.ctxt proto))
+        high
+          (mk-expr (ECast (TInt 64 false)
+                          (box-expr a
+                                    (mk-expr (EBin
+                                               :op 11
+                                               :lhs (box-expr a value)
+                                               :rhs
+                                                 (box-expr a
+                                                           (mk-expr (ECast t
+                                                                           (box-expr a
+                                                                                     (ml-int st
+                                                                                             64
+                                                                                             proto)))
+                                                                    (.lo proto)
+                                                                    (.hi proto)
+                                                                    (.source proto)
+                                                                    (.ctxt proto))))
+                                             (.lo proto)
+                                             (.hi proto)
+                                             (.source proto)
+                                             (.ctxt proto))))
+                   (.lo proto)
+                   (.hi proto)
+                   (.source proto)
+                   (.ctxt proto))]
+    (ml-call2 st "coil.compiler.metashim.mp-unq-wide" high low proto)))
+
+;;; Evaluate nothing more, and fail: a type with no literal, reached at run time.
+(defn ml-lift-fail [(st (ptr MLS)) (proto (ptr Expr))] (-> Expr)
+  (ml-parity-fail st 4 proto))
+
+;;; Syntax for the value at PLACE, the address of a T.
+(defn ml-lift-place [(st (ptr MLS)) (t Type) (place Expr) (proto (ptr Expr))]
+  (-> Expr)
+  (let [a (.a st)]
+    (if (ml-liftable-scalar? t)
+        (ml-lift-scalar st
+                        t
+                        (mk-expr (ELoad (box-expr a place))
+                                 (.lo proto)
+                                 (.hi proto)
+                                 (.source proto)
+                                 (.ctxt proto))
+                        false
+                        proto)
+        (ml-lift-aggregate st t place proto))))
+
+;;; Syntax for the aggregate at PLACE, by the function generated for its type.
+(defn ml-lift-aggregate [(st (ptr MLS)) (t Type) (place Expr) (proto (ptr Expr))]
+  (-> Expr)
+  (match (ml-lift-function st t)
+    (Some [name]
+          (let [ascribed
+                  (ml-call1 st name place proto)]
+            (match t
+              (TArray [_ _]
+                      (ml-lift-ascribed st ascribed t proto))
+              (TSlice [_]
+                      (ml-lift-ascribed st ascribed t proto))
+              (_ ascribed))))
+    (None [] (ml-lift-fail st proto))))
+
+;;; The name of the function that lifts a T, built the first time it is asked for,
+;;; or None when no value of T has a literal: a pointer, a function, an erased or
+;;; vector value.
+(defn ml-lift-function [(st (ptr MLS)) (t Type)] (-> (Option (slice u8)))
+  (let [a (.a st)
+        tp (primitive/alloc-stack Type)
+        _ (store! tp t)
+        name (sconcat a "coil.compiler.metashim.lift-" (ml-lift-key a tp))]
+    (if (block :found
+          (for [i 0 (len (load (.answers st)))]
+            (when (= (.name (elem (.answers st) i)) name) (break :found true)))
+          false)
+        (Some name)
+        (match t
+          (TStruct [n]
+                   (let [sd (ml-find-struct st n)]
+                     (if (!= (primitive/cast i64 sd) 0)
+                         (do (ml-lift-struct! st t name sd) (Some name))
+                         (let [ud (ml-find-sum st n)]
+                           (if (!= (primitive/cast i64 ud) 0)
+                               (do (ml-lift-sum! st t name ud) (Some name))
+                               (None [(slice u8)]))))))
+          (TArray [e n] (do (ml-lift-array! st t name (load e) (extent-value n)) (Some name)))
+          (_ (None [(slice u8)]))))))
+
+(defn ml-lift-key [(a (dyn Allocator)) (t (ptr Type))] (-> (slice u8))
+  (let [text (ty-mangle a t)
+        (mut out) (ArrayList::new [u8] a)]
+    (for [i 0 (len text)]
+      (let [c (get text i)]
+        (push! (mut out) (if (= c (: 46 u8)) (: 45 u8) c))))
+    (slice (load out))))
+
+(defn ml-find-struct [(st (ptr MLS)) (n (slice u8))] (-> (ptr StructDef))
+  (block :found
+    (for [i 0 (len (load (.structs st)))]
+      (when (= (.name (elem (.structs st) i)) n)
+        (break :found (elem (.structs st) i))))
+    (primitive/cast (ptr StructDef) 0)))
+
+(defn ml-find-sum [(st (ptr MLS)) (n (slice u8))] (-> (ptr SumDef))
+  (block :found
+    (for [i 0 (len (load (.sums st)))]
+      (when (= (.name (elem (.sums st) i)) n)
+        (break :found (elem (.sums st) i))))
+    (primitive/cast (ptr SumDef) 0)))
+
+;;; Add `(defn NAME [PARAMS] (-> Code))` to the program with an empty body, and
+;;; answer its index among the generated functions: registered before its body is
+;;; built, so a body that reaches its own type names this function.
+(defn ml-lift-declare! [(st (ptr MLS))
+                        (name (slice u8))
+                        (params (ArrayList Param))] (-> i64)
+  (let [a (.a st)
+        f (primitive/alloc-stack Func)]
+    (set! f (primitive/zeroed Func))
+    (set! (.name f) name)
+    (set! (.type_params f)
+          (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a)))
+    (set! (.bounds f) (box-al [Bound] a (ArrayList::new [Bound] a)))
+    (set! (.cc f) (cc-c))
+    (set! (.annotations f)
+          (box-al [Annotation] a (ArrayList::new [Annotation] a)))
+    (set! (.params f) (box-al [Param] a params))
+    (set! (.ret f) (ml-code-ty a))
+    (set! (.body f) (box-al [Expr] a (ArrayList::new [Expr] a)))
+    (set! (.lo f) -1)
+    (set! (.hi f) -1)
+    (set! (.source f) -1)
+    (set! (.ctxt f) 0)
+    (push! (.answers st) (load f))
+    (primitive/isub (len (load (.answers st))) 1)))
+
+(defn ml-lift-param [(name (slice u8)) (t Type)] (-> Param)
+  (Param
+    :name name
+    :ty t
+    :bid 0
+    :owned_type (primitive/cast (ptr Type) 0)
+    :positional_only false))
+
+(defn ml-lift-finish! [(st (ptr MLS)) (index i64) (result Expr)] (-> i64)
+  (let [a (.a st)
+        (mut body) (ArrayList::new [Expr] a)]
+    (push! (mut body) result)
+    (set! (.body (elem (.answers st) index)) (box-al [Expr] a (load body)))
+    0))
+
+(defn ml-lift-var [(a (dyn Allocator)) (name (slice u8))] (-> (ptr Expr))
+  (box-expr a (mk-expr (EVar name) -1 -1 -1 0)))
+
+;;; `(Type [ARGS] :field VALUE …)`.
+(defn ml-lift-struct! [(st (ptr MLS))
+                       (t Type)
+                       (name (slice u8))
+                       (sd (ptr StructDef))] (-> i64)
+  (let [a (.a st)
+        proto (box! a Expr (mk-expr (EInt 0) -1 -1 -1 0))
+        o (ml-instance-origin st (.name sd))
+        (mut params) (ArrayList::new [Param] a)
+        _ (push! (mut params) (ml-lift-param "value" (TPtr (box-type a t))))
+        index (ml-lift-declare! st name (load params))
+        (mut chain)
+          (ml-lift-push st
+                        (ml-call0 st "coil.compiler.metashim.mp-qq-new" proto)
+                        (ml-lift-sym st
+                                     (if (= (primitive/cast i64 o) 0)
+                                         (.name sd)
+                                         (.source o))
+                                     proto)
+                        proto)]
+    (match (ml-type-args-syntax st o)
+      (Some [args]
+            (set! chain (ml-lift-push st (load chain) (ml-lift-form st args proto) proto)))
+      (None [] 0))
+    (for [i 0 (len (load (.fields sd)))]
+      (let [fd (elem (.fields sd) i)]
+        (set! chain
+              (ml-lift-push st
+                            (load chain)
+                            (ml-lift-form st (mk-sexp (KKw (.name fd)) -1 -1) proto)
+                            proto))
+        (set! chain
+              (ml-lift-push st
+                            (load chain)
+                            (ml-lift-place st
+                                           (.ty fd)
+                                           (mk-expr (EField (ml-lift-var a "value")
+                                                            (.name fd))
+                                                    -1
+                                                    -1
+                                                    -1
+                                                    0)
+                                           proto)
+                            proto))))
+    (ml-lift-finish! st
+                     index
+                     (ml-call1 st
+                               "coil.compiler.metashim.mp-qq-list"
+                               (load chain)
+                               proto))))
+
+;;; `(Variant [ARGS] VALUE …)` for whichever variant the value holds.
+(defn ml-lift-sum! [(st (ptr MLS))
+                    (t Type)
+                    (name (slice u8))
+                    (ud (ptr SumDef))] (-> i64)
+  (let [a (.a st)
+        proto (box! a Expr (mk-expr (EInt 0) -1 -1 -1 0))
+        o (ml-instance-origin st (.name ud))
+        (mut params) (ArrayList::new [Param] a)
+        _ (push! (mut params) (ml-lift-param "value" (TPtr (box-type a t))))
+        index (ml-lift-declare! st name (load params))
+        (mut arms) (ArrayList::new [Arm] a)]
+    (for [k 0 (len (load (.variants ud)))]
+      (let [v (elem (.variants ud) k)
+            (mut binds) (ArrayList::new [(slice u8)] a)
+            (mut chain)
+              (ml-lift-push st
+                            (ml-call0 st "coil.compiler.metashim.mp-qq-new" proto)
+                            (ml-lift-sym st (.name v) proto)
+                            proto)]
+        (match (ml-type-args-syntax st o)
+          (Some [args]
+                (set! chain
+                      (ml-lift-push st (load chain) (ml-lift-form st args proto) proto)))
+          (None [] 0))
+        (for [i 0 (len (load (.fields v)))]
+          (let [fd (elem (.fields v) i)
+                bound (sconcat a "field" (i64->str a i))
+                ref (mk-expr (EVar bound) -1 -1 -1 0)]
+            (push! (mut binds) bound)
+            (set! chain
+                  (ml-lift-push st
+                                (load chain)
+                                (if (ml-liftable-scalar? (.ty fd))
+                                    (ml-lift-scalar st (.ty fd) ref false proto)
+                                    (ml-lift-aggregate
+                                      st
+                                      (.ty fd)
+                                      (mk-expr (ESpillRef (box-expr a ref)) -1 -1 -1 0)
+                                      proto))
+                                proto))))
+        (push! (mut arms)
+               (Arm
+                 :variant (.name v)
+                 :binds (box-al [(slice u8)] a (load binds))
+                 :body
+                   (ml-call1 st
+                             "coil.compiler.metashim.mp-qq-list"
+                             (load chain)
+                             proto)))))
+    (ml-lift-finish! st
+                     index
+                     (mk-expr (EMatch (ml-lift-var a "value")
+                                      (box-al [Arm] a (load arms)))
+                              -1
+                              -1
+                              -1
+                              0))))
+
+;;; `[VALUE …]`, walking the elements by tail calls, so a long table costs no stack.
+(defn ml-lift-array! [(st (ptr MLS))
+                      (t Type)
+                      (name (slice u8))
+                      (element Type)
+                      (n i64)] (-> i64)
+  (let [a (.a st)
+        proto (box! a Expr (mk-expr (EInt 0) -1 -1 -1 0))
+        (mut params) (ArrayList::new [Param] a)
+        _ (push! (mut params) (ml-lift-param "value" (TPtr (box-type a t))))
+        index (ml-lift-declare! st name (load params))
+        walker (sconcat a name "-from")
+        (mut wparams) (ArrayList::new [Param] a)
+        _w1 (push! (mut wparams) (ml-lift-param "value" (TPtr (box-type a t))))
+        _w2 (push! (mut wparams) (ml-lift-param "at" (TInt 64 true)))
+        _w3 (push! (mut wparams) (ml-lift-param "built" (ml-code-ty a)))
+        windex (ml-lift-declare! st walker (load wparams))
+        at (ml-lift-var a "at")
+        (mut next) (ArrayList::new [Expr] a)]
+    (push! (mut next) (load (ml-lift-var a "value")))
+    (push! (mut next)
+           (mk-expr (EBin :op 0 :lhs at :rhs (box-expr a (ml-int st 1 proto)))
+                    -1
+                    -1
+                    -1
+                    0))
+    (push! (mut next)
+           (ml-lift-push st
+                         (load (ml-lift-var a "built"))
+                         (ml-lift-place st
+                                        element
+                                        (mk-expr (EIndex (ml-lift-var a "value") at)
+                                                 -1
+                                                 -1
+                                                 -1
+                                                 0)
+                                        proto)
+                         proto))
+    (ml-lift-finish! st
+                     windex
+                     (mk-expr (EIf
+                                :cnd
+                                  (box-expr a
+                                            (mk-expr (ECmp 3
+                                                           at
+                                                           (box-expr a
+                                                                     (ml-int st n proto)))
+                                                     -1
+                                                     -1
+                                                     -1
+                                                     0))
+                                :thn
+                                  (box-expr a
+                                            (ml-call1 st
+                                                      "coil.compiler.metashim.mp-qq-vec"
+                                                      (load (ml-lift-var a "built"))
+                                                      proto))
+                                :els
+                                  (box-expr a
+                                            (mk-expr (ECall
+                                                       :func walker
+                                                       :type_args
+                                                         (box-al [Type]
+                                                                 a
+                                                                 (ArrayList::new [Type] a))
+                                                       :args
+                                                         (box-al [Expr] a (load next)))
+                                                     -1
+                                                     -1
+                                                     -1
+                                                     0)))
+                              -1
+                              -1
+                              -1
+                              0))
+    (let [(mut start) (ArrayList::new [Expr] a)]
+      (push! (mut start) (load (ml-lift-var a "value")))
+      (push! (mut start) (ml-int st 0 proto))
+      (push! (mut start) (ml-call0 st "coil.compiler.metashim.mp-qq-new" proto))
+      (ml-lift-finish! st
+                       index
+                       (mk-expr (ECall
+                                  :func walker
+                                  :type_args
+                                    (box-al [Type] a (ArrayList::new [Type] a))
+                                  :args (box-al [Expr] a (load start)))
+                                -1
+                                -1
+                                -1
+                                0)))))
+
+;;; `code-lift`, answered by its operand's type rather than by the host.
+(defn ml-lift-op? [(op CodeOp)] (-> bool)
+  (match op
+    (ExpansionOps [o] (match o (CodeLift [] true) (_ false)))
+    (_ false)))
+
+;;; Syntax for the operand of an unquote or `code-lift`: E the operand as checked,
+;;; VALUE as lowered. ASCRIBE keeps a scalar's type, which a bare literal would give
+;;; up to its context.
+(defn ml-lift-operand [(st (ptr MLS))
+                       (t Type)
+                       (value Expr)
+                       (ascribe bool)
+                       (proto (ptr Expr))] (-> Expr)
+  (if (ml-liftable-scalar? t)
+      (ml-lift-scalar st t value ascribe proto)
+      (let [vp (box-expr (.a st) value)]
+        (ml-lift-aggregate st t (borrow-address (.a st) vp) proto))))
+
 ; An unquoted or spliced operand names a value. A `(mut x)` local is a reference
 ; to its cell, so read through the reference: `~@b` for a mutable CodeBuilder
 ; splices the builder, exactly as it does for an immutable one.
@@ -811,13 +1332,7 @@
                                  le
                                  proto))
                  (= k 6) (Ok [Expr Diag] le)
-                 :else  ; aggregate: evaluate it (side effects first, like the interpreter's
-                   ; eval-then-convert), then fail with ctval->sexp's own message
-                   (Ok [Expr Diag]
-                       (ml-do2 st
-                               le
-                               (ml-parity-fail st 1 e)
-                               proto)))))))
+                 :else (Ok [Expr Diag] (ml-lift-operand st t le false proto)))))))
 
 ; the builder chain for a quasi list/vector's items
 (defn ml-quasi-items [(st (ptr MLS))
@@ -1021,7 +1536,12 @@
          (let [a (load (field st a))]
            (match (load (field e kind))
              ; ---- the four lowered kinds ----
-             (ECodeOp [op args] (ml-codeop st op args e))
+             (ECodeOp [op args]
+                      (if (ml-lift-op? op)
+                          (let [operand (try! (ml-quasi-operand st (elem args 0)))]
+                            (Ok [Expr Diag]
+                                (ml-lift-operand st (.t operand) (.e operand) true e)))
+                          (ml-codeop st op args e)))
              (EQuote [form]
                      (Ok [Expr Diag]
                          (ml-quoted st form (ml-int st 0 e) false e)))
@@ -1029,12 +1549,6 @@
                      (let [qp (primitive/alloc-stack Quasi)]
                        (store! qp q)
                        (ml-quasi-root st qp e)))
-             (EComptime [inner]
-                        (Err [Expr Diag]
-                             (derr-at-src (load (field e source))
-                                          (load (field e lo))
-                                          (load (field e hi))
-                                          "metalower: (comptime ...) survived the check fold (compiler bug)")))
              ; ---- types embedded in exprs ----
              (EZeroed [ty]
                       (Ok [Expr Diag]
@@ -1736,20 +2250,23 @@
 
 (defn metalower-program [(a (dyn Allocator))
                          (checked (ptr Program))
-                         (quals (ptr (ArrayList (slice u8))))]
+                         (quals (ptr (ArrayList (slice u8))))
+                         (instances (dyn InstanceExpansion))]
   (-> (Result (ptr MLOut) Diag))
-  (metalower-program-mode a checked quals false))
+  (metalower-program-mode a checked quals false instances))
 
+;;; INSTANCES expands what a generic left for each of its instances.
 (defn metalower-program-mode [(a (dyn Allocator))
                               (checked (ptr Program))
                               (quals (ptr (ArrayList (slice u8))))
-                              (syntax-only bool)] (-> (Result (ptr MLOut) Diag))
+                              (syntax-only bool)
+                              (instances (dyn InstanceExpansion))] (-> (Result (ptr MLOut) Diag))
   (try (do
          ; Lowered after specialization: every type is concrete here, so how each
          ; Code operation's operand crosses into the host is known, in a generic
          ; function's instances as in any other. The lowered program is final; no
          ; specialization runs after it.
-         (let [checked (try! (monomorphize-keeping-code a checked))
+         (let [checked (try! (monomorphize-keeping-code a checked instances))
                st (primitive/alloc-stack MLS)]
            (store! (field st a) a)
            (store! (field st reg)
@@ -1759,6 +2276,8 @@
            (store! (field st restricted)
                    (box-al [MLRestricted] a (ArrayList::new [MLRestricted] a)))
            (store! (field st sums) (load (field checked sums)))
+           (store! (field st structs) (load (field checked structs)))
+           (store! (field st origins) (load (field checked mono_origins)))
            (store! (field st answers)
                    (box-al [Func] a (ArrayList::new [Func] a)))
            (let [out (box! a Program (primitive/zeroed Program))]
@@ -1784,7 +2303,6 @@
                      (box-al [TraitDef] a (ArrayList::new [TraitDef] a)))
              (store! (field out impls)
                      (box-al [ImplDef] a (ArrayList::new [ImplDef] a)))
-             (store! (field out metas) (load (field checked metas)))
              (store! (field out exports)
                      (box-al [ExportC] a (ArrayList::new [ExportC] a)))
              (store! (field out function_abis)

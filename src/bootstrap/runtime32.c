@@ -191,8 +191,15 @@ uint32_t env_memcmp(uint32_t a, uint32_t b, uint32_t n) {
     return (uint32_t)(int32_t)(r < 0 ? -1 : (r > 0 ? 1 : 0));
 }
 uint32_t env_strlen(uint32_t p) { return (uint32_t)strlen(hoststr(p)); }
+// atol(3), widened for the guest's i64 result.
+uint64_t env_atol(uint32_t p) { return (uint64_t)(int64_t)atol(hoststr(p)); }
+// The guest address of the first byte C in the N bytes at P, or 0.
+uint32_t env_memchr(uint32_t p, uint32_t c, uint32_t n) {
+    const uint8_t *hit = memchr(MEM + p, (int)c, (size_t)n);
+    return hit ? (uint32_t)(hit - MEM) : 0;
+}
 // uname(2) for the guest: the host's struct, in the host's layout, which is
-// the one comptime.coil's native-arch-str reads for the OS it reports.
+// the one metastate.coil's native-arch-str reads for the OS it reports.
 uint32_t env_uname(uint32_t buf) {
     struct utsname u;
     if (uname(&u) != 0) return (uint32_t)-1;
@@ -476,6 +483,7 @@ uint32_t env_pthread_self(void) { return 1; }
 uint32_t env_pthread_mutex_init(uint32_t a, uint32_t b) { (void)a; (void)b; return 0; }
 uint32_t env_pthread_mutex_lock(uint32_t a) { (void)a; return 0; }
 uint32_t env_pthread_mutex_unlock(uint32_t a) { (void)a; return 0; }
+uint32_t env_pthread_mutex_destroy(uint32_t a) { (void)a; return 0; }
 uint32_t env_pthread_cond_init(uint32_t a, uint32_t b) { (void)a; (void)b; return 0; }
 uint32_t env_pthread_cond_signal(uint32_t a) { (void)a; return 0; }
 uint32_t env_pthread_cond_wait(uint32_t a, uint32_t b) { (void)a; (void)b; return 0; }

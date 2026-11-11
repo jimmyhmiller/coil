@@ -13,6 +13,7 @@
 #   - never `grep -q` at the end of a pipeline: capture into a variable, then match;
 #   - before concluding something is absent, prove the output it is absent from exists.
 set -uo pipefail
+. "$(dirname "$0")/../../compiler/clear-project-config.sh"
 cd "$(dirname "$0")/../../.."
 ROOT=$PWD
 
@@ -85,6 +86,37 @@ printf '(defn main [] (-> i64) (bad-fn 3))\n' > "$T/broken.coil"
 
 # ---------------------------------------------------------------------------
 section_run() {
+  # include-str is replaced as a file loads, whatever form holds it: a def, and a
+  # top-level macro's argument, whose helper reads a constant of its own module.
+  mkdir -p "$T/embed/src"
+  printf '[package]\nname = "embed"\nentry = "src/main.coil"\n' > "$T/embed/Coil.toml"
+  printf 'abc' > "$T/embed/src/embedded.txt"
+  cat > "$T/embed/src/gen.coil" <<'EOF'
+(module embed.gen)
+(import "coil.primitive" :as primitive)
+(const FACTOR 2)
+(defn factor [] (-> i64) FACTOR)
+(defn report-size [(text Code)] (-> Code)
+  (println "generator saw {} bytes, factor {}" (len (primitive/code-str text)) (factor))
+  `(do))
+EOF
+  cat > "$T/embed/src/main.coil" <<'EOF'
+(module embed.main)
+(import "embed.gen" :as gen)
+(def text (include-str "embedded.txt"))
+(gen/report-size (include-str "embedded.txt"))
+(defn main [] (-> i64) (len text))
+EOF
+  expect_rc_out 3 'generator saw 3 bytes, factor 2' "include-str in a def and in a top-level macro's argument" \
+    bash -c 'cd "$1" && "$2" run' _ "$T/embed" "$COIL"
+
+  # A program is not a compiler: it gets the environment coil was given, without the
+  # project configuration coil applied to itself.
+  mkdir -p "$T/run-env/src"
+  printf '[package]\nname = "runenv"\nentry = "src/main.coil"\n' > "$T/run-env/Coil.toml"
+  printf '(module runenv.main)\n(import "coil.os" :as os)\n(defn main [] (-> i64) (if (= (cast i64 (os/getenv c"COIL_PACKAGE_NAME")) 0) 0 3))\n' > "$T/run-env/src/main.coil"
+  expect_rc 0 "run does not hand a project's configuration to its program" bash -c 'cd "$1" && "$2" run' _ "$T/run-env" "$COIL"
+  expect_rc 3 "run hands its program what the user set" env COIL_PACKAGE_NAME=mine "$COIL" run "$T/run-env/src/main.coil"
   expect_rc 7 "run passes the program's exit status through" "$COIL" run "$T/seven.coil"
   expect_rc_out 134 'signal 6 \(SIGABRT\)' "run reports a signal death as 128+signo and names it" \
     "$COIL" run "$T/abort.coil"
@@ -455,8 +487,8 @@ section_check() {
   expect_rc 0 "an extern may redeclare a library symbol with another integer width" "$COIL" check "$T/extern-width.coil"
   # A constant's initializer is checked for ownership as a body is, and reported
   # against the constant (a constant's error stops the compile, so it is its own).
-  printf '(module const-move)\n(defstruct Owner [(value i64)])\n(impl Drop Owner (drop [(self (mut Owner))] (-> void) 0))\n(defn consume [(o Owner)] (-> i64) (.value o))\n(const TWICE (let [o (Owner :value 1)] (consume o) (consume o)))\n(defn main [] (-> i64) TWICE)\n' > "$T/const-move.coil"
-  expect_rc_out 1 "in 'const const-move.TWICE': use of moved value 'o'" \
+  printf '(module const-move)\n(defstruct Owner [(value i64)])\n(impl Drop Owner (drop [(self (mut Owner))] (-> void) 0))\n(defn consume [(o Owner)] (-> i64) (.value o))\n(const TWICE (comptime (let [o (Owner :value 1)] (consume o) (consume o))))\n(defn main [] (-> i64) TWICE)\n' > "$T/const-move.coil"
+  expect_rc_out 1 "use of moved value 'o'" \
     "check: a constant's initializer moves an owner once" "$COIL" check "$T/const-move.coil"
   # A generic body that copies an element out of a slice is refused at the
   # instance whose element type owns something, at the read.
@@ -490,7 +522,7 @@ section_check() {
 (defstruct S :layout (layout/Align (+ 8 8)) [(a u8)])|:layout takes a coil.layout.Layout
 (def X [1 2 3]) (def Y X) (defn use-y [] (-> i64) (get Y 1))|a def's initializer cannot read the def 'X'
 (defn mk [] (-> (slice i64)) (let [k 3] [1 2 k]))|returns a slice of an array literal that this call's frame holds
-(const target (helper)) (defn helper [] (-> i64) target) (defn stage [] (-> Code) `(do ~target)) (defn use-it [] (-> i64) (stage))|this compile-time value depends on itself
+(const target (comptime (helper))) (defn helper [] (-> i64) target) (defn stage [] (-> Code) `(do ~target)) (defn use-it [] (-> i64) (stage))|this compile-time value depends on itself
 EOF
   # Code has no runtime layout: a runtime function asking for it is compile-time
   # code, and a runtime entry that reaches it is a located error.
@@ -721,6 +753,13 @@ section_fmt() {
   [ $? = 1 ] && ok "fmt --check - reports unformatted standard input" || bad "fmt --check - on stdin" "wrong exit status"
   printf '(defn c [] (-> i64) 1)\n' | "$COIL" fmt --write - >/dev/null 2>&1
   [ $? = 2 ] && ok "fmt --write - is a usage error" || bad "fmt --write - is a usage error" "wrong exit status"
+  # `coil fmt` runs coil-fmt beside the compiler; run alone it does the same.
+  expect_rc 1 "coil-fmt, run on its own, reports an unformatted file" "$(dirname "$COIL")/coil-fmt" --check "$T/messy1.coil"
+  mkdir -p "$T/lone-tool"
+  cp "$COIL" "$T/lone-tool/coil"
+  out=$(cd "$T/lone-tool" && PATH=/usr/bin:/bin ./coil fmt messy.coil 2>&1)
+  case "$out" in *"no coil-fmt beside"*) ok "a compiler with no coil-fmt says where it looked" ;;
+    *) bad "a compiler with no coil-fmt says where it looked" "$out" ;; esac
 
   # Ruby's Open3 hands a child O_NONBLOCK pipe ends. A parent slow to feed the
   # input and slow to drain the output must still get all of it: EAGAIN is not
@@ -894,7 +933,7 @@ open(sys.argv[1], "w").write(
   fix_out=$("$COIL" lint "$T/probe.coil" --fix --verbose 2>&1); rc=$?
   case "$fix_out" in
     *"building the lint profile"*) bad "lint loads the lint profile an earlier lint built" "$fix_out" ;;
-    *"lint: analysis 1"*)
+    *"analysis 1"*)
       if [ -f "$profile/metadata" ]; then
         ok "lint loads the lint profile an earlier lint built"
       else
@@ -979,232 +1018,34 @@ open(sys.argv[1], "w").write(
         "$COIL" run "$T/literal-cast.coil" ;;
     *) bad "lint --fix drops the cast of a literal its type holds" "$(cat "$T/literal-cast.coil")" ;;
   esac
-  # The void-`free` preflight is for C's one-argument `free`. coil.alloc's
-  # `(free [T] a memory)` returns an i64, and a branch ending in it needs nothing.
-  printf '%s' '(module lint-alloc-free-probe)
-(import "coil.alloc" :use [free Allocator])
-(defn release [(a (dyn Allocator)) (s (slice u8)) (keep bool)] (-> i64)
-  (if keep
-      0
-      (do
-        (free [u8] a s))))
-(defn main [] (-> i64) 0)
-' > "$T/alloc-free.coil"
-  expect_rc 0 "lint analyses a branch that ends in coil.alloc's free" "$COIL" lint "$T/alloc-free.coil"
+  # Fixing is coil check's, for any metaprogram's suggestions; coil lint is that with
+  # the standard rules.
+  printf '(module fixing)\n(import "coil.primitive" :as primitive)\n(defn same [(x i64)] (-> bool) (primitive/icmp-eq x x))\n(defn main [] (-> i64) 0)\n' > "$T/fixing.coil"
+  cp "$T/fixing.coil" "$T/fixing.orig"
+  expect_rc 0 "check --fix with no checker changes nothing" "$COIL" check --fix "$T/fixing.coil"
+  cmp -s "$T/fixing.coil" "$T/fixing.orig" && ok "check --fix with no checker leaves the file" \
+    || bad "check --fix with no checker leaves the file" "$(cat "$T/fixing.coil")"
+  local linted checked
+  linted=$("$COIL" lint "$T/fixing.coil" 2>&1)
+  checked=$("$COIL" check --all-files --use coil.lint.default "$T/fixing.coil" 2>&1)
+  [ -n "$linted" ] && [ "$linted" = "$checked" ] && ok "coil lint is check --all-files --use coil.lint.default" \
+    || bad "coil lint is check --all-files --use coil.lint.default" "lint: $linted; check: $checked"
+  expect_rc 0 "check --fix applies a checker's suggestions" "$COIL" check --fix --use coil.lint.default "$T/fixing.coil"
+  case "$(cat "$T/fixing.coil")" in
+    *primitive/icmp-eq*) bad "check --fix rewrote the file" "$(cat "$T/fixing.coil")" ;;
+    *) ok "check --fix rewrote the file" ;;
+  esac
 
   # A fix that does not compile is rolled back byte for byte, across the project.
   mkdir -p "$T/broken-project/src"
   printf '[package]\nname = "broken-project"\nentry = "src/main.coil"\nsource-roots = ["src"]\n' > "$T/broken-project/Coil.toml"
-  printf '(module broken-project)\n(import "broken-dependency")\n(defn main [] (-> i64) (iadd 40 2))\n' > "$T/broken-project/src/main.coil"
+  printf '(module broken-project)\n(import "broken-dependency")\n(import "coil.primitive" :as primitive)\n(defn main [] (-> i64) (if (primitive/icmp-eq 1 1) 42 0))\n' > "$T/broken-project/src/main.coil"
   printf '(module broken-dependency)\n(defn broken [] (-> i64) missing)\n' > "$T/broken-project/src/dependency.coil"
   cp "$T/broken-project/src/main.coil" "$T/broken-main.orig"
-  local broken
-  broken=$(cd "$T/broken-project" && "$COIL" lint --fix 2>&1); rc=$?
+  (cd "$T/broken-project" && "$COIL" lint --fix >/dev/null 2>&1); rc=$?
   [ "$rc" != 0 ] && cmp -s "$T/broken-main.orig" "$T/broken-project/src/main.coil" \
     && ok "project lint --fix that cannot compile rolls back every file" \
     || bad "project lint --fix that cannot compile rolls back every file" "exit $rc"
-  # The preflight rewrote `iadd`, so the error to show is the rewritten program's
-  # (the dependency's unbound name), not `iadd`, which the file is put back to; and
-  # a file put back is not named as fixed.
-  case "$broken" in
-    *"undefined function 'iadd'"*|*"fixed "*) bad "lint --fix reports why the preflight's rewrite does not compile" "$broken" ;;
-    *"rewritten program reported"*"unbound variable 'missing'"*) ok "lint --fix reports why the preflight's rewrite does not compile" ;;
-    *) bad "lint --fix reports why the preflight's rewrite does not compile" "$broken" ;;
-  esac
-
-  # Standard-library names that were removed (src/compiler/migrate/api_renames.coil): a
-  # build points at the migration, lint --fix rewrites every spelling of them (a
-  # :use list, an alias, :use * with :rename, type arguments a method drops, a
-  # constructor that needs its type imported, a binding that would capture the new
-  # name, lines aligned with a call's arguments, a renamed function whose new name
-  # the file already calls, written qualified, a name core provided with no import,
-  # a name reached through a module that re-exports its own, a call in a template,
-  # names a template writes fully dotted (`coil.hashmap.hm-len`) for the module
-  # that expands it, which it rewrites to spellings that need no import there
-  # either; quoted data and a template's symbol only a hand could rewrite are left
-  # as written), and the program runs, the template expanded in another module.
-  mkdir -p "$T/renamed/src"
-  printf '[package]\nname = "renamed"\nentry = "src/main.coil"\n' > "$T/renamed/Coil.toml"
-  cat > "$T/renamed/src/main.coil" <<'EOF'
-(module renamed.main)
-(import "coil.alloc" :use [malloc-allocator])
-(import "coil.hashmap" :use [hm-new-scalar hm-put! hm-get hm-len hm-for hm-free!])
-(import "renamed.tally" :as tally)
-(import "renamed.size" :use [size])
-(import "renamed.show" :use [show census])
-(import "coil.args" :use [args-count])
-
-(defn main [] (-> i64)
-  (let [(mut m) (hm-new-scalar [i64 i64] (malloc-allocator))]
-    (for i (range 0 5) (hm-put! [i64 i64] (mut m) i (* i i)))
-    (hm-put! (mut m)
-             9
-             (+ (match (hm-get m 2) (Some [v] v) (None [] 0))
-                (hm-len m)))
-    (let [len (hm-len m)]
-      (hm-for [k v m] (when (= k 9) (println "{} {} {} {} {} {}" (- (hm-len m) len) v (tally/total (mut m)) (size m) (+ (args-count) (count (range 0 3))) (census m 4)))))
-    (hm-free! (mut m))
-    (show 4 2)
-    0))
-EOF
-  cat > "$T/renamed/src/tally.coil" <<'EOF'
-(module renamed.tally)
-(import "coil.hashmap" :as hm)
-(import "coil.alloc" :use [malloc-allocator])
-
-(defn total [(m (mut (hm/HashMap i64 i64)))] (-> i64)
-  (let [(mut seen) (hm/hm-new [i64 i64] (malloc-allocator) (hm/i64-keyops))
-        (mut sum) 0]
-    (hm/hm-for [k v m]
-      (unless (hm/hm-contains? [i64 i64] seen k)
-        (hm/hm-put! (mut seen) k 1)
-        (set! sum (+ sum v))))
-    (hm/hm-free! (mut seen))
-    sum))
-EOF
-  cat > "$T/renamed/src/size.coil" <<'EOF'
-(module renamed.size)
-(import "coil.hashmap" :use * :rename [[hm-cap capacity]])
-
-(defn size [(m (HashMap i64 i64))] (-> i64) (+ (hm-len m) (capacity m)))
-
-(defn heads [(m Code)] (-> Code) `(do (hm-len ~m) (quote hm-len) (quote coil.hashmap.hm-len) hm-get))
-EOF
-  cat > "$T/renamed/src/show.coil" <<'EOF'
-(module renamed.show)
-(import "coil.debug" :as debug)
-(import "coil.io" :use [stdout])
-
-(defstruct Pair [(a i64) (b i64)])
-
-(impl Display Pair
-  (display-fmt [(p Pair) (f (ptr Formatter))] (-> i64)
-    (formatter-disarm! f)
-    (fmt (formatter-writer f) "{}/{}\n" (.a p) (.b p))
-    0))
-
-(defn show [(a i64) (b i64)] (-> i64)
-  (let [(mut f) (zeroed Formatter)]
-    (debug/formatter-init (mut f) (stdout))
-    (display-fmt (Pair :a a :b b) (mut f))))
-
-(defn census [(m Code) (k Code)] (-> Code)
-  `(let [len 1
-         (mut seen) (coil.hashmap.hm-new-scalar [i64 i64] (coil.alloc.malloc-allocator))]
-     (coil.hashmap.hm-for [key v ~m] (coil.hashmap.hm-put! (mut seen) key v))
-     (let [n (+ (coil.hashmap.hm-len seen) (if (coil.hashmap.hm-contains? seen ~k) len 0))]
-       (coil.hashmap.hm-free! (mut seen))
-       n)))
-EOF
-  expect_rc_out 1 "removed library names.*coil lint --fix" \
-    "building a project that uses removed library names points at lint --fix" \
-    sh -c "cd '$T/renamed' && '$COIL' build -o '$T/renamed-bin' </dev/null"
-  expect_rc_out 1 "has no 'hm-new'; \`hm-new\` was removed from coil.hashmap; it is \`HashMap::new\`" \
-    "an error naming a removed library name says what replaced it" \
-    "$COIL" check "$T/renamed/src/tally.coil"
-  expect_rc_out 1 "undefined function 'hm-len'; \`hm-len\` was removed from coil.hashmap; it is \`len\`" \
-    "a call to a removed library name says what replaced it" \
-    "$COIL" check "$T/renamed/src/size.coil"
-  (cd "$T/renamed" && "$COIL" lint --fix >"$T/renamed.log" 2>&1); rc=$?
-  cat > "$T/renamed-main.want" <<'EOF'
-(module renamed.main)
-(import "coil.alloc" :use [malloc-allocator])
-(import "coil.hashmap" :use [for-entries HashMap])
-(import "renamed.tally" :as tally)
-(import "renamed.size" :use [size])
-(import "renamed.show" :use [show census])
-(import "coil.args")
-
-(defn main [] (-> i64)
-  (let [(mut m) (HashMap::new-scalar [i64 i64] (malloc-allocator))]
-    (for i (range 0 5) (set! (mut m) i (* i i)))
-    (set! (mut m)
-          9
-          (+ (match (get m 2) (Some [v] v) (None [] 0))
-             (len m)))
-    (let [len (len m)]
-      (for-entries [k v m] (when (= k 9) (println "{} {} {} {} {} {}" (- (Len::len m) len) v (tally/total (mut m)) (size m) (+ (coil.args/count) (count (range 0 3))) (census m 4)))))
-    (free! (mut m))
-    (show 4 2)
-    0))
-EOF
-  cat > "$T/renamed-tally.want" <<'EOF'
-(module renamed.tally)
-(import "coil.hashmap" :as hm)
-(import "coil.alloc" :use [malloc-allocator])
-
-(defn total [(m (mut (hm/HashMap i64 i64)))] (-> i64)
-  (let [(mut seen) (hm/HashMap::new [i64 i64] (malloc-allocator) (hm/i64-keyops))
-        (mut sum) 0]
-    (hm/for-entries [k v m]
-      (unless (contains? seen k)
-        (set! (mut seen) k 1)
-        (set! sum (+ sum v))))
-    (free! (mut seen))
-    sum))
-EOF
-  cat > "$T/renamed-size.want" <<'EOF'
-(module renamed.size)
-(import "coil.hashmap" :use *)
-
-(defn size [(m (HashMap i64 i64))] (-> i64) (+ (len m) (cap m)))
-
-(defn heads [(m Code)] (-> Code) `(do (len ~m) (quote hm-len) (quote coil.hashmap.hm-len) hm-get))
-EOF
-  cat > "$T/renamed-show.want" <<'EOF'
-(module renamed.show)
-(import "coil.debug" :as debug)
-(import "coil.io" :use [stdout])
-
-(defstruct Pair [(a i64) (b i64)])
-
-(impl Display Pair
-  (display-fmt [(p Pair) (f (ptr Formatter))] (-> i64)
-    (disarm! f)
-    (fmt (writer f) "{}/{}\n" (.a p) (.b p))
-    0))
-
-(defn show [(a i64) (b i64)] (-> i64)
-  (let [(mut f) (zeroed Formatter)]
-    (debug/Formatter::init (mut f) (stdout))
-    (display-fmt (Pair :a a :b b) (mut f))))
-
-(defn census [(m Code) (k Code)] (-> Code)
-  `(let [len 1
-         (mut seen) (coil.hashmap.HashMap::new-scalar [i64 i64] (coil.alloc.malloc-allocator))]
-     (coil.hashmap.for-entries [key v ~m] (set! (mut seen) key v))
-     (let [n (+ (Len::len seen) (if (contains? seen ~k) len 0))]
-       (free! (mut seen))
-       n)))
-EOF
-  local f migrated=1
-  for f in main tally size show; do
-    cmp -s "$T/renamed-$f.want" "$T/renamed/src/$f.coil" \
-      || { migrated=0; bad "lint --fix migrates removed library names in $f.coil" \
-             "exit $rc: $(diff -u "$T/renamed-$f.want" "$T/renamed/src/$f.coil" | head -40) $(head -c 600 "$T/renamed.log")"; }
-  done
-  [ "$rc" = 0 ] && [ "$migrated" = 1 ] && ok "lint --fix migrates removed library names in every spelling"
-  # One run, two lines: the map arithmetic, then the Display impl's output.
-  local ran
-  ran=$(cd "$T/renamed" && "$COIL" run 2>&1); rc=$?
-  grep -qxF "0 9 39 22 3 7" <<<"$ran" && ok "the migrated project runs" \
-    || bad "the migrated project runs" "exit $rc: $ran"
-  grep -qxF "4/2" <<<"$ran" && ok "the migrated project formats through its Display impl" \
-    || bad "the migrated project formats through its Display impl" "exit $rc: $ran"
-  (cd "$T/renamed" && "$COIL" lint --fix >/dev/null 2>&1); rc=$?
-  cmp -s "$T/renamed-main.want" "$T/renamed/src/main.coil" && cmp -s "$T/renamed-tally.want" "$T/renamed/src/tally.coil" \
-    && [ "$rc" = 0 ] && ok "lint --fix leaves migrated code alone" \
-    || bad "lint --fix leaves migrated code alone" "exit $rc: $(cat "$T/renamed/src/main.coil")"
-
-  # A removed name it cannot rewrite is reported, and its file is left as it was.
-  printf '(module value-use)\n(import "coil.hashmap" :use [hm-get])\n(defn f [] (-> i64) (let [g (fnptr-of hm-get [i64 i64])] 0))\n' > "$T/value-use.coil"
-  cp "$T/value-use.coil" "$T/value-use.orig"
-  expect_rc_out 1 "hm-get.*used as a value" "lint --fix reports a removed name it cannot rewrite" \
-    "$COIL" lint "$T/value-use.coil" --fix
-  cmp -s "$T/value-use.orig" "$T/value-use.coil" \
-    && ok "a file with a removed name it cannot rewrite is left as it was" \
-    || bad "a file with a removed name it cannot rewrite is left as it was" "$(cat "$T/value-use.coil")"
-
   # The authored-source view (coil.meta's source-modules, imports, references and
   # their bindings): import-aliases plans a qualification and suggests it as one
   # group.
@@ -1241,15 +1082,6 @@ EOF
     *"(set! (.slot b) 7)"*|*"did not compile"*) bad "lint does not turn a store through a field's pointer into a field assignment" "exit $rc: $diff_out" ;;
     *) [ "$rc" = 0 ] && ok "lint does not turn a store through a field's pointer into a field assignment" \
          || bad "lint does not turn a store through a field's pointer into a field assignment" "exit $rc: $diff_out" ;;
-  esac
-  local out
-  # coil.core's typed target-arch is no legacy spelling for the preflight to rewrite
-  printf '%s\n' '(module arch-probe)' '(defn arm? [(c Code)] (-> Code) (match (target-arch) (Aarch64 [] `true) (_ `false)))' \
-    '(defn main [] (-> i64) (if (arm? 0) 0 1))' > "$T/arch-probe.coil"
-  out=$("$COIL" lint "$T/arch-probe.coil" 2>&1); rc=$?
-  case "$out" in
-    *"legacy metal"*|*"lint stopped"*) bad "lint leaves coil.core's target-arch alone" "exit $rc: $out" ;;
-    *) [ $rc -eq 0 ] && ok "lint leaves coil.core's target-arch alone" || bad "lint leaves coil.core's target-arch alone" "exit $rc: $out" ;;
   esac
 }
 
@@ -1612,10 +1444,34 @@ arm64-apple-ios18.0-simulator 2 20
 aarch64-unknown-linux-gnu 2 10
 riscv32-unknown-none-elf 4 40
 EOF
+  # A constant is an expression of the program, so it answers for the target: the
+  # size of a struct holding a pointer, where a pointer is 4 bytes.
+  cat > "$T/const-target.coil" <<'EOF'
+(module const-target)
+(defstruct Holder [(tag i8) (at (ptr i8))])
+(const HOLDER-SIZE (cast i64 (sizeof Holder)))
+(defn size [] (-> i64) HOLDER-SIZE)
+(defn main [] (-> i64) (size))
+EOF
+  expect_out 'ret i64 8' "a constant's sizeof answers for the target" \
+    "$COIL" emit-ir "$T/const-target.coil" --target wasm32
+  # An import a top-level macro produces is the program's in a cross build too, where
+  # the macro ran in the host's twin of it.
+  cat > "$T/generated-import.coil" <<'EOF'
+(module generated-import)
+(import "coil.primitive" :as primitive)
+(defn gen [] (-> Code)
+  `(do (import "coil.fs" :as gen-fs)
+       (defn ~(primitive/syntax->datum `create-flag) [] (-> i64) gen-fs/O_CREAT)))
+(gen)
+(defn main [] (-> i64) (create-flag))
+EOF
+  expect_rc 0 "a cross build sees an import a top-level macro produced" \
+    "$COIL" check "$T/generated-import.coil" --target wasm32
   # Code that runs inside the compiler is compiled for the machine running it.
   # A cross build expands it separately from the program: a function a macro
   # calls answers for the host, the program's own copy for the target, and a
-  # (meta …) generator asking at run time gets the program's target.
+  # top-level macro asking at run time gets the program's target.
   cat > "$T/stages.coil" <<'EOF'
 (module stages)
 (import "coil.primitive" :as primitive)
@@ -1628,7 +1484,7 @@ EOF
         via (primitive/code-str (os-name))]
     `(do (defn ~(primitive/syntax->datum `generated-direct) [] (-> (slice u8)) ~direct)
          (defn ~(primitive/syntax->datum `generated-via) [] (-> (slice u8)) ~via))))
-(meta (gen-views))
+(gen-views)
 (defn main [] (-> i64) 0)
 EOF
   local other host_os other_os stages
@@ -1695,23 +1551,23 @@ EOF
   expect_rc_out 1 'is in the program because a template in .write_note.exists-call. uses .fs/exists\?. at run time' \
     "a macro template calling coil.fs keeps it in a bare-metal program, and says so" \
     "$COIL" check "$T/phase/probe.coil" --target riscv32-unknown-none-elf
-  # A (meta …) generator reads a file on the build machine; it needs the O_CREAT
-  # and directory constants coil.fs's own generators produce, so they run first.
+  # A top-level macro reads a file on the build machine; it needs the O_CREAT
+  # and directory constants coil.fs's own top-level macros produce.
   printf 'abc' > "$T/phase/data.txt"
   cat > "$T/phase/sized.coil" <<'EOF'
 (module sized)
 (import "coil.primitive" :as primitive)
 (import "coil.fs" :as fs)
 (import "coil.meta" :use [expansion-allocator])
-(defn gen-size [(path (slice u8))] (-> Code)
-  (match (fs/read-file (expansion-allocator) path)
+(defn gen-size [(path Code)] (-> Code)
+  (match (fs/read-file (expansion-allocator) (primitive/code-str path))
     (Ok [text] `(defn ~(primitive/syntax->datum `data-size) [] (-> i64) ~(primitive/cast i64 (len text))))
     (Err [_] (primitive/error "gen-size: could not read the file"))))
 EOF
-  printf '(module sized_main)\n(import "sized" :use [gen-size])\n(meta (gen-size "%s"))\n(defn main [] (-> i64) (data-size))\n' \
+  printf '(module sized_main)\n(import "sized" :use [gen-size])\n(gen-size "%s")\n(defn main [] (-> i64) (data-size))\n' \
     "$T/phase/data.txt" > "$T/phase/sized_main.coil"
-  expect_rc 3 "a generator reads a file with coil.fs" "$COIL" run "$T/phase/sized_main.coil"
-  expect_out '\(defn\* data-size \[\] \(-> i64\) 3\)' "a bare-metal program's generator reads a file with coil.fs" \
+  expect_rc 3 "a top-level macro reads a file with coil.fs" "$COIL" run "$T/phase/sized_main.coil"
+  expect_out '\(defn\* data-size \[\] \(-> i64\) 3\)' "a bare-metal program's top-level macro reads a file with coil.fs" \
     "$COIL" expand "$T/phase/sized_main.coil" --target riscv32-unknown-none-elf
   expect_rc_out 1 "coil.core.Os does not name: freebsd" "an OS coil.core.Os does not name is an error, not the host's" \
     "$COIL" check "$T/seven.coil" --target x86_64-unknown-freebsd
@@ -2105,6 +1961,37 @@ section_sanitizers() {
 EOF
   if build "$T/asan.coil" "$T/asan" --sanitize=address -O0; then
     expect_crash_or_fail 'AddressSanitizer: heap-use-after-free' "--sanitize=address reports a use-after-free" "$T/asan"
+  fi
+  # An arena tells ASan what it hands out and takes back (`asan-poison!`): a write past a
+  # block, a read after a rewind to a mark, a read after a recycle. Each argument
+  # count picks one.
+  cat > "$T/asan-arena.coil" <<'EOF'
+(module asan-arena)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.scratch" :as scratch)
+(defn one [(a (dyn Allocator))] (-> (ptr i64))
+  (unwrap-ptr [i64] (create [i64] a)))
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [arena (primitive/alloc-stack scratch/ScratchArena)]
+    (scratch/ScratchArena::init arena (malloc-allocator))
+    (let [a (scratch/ScratchArena::allocator arena)
+          kept (one a)
+          mark (scratch/ScratchArena::mark arena)
+          p (one a)]
+      (store! kept 1)
+      (store! p 41)
+      (cond (= argc (: 1 i32))
+              (do (store! (cast (ptr i64) (primitive/index (cast (ptr i8) p) 8)) 99) 0)
+            (= argc (: 2 i32))
+              (do (scratch/ScratchArena::reset-to! arena mark) (store! (one a) 7) (load p))
+            :else
+              (do (scratch/ScratchArena::recycle! arena) (store! (one a) 7) (load p))))))
+EOF
+  if build "$T/asan-arena.coil" "$T/asan-arena" --sanitize=address -O0; then
+    expect_crash_or_fail 'AddressSanitizer: use-after-poison' "--sanitize=address reports a write past an arena block" "$T/asan-arena"
+    expect_crash_or_fail 'AddressSanitizer: use-after-poison' "--sanitize=address reports a read after an arena rewind" "$T/asan-arena" rewind
+    expect_crash_or_fail 'AddressSanitizer: heap-use-after-free' "--sanitize=address reports a read after an arena recycle" "$T/asan-arena" rewind recycle
   fi
   cat > "$T/tsan.coil" <<'EOF'
 (module tsan-race)
