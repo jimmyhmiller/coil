@@ -21,6 +21,8 @@ SYMBOL_PREFIX = '_' if SYSTEM == 'Darwin' else ''
 CALL_RELOCATION = 'R_X86_64_PLT32' if X64 else 'ARM64_RELOC_BRANCH26'
 # The mnemonic of a direct call in `objdump -d`.
 CALL_MNEMONICS = ('call', 'callq') if X64 else ('bl',)
+# The name of the other CIR backend (tpde) for this machine.
+TPDE_BACKEND = 'x64' if X64 else 'arm64'
 
 
 def symbol(name):

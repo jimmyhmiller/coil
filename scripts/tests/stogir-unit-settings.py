@@ -20,6 +20,8 @@ import subprocess
 import sys
 import tempfile
 
+import stogir_target
+
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ['COIL']).resolve()
 BACKEND = ROOT / 'src/compiler/backend/codegen_stogir.coil'
@@ -137,8 +139,8 @@ with tempfile.TemporaryDirectory(prefix='stogir-unit-settings-') as temporary:
     assert bad.returncode != 0 and 'COIL_STOGIR_PREDICT' in bad.stderr, bad.stderr
 
     other = temporary / 'other'
-    build(library, other, backend='arm64', COIL_STOGIR_INLINE='budget=0')
+    build(library, other, backend=stogir_target.TPDE_BACKEND, COIL_STOGIR_INLINE='budget=0')
     assert settings_line(other) is None
-    assert build(library, other, backend='arm64'), 'another backend keys on Stogir settings'
+    assert build(library, other, backend=stogir_target.TPDE_BACKEND), 'another backend keys on Stogir settings'
 
 print('stogir unit settings: ok')

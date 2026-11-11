@@ -1280,7 +1280,10 @@ EOF
       bad "emit-obj ($backend) links into a C program" "emit-obj or cc failed"
     fi
   done
-  if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
+  # The Stogir backend generates code for the machine the compiler was built
+  # for: AArch64 macOS or x86-64 Linux. Checks that read AArch64 instruction
+  # shapes or Mach-O load commands follow in the Darwin block.
+  if [ "$HOST_OS-$HOST_ARCH" = Darwin-arm64 ] || [ "$HOST_OS-$HOST_ARCH" = Linux-x86_64 ]; then
     for backend in llvm tpde stogir; do
       expect_rc 42 "native ABI, control flow, memory and atomics ($backend)" \
         "$COIL" run "$ROOT/tests/cli/native-backends.coil" --backend "$backend" -O3 --no-debug
@@ -1323,10 +1326,6 @@ EOF
       python3 "$ROOT/scripts/tests/stogir-runtime-bulk.py" "$COIL"
     expect_rc 0 "a cached unit is keyed on the Stogir settings it was generated under" \
       python3 "$ROOT/scripts/tests/stogir-unit-settings.py" "$COIL"
-    expect_rc 0 "every backend's program records the same platform, minos and sdk" \
-      python3 "$ROOT/scripts/tests/native-link-versions.py" "$COIL"
-    expect_rc 0 "volatile accesses reach Stogir machine code one for one" \
-      python3 "$ROOT/scripts/tests/stogir-volatile.py" "$COIL"
     expect_rc 0 "Stogir -O1, -O2 and -O3 agree and -O0 is refused" \
       python3 "$ROOT/scripts/tests/stogir-levels.py" "$COIL"
     expect_rc 0 "deferred Stogir graph ownership under ASAN" \
@@ -1335,20 +1334,26 @@ EOF
       "$COIL" run "$ROOT/tests/backend/stogir-pure-runtime-calls.coil" --backend llvm -O1 --no-debug --debug-checks
     expect_rc 0 "loops calling memcmp reload only what a store can change (Stogir O3)" \
       "$COIL" run "$ROOT/tests/backend/stogir-readonly-library-calls.coil" --backend stogir -O3 --no-debug --debug-checks
-    expect_rc 0 "real memcmp calls are read-only to Stogir, a Coil namesake is not" \
-      python3 "$ROOT/scripts/tests/stogir-readonly-library-calls.py" "$COIL"
     expect_rc 0 "a returned aggregate piece used on one path only is computed on every path (Stogir O3)" \
       "$COIL" run "$ROOT/tests/backend/stogir-return-piece-placement.coil" --backend stogir -O3 --no-debug
     expect_rc 0 "a returned aggregate piece used by a debug check only (Stogir O1, debug checks)" \
       "$COIL" run "$ROOT/tests/backend/stogir-return-piece-placement.coil" --backend stogir -O1 --no-debug --debug-checks
-    expect_rc 0 "random conditional call crossings keep their values (Stogir O3)" \
-      "$COIL" run "$ROOT/tests/backend/stogir-frame-split.coil" --backend stogir -O3 --no-debug
     expect_rc 0 "calls in tail position run in constant stack (Stogir O3)" \
       "$COIL" run "$ROOT/tests/backend/stogir-tail-calls.coil" --backend stogir -O3 --no-debug
     expect_rc 0 "calls in tail position run in constant stack (Stogir O1, debug checks)" \
       "$COIL" run "$ROOT/tests/backend/stogir-tail-calls.coil" --backend stogir -O1 --no-debug --debug-checks
     expect_rc 0 "128-bit arithmetic by literal powers of two is inline (Stogir)" \
       python3 "$ROOT/scripts/tests/stogir-wide-powers.py" "$COIL"
+  fi
+  if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
+    expect_rc 0 "every backend's program records the same platform, minos and sdk" \
+      python3 "$ROOT/scripts/tests/native-link-versions.py" "$COIL"
+    expect_rc 0 "volatile accesses reach Stogir machine code one for one" \
+      python3 "$ROOT/scripts/tests/stogir-volatile.py" "$COIL"
+    expect_rc 0 "real memcmp calls are read-only to Stogir, a Coil namesake is not" \
+      python3 "$ROOT/scripts/tests/stogir-readonly-library-calls.py" "$COIL"
+    expect_rc 0 "random conditional call crossings keep their values (Stogir O3)" \
+      "$COIL" run "$ROOT/tests/backend/stogir-frame-split.coil" --backend stogir -O3 --no-debug
     expect_rc 0 "native Mach-O data-in-code serialization and JIT loader" \
       "$COIL" run "$ROOT/src/compiler/selftest/jit_selftest.coil" --backend llvm
   fi
