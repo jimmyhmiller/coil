@@ -6,6 +6,8 @@ import subprocess
 import sys
 import tempfile
 
+import stogir_target
+
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ['COIL']).resolve()
 ENV = dict(os.environ, COIL_LIBRARY_STATE='0', COIL_TPDE_SERIAL='1')
@@ -20,7 +22,8 @@ def run(*args):
 
 
 SOURCE = ROOT / 'tests/cli/stogir-live-emission.coil'
-PREFIX = '_tests.cli.stogir-live-emission.'
+MODULE_PREFIX = 'tests.cli.stogir-live-emission.'
+PREFIX = stogir_target.symbol(MODULE_PREFIX)
 # The policy that charges every clone to the caller's budget, so the fanout
 # callers keep most of their calls whatever the default policy inlines.
 CHARGED = {'COIL_STOGIR_INLINE': 'budget=512'}
@@ -58,9 +61,9 @@ def emit(directory, name, settings):
     assert result.returncode == 0, result.stdout + result.stderr
     assert obj.read_bytes() == traced.read_bytes(), 'effect tracing changes object bytes'
     # The effect proof comes from each body, under every inline policy.
-    assert f'stogir nonwriting-body {PREFIX[1:]}readonly-leaf: true' in result.stderr
-    assert f'stogir nonwriting-body {PREFIX[1:]}writing-leaf: false' in result.stderr
-    assert f'stogir nonwriting-body {PREFIX[1:]}readonly-pair-result: true' in result.stderr
+    assert f'stogir nonwriting-body {MODULE_PREFIX}readonly-leaf: true' in result.stderr
+    assert f'stogir nonwriting-body {MODULE_PREFIX}writing-leaf: false' in result.stderr
+    assert f'stogir nonwriting-body {MODULE_PREFIX}readonly-pair-result: true' in result.stderr
     # The native prepass publishes once, and the ordinary job reuses each body.
     native_lines = [line for line in result.stderr.splitlines()
                     if line.startswith('stogir native-leaf ')]
@@ -73,8 +76,8 @@ def emit(directory, name, settings):
                     if line.startswith('stogir reuse-native ')]
     assert sorted(cached_names) == sorted(reused_names), 'cache/job identity mismatch'
     assert any(': certifiedtrue ' in line for line in native_lines), 'no certified leaf exercised'
-    targets = {line.split()[-1] for line in run('llvm-objdump', '-dr', obj).splitlines()
-               if 'ARM64_RELOC_BRANCH26' in line}
+    targets = {stogir_target.call_target(line)
+               for line in run('llvm-objdump', '-dr', obj).splitlines()} - {None}
     listing = run('nm', obj)
     assert listing.strip(), 'nm returned no symbol table'
     defined = {fields[-1] for fields in map(str.split, listing.splitlines())
@@ -87,7 +90,7 @@ def emit(directory, name, settings):
     # Roots that no direct call reaches: native data, an address that arrives
     # through an inlined helper, an export alias, and a recursive function.
     for retained in [PREFIX + 'address-only', PREFIX + 'returned-callback',
-                     '_stogir_retained_entry', PREFIX + 'recursive']:
+                     stogir_target.symbol('stogir_retained_entry'), PREFIX + 'recursive']:
         assert retained in defined, retained
     # A helper with no other root is emitted exactly when a call to it
     # survived inlining, whichever calls the policy in force left.
@@ -122,8 +125,8 @@ with tempfile.TemporaryDirectory(prefix='stogir-emission-') as temporary:
     unit = directory / 'unit'
     run(COMPILER, 'build-unit', library, '--backend', 'stogir', '-O3', '-o', unit)
     unit_symbols = run('nm', unit / 'unit.o')
-    assert '_emission.unit.first' in unit_symbols
-    assert '_emission.unit.second' in unit_symbols
+    assert stogir_target.symbol('emission.unit.first') in unit_symbols
+    assert stogir_target.symbol('emission.unit.second') in unit_symbols
     consumer = directory / 'consumer.coil'
     consumer.write_text('(module emission.consumer)\n'
                         '(import "emission.unit" :as lib)\n'

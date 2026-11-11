@@ -15,11 +15,14 @@ import subprocess
 import sys
 import tempfile
 
+import stogir_target
+
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ['COIL']).resolve()
 SOURCE = ROOT / 'tests/backend/stogir-wide-powers.coil'
 ENV = dict(os.environ, COIL_LIBRARY_STATE='0', COIL_TPDE_SERIAL='1')
-HELPERS = ('___divti3', '___modti3', '___udivti3', '___umodti3')
+HELPERS = tuple(stogir_target.symbol(name)
+                for name in ('__divti3', '__modti3', '__udivti3', '__umodti3'))
 
 with tempfile.TemporaryDirectory(prefix='stogir-wide-powers-') as temporary:
     for level in ('-O3', '-O1'):

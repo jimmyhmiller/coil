@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 
+import stogir_target
+
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ['COIL']).resolve()
 SIZES = [0, 1, 7, 8, 15, 16, 17, 127, 128, 129, 135, 136, 255, 256, 257, 416, 1024]
@@ -79,8 +81,9 @@ int main(void) {
     functions = dict(zip(bodies[1::2], bodies[2::2]))
     for size in SIZES:
         if size <= 128:
-            body = functions[f'_zero_{size}']
-            if re.search(r'ARM64_RELOC_BRANCH26\s+_(memset|memmove)', body):
+            body = functions[stogir_target.symbol(f'zero_{size}')]
+            if re.search(stogir_target.CALL_RELOCATION + r'\s+'
+                         + re.escape(stogir_target.SYMBOL_PREFIX) + r'(memset|memmove)', body):
                 raise AssertionError(f'small zero-fill {size} became a runtime call')
     executable = d / 'matrix' 
     run('cc', '-O2', '-fsanitize=address', driver, obj, '-o', executable)
