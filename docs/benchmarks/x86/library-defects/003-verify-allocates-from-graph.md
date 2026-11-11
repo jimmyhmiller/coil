@@ -1,5 +1,7 @@
 # 003: native-input verification allocates from the graph's allocator (data race between compiling threads)
 
+**Status: fixed** in library `feature/x86` 9cf1283 (vendored with d278aba). 2400 parallel `-O3` compiles are identical and a ThreadSanitizer build reports nothing.
+
 Library `feature/x86` 9471372, neutral file `src/stogir/verify.coil` (lines
 700-706 and 736): `switch/verify`, `terminal/verify-chains` and
 `argval/verify` are called with `(.alc (.instructions graph))`.

@@ -15,6 +15,25 @@ its own LLVM side.
 |---|---|---|---|---|---|---|---|---|
 | 0 | 9471372 | first self-hosting build; adapter workarounds for defects 001 and 002 | 106.50 / 91.89 | 1.159 | 278.3 / 185.7 | 1.50 | 1.095 / 9.50 | 8.7x |
 | 1 | d278aba | defects 001-003 fixed in the library; 002 workaround removed; 001 workaround kept (defect 004) | 106.70 / 91.49 | 1.166 | 278.4 / 185.7 | 1.50 | 1.089 / 9.50 | 8.7x |
+| 2 | ded7635 | defect 004 fixed; the adapter's MEMORY-parameter template exclusion removed, so calls passing an aggregate by value are inlined | 106.74 / 92.35 | 1.156 | 277.9 / 187.4 | 1.48 | 1.097 / 9.50 | 8.7x |
+
+Round 2 is one percentage point: inlining through MEMORY-class parameters is
+now on (the over-budget sites are declined), and it moves instructions from
+1.50x to 1.48x and cycles from 1.166x to 1.156x. The standalone accessors
+were therefore not the main cost; the allocator findings below are. The
+per-site ARGVAL scan of the 001 fix is not visible in the generation spans
+(ms, 1101 total: emit 468, finalize 255, prepare 130, plan 82, copies 42,
+leaf cache 27; round 1: 475, 245, 143, 95, 40, 25), and generation wall is
+unchanged.
+
+Checks at round 2, all as at round 1: 2400 parallel `-O3` compiles identical
+(`cbb29c4a…`), ThreadSanitizer self-emit without a report and with the
+bootstrap's object (`d0932326…`), the bootstrap reproduces and the object is
+the same under every thread setting, the sweep is unchanged (corpus 24 of 27,
+demos 138 of 138, simd 6 of 6, backend 45 of 45, stdlib 24 of 24, examples 30
+of 30, library tests 1053 of 1056), the 22 Stogir rows of `cli.sh objects`
+pass, and on macOS the AArch64 objects are unchanged (compiler `9688c00a…`),
+the Stogir-only bootstrap reproduces and quick FAST passes.
 
 Round 1 changes nothing measurable: the 002 fix replaces an equivalent
 workaround, the 003 fix is a correctness fix, and the 001 fix cannot be used
@@ -76,8 +95,7 @@ allocated, so twelve general registers are available against LLVM's fifteen.
 
 Next, in the order the profile suggests: (1) the allocation policies above
 for x86-64 (a first, unverified step is on library branch `x86/tune-wip`),
-and more allocatable registers; (2) defect 004, then inlining through
-MEMORY-class parameters (the largest single symbols in the cycle profile are
-such accessors); (3) redundant extensions of narrow values; (4) repeated
+and more allocatable registers; (2) done in round 2 (inlining through
+MEMORY-class parameters); (3) redundant extensions of narrow values; (4) repeated
 compares and compare-with-memory forms; (5) constants (`movabs` rebuilt in
 loops, `mov $0`), 16-byte copies.

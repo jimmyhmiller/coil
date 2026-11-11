@@ -1,5 +1,7 @@
 # 001: the inliner puts an ARGVAL where the callee's MEMORY parameter was
 
+**Status: fixed** in library `feature/x86` 9cb940a (vendored with d278aba). The adapter workaround was removed with the fix of 004 (ded7635).
+
 Library `feature/x86` 9342480. Reproducer: `001-inline-argval.coil` (copy to
 the library's `tests/x64-inline-argval.coil`; `tools/x86/remote-test.sh`).
 It prints `FAILED: the expanded graph does not compile: ARGVAL is only valid as

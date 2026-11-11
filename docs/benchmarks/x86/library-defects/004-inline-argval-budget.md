@@ -1,5 +1,7 @@
 # 004: an ARGVAL private copy is not in the inliner's preflight size, and the overrun is a hard error
 
+**Status: fixed** in library `feature/x86` ded7635: the preflight counts the private copy and an over-budget site is declined. The adapter's MEMORY-parameter template exclusion is removed.
+
 Library `feature/x86` d278aba (introduced by the fix of 001, `9cb940a`).
 Reproducer: `004-inline-argval-budget.coil` (copy to the library's
 `tests/x64-inline-argval-budget.coil`): budgets 4 to 10 print `FAILED: budget

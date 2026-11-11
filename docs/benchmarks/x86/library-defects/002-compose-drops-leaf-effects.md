@@ -1,5 +1,7 @@
 # 002: `link/compose` of one image drops `Image.leaf-effects`
 
+**Status: fixed** in library `feature/x86` 9cf1283 (vendored with d278aba); the adapter workaround is removed.
+
 Library `feature/x86` 9471372. No test file: the check is three lines in any
 x86-64 test that compiles a leaf (for example `tests/x64-call-flow.coil`'s leaf
 case): compile a call-free function with `compile/image-with-private`, pass the
