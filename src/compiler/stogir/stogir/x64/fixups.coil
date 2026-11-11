@@ -1,0 +1,676 @@
+;;; Internal branch fixups for x86-64 text, in byte offsets independent of the
+;;; load address: records, relaxation, alignment padding and patching.
+;;;
+;;; A jump is emitted in its long form (`jmp rel32`, `jcc rel32`) with a zero
+;;; displacement and one Branch record. Labels are byte offsets, -1 while
+;;; unbound; block labels are indexed by graph reference and further labels
+;;; (edge stubs, switch tree nodes, jump tables) are appended.
+;;;
+;;; Once every label is bound the driver runs, in this order:
+;;;   relax!           shrinks every jump whose displacement fits rel8, inserts
+;;;                    alignment padding, and moves every recorded offset;
+;;;   apply!           writes the displacements;
+;;;   apply-relative!  writes the jump-table words;
+;;;   verify           decodes every branch again and checks its target.
+;;;
+;;; What records a text offset, and so what relax! rebases: the labels, the
+;;; Branch records (start and field), the Relative records (word and base),
+;;; the buffer's references and text-data ranges, and its flags record (which
+;;; is cleared). Edge stubs hold labels only and are already appended. The
+;;; image and everything after it sees only the finished buffer. Whoever adds
+;;; another structure holding text offsets inside the driver must extend
+;;; relax! to move it.
+;;;
+;;; The a64 module of this name is not shared: it patches 4-byte instruction
+;;; words, and its relaxation (growing, with veneers) and peepholes are word
+;;; arithmetic.
+(module stogir.x64.fixups)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.bytes" :as bytes)
+(import "coil.slice" :use [subslice])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err])
+
+;;; `condition` of an unconditional `jmp`.
+(const JUMP -1)
+
+;;; `condition` of a `lea r64, [rip + label]`: a rel32 field that is patched
+;;; like a branch but never shrunk.
+(const ADDRESS -2)
+
+;;; One instruction with a PC-relative field naming a label. `start` is its
+;;; first byte and `field` its displacement, which ends the instruction.
+;;; `condition` is JUMP, ADDRESS, or 0..15 for `jcc` with that condition code.
+;;; `short` says the field is one byte (rel8) instead of four.
+(defstruct Branch [(start i64) (field i64) (label i32) (condition i32) (short bool)])
+
+;;; A signed 32-bit table word at `offset` holding `label - base` (jump
+;;; tables of the switch family). Both addresses are text-relative.
+(defstruct Relative [(offset i64) (base i64) (label i32)])
+
+;;; A request to align the address of `label` to `boundary` bytes (a power of
+;;; two) with no-op padding in front of it, unless that takes more than
+;;; `limit` bytes. With `loop`, only when some branch at or behind the label
+;;; jumps back to it.
+(defstruct Alignment [(label i32) (boundary i64) (limit i64) (loop bool)])
+
+;;; Loop headers are aligned to 16 bytes, the boundary both LLVM and GCC use
+;;; on x86-64.
+(const LOOP-BOUNDARY 16)
+
+;;; The most padding a loop header may cost. Padding is executed once per
+;;; entry into the loop and pushes the loop body out of the lines the entry
+;;; path already fetched, so a header that needs more than this is left
+;;; where it is (GCC's generic x86-64 tuning skips at most 10 bytes).
+(const LOOP-PADDING-LIMIT 10)
+
+;;; The alignment policy for the block that starts at `label`, which the
+;;; block layout marked as the head of a cycle. This is the one place that
+;;; decides how loop headers are aligned.
+(defn loop-alignment [(label i32)] (-> Alignment)
+  (Alignment :label label :boundary LOOP-BOUNDARY :limit LOOP-PADDING-LIMIT :loop true))
+
+;;; The padding in front of an alignment point that would otherwise be at
+;;; `offset`: the bytes up to the next multiple of `boundary`, or none when
+;;; that exceeds `limit`.
+(defn padding [(offset i64) (boundary i64) (limit i64)] (-> i64)
+  (let [needed (% (- boundary (% offset boundary)) boundary)]
+    (if (> needed limit) 0 needed)))
+
+;;; Bytes of a branch in its long form and what its short form saves.
+(defn long-size [(branch Branch)] (-> i64)
+  (+ (- (.field branch) (.start branch)) 4))
+
+(defn saving [(condition i32)] (-> i64)
+  (cond (= condition JUMP) 3
+        (= condition ADDRESS) 0
+        :else 4))
+
+;;; Append a jump to `label` and record it.
+(defn jump! [(out (mut code/Buffer))
+             (branches (mut (ArrayList Branch)))
+             (label i32)
+             (condition i32)] (-> (Result i32 (slice u8)))
+  (let [start (len (.text out))]
+    (match (if (= condition JUMP)
+               (encode/jmp-rel32 (mut (.text out)) 0)
+               (encode/jcc-rel32 (mut (.text out)) condition 0))
+      (Err [message] (Err message))
+      (Ok [field]
+          (push! (mut branches)
+                 (Branch :start start :field field :label label :condition condition
+                         :short false))
+          (Ok (cast i32 (- (len (.text out)) start)))))))
+
+;;; Append `lea register, [rip + label]` and record it.
+(defn address! [(out (mut code/Buffer))
+                (branches (mut (ArrayList Branch)))
+                (label i32)
+                (register i32)] (-> (Result i32 (slice u8)))
+  (let [start (len (.text out))]
+    (match (encode/lea (mut (.text out)) 64 register (encode/mem-rip 0))
+      (Err [message] (Err message))
+      (Ok [field]
+          (push! (mut branches)
+                 (Branch :start start :field field :label label :condition ADDRESS
+                         :short false))
+          (Ok (cast i32 (- (len (.text out)) start)))))))
+
+(defn patch32! [(output (mut (ArrayList u8))) (offset i64) (value i64)] (-> void)
+  (for [i 0 4]
+    (set! (mut output) (+ offset i) (cast u8 (& (>> value (* i 8)) 255)))))
+
+(defn read32 [(text (ArrayList u8)) (offset i64)] (-> i64)
+  (encode/sign-extend 32
+                      (| (cast i64 (get text offset))
+                         (<< (cast i64 (get text (+ offset 1))) 8)
+                         (<< (cast i64 (get text (+ offset 2))) 16)
+                         (<< (cast i64 (get text (+ offset 3))) 24))))
+
+;;; The field width of a record in bytes.
+(defn field-size [(branch Branch)] (-> i64)
+  (if (.short branch) 1 4))
+
+;;; Patch every branch. Everything is validated before the first byte
+;;; changes, so a failure leaves the text as it was.
+(defn apply! [(output (mut (ArrayList u8)))
+              (labels (ArrayList i64))
+              (branches (ArrayList Branch))] (-> (Result i32 (slice u8)))
+  (let [(mut error) ""]
+    (for branch branches
+      (when (= error "")
+        (if (or (< (.field branch) 0)
+                (> (.field branch) (- (len output) (field-size branch)))
+                (< (.label branch) 0)
+                (>= (cast i64 (.label branch)) (len labels)))
+            (set! error "invalid x86-64 branch fixup offset or label")
+            (let [target (get labels (cast i64 (.label branch)))
+                  displacement (- target (+ (.field branch) (field-size branch)))]
+              (when (or (< target 0)
+                        (> target (len output))
+                        (not (if (.short branch)
+                                 (encode/fits8? displacement)
+                                 (encode/fits32? displacement))))
+                (set! error "unbound or out-of-range x86-64 branch target"))))))
+    (if (!= error "")
+        (Err error)
+        (do
+          (for branch branches
+            (let [displacement (- (get labels (cast i64 (.label branch)))
+                                  (+ (.field branch) (field-size branch)))]
+              (if (.short branch)
+                  (set! (mut output) (.field branch) (cast u8 (& displacement 255)))
+                  (patch32! (mut output) (.field branch) displacement))))
+          (Ok (cast i32 (len branches)))))))
+
+;;; Patch every table word with `label - base`.
+(defn apply-relative! [(output (mut (ArrayList u8)))
+                       (labels (ArrayList i64))
+                       (relatives (ArrayList Relative))] (-> (Result i32 (slice u8)))
+  (let [(mut error) ""]
+    (for relative relatives
+      (when (= error "")
+        (if (or (< (.offset relative) 0)
+                (> (.offset relative) (- (len output) 4))
+                (< (.label relative) 0)
+                (>= (cast i64 (.label relative)) (len labels))
+                (< (get labels (cast i64 (.label relative))) 0)
+                (not (encode/fits32? (- (get labels (cast i64 (.label relative)))
+                                        (.base relative)))))
+            (set! error "invalid x86-64 relative table fixup")
+            0)))
+    (if (!= error "")
+        (Err error)
+        (do
+          (for relative relatives
+            (patch32! (mut output) (.offset relative)
+                      (- (get labels (cast i64 (.label relative))) (.base relative))))
+          (Ok (cast i32 (len relatives)))))))
+
+;;; Decode every recorded branch in `text` and check that its opcode bytes
+;;; are the record's form and condition and that its displacement reaches
+;;; the record's label. Every table word must likewise hold `label - base`.
+;;; Run after apply! and apply-relative!; returns the number of branches.
+(defn verify [(text (ArrayList u8))
+              (labels (ArrayList i64))
+              (branches (ArrayList Branch))
+              (relatives (ArrayList Relative))] (-> (Result i32 (slice u8)))
+  (let [size (len text)
+        (mut error) ""]
+    (for branch branches
+      (when (= error "")
+        (let [start (.start branch)
+              condition (.condition branch)
+              width (field-size branch)]
+          (if (or (< start 0)
+                  (< (.field branch) start)
+                  (> (+ (.field branch) width) size)
+                  (< (.label branch) 0)
+                  (>= (cast i64 (.label branch)) (len labels)))
+              (set! error "x86-64 branch verification: record outside the text")
+              (let [first (cast i32 (get text start))
+                    second (if (< (+ start 1) size) (cast i32 (get text (+ start 1))) 0)
+                    third (if (< (+ start 2) size) (cast i32 (get text (+ start 2))) 0)
+                    opcode-bytes
+                      (cond (= condition ADDRESS)
+                              (if (and (not (.short branch))
+                                       (= (& first 0xFB) 0x48)
+                                       (= second 0x8D)
+                                       (= (& third 0xC7) 0x05))
+                                  3
+                                  -1)
+                            (= condition JUMP)
+                              (if (.short branch)
+                                  (if (= first 0xEB) 1 -1)
+                                  (if (= first 0xE9) 1 -1))
+                            (not (encode/condition? condition)) -1
+                            (.short branch) (if (= first (+ 0x70 condition)) 1 -1)
+                            :else (if (and (= first 0x0F) (= second (+ 0x80 condition))) 2 -1))]
+                (cond (< opcode-bytes 0)
+                        (set! error "x86-64 branch verification: the bytes are not the recorded branch")
+                      (!= (.field branch) (+ start opcode-bytes))
+                        (set! error "x86-64 branch verification: displacement field is misplaced")
+                      :else
+                        (let [displacement
+                                (if (.short branch)
+                                    (encode/sign-extend 8 (cast i64 (get text (.field branch))))
+                                    (read32 text (.field branch)))
+                              target (+ (.field branch) width displacement)]
+                          (when (!= target (get labels (cast i64 (.label branch))))
+                            (set! error "x86-64 branch verification: a branch misses its label")))))))))
+    (for relative relatives
+      (when (= error "")
+        (if (or (< (.offset relative) 0)
+                (> (+ (.offset relative) 4) size)
+                (< (.label relative) 0)
+                (>= (cast i64 (.label relative)) (len labels)))
+            (set! error "x86-64 branch verification: table word outside the text")
+            (when (!= (+ (.base relative) (read32 text (.offset relative)))
+                      (get labels (cast i64 (.label relative))))
+              (set! error "x86-64 branch verification: a table word misses its label")))))
+    (if (= error "") (Ok (cast i32 (len branches))) (Err error))))
+
+;;; In-place heapsort of branch records by `start`.
+(defn sift! [(items (mut (ArrayList Branch))) (root i64) (end i64)] (-> void)
+  (let [(mut current) root
+        (mut done) false]
+    (while (and (not done) (< current (/ end 2)))
+      (let [(mut child) (+ (* current 2) 1)]
+        (when (and (< (+ child 1) end)
+                   (< (.start (get items child)) (.start (get items (+ child 1)))))
+          (set! child (+ child 1)))
+        (if (>= (.start (get items current)) (.start (get items child)))
+            (set! done true)
+            (let [saved (get items current)]
+              (set! (mut items) current (get items child))
+              (set! (mut items) child saved)
+              (set! current child)))))))
+
+(defn sort! [(items (mut (ArrayList Branch)))] (-> void)
+  (let [(mut i) (/ (len items) 2)
+        (mut end) (len items)]
+    (while (> i 0)
+      (set! i (- i 1))
+      (sift! (mut items) i end))
+    (while (> end 1)
+      (set! end (- end 1))
+      (let [saved (get items 0)]
+        (set! (mut items) 0 (get items end))
+        (set! (mut items) end saved))
+      (sift! (mut items) 0 end))))
+
+;;; An alignment point resolved to its text offset. `sum` is the total of
+;;; the limits (while relaxing) or of the actual padding (afterwards) of
+;;; this point and every earlier one.
+(defstruct Point [(offset i64) (boundary i64) (limit i64) (loop bool) (wanted bool) (sum i64)])
+
+(defn sift-points! [(items (mut (ArrayList Point))) (root i64) (end i64)] (-> void)
+  (let [(mut current) root
+        (mut done) false]
+    (while (and (not done) (< current (/ end 2)))
+      (let [(mut child) (+ (* current 2) 1)]
+        (when (and (< (+ child 1) end)
+                   (< (.offset (get items child)) (.offset (get items (+ child 1)))))
+          (set! child (+ child 1)))
+        (if (>= (.offset (get items current)) (.offset (get items child)))
+            (set! done true)
+            (let [saved (get items current)]
+              (set! (mut items) current (get items child))
+              (set! (mut items) child saved)
+              (set! current child)))))))
+
+(defn sort-points! [(items (mut (ArrayList Point)))] (-> void)
+  (let [(mut i) (/ (len items) 2)
+        (mut end) (len items)]
+    (while (> i 0)
+      (set! i (- i 1))
+      (sift-points! (mut items) i end))
+    (while (> end 1)
+      (set! end (- end 1))
+      (let [saved (get items 0)]
+        (set! (mut items) 0 (get items end))
+        (set! (mut items) end saved))
+      (sift-points! (mut items) 0 end))))
+
+;;; The number of branches that start before `offset` (records sorted).
+(defn branches-before [(branches (ArrayList Branch)) (offset i64)] (-> i64)
+  (let [(mut lo) (: 0 i64)
+        (mut hi) (len branches)]
+    (while (< lo hi)
+      (let [mid (+ lo (/ (- hi lo) 2))]
+        (if (< (.start (get branches mid)) offset) (set! lo (+ mid 1)) (set! hi mid))))
+    lo))
+
+;;; `sum` of the last point at or before `offset`; zero when there is none.
+(defn points-through [(points (ArrayList Point)) (offset i64)] (-> i64)
+  (let [(mut lo) (: 0 i64)
+        (mut hi) (len points)]
+    (while (< lo hi)
+      (let [mid (+ lo (/ (- hi lo) 2))]
+        (if (<= (.offset (get points mid)) offset) (set! lo (+ mid 1)) (set! hi mid))))
+    (if (= lo 0) 0 (.sum (get points (- lo 1))))))
+
+;;; The index of the point at exactly `offset`, or -1.
+(defn point-at [(points (ArrayList Point)) (offset i64)] (-> i64)
+  (let [(mut lo) (: 0 i64)
+        (mut hi) (len points)]
+    (while (< lo hi)
+      (let [mid (+ lo (/ (- hi lo) 2))]
+        (if (< (.offset (get points mid)) offset) (set! lo (+ mid 1)) (set! hi mid))))
+    (if (and (< lo (len points)) (= (.offset (get points lo)) offset)) lo -1)))
+
+;;; A Fenwick tree over the branches: the bytes saved by the short branches
+;;; among the first `count` records.
+(defn saved-before [(tree (ArrayList i64)) (count i64)] (-> i64)
+  (let [(mut index) count
+        (mut total) (: 0 i64)]
+    (while (> index 0)
+      (set! total (+ total (get tree index)))
+      (set! index (- index (& index (- 0 index)))))
+    total))
+
+(defn save! [(tree (mut (ArrayList i64))) (branch i64) (amount i64)] (-> void)
+  (let [(mut index) (+ branch 1)]
+    (while (< index (len tree))
+      (set! (mut tree) index (+ (get tree index) amount))
+      (set! index (+ index (& index (- 0 index)))))))
+
+;;; Where old offset `offset` is once the short branches before it have
+;;; shrunk, before any padding.
+(defn shrunk [(branches (ArrayList Branch)) (tree (ArrayList i64)) (offset i64)] (-> i64)
+  (- offset (saved-before tree (branches-before branches offset))))
+
+;;; Whether branch `index`, still long, may take its short form given the
+;;; branches already short. The displacement is measured without padding and
+;;; every alignment point it crosses is charged its full limit: sizes only
+;;; shrink and padding never exceeds a limit, so a branch that fits here fits
+;;; in every later layout, whatever padding the final offsets produce.
+(defn fits-short? [(branches (ArrayList Branch)) (tree (ArrayList i64))
+                   (points (ArrayList Point)) (labels (ArrayList i64)) (index i64)] (-> bool)
+  (let [branch (get branches index)
+        start (.start branch)
+        end (+ start (long-size branch))
+        target (get labels (cast i64 (.label branch)))
+        new-start (- start (saved-before tree index))
+        new-target (shrunk branches tree target)]
+    (if (>= target end)
+        ; Forward: this branch's own shrinking moves both ends alike.
+        (<= (+ (- new-target (+ new-start (long-size branch)))
+               (- (points-through points target) (points-through points start)))
+            127)
+        (>= (- (- new-target (+ new-start 2))
+               (- (points-through points start) (points-through points target)))
+            -128))))
+
+;;; Shrink every jump whose displacement fits rel8 and insert the padding the
+;;; alignment requests ask for; move every recorded offset accordingly.
+;;;
+;;; Branches only ever shrink, so the iteration terminates: sweeps alternate
+;;; direction (a forward branch depends on the branches behind it, a backward
+;;; one on those before it) until one changes nothing. The displacements
+;;; themselves stay zero; apply! writes them afterwards.
+;;;
+;;; Offsets that sit exactly on an alignment point move behind its padding:
+;;; the label, an instruction or table that starts there, a reference in it.
+;;; The padding is no-op instructions, so falling into it is harmless.
+;;;
+;;; Everything is validated before anything changes; on an error the buffer
+;;; and the records are as they were. Returns the number of bytes removed
+;;; (negative when padding outweighs the shrinking).
+(defn relax! [(output (mut code/Buffer))
+              (labels (mut (ArrayList i64)))
+              (branches (mut (ArrayList Branch)))
+              (relatives (mut (ArrayList Relative)))
+              (alignments (ArrayList Alignment))] (-> (Result i64 (slice u8)))
+  (let [size (len (.text output))
+        allocator (.alc (.text output))
+        count (len branches)
+        (mut points) (ArrayList::new [Point] allocator)
+        (mut tree) (ArrayList::new [i64] allocator)
+        (mut text) (ArrayList::new [u8] allocator)
+        (mut starts) (ArrayList::new [i64] allocator)
+        (mut sorted) true
+        (mut marked) false
+        (mut loops) (: 0 i64)
+        (mut aligned) (: 0 i64)
+        (mut error) ""
+        (mut removed) (: 0 i64)]
+    ; Records in text order, each inside the text and none overlapping.
+    (for [i 1 count]
+      (when (< (.start (get branches i)) (.start (get branches (- i 1))))
+        (set! sorted false)))
+    (unless sorted (sort! (mut branches)))
+    (for [i 0 count]
+      (let [branch (get branches i)
+            condition (.condition branch)
+            head (- (.field branch) (.start branch))]
+        (cond (.short branch)
+                (set! error "x86-64 relaxation: a branch is already short")
+              (or (< (.start branch) 0)
+                  (> (+ (.field branch) 4) size)
+                  (< (.label branch) 0)
+                  (>= (cast i64 (.label branch)) (len labels))
+                  (and (!= condition JUMP) (!= condition ADDRESS)
+                       (not (encode/condition? condition)))
+                  (!= head (cond (= condition JUMP) 1 (= condition ADDRESS) 3 :else 2))
+                  (and (> i 0)
+                       (< (.start branch)
+                          (+ (.start (get branches (- i 1)))
+                             (long-size (get branches (- i 1)))))))
+                (set! error "x86-64 relaxation: invalid or overlapping branch record")
+              :else
+                (let [target (get labels (cast i64 (.label branch)))]
+                  (when (or (< target 0) (> target size))
+                    (set! error "x86-64 relaxation: branch to an unbound label"))))))
+    ; No recorded offset may be inside a branch instruction.
+    (when (= error "")
+      (for label labels
+        (when (or (< label -1) (> label size))
+          (set! error "x86-64 relaxation: label outside the text"))
+        (when (and (= error "") (> label 0))
+          (let [before (branches-before branches label)]
+            (when (and (> before 0)
+                       (> (+ (.start (get branches (- before 1)))
+                             (long-size (get branches (- before 1))))
+                          label))
+              (set! error "x86-64 relaxation: label inside a branch instruction")))))
+      (for range (.text-data output)
+        (let [inside (branches-before branches (+ (.offset range) (.length range)))]
+          (when (or (< (.offset range) 0)
+                    (> (+ (.offset range) (.length range)) size)
+                    (and (> inside 0)
+                         (> (+ (.start (get branches (- inside 1)))
+                               (long-size (get branches (- inside 1))))
+                            (.offset range))))
+            (set! error "x86-64 relaxation: a branch overlaps inline data"))))
+      (for relative relatives
+        (when (or (< (.offset relative) 0) (> (+ (.offset relative) 4) size)
+                  (< (.base relative) 0) (> (.base relative) size))
+          (set! error "x86-64 relaxation: table word outside the text")))
+      (for reference (.references output)
+        (when (or (< (.offset reference) 0) (> (+ (.offset reference) 4) size))
+          (set! error "x86-64 relaxation: reference outside the text"))))
+    ; Alignment points, in text order, one per offset.
+    (when (= error "")
+      (for alignment alignments
+        (let [boundary (.boundary alignment)]
+          (if (or (< (.label alignment) 0)
+                  (>= (cast i64 (.label alignment)) (len labels))
+                  (< (get labels (cast i64 (.label alignment))) 0)
+                  (< boundary 1) (> boundary 4096) (!= (& boundary (- boundary 1)) 0)
+                  (< (.limit alignment) 0))
+              (set! error "x86-64 relaxation: invalid alignment request")
+              (push! (mut points)
+                     (Point :offset (get labels (cast i64 (.label alignment)))
+                            :boundary boundary
+                            :limit (if (< (.limit alignment) boundary)
+                                       (.limit alignment)
+                                       (- boundary 1))
+                            :loop (.loop alignment)
+                            :wanted (not (.loop alignment))
+                            :sum 0)))))
+      (sort-points! (mut points))
+      ; Requests for one offset combine into the stricter boundary.
+      (let [(mut kept) (: 0 i64)]
+        (for [i 0 (len points)]
+          (let [point (get points i)]
+            (if (and (> kept 0) (= (.offset (get points (- kept 1))) (.offset point)))
+                (let [previous (get points (- kept 1))
+                      wider (if (> (.boundary point) (.boundary previous)) point previous)]
+                  (set! (mut points) (- kept 1)
+                        (Point :offset (.offset wider) :boundary (.boundary wider)
+                               :limit (.limit wider)
+                               :loop (and (.loop point) (.loop previous))
+                               :wanted (or (.wanted point) (.wanted previous))
+                               :sum 0)))
+                (do (set! (mut points) kept point)
+                    (set! kept (+ kept 1))))))
+        (while (> (len points) kept) (pop! (mut points))))
+      ; A loop request stands only when a branch jumps back to its label.
+      (for branch branches
+        (let [target (get labels (cast i64 (.label branch)))]
+          (when (and (<= target (.start branch)) (!= (.condition branch) ADDRESS))
+            (let [at (point-at points target)]
+              (when (>= at 0) (set! (.wanted (elem (mut points) at)) true))))))
+      (let [(mut kept) (: 0 i64)]
+        (for [i 0 (len points)]
+          (let [point (get points i)]
+            (when (.wanted point)
+              (set! (mut points) kept point)
+              (set! kept (+ kept 1)))))
+        (while (> (len points) kept) (pop! (mut points))))
+      (let [(mut total) (: 0 i64)]
+        (for [i 0 (len points)]
+          (let [point (get points i)
+                before (branches-before branches (.offset point))]
+            (when (and (> before 0)
+                       (> (+ (.start (get branches (- before 1)))
+                             (long-size (get branches (- before 1))))
+                          (.offset point)))
+              (set! error "x86-64 relaxation: alignment inside a branch instruction"))
+            (for range (.text-data output)
+              (when (and (> (.offset point) (.offset range))
+                         (< (.offset point) (+ (.offset range) (.length range))))
+                (set! error "x86-64 relaxation: alignment inside inline data")))
+            (set! total (+ total (.limit point)))
+            (set! (.sum (elem (mut points) i)) total)))))
+    ; The fixed point.
+    (when (= error "")
+      (set! marked true)
+      (extend-zeroed! (mut tree) (+ count 1))
+      (let [(mut changed) true
+            (mut backward) true]
+        (while changed
+          (set! changed false)
+          (for [step 0 count]
+            (let [i (if backward (- (- count 1) step) step)
+                  branch (get branches i)]
+              (when (and (not (.short branch))
+                         (!= (.condition branch) ADDRESS)
+                         (fits-short? branches tree points labels i))
+                (set! (.short (elem (mut branches) i)) true)
+                (save! (mut tree) i (saving (.condition branch)))
+                (set! changed true))))
+          (set! backward (not backward)))))
+    ; The new text: bytes between events copied, short forms and padding
+    ; written. `starts` receives each branch's new first byte.
+    (when (= error "")
+      (reserve! (mut text) size)
+      (let [(mut cursor) (: 0 i64)
+            (mut bi) (: 0 i64)
+            (mut pi) (: 0 i64)
+            (mut padded) (: 0 i64)]
+        (while (and (= error "") (or (< bi count) (< pi (len points))))
+          (let [point? (and (< pi (len points))
+                            (or (>= bi count)
+                                (<= (.offset (get points pi)) (.start (get branches bi)))))
+                event (if point? (.offset (get points pi)) (.start (get branches bi)))]
+            (unless (bytes/append-slice! (mut text)
+                                         (subslice (slice (.text output)) cursor event))
+              (set! error "x86-64 relaxation: text too large"))
+            (set! cursor event)
+            (if point?
+                (let [point (get points pi)
+                      (mut pad) (padding (len text) (.boundary point) (.limit point))]
+                  (when (.loop point)
+                    (set! loops (+ loops 1))
+                    (when (= (% (+ (len text) pad) (.boundary point)) 0)
+                      (set! aligned (+ aligned 1))))
+                  (set! padded (+ padded pad))
+                  (set! (.sum (elem (mut points) pi)) padded)
+                  (while (and (= error "") (> pad 0))
+                    (let [piece (if (> pad 9) 9 pad)]
+                      (match (encode/nop (mut text) (cast i32 piece))
+                        (Err [message] (set! error message))
+                        (Ok [_] 0))
+                      (set! pad (- pad piece))))
+                  (set! pi (+ pi 1)))
+                (let [branch (get branches bi)
+                      end (+ (.start branch) (long-size branch))]
+                  (push! (mut starts) (len text))
+                  (if (.short branch)
+                      (match (if (= (.condition branch) JUMP)
+                                 (encode/jmp-rel8 (mut text) 0)
+                                 (encode/jcc-rel8 (mut text) (.condition branch) 0))
+                        (Err [message] (set! error message))
+                        (Ok [_] 0))
+                      (unless (bytes/append-slice! (mut text)
+                                                   (subslice (slice (.text output))
+                                                             (.start branch) end))
+                        (set! error "x86-64 relaxation: text too large")))
+                  (set! cursor end)
+                  (set! bi (+ bi 1))))))
+        (unless (bytes/append-slice! (mut text) (subslice (slice (.text output)) cursor size))
+          (set! error "x86-64 relaxation: text too large"))))
+    ; The writer's positions must be the positions the mapping gives.
+    (when (= error "")
+      (for [i 0 count]
+        (let [branch (get branches i)]
+          (when (!= (get starts i)
+                    (+ (shrunk branches tree (.start branch))
+                       (points-through points (.start branch))))
+            (set! error "x86-64 relaxation: layout and offset mapping disagree"))))
+      (when (!= (len text)
+                (+ (shrunk branches tree size) (points-through points size)))
+        (set! error "x86-64 relaxation: layout and offset mapping disagree")))
+    (if (!= error "")
+        (do
+          ; Only the short marks were written to the caller's records.
+          (when marked
+            (for [i 0 count] (set! (.short (elem (mut branches) i)) false)))
+          (free! (mut points)) (free! (mut tree)) (free! (mut text)) (free! (mut starts))
+          (Err error))
+        (do
+          (for [i 0 (len labels)]
+            (let [label (get labels i)]
+              (when (>= label 0)
+                (set! (mut labels) i
+                      (+ (shrunk branches tree label) (points-through points label))))))
+          (for [i 0 (len relatives)]
+            (let [relative (get relatives i)]
+              (set! (mut relatives) i
+                    (Relative
+                      :offset (+ (shrunk branches tree (.offset relative))
+                                 (points-through points (.offset relative)))
+                      :base (+ (shrunk branches tree (.base relative))
+                               (points-through points (.base relative)))
+                      :label (.label relative)))))
+          (for [i 0 (len (.references output))]
+            (let [reference (get (.references output) i)]
+              (set! (.offset (elem (mut (.references output)) i))
+                    (+ (shrunk branches tree (.offset reference))
+                       (points-through points (.offset reference))))))
+          (for [i 0 (len (.text-data output))]
+            (let [range (get (.text-data output) i)]
+              (set! (.offset (elem (mut (.text-data output)) i))
+                    (+ (shrunk branches tree (.offset range))
+                       (points-through points (.offset range))))))
+          ; The records last: the mapping above reads their old offsets.
+          (for [i 0 count]
+            (let [branch (get branches i)
+                  start (get starts i)]
+              (set! (mut branches) i
+                    (Branch :start start
+                            :field (if (.short branch)
+                                       (+ start 1)
+                                       (+ start (- (.field branch) (.start branch))))
+                            :label (.label branch)
+                            :condition (.condition branch)
+                            :short (.short branch)))))
+          (for point points
+            (when (> (.boundary point) (.alignment output))
+              (set! (.alignment output) (.boundary point))))
+          (set! (.loops (.summary output)) (+ (.loops (.summary output)) loops))
+          (set! (.aligned-loops (.summary output))
+                (+ (.aligned-loops (.summary output)) aligned))
+          (when (> (len points) 0)
+            (set! (.padding (.summary output))
+                  (+ (.padding (.summary output)) (.sum (get points (- (len points) 1))))))
+          (set! removed (- size (len text)))
+          (code/clear-flags! (mut output))
+          (free! (mut (.text output)))
+          (set! (.text output) text)
+          (free! (mut points)) (free! (mut tree)) (free! (mut starts))
+          (Ok removed)))))

@@ -1,0 +1,246 @@
+;;; x86-64 atomic operations.
+;;;
+;;; Operations: ATOMIC_LOAD, ATOMIC_STORE, ATOMIC_RMW, ATOMIC_CMPXCHG and
+;;; ATOMIC_FENCE (126..130, stogir.atomic) at 1, 2, 4 and 8 bytes, all
+;;; sequentially consistent, with the results of the a64 backend:
+;;;
+;;;   ATOMIC_LOAD      mov rd, [m]              (zero-extended when narrow)
+;;;   ATOMIC_STORE     xchg [m], r11            (implicitly locked: a full
+;;;                                              barrier, unlike plain mov)
+;;;   RMW add          lock xadd [m], r11       result: the old value
+;;;   RMW sub          neg r11; lock xadd [m], r11
+;;;   RMW xchg         xchg [m], r11
+;;;   RMW and/or/xor   mov rax, [m]
+;;;                 L: r11 = value; op r11, rax
+;;;                    lock cmpxchg [m], r11; jne L      result: rax
+;;;   RMW min/max      as above with `cmp rax, r11; cmovcc r11, rax` choosing
+;;;                    between the old value and the operand (signed or
+;;;                    unsigned by the operation, at the storage width)
+;;;   ATOMIC_CMPXCHG   rax = expected; r11 = desired
+;;;                    lock cmpxchg [m], r11             result: rax (the
+;;;                    old value whether or not the exchange happened)
+;;;   ATOMIC_FENCE     mfence
+;;;
+;;; Registers. The value operand is always copied into r11 first, so the
+;;; instruction never overwrites an operand that lives on, and the result is
+;;; moved out afterwards; no result aliases an operand while it is read.
+;;; `cmpxchg` needs rax: it is clobbered over the operand position (no
+;;; operand and no live value is in it), the operand is copied in, and the
+;;; result prefers rax (docs/X86_PORT.md, "Fixed registers are clobbers").
+;;; The address is a memory operand from stogir.x64.address/plain!, which
+;;; names at most r10, so a frame object is addressed in place.
+;;;
+;;; Narrow results are defined in their low bits only (stogir.x64.value).
+;;; Flags are written and dead on exit.
+;;;
+;;; The a64 module of this name is not shared: it is FEAT_LSE encodings.
+;;;
+;;; Interface (called through stogir.x64.families; see docs/X86_FAMILIES.md):
+;;; `select!`, `constrain!`, `emit!`.
+(module stogir.x64.atomic)
+(import "stogir.atomic" :as atomic)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.x64.address" :as address)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.uses" :as uses)
+(import "stogir.x64.value" :as value)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(const CONFLICT "conflicting x86-64 register constraints")
+
+;;; RMW operations (operand 4 of ATOMIC_RMW).
+(const RMW-ADD 0)
+
+(const RMW-SUB 1)
+
+(const RMW-AND 2)
+
+(const RMW-OR 3)
+
+(const RMW-XOR 4)
+
+(const RMW-XCHG 5)
+
+(const RMW-SIGNED-MAX 6)
+
+(const RMW-SIGNED-MIN 7)
+
+(const RMW-UNSIGNED-MAX 8)
+
+(const RMW-UNSIGNED-MIN 9)
+
+;;; The RMW operation of node `reference`, -1 when it is not an RMW.
+(defn operation [(graph g/Graph) (reference i32)] (-> i32)
+  (if (!= (n/opcode (get (.instructions graph) (cast i64 reference))) 128)
+      -1
+      (match (g/operand graph reference 4)
+        (None [] -1)
+        (Some [number] number))))
+
+;;; Whether the node runs a `lock cmpxchg`, which needs rax.
+(defn exchanges? [(graph g/Graph) (reference i32)] (-> bool)
+  (let [opcode (n/opcode (get (.instructions graph) (cast i64 reference)))
+        rmw (operation graph reference)]
+    (or (= opcode 129)
+        (and (= opcode 128) (!= rmw RMW-ADD) (!= rmw RMW-SUB) (!= rmw RMW-XCHG)))))
+
+(defn select! [(state (mut plan/Matching)) (graph g/Graph) (reference i32)]
+  (-> (Result i32 (slice u8)))
+  (match (atomic/validate graph reference)
+    (Err [message] (Err message))
+    (Ok [_] (Ok 0))))
+
+(defn constrain! [(set (mut uses/Set)) (graph g/Graph) (matched plan/Plan)
+                  (reference i32) (position i64)] (-> (Result i32 (slice u8)))
+  (match (atomic/validate graph reference)
+    (Err [message] (Err message))
+    (Ok [_]
+        (let [node (get (.instructions graph) (cast i64 reference))
+              opcode (cast i32 (n/opcode node))
+              (mut accepted) true]
+          (when (!= opcode 130)
+            (set! accepted (uses/use! (mut set) (.op2 node) position))
+            (when (!= opcode 126)
+              (set! accepted (and accepted (uses/use! (mut set) (.op3 node) position))))
+            (when (= opcode 129)
+              (match (g/operand graph reference 4)
+                (None [] (set! accepted false))
+                (Some [desired]
+                      (set! accepted (and accepted (uses/use! (mut set) desired position))))))
+            (when (!= opcode 127)
+              (set! accepted (and accepted (uses/define! (mut set) reference position))))
+            (when (exchanges? graph reference)
+              (uses/clobber! (mut set) registers/RAX position (+ position 1))
+              (uses/prefer! (mut set) reference registers/RAX)))
+          (if accepted (Ok 0) (Err CONFLICT))))))
+
+;;; mov destination, value-of(reference), at the 32- or 64-bit move width.
+(defn capture! [(out (mut code/Buffer)) (cx context/Context) (error (mut (slice u8)))
+                (reference i32) (position i64) (destination i32)] (-> void)
+  (code/accept-count! (mut error)
+                      (value/into! (mut out) (.graph cx) (.parts cx) (.base cx) reference
+                                   position destination)))
+
+;;; rd = rax or r11 after the operation, at the move width of `bits`.
+(defn result! [(out (mut code/Buffer)) (error (mut (slice u8))) (bits i32) (rd i32)
+               (source i32)] (-> void)
+  (when (!= rd source)
+    (code/accept! (mut error)
+                  (encode/mov-rr (mut (.text out)) (if (= bits 64) 64 32) rd source))))
+
+;;; The compare-exchange loop of an RMW that x86 has no single instruction
+;;; for; the old value is left in rax.
+(defn exchange-loop! [(out (mut code/Buffer)) (cx context/Context) (error (mut (slice u8)))
+                      (m encode/Mem) (rmw i32) (bits i32) (operand i32) (position i64)]
+  (-> void)
+  (let [new (: registers/SCRATCH-GPR-2 i32)
+        wide (if (= bits 64) (: 64 i32) 32)]
+    (code/accept! (mut error) (encode/mov-rm (mut (.text out)) bits registers/RAX m))
+    (let [head (len (.text out))]
+      (capture! (mut out) cx (mut error) operand position new)
+      (cond (= rmw RMW-AND)
+              (code/accept! (mut error)
+                            (encode/alu-rr (mut (.text out)) encode/AND wide new registers/RAX))
+            (= rmw RMW-OR)
+              (code/accept! (mut error)
+                            (encode/alu-rr (mut (.text out)) encode/OR wide new registers/RAX))
+            (= rmw RMW-XOR)
+              (code/accept! (mut error)
+                            (encode/alu-rr (mut (.text out)) encode/XOR wide new registers/RAX))
+            :else
+              ; Keep the old value when it already is the extremum.
+              (let [keep (cond (= rmw RMW-SIGNED-MAX) (: encode/CC-GE i32)
+                               (= rmw RMW-SIGNED-MIN) encode/CC-L
+                               (= rmw RMW-UNSIGNED-MAX) encode/CC-AE
+                               (= rmw RMW-UNSIGNED-MIN) encode/CC-B
+                               :else -1)]
+                (if (< keep 0)
+                    (set! error "invalid atomic RMW operation")
+                    (do
+                      (code/accept! (mut error)
+                                    (encode/alu-rr (mut (.text out)) encode/CMP bits
+                                                   registers/RAX new))
+                      (code/accept! (mut error)
+                                    (encode/cmov-rr (mut (.text out)) keep wide new
+                                                    registers/RAX))))))
+      (code/accept! (mut error) (encode/lock-cmpxchg-mr (mut (.text out)) bits m new))
+      ; Back to the head when another thread changed the cell: rax then
+      ; holds the value it found.
+      (code/accept! (mut error)
+                    (encode/jcc-rel8 (mut (.text out)) encode/CC-NE
+                                     (- head (+ (len (.text out)) 2)))))))
+
+(defn emit! [(out (mut code/Buffer)) (cx context/Context) (reference i32) (position i64)]
+  (-> (Result i32 (slice u8)))
+  (match (atomic/validate (.graph cx) reference)
+    (Err [message] (Err message))
+    (Ok [width]
+        (let [node (get (.instructions (.graph cx)) (cast i64 reference))
+              opcode (cast i32 (n/opcode node))
+              bits (* width 8)
+              scratch (: registers/SCRATCH-GPR-2 i32)
+              (mut error) ""
+              (mut rd) (: -1 i32)]
+          (when (and (!= opcode 127) (!= opcode 130))
+            (match (value/destination (.graph cx) (.parts cx) reference position)
+              (Err [message] (set! error message))
+              (Ok [register] (set! rd register))))
+          (cond (!= error "") 0
+                (= opcode 130) (code/accept! (mut error) (encode/mfence (mut (.text out))))
+                :else
+                  (match (address/plain! (mut out) cx (.op2 node) position)
+                    (Err [message] (set! error message))
+                    (Ok [m]
+                        (cond (= opcode 126)
+                                (code/accept! (mut error)
+                                              (if (< bits 32)
+                                                  (encode/movzx-rm (mut (.text out)) 32 bits rd m)
+                                                  (encode/mov-rm (mut (.text out)) bits rd m)))
+                              (= opcode 127)
+                                (do
+                                  (capture! (mut out) cx (mut error) (.op3 node) position scratch)
+                                  (code/accept! (mut error)
+                                                (encode/xchg-rm (mut (.text out)) bits scratch m)))
+                              (= opcode 129)
+                                (match (g/operand (.graph cx) reference 4)
+                                  (None [] (set! error "atomic desired value missing"))
+                                  (Some [desired]
+                                        (capture! (mut out) cx (mut error) (.op3 node) position
+                                                  registers/RAX)
+                                        (capture! (mut out) cx (mut error) desired position
+                                                  scratch)
+                                        (code/accept! (mut error)
+                                                      (encode/lock-cmpxchg-mr (mut (.text out))
+                                                                              bits m scratch))
+                                        (result! (mut out) (mut error) bits rd registers/RAX)))
+                              :else
+                                (let [rmw (operation (.graph cx) reference)]
+                                  (cond (or (= rmw RMW-ADD) (= rmw RMW-SUB) (= rmw RMW-XCHG))
+                                          (do
+                                            (capture! (mut out) cx (mut error) (.op3 node)
+                                                      position scratch)
+                                            (when (= rmw RMW-SUB)
+                                              (code/accept! (mut error)
+                                                            (encode/unary-r (mut (.text out))
+                                                                            encode/NEG
+                                                                            (if (= bits 64) 64 32)
+                                                                            scratch)))
+                                            (code/accept! (mut error)
+                                                          (if (= rmw RMW-XCHG)
+                                                              (encode/xchg-rm (mut (.text out))
+                                                                              bits scratch m)
+                                                              (encode/lock-xadd-mr
+                                                                (mut (.text out)) bits m scratch)))
+                                            (result! (mut out) (mut error) bits rd scratch))
+                                        :else
+                                          (do
+                                            (exchange-loop! (mut out) cx (mut error) m rmw bits
+                                                            (.op3 node) position)
+                                            (result! (mut out) (mut error) bits rd
+                                                     registers/RAX))))))))
+          (if (= error "") (Ok 0) (Err error))))))

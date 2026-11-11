@@ -1,0 +1,250 @@
+;;; Bridge from x86-64 constraints and live ranges to the neutral linear-scan
+;;; allocator, and the fixed frame that results.
+;;;
+;;; Register domain: general registers 0..15 and XMM registers 32..47
+;;; (stogir.x64.registers). rsp, rbp, r10, r11, xmm14 and xmm15 are never
+;;; allocated. A function without floating or vector values scans only the
+;;; general registers.
+;;;
+;;; Frame (docs/X86_PORT.md): logical offsets upward from rsp after the
+;;; prologue: outgoing call area, frame objects of operation families,
+;;; spill slots, callee-saved area. The return address sits above the frame.
+;;; A function with dynamic stack (`(.anchored set)`) or any alignment above
+;;; 16 gets an anchored frame: rbp is the base of every logical offset
+;;; (stogir.x64.frame-address), the frame size is a multiple of the frame
+;;; alignment, and an over-aligned frame owns an 8-byte entry slot for its
+;;; anchor.
+;;;
+;;; A static frame object (stogir.stack/frame-object?) defines no register:
+;;; its value is the address of its frame slot, indexed here as a
+;;; rematerialized location whose `value` is the slot's logical offset
+;;; (kind 2 in an anchored frame, kind 3 otherwise; resolve it with
+;;; stogir.x64.frame-address/slot).
+;;;
+;;; Operation families never edit this module: clobbers, hints, frame
+;;; objects, the outgoing area and odd-position transfer sites all arrive
+;;; through the uses/Set their `constrain!` hooks fill.
+;;;
+;;; Not ported from the a64 bridge (all are tuning, hard-disabled here):
+;;; shrink-wrapping and its late-preserved retry, framed-span cuts, spill-home
+;;; planning, recoloring and regional reallocation, and the optional
+;;; allocation Tuning policies (the pinned plain tuning is used).
+(module stogir.x64.allocate)
+(import "stogir.split-position" :as split-position)
+(import "stogir.live-ranges" :as ranges)
+(import "stogir.allocation" :as allocation)
+(import "stogir.allocation-check" :as check)
+(import "stogir.allocation-regions" :as regions)
+(import "stogir.locations" :as locations)
+(import "stogir.frame" :as frame)
+(import "stogir.graph" :as g)
+(import "stogir.cfg" :as cfg)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.schedule" :as schedule)
+(import "stogir.stack" :as stack)
+(import "stogir.x64.callee-saved" :as callee)
+(import "stogir.x64.coalesce" :as coalesce)
+(import "stogir.x64.frame-address" :as address)
+(import "stogir.x64.preferences" :as preferences)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.uses" :as uses)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defstruct Assigned
+  [(parts (ArrayList allocation/Part))
+   (locations locations/Index)
+   (frame frame/Frame)
+   (base address/Base)
+   (outgoing-size i64)
+   (alignment i64)
+   (callee callee/Saved)
+   (calls bool)])
+
+(defn release! [(assigned (mut Assigned))] (-> void)
+  (for [i 0 (len (.parts assigned))]
+    (allocation/release! (elem (mut (.parts assigned)) i)))
+  (locations/release-index! (mut (.locations assigned)))
+  (free! (mut (.parts assigned)))
+  (frame/release! (mut (.frame assigned))))
+
+;;; The rsp adjustment of the prologue for this frame: its contents rounded
+;;; so rsp is 16-byte aligned afterwards (entry rsp + 8 + N is a multiple of
+;;; 16). Zero for a frame without contents in a function that makes no call:
+;;; the function is frameless. One that calls needs at least the 8 bytes.
+(defn frame-size [(assigned Assigned)] (-> i64)
+  (let [contents (.size (.frame assigned))]
+    (cond (address/anchored? (.base assigned)) (.bias (.base assigned))
+          (and (= contents 0) (not (.calls assigned))) 0
+          :else (+ (& (+ contents 7) (- 0 16)) 8))))
+
+;;; Index every scheduled static frame object as the read-only address of
+;;; its slot, in reference order.
+(defn index-objects! [(assigned (mut Assigned)) (graph g/Graph)] (-> (Result i32 (slice u8)))
+  (let [(mut error) ""
+        kind (if (address/anchored? (.base assigned)) (: 2 i32) 3)
+        (mut r) 1]
+    ; Instruction cells span several slots; only cell starts are nodes.
+    (while (and (= error "") (< r (len (.instructions graph))))
+      (when (stack/frame-object? (get (.instructions graph) r))
+        (match (get (.locals (.frame assigned)) (cast i32 r))
+          ; An unscheduled object has no slot and no reader.
+          (None [] 0)
+          (Some [slot]
+                (if (or (>= r (len (.parents (.locations assigned))))
+                        (!= (.count (get (.parents (.locations assigned)) r)) 0))
+                    (set! error "static frame address still has a virtual allocation")
+                    (push! (mut (.rematerialized (.locations assigned)))
+                           (locations/Rematerialized
+                             :parent (cast i32 r)
+                             :location
+                               (locations/Location
+                                 :kind kind
+                                 :value (.offset (get (.slots (.frame assigned)) slot)))))))))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    (if (= error "") (Ok 0) (Err error))))
+
+(defn build [(intervals (ArrayList ranges/Value))
+             (set uses/Set)
+             (graph g/Graph)
+             (scheduled schedule/Schedule)
+             (blocks cfg/Blocks)
+             (depths (ArrayList i32))
+             (split-blocks (slice split-position/Block))
+             (allocator (dyn Allocator))] (-> (Result Assigned (slice u8)))
+  (let [(mut assigned)
+          (Assigned
+            :parts (ArrayList::new [allocation/Part] allocator)
+            :locations (locations/empty-index allocator)
+            :frame (frame/create allocator)
+            :base (address/stack-base)
+            :outgoing-size 0
+            :alignment (.alignment set)
+            :callee (callee/none)
+            :calls (.calls set))
+        (mut shapes) (ArrayList::new [allocation/SpillShape] allocator)
+        (mut error) ""
+        (mut register-count) (: 16 i32)
+        (mut allowed) (registers/gpr-mask)]
+    (reserve! (mut shapes) (+ (len intervals) 1))
+    (push! (mut shapes) (allocation/SpillShape :size 0 :alignment 0))
+    (for [i 1 (len intervals)]
+      (let [interval (at intervals i)
+            requirement (at (.values set) i)
+            ty (cast i32 (n/type-id (get (.instructions graph) i)))
+            width (types/size ty 8)
+            extent (if (> width 8) (cast i64 width) (: 8 i64))]
+        (when (and (> (len (.ranges interval)) 0) (or (<= width 0) (> width 16)))
+          (set! error "unsupported allocated value extent"))
+        ; Spill geometry stays indexed by graph reference, dead cells included.
+        (push! (mut shapes) (allocation/SpillShape :size extent :alignment extent))
+        (when (and (registers/simd-type? ty) (> (len (.ranges interval)) 0))
+          (set! register-count 48)
+          (set! allowed (| (registers/gpr-mask) (registers/simd-mask))))
+        ; Parts carry explicit parent references. A value with constraints but
+        ; no range keeps its part; only one with neither is inert.
+        (when (or (> (len (.ranges interval)) 0) (> (len (.uses requirement)) 0))
+          (let [(mut part) (allocation/create (cast i32 i) allocator)]
+            (set! (.allowed part) (registers/class-mask ty))
+            (when (> (len (.ranges interval)) 0)
+              (extend! (mut (.ranges part)) (.data (.ranges interval)) (len (.ranges interval))))
+            (when (> (len (.uses requirement)) 0)
+              (extend! (mut (.uses part)) (.data (.uses requirement))
+                       (len (.uses requirement))))
+            (push! (mut (.parts assigned)) part)))))
+    (for local (.locals set)
+      (when (> (.alignment local) (.alignment assigned))
+        (set! (.alignment assigned) (.alignment local))))
+    (when (or (< (.alignment assigned) 16) (not (frame/valid-alignment? (.alignment assigned))))
+      (set! error "invalid x86-64 frame alignment"))
+    (let [(mut aliases) (coalesce/run-prepared! (mut (.parts assigned)) graph scheduled
+                                                blocks depths (slice intervals) allocator)]
+      (preferences/apply! (mut (.parts assigned)) aliases set)
+      ; Incoming registers are live from entry: reserve each until its PARAM
+      ; definition so nothing scheduled earlier can take it.
+      (for [i 0 (len (.nodes scheduled))]
+        (let [reference (get (.nodes scheduled) i)]
+          (when (= (n/opcode (get (.instructions graph) (cast i64 reference))) 71)
+            (let [parameter (.parameter (at (.values set) (cast i64 reference)))]
+              (when (or (= (.kind parameter) 0) (= (.kind parameter) 2))
+                (allocation/reserve! (mut (.parts assigned)) (.register parameter)
+                                     0 (+ (* i 2) 1) allocator))))))
+      (for clobber (.clobbers set)
+        (cond
+          (or (< (.register clobber) 0) (>= (.register clobber) 48)
+              (>= (.start clobber) (.end clobber))
+              (>= (cast i64 (.except clobber)) (len intervals)))
+            (set! error "invalid x86-64 register clobber")
+          (and (> (.except clobber) 0)
+               (> (len (.ranges (at intervals (cast i64 (.except clobber))))) 0))
+            0
+          :else
+            (do
+              (when (>= (.register clobber) 32)
+                (set! register-count 48)
+                (set! allowed (| (registers/gpr-mask) (registers/simd-mask))))
+              (allocation/reserve! (mut (.parts assigned)) (.register clobber)
+                                   (.start clobber) (.end clobber) allocator))))
+      ; The outgoing call area is the bottom of the frame; family frame
+      ; objects follow, then the allocator's spill slots.
+      (when (or (< (.outgoing-size set) 0) (!= (% (.outgoing-size set) 16) 0))
+        (set! error "invalid x86-64 outgoing call area size"))
+      ; ALLOCA results are rsp + outgoing size, so the area is rounded to the
+      ; frame alignment like every dynamic object.
+      (set! (.outgoing-size assigned)
+            (* (/ (+ (.outgoing-size set) (- (.alignment assigned) 1)) (.alignment assigned))
+               (.alignment assigned)))
+      (set! (.size (.frame assigned)) (.outgoing-size assigned))
+      (for local (.locals set)
+        (match (frame/local-slot! (mut (.frame assigned)) (.owner local) (.size local)
+                                  (.alignment local))
+          (Err [message] (set! error message))
+          (Ok [_] 0)))
+      (when (= error "")
+        (match (allocation/run-shaped-with-tuning! (mut (.parts assigned))
+                 (mut (.frame assigned)) register-count allowed (slice shapes)
+                 (slice (.definition-moves set)) split-blocks (allocation/plain-tuning)
+                 allocator)
+          (Err [message] (set! error message))
+          (Ok [_] 0)))
+      (when (= error "")
+        (match (check/verify (.parts assigned) register-count allowed)
+          (Err [message] (set! error message))
+          (Ok [_] 0)))
+      (when (= error "")
+        (regions/run! (mut (.parts assigned)) graph blocks scheduled allocator)
+        (match (check/verify (.parts assigned) register-count allowed)
+          (Err [message] (set! error message))
+          (Ok [_] 0)))
+      (when (= error "")
+        (match (locations/build-index (.parts assigned) (len (.instructions graph)) allocator)
+          (Err [message] (set! error message))
+          (Ok [index]
+              (locations/release-index! (mut (.locations assigned)))
+              (set! (.locations assigned) index)
+              (coalesce/index! (mut (.locations assigned)) aliases))))
+      (when (= error "")
+        (match (callee/layout! (.parts assigned) (mut (.frame assigned)))
+          (Err [message] (set! error message))
+          (Ok [saved] (set! (.callee assigned) saved))))
+      ; The frame is complete: an anchored frame fixes its size and base.
+      (when (and (= error "") (or (.anchored set) (> (.alignment assigned) 16)))
+        (let [(mut entry) (: -1 i64)]
+          (when (> (.alignment assigned) 16)
+            (match (frame/private-slot! (mut (.frame assigned)) 8 8)
+              (Err [message] (set! error message))
+              (Ok [offset] (set! entry offset))))
+          (match (frame/aligned-size (.frame assigned) (.alignment assigned))
+            (Err [message] (set! error message))
+            (Ok [size] (set! (.base assigned) (address/anchored-base size entry))))))
+      (when (= error "")
+        (match (index-objects! (mut assigned) graph)
+          (Err [message] (set! error message))
+          (Ok [_] 0)))
+      (free! (mut aliases)))
+    (free! (mut shapes))
+    (if (= error "")
+        (Ok assigned)
+        (do (release! (mut assigned)) (Err error)))))

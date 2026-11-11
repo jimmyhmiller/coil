@@ -1,0 +1,207 @@
+;;; System V x86-64 call layout: where every argument of one CALL or TAILCALL
+;;; goes, and how large the outgoing stack area must be.
+;;;
+;;; Placement itself is stogir.x64.abi-arguments (shared with the callee
+;;; side, stogir.x64.incoming). This module binds it to a call node:
+;;;
+;;;   * The prototype (when the callee carries one) gives the fixed argument
+;;;     count, the variadic flag, the groups and the result role. Convention
+;;;     numbers 0 and 8 are accepted.
+;;;   * An ARGVAL argument is a by-value aggregate of memory class: its bytes
+;;;     are copied into the outgoing stack arguments, as upstream's
+;;;     `pass_struct_by_val` does (not into a private copy passed by pointer,
+;;;     which is the AArch64 rule). A zero-sized one still takes one slot.
+;;;   * A CALL whose result is register pieces keeps the result place pointer
+;;;     in a slot of the outgoing area above the passed arguments
+;;;     (`result-save`), because every register that could hold it is
+;;;     call-clobbered; the pieces are stored through it after the call.
+;;;
+;;; The outgoing area is the bottom of the frame: argument offsets are rsp
+;;; displacements at the call instruction.
+(module stogir.x64.call-abi)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.calls" :as calls)
+(import "stogir.call-groups" :as groups)
+(import "stogir.call-results" :as results)
+(import "stogir.argument-value" :as argval)
+(import "stogir.strings" :as strings)
+(import "stogir.frame" :as frame-layout)
+(import "stogir.schedule" :as schedule)
+(import "stogir.types" :as types)
+(import "stogir.x64.abi-arguments" :as arguments)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.incoming" :as incoming)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.value" :as value)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; One argument of a call. `register` is a library register, -1 for a stack
+;;; slot at rsp + `offset`, -2 for the result place of register pieces (not
+;;; passed). `memory` > 0: an ARGVAL whose `copy` bytes are copied to
+;;; rsp + `offset` (`memory` is the stack extent reserved, at least 1).
+(defstruct Argument
+  [(value i32)
+   (ty u8)
+   (register i32)
+   (offset i64)
+   (size i32)
+   (promote? bool)
+   (memory i64)
+   (copy i64)])
+
+;;; passed: bytes of stack arguments the callee reads from its entry rsp + 8.
+;;; stack: passed plus the result-pointer save slot. vectors: xmm registers
+;;; used by arguments (al of a variadic call).
+(defstruct Layout
+  [(arguments (ArrayList Argument))
+   (passed i64)
+   (stack i64)
+   (result results/Spec)
+   (result-save i64)
+   (vectors i32)
+   (variadic? bool)])
+
+(defn release! [(layout (mut Layout))] (-> void)
+  (free! (mut (.arguments layout))))
+
+;;; Whether `callee` is a named function constant (FUNC), called directly.
+(defn direct-callee? [(graph g/Graph) (callee i32)] (-> bool)
+  (and (< callee 0)
+       (match (g/lookup graph callee)
+         (None [] false)
+         (Some [node] (= (n/opcode node) 74)))))
+
+(defn layout [(graph g/Graph) (reference i32) (allocator (dyn Allocator))]
+  (-> (Result Layout (slice u8)))
+  (match (calls/validate-call graph reference)
+    (Err [message] (Err message))
+    (Ok [signature]
+        (let [(mut result)
+                (Layout
+                  :arguments (ArrayList::new [Argument] allocator)
+                  :passed 0
+                  :stack 0
+                  :result (results/ordinary)
+                  :result-save -1
+                  :vectors 0
+                  :variadic? (!= (& (.flags signature) 16) 0))
+              (mut tys) (ArrayList::new [u8] allocator)
+              (mut references) (ArrayList::new [i32] allocator)
+              (mut copies) (ArrayList::new [i64] allocator)
+              (mut descriptors) (ArrayList::new [groups/Group] allocator)
+              (mut memory) (ArrayList::new [groups/Memory] allocator)
+              (mut error) (if (incoming/convention? (.flags signature))
+                              ""
+                              "unsupported x86-64 call convention")
+              count (get (.arities graph) (cast i64 reference))]
+          (for [j 3 (+ (cast i64 count) 1)]
+            (when (= error "")
+              (match (g/operand graph reference (cast i32 j))
+                (None [] (set! error "missing call argument"))
+                (Some [argument]
+                      (match (g/lookup graph argument)
+                        (None [] (set! error "invalid call argument"))
+                        (Some [input]
+                              (push! (mut tys) (n/type-id input))
+                              (push! (mut references) argument)
+                              (if (and (> argument 0) (= (n/opcode input) 70))
+                                  (match (argval/validate graph argument)
+                                    (Err [message] (set! error message))
+                                    (Ok [shape]
+                                        (if (> (.size shape) groups/MAX-MEMORY)
+                                            (set! error "x86-64 ARGVAL exceeds the MEMORY argument size limit")
+                                            (do
+                                              (push! (mut copies) (.size shape))
+                                              (push! (mut memory)
+                                                     (groups/Memory
+                                                       :ordinal (cast i32 (- j 3))
+                                                       :size (if (= (.size shape) 0) 1 (.size shape))
+                                                       :alignment (if (> (.alignment shape) 8) 16 8)))))))
+                                  (push! (mut copies) -1))))))))
+          (when (and (= error "") (> (.id signature) 0))
+            (match (strings/lookup (.strings graph) (.id signature))
+              (None [] (set! error "prototype string missing"))
+              (Some [bytes]
+                    (set! (.result result) (results/decode bytes))
+                    (for [i 0 (groups/count bytes)]
+                      (unless (groups/memory? bytes i)
+                        (push! (mut descriptors) (groups/at bytes i)))))))
+          (when (= error "")
+            (match (arguments/plan-result (slice tys) (cast i64 (.count signature))
+                                          (.variadic? result) (slice descriptors)
+                                          (slice memory) (.result result) allocator)
+              (Err [message] (set! error message))
+              (Ok [planned]
+                  (let [(mut planned) planned]
+                    (set! (.passed result) (.stack planned))
+                    (set! (.stack result) (.stack planned))
+                    (set! (.vectors result) (.vectors planned))
+                    (for [i 0 (len (.parts planned))]
+                      (let [part (get (.parts planned) i)]
+                        (push! (mut (.arguments result))
+                               (Argument
+                                 :value (get references i)
+                                 :ty (get tys i)
+                                 :register (.register part)
+                                 :offset (.offset part)
+                                 :size (.size part)
+                                 :promote? (.promote? part)
+                                 :memory (.memory part)
+                                 :copy (if (> (.memory part) 0) (get copies i) -1)))))
+                    (arguments/release! (mut planned))))))
+          (when (and (= error "")
+                     (= (n/opcode (get (.instructions graph) (cast i64 reference))) 79)
+                     (= (.kind (.result result)) 1))
+            (set! (.result-save result) (.stack result))
+            (set! (.stack result) (+ (.stack result) 8)))
+          (free! (mut tys))
+          (free! (mut references))
+          (free! (mut copies))
+          (free! (mut descriptors))
+          (free! (mut memory))
+          (if (= error "") (Ok result) (do (release! (mut result)) (Err error)))))))
+
+;;; Bytes of outgoing area CALL or TAILCALL `reference` needs, a multiple of 16.
+(defn outgoing-of [(graph g/Graph) (reference i32) (allocator (dyn Allocator))]
+  (-> (Result i64 (slice u8)))
+  (match (layout graph reference allocator)
+    (Err [message] (Err message))
+    (Ok [planned]
+        (let [(mut planned) planned
+              size (arguments/round-up (.stack planned) 16)]
+          (release! (mut planned))
+          (Ok size)))))
+
+;;; Largest outgoing area of any scheduled call.
+(defn outgoing-size [(graph g/Graph) (scheduled schedule/Schedule)]
+  (-> (Result i64 (slice u8)))
+  (let [(mut maximum) (: 0 i64)
+        (mut error) ""]
+    (for reference (.nodes scheduled)
+      (let [opcode (n/opcode (get (.instructions graph) (cast i64 reference)))]
+        (when (and (= error "") (or (= opcode 79) (= opcode 80)))
+          (match (outgoing-of graph reference (.alc (.nodes scheduled)))
+            (Err [message] (set! error message))
+            (Ok [size] (when (> size maximum) (set! maximum size)))))))
+    (if (= error "") (Ok maximum) (Err error))))
+
+;;; Logical frame offset of the frame object `owner` owns, -1 when it has none.
+(defn local-offset [(frame frame-layout/Frame) (owner i32)] (-> i64)
+  (match (get (.locals frame) owner)
+    (None [] -1)
+    (Some [index] (.offset (get (.slots frame) index)))))
+
+;;; Extend the narrow integer in general register `register` to 32 bits by
+;;; its type's signedness; wider, floating and void types need nothing. This
+;;; is the normalization of an integer argument or result at a call boundary.
+(defn normalize! [(out (mut code/Buffer)) (ty i32) (register i32)]
+  (-> (Result i32 (slice u8)))
+  (cond (or (= ty 0) (types/floating? ty)) (Ok 0)
+        (not (types/integer? ty))
+          (Err "x86-64 backend: vector values at a call boundary are not implemented (vector family)")
+        (>= (value/type-bits ty) 32) (Ok 0)
+        (not (registers/gpr? register)) (Err "integer normalization requires a general register")
+        :else (value/extend! (mut out) ty register register)))

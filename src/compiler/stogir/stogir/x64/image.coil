@@ -1,0 +1,225 @@
+;;; Finish x86-64 code as a shared, address-independent image
+;;; (stogir.image, machine x86-64): the text, its data ranges, the entry
+;;; symbol at text offset 0, and one relocation per pending reference
+;;; (stogir.x64.code/Reference), with its explicit addend:
+;;;
+;;;   PC32 to FUNC or SYM   the symbol's private 8-byte address slot in data
+;;;                         (one per symbol; ABS64 against the symbol, which
+;;;                         stays undefined unless the image defines it), as
+;;;                         read by `mov r64, [rip + slot]`
+;;;   PC32 to STR           the string's bytes in data, NUL-terminated
+;;;   PC32 to LONG_CONST    the payload in data at its natural alignment
+;;;   PLT32 to FUNC         the function symbol itself (`call`/`jmp rel32`)
+;;;
+;;; Every public name is registered before a private one is generated, so
+;;; private names never collide. The a64 module of this name is not shared:
+;;; its relocation kinds come in ADRP/ADD pairs without addends; the data
+;;; builders have the same shape.
+;;;   PLT32 to a runtime    libm's `fma` / `fmaf`, which FMA calls
+;;;   routine               (code/RUNTIME-*): an undefined global symbol
+;;;
+;;; A private-leaf context may later bind an undefined function symbol to a
+;;; private body (stogir.x64.private-leaf/bind-image!). The emitter's leaf
+;;; record (code/Buffer `written`, `calls`) is carried into
+;;; `Image.leaf-effects` when the function makes no call and has no reference.
+(module stogir.x64.image)
+(import "stogir.bytes" :as bytes)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.image" :as image)
+(import "stogir.long-constant" :as long)
+(import "stogir.node" :as n)
+(import "stogir.strings" :as strings)
+(import "stogir.symbols" :as symbols)
+(import "stogir.target" :as target)
+(import "stogir.text-data" :as text-data)
+(import "stogir.x64.code" :as code)
+(import "coil.alloc" :use [Allocator])
+(import "coil.hashmap" :use [HashMap])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn string-target! [(output (mut image/Image)) (graph g/Graph) (node n/Node)
+                      (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (match (strings/lookup (.strings graph) (cast i32 (n/constant-bits node)))
+    (None [] (Err "string bytes missing"))
+    (Some [text]
+          (let [offset (len (.data output))]
+            (if (not (bytes/append-slice! (mut (.data output)) text))
+                (Err "string data space exhausted")
+                (do
+                  (push! (mut (.data output)) 0)
+                  (image/fresh-local! (mut output) 2 offset allocator)))))))
+
+;;; The verified payload of LONG_CONST `reference` as private data.
+(defn long-target! [(output (mut image/Image)) (graph g/Graph) (reference i32)
+                    (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "long constant missing"))
+    (Some [node]
+          (let [size (g/long-size graph reference)
+                (mut hash) (: 5381 u32)
+                (mut error) ""]
+            (when (or (not (long/valid-header? node 8)) (<= size 0))
+              (set! error "invalid long constant image target"))
+            (for [i 0 size]
+              (when (= error "")
+                (match (g/long-byte graph reference i)
+                  (None [] (set! error "long constant image payload missing"))
+                  (Some [byte] (set! hash (long/hash-step hash byte))))))
+            (when (and (= error "")
+                       (!= (n/constant-bits node) (cast u64 (^ hash (.header node)))))
+              (set! error "long constant image hash mismatch"))
+            (if (!= error "")
+                (Err error)
+                (match (image/data-space! (mut output) size (if (< size 8) 8 size))
+                  (Err [message] (Err message))
+                  (Ok [offset]
+                      (for [i 0 size]
+                        (match (g/long-byte graph reference i)
+                          (None [] (set! error "long constant image payload missing"))
+                          (Some [byte] (set! (mut (.data output)) (+ offset i) byte))))
+                      (if (!= error "")
+                          (Err error)
+                          (image/fresh-local! (mut output) 2 offset allocator)))))))))
+
+;;; The private address slot of image symbol `target`, created on first use.
+(defn address-slot! [(output (mut image/Image)) (target i32)
+                     (addresses (mut (HashMap i32 i32))) (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (match (get addresses target)
+    (Some [slot] (Ok slot))
+    (None []
+          (if (< target 0)
+              (Err "address symbol missing")
+              (match (image/data-space! (mut output) 8 8)
+                (Err [message] (Err message))
+                (Ok [offset]
+                    (match (image/fresh-local! (mut output) 2 offset allocator)
+                      (Err [message] (Err message))
+                      (Ok [slot]
+                          (if (not (image/relocate! (mut output)
+                                                    (image/Relocation
+                                                      :section 2
+                                                      :offset offset
+                                                      :kind image/ABS64
+                                                      :symbol target
+                                                      :addend 0)))
+                              (Err "invalid address slot relocation")
+                              (do (set! (mut addresses) target slot) (Ok slot)))))))))))
+
+;;; The image symbol a named constant stands for, registered by name; -1 for
+;;; a constant whose target is private data (STR, LONG_CONST).
+(defn register-target! [(output (mut image/Image)) (graph g/Graph) (reference i32)]
+  (-> (Result i32 (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "emitted symbol constant missing"))
+    (Some [node]
+          (cond (= (n/opcode node) 78)
+                  (if (and (< reference 0)
+                           (long/valid-header? node 8)
+                           (> (g/long-size graph reference) 0))
+                      (Ok -1)
+                      (Err "invalid emitted long constant"))
+                (or (>= reference 0)
+                    (not (symbols/validate graph node))
+                    (not (symbols/named? (n/opcode node))))
+                  (Err "invalid emitted symbolic constant")
+                (= (n/opcode node) 77) (Ok -1)
+                :else
+                  (match (strings/lookup (.strings graph) (cast i32 (n/constant-bits node)))
+                    (None [] (Err "symbol name missing"))
+                    (Some [name] (image/symbol! (mut output) name 0 0)))))))
+
+;;; The image symbol the relocation of `pending` is made against.
+(defn relocation-target! [(output (mut image/Image)) (graph g/Graph)
+                          (pending code/Reference) (targets (HashMap i32 i32))
+                          (addresses (mut (HashMap i32 i32)))
+                          (literals (mut (HashMap i32 i32))) (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [symbol (match (get targets (.target pending))
+                 (Some [id] id)
+                 (None [] -1))]
+    (match (g/lookup graph (.target pending))
+      (None [] (Err "emitted constant missing"))
+      (Some [node]
+            (cond (= (.kind pending) image/X64-PLT32)
+                    (if (and (= (n/opcode node) 74) (>= symbol 0))
+                        (Ok symbol)
+                        (Err "direct branch requires named function"))
+                  (!= (.kind pending) image/X64-PC32) (Err "unsupported emitted relocation")
+                  :else
+                    (match (get literals (.target pending))
+                      (Some [id] (Ok id))
+                      (None []
+                            (match (cond (= (n/opcode node) 78)
+                                           (long-target! (mut output) graph (.target pending)
+                                                         allocator)
+                                         (= (n/opcode node) 77)
+                                           (string-target! (mut output) graph node allocator)
+                                         :else
+                                           (address-slot! (mut output) symbol (mut addresses)
+                                                          allocator))
+                              (Err [message] (Err message))
+                              (Ok [id]
+                                  (set! (mut literals) (.target pending) id)
+                                  (Ok id))))))))))
+
+(defn finish! [(source (mut code/Buffer))
+               (graph g/Graph)
+               (entry (slice u8))
+               (allocator (dyn Allocator))] (-> (Result image/Image (slice u8)))
+  (let [(mut output) (image/create-x64 allocator)
+        (mut targets) (HashMap::new-scalar [i32 i32] allocator)
+        (mut addresses) (HashMap::new-scalar [i32 i32] allocator)
+        (mut literals) (HashMap::new-scalar [i32 i32] allocator)
+        (mut error) ""]
+    (match (image/require-alignments! (mut output) (.alignment source) 8)
+      (Err [message] (set! error message))
+      (Ok [_] 0))
+    (match (text-data/validate (.text-data source) (len (.text source)))
+      (Err [message] (set! error message))
+      (Ok [_] 0))
+    (free! (mut (.text output)))
+    (set! (.text output) (code/take-text! (mut source) allocator))
+    (for range (.text-data source) (push! (mut (.text-data output)) range))
+    (match (image/symbol! (mut output) entry 1 0)
+      (Err [message] (when (= error "") (set! error message)))
+      (Ok [_] 0))
+    (for pending (.references source)
+      (when (= error "")
+        (match (get targets (.target pending))
+          (Some [_] 0)
+          (None []
+                (match (if (code/runtime? pending)
+                           (image/symbol! (mut output)
+                                          (if (= (.target pending) code/RUNTIME-FMA)
+                                              (target/os-pick "_fma" "fma")
+                                              (target/os-pick "_fmaf" "fmaf"))
+                                          0 0)
+                           (register-target! (mut output) graph (.target pending)))
+                  (Err [message] (set! error message))
+                  (Ok [target] (set! (mut targets) (.target pending) target)))))))
+    (for pending (.references source)
+      (when (= error "")
+        (match (if (code/runtime? pending)
+                   (match (get targets (.target pending))
+                     (Some [id] (Ok [i32 (slice u8)] id))
+                     (None [] (Err "runtime routine symbol missing")))
+                   (relocation-target! (mut output) graph pending targets (mut addresses)
+                                       (mut literals) allocator))
+          (Err [message] (set! error message))
+          (Ok [destination]
+              (unless (image/relocate! (mut output)
+                                       (image/Relocation
+                                         :section 1
+                                         :offset (.offset pending)
+                                         :kind (.kind pending)
+                                         :symbol destination
+                                         :addend (.addend pending)))
+                (set! error "invalid emitted relocation offset or target"))))))
+    (free! (mut targets))
+    (free! (mut addresses))
+    (free! (mut literals))
+    (when (and (not (.calls source)) (= (len (.references source)) 0))
+      (set! (.leaf-effects output) (| image/LEAF-RECORDED (.written source))))
+    (if (= error "") (Ok output) (do (image/release! (mut output)) (Err error)))))

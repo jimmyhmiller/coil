@@ -1,0 +1,758 @@
+;;; x86-64 scalar floating point (f32 and f64 in XMM registers), SSE2 only.
+;;;
+;;; This family owns every node of type FLOAT or DOUBLE and every node that
+;;; reads one (stogir.x64.families/of): arithmetic, NEG/ABS, the selecting
+;;; MIN/MAX, comparisons, the extension opcodes 131..141, INT2FP/FP2INT/FP2FP,
+;;; BITCAST between the register banks, floating COPY, COND and PHI, and the
+;;; floating forms of PARAM, RETURN and IF, which the driver emits
+;;; (stogir.x64.function) after this module constrained them. Floating LOAD
+;;; and STORE are in stogir.x64.float-memory.
+;;;
+;;; Operand helpers are in stogir.x64.value ("Floating values"), comparisons
+;;; and their two-flag conditions in stogir.x64.fcompare.
+;;;
+;;; Scratch registers: xmm14 carries the first operand when it is a constant
+;;; or a reload, xmm15 the second; both and r10/r11 are free inside a node.
+;;;
+;;; Results and NaNs
+;;;   * ADD SUB MUL DIV are `op rd, right` with rd = left. A NaN operand is
+;;;     returned quieted and an invalid operation produces the x86 default
+;;;     NaN (sign bit set). With two NaN operands the hardware returns the
+;;;     first; ADD and MUL may be commuted when rd is the right operand's
+;;;     register, so which of two different NaNs survives is unspecified,
+;;;     as it is for constant folding.
+;;;   * NEG and ABS flip or clear the sign bit of any value, NaNs included.
+;;;   * MIN is `left <= right ? left : right` and MAX `left >= right ? left :
+;;;     right` on the raw operands, as stogir.floating/evaluate and the
+;;;     AArch64 backend (fcmp + fcsel): the right operand when unordered, the
+;;;     left one for equal operands (signed zeros). minsd/maxsd return their
+;;;     second operand in both cases, so a compare and a select are emitted.
+;;;   * FMIN/FMAX (IEEE 754-2019 minimum/maximum) and FMINNM/FMAXNM (minNum/
+;;;     maxNum) order -0 below +0 and give the AArch64 instructions' results
+;;;     bit for bit, NaNs included: a signalling NaN operand is returned
+;;;     quieted (the left one first), else a quiet NaN operand (the left one
+;;;     first); FMINNM/FMAXNM return the other operand when exactly one is a
+;;;     quiet NaN.
+;;;   * ROUND_* are exact for every input: values of magnitude 2^52 (2^23 for
+;;;     f32) and above are already integral and returned as they are, NaNs
+;;;     quieted; smaller ones go through cvttsd2si (always in range) or the
+;;;     add-and-subtract-2^52 identity, and keep the operand's sign, so -0.0
+;;;     and negative values rounding to zero give -0.0. ROUND_EVEN relies on
+;;;     MXCSR being in its default round-to-nearest mode, like every other
+;;;     arithmetic instruction here.
+;;;   * FMA needs FMA3 (not baseline), so it calls libm's fma / fmaf through
+;;;     the call family's runtime-call sequence (`fma!`); that needs an image.
+;;;   * FP2INT is cvttss2si/cvttsd2si. The IR leaves NaN and out-of-range
+;;;     inputs undefined (stogir.numeric-conversion/fp-to-int folds none of
+;;;     them); AArch64 saturates there, x86-64 returns what the instruction
+;;;     gives (0x8000... for the 32/64-bit signed forms). Every defined input
+;;;     agrees with constant folding, including the full u64 range.
+;;;   * INT2FP is exact rounding to nearest for every source type; u64 uses
+;;;     the halve-and-keep-the-low-bit sequence when the top bit is set.
+(module stogir.x64.floating)
+(import "stogir.conditional" :as conditional-ops)
+(import "stogir.conversion" :as conversion)
+(import "stogir.copy" :as copy)
+(import "stogir.floating" :as floating)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.x64.call" :as call)
+(import "stogir.x64.address" :as address)
+(import "stogir.x64.code" :as code)
+(import "stogir.locations" :as loc)
+(import "coil.alloc" :use [Allocator])
+(import "stogir.x64.conditional" :as conditional)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.emit" :as emit)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.fcompare" :as fcompare)
+(import "stogir.x64.float-memory" :as memory)
+(import "stogir.x64.local" :as local)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.truth" :as truth)
+(import "stogir.x64.uses" :as uses)
+(import "stogir.x64.value" :as value)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(const CONFLICT "conflicting x86-64 register constraints")
+
+;;; FMA: op1 * op2 + op3 rounded once, by libm's fma (DOUBLE) or fmaf
+;;; (FLOAT). The driver calls this in place of `emit!` with the allocator's
+;;; transfers at the node's definition position, which the call sequence
+;;; lowers itself. The reference to the routine needs an image: bare text
+;;; (compile/text) reports a clear error.
+(defn fma! [(out (mut code/Buffer)) (cx context/Context) (reference i32) (position i64)
+            (preserve (slice loc/Transfer)) (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions (.graph cx)) (cast i64 reference))
+        ty (cast i32 (n/type-id node))]
+    (if (not (types/floating? ty))
+        (Err "x86-64 backend: FMA of a vector type is not implemented (vector family)")
+        (call/emit-runtime! (mut out) cx position [(.op1 node) (.op2 node) (.op3 node)]
+                            (if (= ty 12) (: code/RUNTIME-FMA i32) code/RUNTIME-FMAF)
+                            preserve allocator))))
+
+(const X14 registers/SCRATCH-SIMD)
+
+(const X15 registers/SCRATCH-SIMD-2)
+
+(const R10 registers/SCRATCH-GPR)
+
+(const R11 registers/SCRATCH-GPR-2)
+
+(defn fail! [(error (mut (slice u8))) (message (slice u8))] (-> void)
+  (when (= error "") (set! error message)))
+
+(defn require! [(error (mut (slice u8))) (accepted bool)] (-> void)
+  (when (not accepted) (fail! (mut error) CONFLICT)))
+
+(defn check! [(error (mut (slice u8))) (result (Result i32 (slice u8)))] (-> void)
+  (match result
+    (Err [message] (fail! (mut error) message))
+    (Ok [_] 0)))
+
+;;; ---- Selection --------------------------------------------------------------
+
+(defn select! [(state (mut plan/Matching)) (graph g/Graph) (reference i32)]
+  (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions graph) (cast i64 reference))
+        opcode (cast i32 (n/opcode node))]
+    (cond (memory/operation? opcode) (memory/select! (mut state) graph reference)
+          (floating/comparison? opcode)
+            (match (fcompare/tile graph reference)
+              (Err [message] (Err message))
+              (Ok [tile]
+                  (set! (mut (.tiles state)) (cast i64 reference) tile)
+                  (Ok 0)))
+          :else (Ok 0))))
+
+;;; ---- Constraints ------------------------------------------------------------
+
+(defn constrain! [(set (mut uses/Set)) (graph g/Graph) (matched plan/Plan)
+                  (reference i32) (position i64)] (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions graph) (cast i64 reference))
+        opcode (cast i32 (n/opcode node))
+        ty (cast i32 (n/type-id node))
+        (mut error) ""]
+    (cond (memory/operation? opcode)
+            (check! (mut error) (memory/constrain! (mut set) graph matched reference position))
+          ; PHI: the edges write it.
+          (= opcode 67) 0
+          (= opcode 71)
+            (let [parameter (.parameter (at (.values set) (cast i64 reference)))]
+              (cond (= (.kind parameter) 2)
+                      (require! (mut error)
+                                (uses/define-fixed! (mut set) reference position
+                                                    (.register parameter)))
+                    (= (.kind parameter) 1)
+                      (require! (mut error) (uses/define! (mut set) reference position))
+                    :else (fail! (mut error) "unsupported x86-64 floating parameter")))
+          (= opcode 120)
+            (do
+              (require! (mut error) (uses/use-anywhere! (mut set) (.op2 node) position))
+              (uses/prefer! (mut set) (.op2 node) registers/XMM0))
+          ; IF on a floating value (the truth test).
+          (= opcode 116) (require! (mut error) (uses/use! (mut set) (.op2 node) position))
+          (= opcode 68)
+            (match (copy/validate graph reference)
+              (Err [message] (fail! (mut error) message))
+              (Ok [_]
+                  (require! (mut error) (uses/use-anywhere! (mut set) (.op1 node) position))
+                  (require! (mut error) (uses/define! (mut set) reference position))
+                  (uses/hint! (mut set) reference (.op1 node))))
+          (= opcode 60)
+            (match (conditional-ops/validate graph reference)
+              (Err [message] (fail! (mut error) message))
+              (Ok [_]
+                  (if (plan/fused? matched reference)
+                      ; The condition may be an integer comparison that
+                      ; reads a fused load: its base and index, not the load.
+                      (let [read (address/tile-operands matched graph
+                                                        (plan/condition-tile matched reference))]
+                        (require! (mut error) (uses/use! (mut set) (.first read) position))
+                        (require! (mut error) (uses/use! (mut set) (.second read) position))
+                        (require! (mut error) (uses/use! (mut set) (.third read) position)))
+                      (require! (mut error) (uses/use! (mut set) (.op1 node) position)))
+                  (require! (mut error) (uses/use! (mut set) (.op2 node) position))
+                  (require! (mut error) (uses/use! (mut set) (.op3 node) position))
+                  (require! (mut error) (uses/define! (mut set) reference position))
+                  ; Both emitters put the false arm into rd first.
+                  (uses/hint! (mut set) reference (.op3 node))))
+          (conversion/operation? opcode)
+            (match (conversion/validate graph reference 8)
+              (Err [message] (fail! (mut error) message))
+              (Ok [_]
+                  (if (or (types/vector? ty) (types/vector? (value/type-of graph (.op1 node))))
+                      (fail! (mut error) "x86-64 backend: vector conversions are not implemented yet (vector family)")
+                      (do
+                        (require! (mut error) (uses/use! (mut set) (.op1 node) position))
+                        (require! (mut error) (uses/define! (mut set) reference position))
+                        (when (= (types/floating? ty)
+                                 (types/floating? (value/type-of graph (.op1 node))))
+                          (uses/hint! (mut set) reference (.op1 node)))))))
+          ; FMA is a call to libm (stogir.x64.call/runtime-constraints!).
+          (floating/ternary? opcode)
+            (match (floating/validate graph reference)
+              (Err [message] (fail! (mut error) message))
+              (Ok [_]
+                  (check! (mut error)
+                          (call/runtime-constraints! (mut set) reference position
+                                                     [(.op1 node) (.op2 node) (.op3 node)]))))
+          (floating/operation? opcode)
+            (match (floating/validate graph reference)
+              (Err [message] (fail! (mut error) message))
+              (Ok [_]
+                  (if (floating/comparison? opcode)
+                      (let [tile (get (.tiles matched) (cast i64 reference))]
+                        (require! (mut error) (uses/use! (mut set) (.left tile) position))
+                        (require! (mut error) (uses/use! (mut set) (.right tile) position)))
+                      (do
+                        (require! (mut error) (uses/use! (mut set) (.op1 node) position))
+                        ; ADD SUB MUL DIV read their right operand from its
+                        ; spill slot when it has no register.
+                        (unless (floating/unary? opcode)
+                          (require! (mut error)
+                                    (if (and (>= opcode 26) (<= opcode 29))
+                                        (uses/use-anywhere! (mut set) (.op2 node) position)
+                                        (uses/use! (mut set) (.op2 node) position))))
+                        ; Two-address forms compute in rd = left.
+                        (when (or (and (>= opcode 26) (<= opcode 32)) (= opcode 58)
+                                  (= opcode 59))
+                          (uses/hint! (mut set) reference (.op1 node)))))
+                  (require! (mut error) (uses/define! (mut set) reference position))))
+          :else (fail! (mut error) "x86-64 backend: this operation on a floating value is not implemented"))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; ---- Emission helpers ---------------------------------------------------------
+
+;;; The XMM register of floating operand `reference` (`scratch` for a
+;;; constant or a reload); -1 after recording a failure.
+(defn operand! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+                (reference i32) (position i64) (scratch i32)] (-> i32)
+  (match (value/float-register! (mut out) (.graph cx) (.parts cx) (.base cx)
+                                reference position scratch)
+    (Err [message] (fail! (mut error) message) -1)
+    (Ok [register] register)))
+
+;;; Copy floating operand `reference` into XMM register `destination`.
+(defn into! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+             (reference i32) (position i64) (destination i32)] (-> void)
+  (check! (mut error)
+          (value/float-into! (mut out) (.graph cx) (.parts cx) (.base cx)
+                             reference position destination)))
+
+(defn sse! [(out (mut code/Buffer)) (error (mut (slice u8))) (op i32) (dst i32) (src i32)]
+  (-> void)
+  (code/accept! (mut error) (encode/sse-rr (mut (.text out)) op dst src)))
+
+(defn move! [(out (mut code/Buffer)) (error (mut (slice u8))) (dst i32) (src i32)] (-> void)
+  (check! (mut error) (value/float-move! (mut out) dst src)))
+
+;;; `register` = the bits `raw` of a floating value, through r10.
+(defn bits! [(out (mut code/Buffer)) (error (mut (slice u8))) (wide bool) (register i32)
+             (raw u64)] (-> void)
+  (check! (mut error) (value/bits! (mut out) R10 raw (if wide 64 32)))
+  (code/accept! (mut error)
+                (encode/movd-xr (mut (.text out)) (if wide 64 32) register R10)))
+
+;;; `register` = the sign bit alone (`magnitude` false) or every bit but the
+;;; sign (`magnitude` true) in the value's lane: all ones shifted.
+(defn sign-mask! [(out (mut code/Buffer)) (error (mut (slice u8))) (wide bool)
+                  (magnitude bool) (register i32)] (-> void)
+  (sse! (mut out) (mut error) encode/PCMPEQD register register)
+  (code/accept! (mut error)
+                (encode/sse-shift-ri (mut (.text out))
+                                     (cond (and wide magnitude) encode/PSRLQ-I
+                                           wide encode/PSLLQ-I
+                                           magnitude encode/PSRLD-I
+                                           :else encode/PSLLD-I)
+                                     register
+                                     (if magnitude 1 (if wide 63 31)))))
+
+(defn arithmetic-op [(opcode i32) (wide bool)] (-> i32)
+  (case opcode
+    26 (if wide encode/ADDSD encode/ADDSS)
+    27 (if wide encode/SUBSD encode/SUBSS)
+    28 (if wide encode/MULSD encode/MULSS)
+    29 (if wide encode/DIVSD encode/DIVSS)
+    131 (if wide encode/SQRTSD encode/SQRTSS)
+    -1))
+
+;;; rd = left OP right for ADD SUB MUL DIV. The right operand is read where
+;;; it is: its register, its spill slot or the constant pool. When rd is the
+;;; right operand's register, ADD and MUL are commuted and SUB and DIV are
+;;; computed in xmm14.
+(defn binary! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+               (node n/Node) (position i64) (wide bool) (rd i32)] (-> void)
+  (let [opcode (cast i32 (n/opcode node))
+        op (arithmetic-op opcode wide)
+        xa (operand! (mut out) (mut error) cx (.op1 node) position X14)
+        xb (value/float-register-of (.graph cx) (.parts cx) (.op2 node) position)]
+    (cond (and (= rd xb) (!= rd xa) (or (= opcode 26) (= opcode 28)))
+            (sse! (mut out) (mut error) op rd xa)
+          (and (= rd xb) (!= rd xa))
+            (do
+              (move! (mut out) (mut error) X14 xa)
+              (sse! (mut out) (mut error) op X14 xb)
+              (move! (mut out) (mut error) rd X14))
+          :else
+            (do
+              (move! (mut out) (mut error) rd xa)
+              (check! (mut error)
+                      (value/float-apply! (mut out) (.graph cx) (.parts cx) (.base cx) op rd
+                                          (.op2 node) position X15))))))
+
+;;; NEG and ABS: the sign bit flipped or cleared with a mask built in xmm15.
+(defn sign! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+             (node n/Node) (position i64) (wide bool) (rd i32)] (-> void)
+  (let [absolute (= (n/opcode node) 32)
+        xa (operand! (mut out) (mut error) cx (.op1 node) position X14)]
+    (sign-mask! (mut out) (mut error) wide absolute X15)
+    (move! (mut out) (mut error) rd xa)
+    (sse! (mut out) (mut error) (if absolute encode/ANDPS encode/XORPS) rd X15)))
+
+;;; rd = `condition` ? yes : no for values already in registers `xyes` and
+;;; `xno`, after the flags are set. Only moves and short jumps are emitted.
+(defn choose! [(out (mut code/Buffer)) (error (mut (slice u8))) (condition i32)
+               (xyes i32) (xno i32) (rd i32)] (-> void)
+  (let [(mut jumps) (local/create)
+        done (local/label! (mut jumps))]
+    (if (= rd xyes)
+        (do
+          (fcompare/jump-if! (mut out) (mut error) (mut jumps) condition done)
+          (move! (mut out) (mut error) rd xno))
+        (do
+          (move! (mut out) (mut error) rd xno)
+          (fcompare/jump-if! (mut out) (mut error) (mut jumps) (fcompare/invert condition) done)
+          (move! (mut out) (mut error) rd xyes)))
+    (local/bind! (mut out) (mut jumps) done)
+    (local/finish! (mut out) (mut error) jumps)))
+
+;;; The selecting MIN and MAX: flags of `left <= right` (MIN) or
+;;; `left >= right` (MAX), false when unordered, then the left operand if
+;;; the relation holds and the right one otherwise.
+(defn extremum! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+                 (node n/Node) (position i64) (wide bool) (rd i32)] (-> void)
+  (let [minimum (= (n/opcode node) 58)
+        xa (operand! (mut out) (mut error) cx (.op1 node) position X14)
+        xb (operand! (mut out) (mut error) cx (.op2 node) position X15)
+        compare (fcompare/compare-op (if wide 64 32))]
+    ; AE after `ucomis x, y` is x >= y and ordered.
+    (if minimum
+        (sse! (mut out) (mut error) compare xb xa)
+        (sse! (mut out) (mut error) compare xa xb))
+    (choose! (mut out) (mut error) encode/CC-AE xa xb rd)))
+
+;;; FMIN FMAX FMINNM FMAXNM. Both operands are copied to the scratch
+;;; registers, so rd may be either operand's register.
+;;;   ordered: min = minsd(b, a) | minsd(a, b), max = maxsd(b, a) & maxsd(a, b):
+;;;            the two orders differ only for equal operands, where one gives
+;;;            a and the other b, and OR (AND) of the two zeros is -0 (+0).
+;;;   a NaN:   FMINNM/FMAXNM return the other operand when exactly one is a
+;;;            quiet NaN; otherwise the sum of the operands, in the order
+;;;            that makes the hardware's NaN propagation pick AArch64's NaN.
+(defn ieee-extremum! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+                      (node n/Node) (position i64) (wide bool) (rd i32)] (-> void)
+  (let [opcode (cast i32 (n/opcode node))
+        minimum (or (= opcode 133) (= opcode 135))
+        number (or (= opcode 135) (= opcode 136))
+        bits (if wide (: 64 i32) 32)
+        quiet-bit (if wide (: 51 i32) 22)
+        compare (fcompare/compare-op bits)
+        op (if minimum
+               (if wide (: encode/MINSD i32) encode/MINSS)
+               (if wide (: encode/MAXSD i32) encode/MAXSS))
+        add (if wide (: encode/ADDSD i32) encode/ADDSS)
+        (mut jumps) (local/create)
+        unordered (local/label! (mut jumps))
+        done (local/label! (mut jumps))]
+    (into! (mut out) (mut error) cx (.op1 node) position X14)
+    (into! (mut out) (mut error) cx (.op2 node) position X15)
+    (sse! (mut out) (mut error) compare X14 X15)
+    (local/jump! (mut out) (mut error) (mut jumps) encode/CC-P unordered)
+    (move! (mut out) (mut error) rd X15)
+    (sse! (mut out) (mut error) op rd X14)
+    (sse! (mut out) (mut error) op X14 X15)
+    (sse! (mut out) (mut error) (if minimum encode/ORPS encode/ANDPS) rd X14)
+    (local/jump! (mut out) (mut error) (mut jumps) -1 done)
+    (local/bind! (mut out) (mut jumps) unordered)
+    (when number
+      (let [right-nan (local/label! (mut jumps))
+            sum (local/label! (mut jumps))]
+        (sse! (mut out) (mut error) compare X15 X15)
+        (local/jump! (mut out) (mut error) (mut jumps) encode/CC-P right-nan)
+        ; The right operand is a number, so the left one is the NaN: the
+        ; right operand unless that NaN is signalling.
+        (code/accept! (mut error) (encode/movd-rx (mut (.text out)) bits R11 X14))
+        (code/accept! (mut error)
+                      (encode/bt-ri (mut (.text out)) encode/BT bits R11 quiet-bit))
+        (local/jump! (mut out) (mut error) (mut jumps) encode/CC-AE sum)
+        (move! (mut out) (mut error) rd X15)
+        (local/jump! (mut out) (mut error) (mut jumps) -1 done)
+        (local/bind! (mut out) (mut jumps) right-nan)
+        ; The right operand is a NaN: the left operand when it is a number
+        ; and the right NaN is quiet.
+        (sse! (mut out) (mut error) compare X14 X14)
+        (local/jump! (mut out) (mut error) (mut jumps) encode/CC-P sum)
+        (code/accept! (mut error) (encode/movd-rx (mut (.text out)) bits R11 X15))
+        (code/accept! (mut error)
+                      (encode/bt-ri (mut (.text out)) encode/BT bits R11 quiet-bit))
+        (local/jump! (mut out) (mut error) (mut jumps) encode/CC-AE sum)
+        (move! (mut out) (mut error) rd X14)
+        (local/jump! (mut out) (mut error) (mut jumps) -1 done)
+        (local/bind! (mut out) (mut jumps) sum)))
+    ; The NaN result is left + right, which the hardware resolves to the
+    ; left NaN (quieted) or else the right one. AArch64 lets a signalling
+    ; NaN win over a quiet one: when the left operand's quiet bit is set and
+    ; the right one's is clear, right + left gives that result (the left
+    ; operand is then a quiet NaN or a number, the right one a signalling NaN
+    ; or a number, and not both are numbers).
+    (let [forward (local/label! (mut jumps))]
+      (code/accept! (mut error) (encode/movd-rx (mut (.text out)) bits R11 X14))
+      (code/accept! (mut error) (encode/bt-ri (mut (.text out)) encode/BT bits R11 quiet-bit))
+      (local/jump! (mut out) (mut error) (mut jumps) encode/CC-AE forward)
+      (code/accept! (mut error) (encode/movd-rx (mut (.text out)) bits R11 X15))
+      (code/accept! (mut error) (encode/bt-ri (mut (.text out)) encode/BT bits R11 quiet-bit))
+      (local/jump! (mut out) (mut error) (mut jumps) encode/CC-B forward)
+      (move! (mut out) (mut error) rd X15)
+      (sse! (mut out) (mut error) add rd X14)
+      (local/jump! (mut out) (mut error) (mut jumps) -1 done)
+      (local/bind! (mut out) (mut jumps) forward))
+    (move! (mut out) (mut error) rd X14)
+    (sse! (mut out) (mut error) add rd X15)
+    (local/bind! (mut out) (mut jumps) done)
+    (local/finish! (mut out) (mut error) jumps)))
+
+;;; r10 = the operand in xmm14 truncated toward zero, then xmm15 = that
+;;; integer as a floating value. Exact for magnitudes below 2^63.
+(defn truncate! [(out (mut code/Buffer)) (error (mut (slice u8))) (wide bool)
+                 (source i32)] (-> void)
+  (let [bits (if wide (: 64 i32) 32)]
+    (code/accept! (mut error) (encode/cvttfp2si-rr (mut (.text out)) bits 64 R10 source))
+    (sse! (mut out) (mut error) encode/XORPS X15 X15)
+    (code/accept! (mut error) (encode/cvtsi2fp-rr (mut (.text out)) bits 64 X15 R10))))
+
+;;; ROUND_EVEN UP DOWN ZERO AWAY (137..141). The operand is copied to xmm14.
+;;; A biased exponent of bias + fraction bits or more (magnitude >= 2^52 or
+;;; 2^23, infinities, NaNs) means the value is integral already: it is
+;;; returned through `x + 0.0`, which changes nothing but quiets a NaN.
+;;; Below that every intermediate is exact, and the result takes the
+;;; operand's sign bit at the end (rounding never changes the sign).
+;;;   ZERO  t = trunc(x)
+;;;   DOWN  t = trunc(x); t -= 1 when x < t
+;;;   UP    t = trunc(x); t += 1 when t < x
+;;;   EVEN  t = (|x| + 2^52) - 2^52 in round-to-nearest-even
+;;;   AWAY  t = trunc(x + copysign(pred(0.5), x)): the sum rounds to the next
+;;;         integer exactly when the fraction is at least one half
+;;; (`cmpsd` leaves all ones or zero, and cvtdq2pd turns that into -1.0 or 0.0.)
+(defn round! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+              (node n/Node) (position i64) (wide bool) (rd i32)] (-> void)
+  (let [opcode (cast i32 (n/opcode node))
+        bits (if wide (: 64 i32) 32)
+        fraction (if wide (: 52 i32) 23)
+        limit (if wide (: 1075 i64) 150)
+        add (if wide (: encode/ADDSD i32) encode/ADDSS)
+        subtract (if wide (: encode/SUBSD i32) encode/SUBSS)
+        compare (if wide (: encode/CMPSD i32) encode/CMPSS)
+        widen (if wide (: encode/CVTDQ2PD i32) encode/CVTDQ2PS)
+        (mut jumps) (local/create)
+        small (local/label! (mut jumps))
+        done (local/label! (mut jumps))]
+    (into! (mut out) (mut error) cx (.op1 node) position X14)
+    (code/accept! (mut error) (encode/movd-rx (mut (.text out)) bits R10 X14))
+    (code/accept! (mut error) (encode/shift-ri (mut (.text out)) encode/SHL bits R10 1))
+    (code/accept! (mut error)
+                  (encode/shift-ri (mut (.text out)) encode/SHR bits R10 (+ fraction 1)))
+    (code/accept! (mut error) (encode/alu-ri (mut (.text out)) encode/CMP 32 R10 limit))
+    (local/jump! (mut out) (mut error) (mut jumps) encode/CC-B small)
+    (sse! (mut out) (mut error) encode/XORPS X15 X15)
+    (move! (mut out) (mut error) rd X14)
+    (sse! (mut out) (mut error) add rd X15)
+    (local/jump! (mut out) (mut error) (mut jumps) -1 done)
+    (local/bind! (mut out) (mut jumps) small)
+    (cond (= opcode 137)
+            (do
+              (bits! (mut out) (mut error) wide X15
+                     (if wide (: 0x4330000000000000 u64) 0x4B000000))
+              (sign-mask! (mut out) (mut error) wide false rd)
+              (sse! (mut out) (mut error) encode/ANDNPS rd X14)
+              (sse! (mut out) (mut error) add rd X15)
+              (sse! (mut out) (mut error) subtract rd X15)
+              (sign-mask! (mut out) (mut error) wide false X15)
+              (sse! (mut out) (mut error) encode/ANDPS X15 X14)
+              (sse! (mut out) (mut error) encode/ORPS rd X15))
+          (= opcode 141)
+            (do
+              (bits! (mut out) (mut error) wide X15
+                     (if wide (: 0x3FDFFFFFFFFFFFFF u64) 0x3EFFFFFF))
+              (sign-mask! (mut out) (mut error) wide false rd)
+              (sse! (mut out) (mut error) encode/ANDPS rd X14)
+              (sse! (mut out) (mut error) encode/ORPS X15 rd)
+              (sse! (mut out) (mut error) add X15 X14)
+              (truncate! (mut out) (mut error) wide X15)
+              (sse! (mut out) (mut error) encode/ORPS rd X15))
+          :else
+            (do
+              (truncate! (mut out) (mut error) wide X14)
+              (when (= opcode 139)
+                (move! (mut out) (mut error) rd X14)
+                (code/accept! (mut error)
+                              (encode/sse-rri (mut (.text out)) compare rd X15 1))
+                (sse! (mut out) (mut error) widen rd rd)
+                (sse! (mut out) (mut error) add X15 rd))
+              (when (= opcode 138)
+                (move! (mut out) (mut error) rd X15)
+                (code/accept! (mut error)
+                              (encode/sse-rri (mut (.text out)) compare rd X14 1))
+                (sse! (mut out) (mut error) widen rd rd)
+                (sse! (mut out) (mut error) subtract X15 rd))
+              (sign-mask! (mut out) (mut error) wide false rd)
+              (sse! (mut out) (mut error) encode/ANDPS rd X14)
+              (sse! (mut out) (mut error) encode/ORPS rd X15)))
+    (local/bind! (mut out) (mut jumps) done)
+    (local/finish! (mut out) (mut error) jumps)))
+
+;;; INT2FP: rd (XMM) = the integer operand converted, rounded to nearest.
+;;; `xorps rd, rd` first removes cvtsi2ss/sd's dependency on rd's old value.
+(defn from-integer! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+                     (node n/Node) (position i64) (rd i32)] (-> void)
+  (let [origin (value/type-of (.graph cx) (.op1 node))
+        own (value/type-bits origin)
+        signed (types/signed? origin)
+        fp (if (value/double? (cast i32 (n/type-id node))) (: 64 i32) 32)]
+    (match (emit/operand! (mut out) cx (.op1 node) position R10)
+      (Err [message] (fail! (mut error) message))
+      (Ok [ra]
+          (cond (< own 32)
+                  ; BOOL and the 8- and 16-bit types: extended into r10d.
+                  (do
+                    (code/accept! (mut error)
+                                  (if signed
+                                      (encode/movsx-rr (mut (.text out)) 32 own R10 ra)
+                                      (encode/movzx-rr (mut (.text out)) 32 own R10 ra)))
+                    (sse! (mut out) (mut error) encode/XORPS rd rd)
+                    (code/accept! (mut error)
+                                  (encode/cvtsi2fp-rr (mut (.text out)) fp 32 rd R10)))
+                (or signed (= own 32))
+                  (do
+                    ; A u32 is zero-extended into r10 and converted as i64.
+                    (unless signed
+                      (code/accept! (mut error) (encode/mov-rr (mut (.text out)) 32 R10 ra)))
+                    (sse! (mut out) (mut error) encode/XORPS rd rd)
+                    (code/accept! (mut error)
+                                  (encode/cvtsi2fp-rr (mut (.text out)) fp
+                                                      (if signed own 64) rd
+                                                      (if signed ra R10))))
+                :else
+                  ; u64 (and ADDR): below 2^63 it is an i64. Otherwise halve
+                  ; it, keeping the lost bit as a sticky low bit so the one
+                  ; rounding of the conversion sees it, and double the result.
+                  (let [(mut jumps) (local/create)
+                        large (local/label! (mut jumps))
+                        done (local/label! (mut jumps))]
+                    (code/accept! (mut error) (encode/test-rr (mut (.text out)) 64 ra ra))
+                    (local/jump! (mut out) (mut error) (mut jumps) encode/CC-S large)
+                    (sse! (mut out) (mut error) encode/XORPS rd rd)
+                    (code/accept! (mut error)
+                                  (encode/cvtsi2fp-rr (mut (.text out)) fp 64 rd ra))
+                    (local/jump! (mut out) (mut error) (mut jumps) -1 done)
+                    (local/bind! (mut out) (mut jumps) large)
+                    (emit/move! (mut out) (mut error) 64 R11 ra)
+                    (code/accept! (mut error)
+                                  (encode/shift-ri (mut (.text out)) encode/SHR 64 R11 1))
+                    (emit/move! (mut out) (mut error) 64 R10 ra)
+                    (code/accept! (mut error)
+                                  (encode/alu-ri (mut (.text out)) encode/AND 32 R10 1))
+                    (code/accept! (mut error)
+                                  (encode/alu-rr (mut (.text out)) encode/OR 64 R11 R10))
+                    (sse! (mut out) (mut error) encode/XORPS rd rd)
+                    (code/accept! (mut error)
+                                  (encode/cvtsi2fp-rr (mut (.text out)) fp 64 rd R11))
+                    (sse! (mut out) (mut error) (if (= fp 64) encode/ADDSD encode/ADDSS) rd rd)
+                    (local/bind! (mut out) (mut jumps) done)
+                    (local/finish! (mut out) (mut error) jumps)))))))
+
+;;; FP2INT: rd (general) = the floating operand truncated toward zero.
+;;;   8/16/32-bit signed, BOOL, u8, u16   cvtt to 32 bits
+;;;   i64, u32                            cvtt to 64 bits
+;;;   u64 (and ADDR)                      cvtt(x) | (cvtt(x - 2^63) & sign of
+;;;                                       cvtt(x)): the first conversion is
+;;;                                       0x8000... exactly when x >= 2^63
+;;; A BOOL result is 1 when the truncated byte is not zero.
+(defn to-integer! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+                   (node n/Node) (position i64) (rd i32)] (-> void)
+  (let [target (cast i32 (n/type-id node))
+        origin (value/type-of (.graph cx) (.op1 node))
+        wide (value/double? origin)
+        fp (if wide (: 64 i32) 32)
+        own (value/type-bits target)
+        signed (types/signed? target)]
+    (if (and (= own 64) (not signed))
+        (do
+          (into! (mut out) (mut error) cx (.op1 node) position X14)
+          (code/accept! (mut error) (encode/cvttfp2si-rr (mut (.text out)) fp 64 rd X14))
+          (emit/move! (mut out) (mut error) 64 R10 rd)
+          (code/accept! (mut error) (encode/shift-ri (mut (.text out)) encode/SAR 64 R10 63))
+          (check! (mut error)
+                  (value/bits! (mut out) R11
+                               (if wide (: 0x43E0000000000000 u64) 0x5F000000) fp))
+          (code/accept! (mut error) (encode/movd-xr (mut (.text out)) fp X15 R11))
+          (sse! (mut out) (mut error) (if wide encode/SUBSD encode/SUBSS) X14 X15)
+          (code/accept! (mut error) (encode/cvttfp2si-rr (mut (.text out)) fp 64 R11 X14))
+          (code/accept! (mut error) (encode/alu-rr (mut (.text out)) encode/AND 64 R11 R10))
+          (code/accept! (mut error) (encode/alu-rr (mut (.text out)) encode/OR 64 rd R11)))
+        (let [xa (operand! (mut out) (mut error) cx (.op1 node) position X14)]
+          (code/accept! (mut error)
+                        (encode/cvttfp2si-rr (mut (.text out)) fp
+                                             (if (or (= own 64) (and (= own 32) (not signed)))
+                                                 64
+                                                 32)
+                                             rd xa))
+          (when (= target 1)
+            (code/accept! (mut error) (encode/test-rr (mut (.text out)) 8 rd rd))
+            (check! (mut error) (emit/set-condition! (mut out) encode/CC-NE rd)))))))
+
+;;; BITCAST INT2FP FP2INT FP2FP with a floating source or result.
+(defn convert! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+                (reference i32) (node n/Node) (position i64)] (-> void)
+  (let [opcode (cast i32 (n/opcode node))
+        target (cast i32 (n/type-id node))
+        origin (value/type-of (.graph cx) (.op1 node))]
+    (cond (or (types/vector? target) (types/vector? origin))
+            (fail! (mut error) "x86-64 backend: vector conversions are not implemented yet (vector family)")
+          (types/floating? target)
+            (match (value/float-destination (.graph cx) (.parts cx) reference position)
+              (Err [message] (fail! (mut error) message))
+              (Ok [rd]
+                  (cond (= opcode 37) (from-integer! (mut out) (mut error) cx node position rd)
+                        (and (= opcode 36) (types/integer? origin))
+                          (match (emit/operand! (mut out) cx (.op1 node) position R10)
+                            (Err [message] (fail! (mut error) message))
+                            (Ok [ra]
+                                (code/accept! (mut error)
+                                              (encode/movd-xr (mut (.text out))
+                                                              (if (value/double? target) 64 32)
+                                                              rd ra))))
+                        (= origin target) (into! (mut out) (mut error) cx (.op1 node) position rd)
+                        (= opcode 39)
+                          (let [xa (operand! (mut out) (mut error) cx (.op1 node) position X14)]
+                            ; Break the dependency on rd's old value.
+                            (when (!= rd xa) (sse! (mut out) (mut error) encode/XORPS rd rd))
+                            (sse! (mut out) (mut error)
+                                  (if (value/double? target) encode/CVTSS2SD encode/CVTSD2SS)
+                                  rd xa))
+                        :else (fail! (mut error) "invalid x86-64 floating conversion"))))
+          :else
+            (match (emit/destination cx reference position)
+              (Err [message] (fail! (mut error) message))
+              (Ok [rd]
+                  (cond (= opcode 38) (to-integer! (mut out) (mut error) cx node position rd)
+                        (= opcode 36)
+                          (let [xa (operand! (mut out) (mut error) cx (.op1 node) position X14)]
+                            (code/accept! (mut error)
+                                          (encode/movd-rx (mut (.text out))
+                                                          (if (value/double? origin) 64 32)
+                                                          rd xa)))
+                        :else (fail! (mut error) "invalid x86-64 floating conversion")))))))
+
+;;; Floating COND: rd = condition ? yes : no, with a short branch (SSE2 has
+;;; no conditional move for XMM registers). The flags come from the fused
+;;; comparison (integer or floating) or the truth test of the condition
+;;; value; the arms are then read with moves, which keep the flags.
+(defn conditional! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+                    (reference i32) (node n/Node) (position i64) (rd i32)] (-> void)
+  (match (if (plan/fused? (.matched cx) reference)
+             (emit/flags! (mut out) cx position (plan/condition-tile (.matched cx) reference))
+             (truth/flags! (mut out) cx (.op1 node) position))
+    (Err [message] (fail! (mut error) message))
+    (Ok [condition]
+        (let [yes (.op2 node)
+              no (.op3 node)
+              ryes (value/float-register-of (.graph cx) (.parts cx) yes position)
+              (mut jumps) (local/create)
+              done (local/label! (mut jumps))]
+          (if (= ryes rd)
+              (do
+                (fcompare/jump-if! (mut out) (mut error) (mut jumps) condition done)
+                (into! (mut out) (mut error) cx no position rd))
+              (do
+                (into! (mut out) (mut error) cx no position rd)
+                (fcompare/jump-if! (mut out) (mut error) (mut jumps)
+                                   (fcompare/invert condition) done)
+                (into! (mut out) (mut error) cx yes position rd)))
+          (local/bind! (mut out) (mut jumps) done)
+          (local/finish! (mut out) (mut error) jumps)))))
+
+;;; ---- Emission ---------------------------------------------------------------
+
+(defn emit! [(out (mut code/Buffer)) (cx context/Context) (reference i32) (position i64)]
+  (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions (.graph cx)) (cast i64 reference))
+        opcode (cast i32 (n/opcode node))
+        ty (cast i32 (n/type-id node))
+        (mut error) ""]
+    (cond (memory/operation? opcode)
+            (check! (mut error) (memory/emit! (mut out) cx reference position))
+          (or (= opcode 71) (= opcode 116) (= opcode 120))
+            (fail! (mut error) "x86-64 backend: floating PARAM, IF and RETURN are emitted by the driver")
+          (conversion/operation? opcode)
+            (match (conversion/validate (.graph cx) reference 8)
+              (Err [message] (fail! (mut error) message))
+              (Ok [_] (convert! (mut out) (mut error) cx reference node position)))
+          ; An integer COND whose condition is a floating value.
+          (and (= opcode 60) (types/integer? ty))
+            (check! (mut error) (conditional/emit! (mut out) cx reference position))
+          (floating/comparison? opcode)
+            (match (emit/destination cx reference position)
+              (Err [message] (fail! (mut error) message))
+              (Ok [rd]
+                  (match (fcompare/flags! (mut out) cx position
+                                          (get (.tiles (.matched cx)) (cast i64 reference)))
+                    (Err [message] (fail! (mut error) message))
+                    (Ok [condition]
+                        (check! (mut error) (fcompare/boolean! (mut out) condition rd))))))
+          (not (types/floating? ty))
+            (fail! (mut error) "x86-64 backend: this operation on a floating value is not implemented")
+          (floating/ternary? opcode)
+            (fail! (mut error) "x86-64 backend: FMA is emitted by the driver (stogir.x64.floating/fma!)")
+          :else
+            (match (value/float-destination (.graph cx) (.parts cx) reference position)
+              (Err [message] (fail! (mut error) message))
+              (Ok [rd]
+                  (let [wide (value/double? ty)]
+                    (cond (= opcode 68) (into! (mut out) (mut error) cx (.op1 node) position rd)
+                          (= opcode 60)
+                            (match (conditional-ops/validate (.graph cx) reference)
+                              (Err [message] (fail! (mut error) message))
+                              (Ok [_]
+                                  (conditional! (mut out) (mut error) cx reference node
+                                                position rd)))
+                          (not (floating/operation? opcode))
+                            (fail! (mut error) "x86-64 backend: this operation of a floating type is not implemented")
+                          :else
+                            (match (floating/validate (.graph cx) reference)
+                              (Err [message] (fail! (mut error) message))
+                              (Ok [_]
+                                  (cond (and (>= opcode 26) (<= opcode 29))
+                                          (binary! (mut out) (mut error) cx node position wide rd)
+                                        (or (= opcode 31) (= opcode 32))
+                                          (sign! (mut out) (mut error) cx node position wide rd)
+                                        (or (= opcode 58) (= opcode 59))
+                                          (extremum! (mut out) (mut error) cx node position
+                                                     wide rd)
+                                        (= opcode 131)
+                                          (let [xa (operand! (mut out) (mut error) cx (.op1 node)
+                                                             position X14)]
+                                            (sse! (mut out) (mut error)
+                                                  (arithmetic-op 131 wide) rd xa))
+                                        (floating/extremum? opcode)
+                                          (ieee-extremum! (mut out) (mut error) cx node position
+                                                          wide rd)
+                                        (floating/rounding? opcode)
+                                          (round! (mut out) (mut error) cx node position wide rd)
+                                        :else
+                                          (fail! (mut error)
+                                                 "x86-64 backend: this floating operation is not implemented")))))))))
+    (if (= error "") (Ok 0) (Err error))))

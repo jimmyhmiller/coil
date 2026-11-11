@@ -1,0 +1,374 @@
+;;; x86-64 division and remainder by a constant without `div`.
+;;;
+;;; `select` looks at every DIV/MOD tile (RULE-DIVIDE) the matcher produced
+;;; and replaces it when the divisor is a numeric constant and the dividend
+;;; is not:
+;;;
+;;;   unsigned, 2^k     DIV: the core's RULE-SHIFT-RI (shr at the own width)
+;;;                     MOD: RULE-POWER-MASK (and with 2^k - 1)
+;;;   signed, +-2^k     RULE-POWER-SIGNED: the biased shift
+;;;                       t = x + ((x >> W-1) >>> (W-k))
+;;;                       DIV: t >> k, negated for a negative divisor
+;;;                       MOD: x - (t & -2^k), the same for either sign
+;;;                     (k up to W-1, so the minimum value is a divisor too)
+;;;   anything else     RULE-MAGIC: the high half of a multiplication by a
+;;;                     fixed-point reciprocal (stogir.reciprocal, the
+;;;                     recipes the AArch64 backend uses), and for MOD
+;;;                     x - q * d by multiply and subtract
+;;;
+;;; Divisors 0, 1 and -1 keep the hardware division, and with it the trap
+;;; on a zero divisor and on the overflowing quotient (docs/X86_PORT.md); so
+;;; does an unsigned recipe that would need both a pre-shift and the wide
+;;; fix-up (stogir.reciprocal never produces one).
+;;;
+;;; Widths. W is the operation width: 32 for every type of at most four
+;;; bytes and 64 otherwise. An 8- or 16-bit dividend is extended to 32 bits
+;;; by the division's signedness, as the hardware division of the core does,
+;;; and the divisor likewise; an unsigned narrow dividend then has known
+;;; clear top bits, which the recipe uses.
+;;;
+;;; RULE-MAGIC at W = 32 computes in r10 and r11 only: the 64-bit product of
+;;; the extended dividend and the reciprocal has the wanted word in its upper
+;;; half. At W = 64 it needs rdx:rax of the one-operand mul/imul: both are
+;;; clobbered while the dividend is read (as for RULE-DIVIDE), the quotient
+;;; is built in rdx with rax as the temporary, and the result prefers rdx.
+;;; The dividend's register is read until the end, so rd, which may be that
+;;; register, is written last.
+;;;
+;;; Tile fields of the rules here
+;;;   RULE-POWER-MASK    bits W, left dividend, immediate k
+;;;   RULE-POWER-SIGNED  bits W, left dividend, immediate k (1..W-1),
+;;;                      operation REMAINDER and/or NEGATE
+;;;   RULE-MAGIC         bits W, left dividend, immediate the divisor's bits
+;;;                      extended to W, operation REMAINDER and/or SIGNED
+;;;
+;;; Flags are dead on entry and exit, so every instruction is free to write
+;;; them.
+(module stogir.x64.reciprocal)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.reciprocal" :as recipes)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.emit" :as emit)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.select" :as select)
+(import "stogir.x64.uses" :as uses)
+(import "stogir.x64.value" :as value)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(const RULE-POWER-MASK 100)
+
+(const RULE-POWER-SIGNED 101)
+
+(const RULE-MAGIC 102)
+
+;;; `operation` bits.
+(const REMAINDER 1)
+
+(const NEGATE 2)
+
+(const SIGNED 2)
+
+(const CONFLICT "conflicting x86-64 register constraints")
+
+(defn power-of-two? [(value u64)] (-> bool)
+  (and (!= value 0) (= (& value (- value 1)) 0)))
+
+;;; log2 of a power of two.
+(defn exponent [(value u64)] (-> i64)
+  (let [(mut bits) value
+        (mut result) (: 0 i64)]
+    (while (> bits 1)
+      (set! bits (>> bits 1))
+      (set! result (+ result 1)))
+    result))
+
+(defn flag [(set bool) (bit i32)] (-> i32)
+  (if set bit 0))
+
+;;; The unsigned recipe of divisor `d` for a dividend of `own` bits computed
+;;; at `wide` bits.
+(defn unsigned-recipe [(d u64) (wide i32) (own i32)] (-> recipes/Unsigned)
+  (recipes/unsigned-recipe d wide (- wide own)))
+
+;;; The tile that replaces hardware division `tile` of node `reference`, or
+;;; `tile` itself.
+(defn select [(graph g/Graph) (reference i32) (tile select/Tile)] (-> select/Tile)
+  (let [ty (cast i32 (n/type-id (get (.instructions graph) (cast i64 reference))))
+        own (value/type-bits ty)
+        wide (value/operation-bits ty)
+        signed (= (.immediate tile) 1)
+        remainder (= (.operation tile) select/DIVIDE-REMAINDER)
+        full (value/mask own)]
+    (match (value/constant-bits graph (.right tile))
+      (None [] tile)
+      (Some [raw]
+            (let [negative (and signed (!= (& raw (<< (: 1 u64) (cast u64 (- own 1)))) 0))
+                  magnitude (if negative (& (- 0 raw) full) raw)
+                  ; The divisor's bits at the operation width.
+                  extended (if negative
+                               (& (- 0 magnitude) (value/mask wide))
+                               raw)]
+              (cond (or (!= (.rule tile) select/RULE-DIVIDE) (<= (.left tile) 0) (< magnitude 2))
+                      tile
+                    (and (power-of-two? magnitude) signed)
+                      (select/Tile :rule RULE-POWER-SIGNED
+                                   :operation (| (flag remainder REMAINDER)
+                                                 (flag (and negative (not remainder)) NEGATE))
+                                   :bits wide :left (.left tile) :right 0
+                                   :immediate (exponent magnitude))
+                    (and (power-of-two? magnitude) remainder)
+                      (select/Tile :rule RULE-POWER-MASK :operation 0 :bits wide
+                                   :left (.left tile) :right 0
+                                   :immediate (exponent magnitude))
+                    (power-of-two? magnitude)
+                      (select/Tile :rule select/RULE-SHIFT-RI :operation encode/SHR :bits own
+                                   :left (.left tile) :right 0
+                                   :immediate (exponent magnitude))
+                    (and (not signed)
+                         (let [recipe (unsigned-recipe raw wide own)]
+                           (and (.add recipe) (> (.pre recipe) 0))))
+                      tile
+                    :else
+                      (select/Tile :rule RULE-MAGIC
+                                   :operation (| (flag remainder REMAINDER) (flag signed SIGNED))
+                                   :bits wide :left (.left tile) :right 0
+                                   :immediate (cast i64 extended))))))))
+
+(defn constrain! [(set (mut uses/Set)) (graph g/Graph) (matched plan/Plan)
+                  (reference i32) (position i64) (tile select/Tile)]
+  (-> (Result i32 (slice u8)))
+  (let [rule (.rule tile)
+        (mut accepted) (uses/use! (mut set) (.left tile) position)]
+    (unless (uses/define! (mut set) reference position) (set! accepted false))
+    (cond (not (or (= rule RULE-POWER-MASK) (= rule RULE-POWER-SIGNED) (= rule RULE-MAGIC)))
+            (Err "x86-64 backend: unknown reciprocal division rule")
+          (not accepted) (Err CONFLICT)
+          (and (= rule RULE-MAGIC) (= (.bits tile) 64))
+            (do
+              (uses/clobber! (mut set) registers/RAX position (+ position 1))
+              (uses/clobber! (mut set) registers/RDX position (+ position 1))
+              (uses/prefer! (mut set) reference
+                            (if (= (& (.operation tile) REMAINDER) 0)
+                                (: registers/RDX i32)
+                                registers/RAX))
+              (Ok 0))
+          (= rule RULE-MAGIC) (Ok 0)
+          :else
+            (do
+              (uses/hint! (mut set) reference (.left tile))
+              (Ok 0)))))
+
+(defn shift! [(out (mut code/Buffer)) (error (mut (slice u8))) (kind i32) (bits i32)
+              (register i32) (count i64)] (-> void)
+  (when (> count 0)
+    (code/accept! (mut error)
+                  (encode/shift-ri (mut (.text out)) kind bits register (cast i32 count)))))
+
+(defn alu! [(out (mut code/Buffer)) (error (mut (slice u8))) (operation i32) (bits i32)
+            (destination i32) (source i32)] (-> void)
+  (code/accept! (mut error)
+                (encode/alu-rr (mut (.text out)) operation bits destination source)))
+
+;;; `target` = the dividend extended to `to` bits by `signed` from its own
+;;; width, read from `source`.
+(defn extend! [(out (mut code/Buffer)) (error (mut (slice u8))) (signed bool) (to i32)
+               (own i32) (target i32) (source i32)] (-> void)
+  (cond (= own to) (emit/move! (mut out) (mut error) to target source)
+        signed
+          (code/accept! (mut error) (encode/movsx-rr (mut (.text out)) to own target source))
+        :else
+          (code/accept! (mut error) (encode/movzx-rr (mut (.text out)) to own target source))))
+
+;;; rd = dividend & (2^k - 1).
+(defn power-mask! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+                   (position i64) (tile select/Tile) (rd i32)] (-> void)
+  (let [bits (.bits tile)
+        mask (- (<< (: 1 u64) (cast u64 (.immediate tile))) 1)]
+    (code/accept-count! (mut error) (emit/into! (mut out) cx (.left tile) position rd))
+    (match (value/immediate-of mask bits)
+      (Some [imm]
+            (code/accept! (mut error)
+                          (encode/alu-ri (mut (.text out)) encode/AND bits rd imm)))
+      (None []
+            (do
+              (code/accept-count! (mut error)
+                                  (value/bits! (mut out) registers/SCRATCH-GPR-2 mask 64))
+              (alu! (mut out) (mut error) encode/AND bits rd registers/SCRATCH-GPR-2))))))
+
+;;; Signed division or remainder by +-2^k (RULE-POWER-SIGNED).
+(defn power-signed! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+                     (position i64) (tile select/Tile) (rd i32)] (-> void)
+  (let [bits (.bits tile)
+        k (.immediate tile)
+        own (value/type-bits (value/type-of (.graph cx) (.left tile)))
+        bias (: registers/SCRATCH-GPR i32)
+        rounded (: registers/SCRATCH-GPR-2 i32)]
+    (match (emit/operand! (mut out) cx (.left tile) position registers/SCRATCH-GPR)
+      (Err [message] (when (= error "") (set! error message)))
+      (Ok [source]
+          (extend! (mut out) (mut error) true bits own rd source)
+          ; bias = 2^k - 1 for a negative dividend, else 0.
+          (emit/move! (mut out) (mut error) bits bias rd)
+          (when (> k 1) (shift! (mut out) (mut error) encode/SAR bits bias (cast i64 (- bits 1))))
+          (shift! (mut out) (mut error) encode/SHR bits bias (- (cast i64 bits) k))
+          (if (= (& (.operation tile) REMAINDER) 0)
+              (do
+                (alu! (mut out) (mut error) encode/ADD bits rd bias)
+                (shift! (mut out) (mut error) encode/SAR bits rd k)
+                (when (!= (& (.operation tile) NEGATE) 0)
+                  (code/accept! (mut error)
+                                (encode/unary-r (mut (.text out)) encode/NEG bits rd))))
+              (do
+                (code/accept! (mut error)
+                              (encode/lea (mut (.text out)) bits rounded
+                                          (encode/mem-index rd bias 1 0)))
+                (if (<= k 31)
+                    (code/accept! (mut error)
+                                  (encode/alu-ri (mut (.text out)) encode/AND bits rounded
+                                                 (- 0 (<< (: 1 i64) k))))
+                    (do
+                      (shift! (mut out) (mut error) encode/SHR bits rounded k)
+                      (shift! (mut out) (mut error) encode/SHL bits rounded k)))
+                (alu! (mut out) (mut error) encode/SUB bits rd rounded)))))))
+
+;;; The 32-bit quotient of RULE-MAGIC into r10d. `x` holds the dividend at
+;;; its own width and is left unchanged.
+(defn magic-word! [(out (mut code/Buffer)) (error (mut (slice u8))) (tile select/Tile)
+                   (own i32) (x i32)] (-> void)
+  (let [q (: registers/SCRATCH-GPR i32)
+        t (: registers/SCRATCH-GPR-2 i32)
+        d (cast u64 (.immediate tile))]
+    (if (!= (& (.operation tile) SIGNED) 0)
+        (let [recipe (recipes/signed-recipe d 32)
+              negative-divisor (!= (& d 0x80000000) 0)
+              negative-magic (!= (& (.magic recipe) 0x80000000) 0)
+              correction (!= negative-divisor negative-magic)]
+          (extend! (mut out) (mut error) true 64 own q x)
+          (code/accept! (mut error)
+                        (encode/imul-rri (mut (.text out)) 64 q q
+                                         (encode/sign-extend 32 (cast i64 (.magic recipe)))))
+          (shift! (mut out) (mut error) encode/SAR 64 q 32)
+          (when correction
+            (extend! (mut out) (mut error) true 32 own t x)
+            (alu! (mut out) (mut error) (if negative-magic encode/ADD encode/SUB) 32 q t))
+          (shift! (mut out) (mut error) encode/SAR 32 q (cast i64 (.shift recipe)))
+          (emit/move! (mut out) (mut error) 32 t q)
+          (shift! (mut out) (mut error) encode/SHR 32 t 31)
+          (alu! (mut out) (mut error) encode/ADD 32 q t))
+        (let [recipe (unsigned-recipe d 32 own)]
+          (extend! (mut out) (mut error) false 32 own t x)
+          (shift! (mut out) (mut error) encode/SHR 32 t (cast i64 (.pre recipe)))
+          (code/accept-count! (mut error) (value/bits! (mut out) q (.magic recipe) 32))
+          (code/accept! (mut error) (encode/imul-rr (mut (.text out)) 64 q t))
+          (if (.add recipe)
+              (do
+                (shift! (mut out) (mut error) encode/SHR 64 q 32)
+                (alu! (mut out) (mut error) encode/SUB 32 t q)
+                (shift! (mut out) (mut error) encode/SHR 32 t 1)
+                (alu! (mut out) (mut error) encode/ADD 32 q t)
+                (shift! (mut out) (mut error) encode/SHR 32 q (cast i64 (.post recipe))))
+              (shift! (mut out) (mut error) encode/SHR 64 q
+                      (+ 32 (cast i64 (.post recipe)))))))))
+
+;;; The 64-bit quotient of RULE-MAGIC into rdx, with rax as the temporary.
+;;; `x` holds the dividend and is left unchanged.
+(defn magic-long! [(out (mut code/Buffer)) (error (mut (slice u8))) (tile select/Tile)
+                   (x i32)] (-> void)
+  (let [q (: registers/RDX i32)
+        t (: registers/RAX i32)
+        d (cast u64 (.immediate tile))
+        top (: 0x8000000000000000 u64)]
+    (if (!= (& (.operation tile) SIGNED) 0)
+        (let [recipe (recipes/signed-recipe d 64)
+              negative-divisor (!= (& d top) 0)
+              negative-magic (!= (& (.magic recipe) top) 0)]
+          (code/accept-count! (mut error) (value/bits! (mut out) t (.magic recipe) 64))
+          (code/accept! (mut error) (encode/unary-r (mut (.text out)) encode/IMUL 64 x))
+          (when (!= negative-divisor negative-magic)
+            (alu! (mut out) (mut error) (if negative-magic encode/ADD encode/SUB) 64 q x))
+          (shift! (mut out) (mut error) encode/SAR 64 q (cast i64 (.shift recipe)))
+          (emit/move! (mut out) (mut error) 64 t q)
+          (shift! (mut out) (mut error) encode/SHR 64 t 63)
+          (alu! (mut out) (mut error) encode/ADD 64 q t))
+        (let [recipe (unsigned-recipe d 64 64)]
+          (if (> (.pre recipe) 0)
+              (do
+                (emit/move! (mut out) (mut error) 64 t x)
+                (shift! (mut out) (mut error) encode/SHR 64 t (cast i64 (.pre recipe)))
+                (code/accept-count! (mut error)
+                                    (value/bits! (mut out) registers/SCRATCH-GPR-2
+                                                 (.magic recipe) 64))
+                (code/accept! (mut error)
+                              (encode/unary-r (mut (.text out)) encode/MUL 64
+                                              registers/SCRATCH-GPR-2)))
+              (do
+                (code/accept-count! (mut error) (value/bits! (mut out) t (.magic recipe) 64))
+                (code/accept! (mut error) (encode/unary-r (mut (.text out)) encode/MUL 64 x))))
+          (when (.add recipe)
+            (emit/move! (mut out) (mut error) 64 t x)
+            (alu! (mut out) (mut error) encode/SUB 64 t q)
+            (shift! (mut out) (mut error) encode/SHR 64 t 1)
+            (alu! (mut out) (mut error) encode/ADD 64 q t))
+          (shift! (mut out) (mut error) encode/SHR 64 q (cast i64 (.post recipe)))))))
+
+;;; Division or remainder by multiply-high (RULE-MAGIC).
+(defn magic! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+              (position i64) (tile select/Tile) (rd i32)] (-> void)
+  (let [bits (.bits tile)
+        long (= bits 64)
+        own (value/type-bits (value/type-of (.graph cx) (.left tile)))
+        q (if long (: registers/RDX i32) registers/SCRATCH-GPR)
+        t (if long (: registers/RAX i32) registers/SCRATCH-GPR-2)
+        d (cast u64 (.immediate tile))]
+    (match (emit/operand! (mut out) cx (.left tile) position registers/SCRATCH-GPR)
+      (Err [message] (when (= error "") (set! error message)))
+      (Ok [source]
+          ; The word form computes in r10 and r11: a dividend that emission
+          ; put in r10 moves to rd, which is written last. The long form
+          ; leaves r10 alone.
+          (let [displaced (and (not long) (= source registers/SCRATCH-GPR))
+                x (if displaced rd source)]
+            (when displaced (emit/move! (mut out) (mut error) bits rd source))
+            (if (and long (or (= x registers/RAX) (= x registers/RDX)))
+                (when (= error "")
+                  (set! error "x86-64 reciprocal division found its dividend in reserved rax/rdx"))
+                (do
+                  (if long
+                      (magic-long! (mut out) (mut error) tile x)
+                      (magic-word! (mut out) (mut error) tile own x))
+                  (if (= (& (.operation tile) REMAINDER) 0)
+                      (emit/move! (mut out) (mut error) bits rd q)
+                      (do
+                        ; q = q * d, then rd = x - q.
+                        (match (value/immediate-of d bits)
+                          (Some [imm]
+                                (code/accept! (mut error)
+                                              (encode/imul-rri (mut (.text out)) bits q q imm)))
+                          (None []
+                                (do
+                                  (code/accept-count! (mut error)
+                                                      (value/bits! (mut out) t d 64))
+                                  (code/accept! (mut error)
+                                                (encode/imul-rr (mut (.text out)) bits q t)))))
+                        (emit/move! (mut out) (mut error) bits t x)
+                        (alu! (mut out) (mut error) encode/SUB bits t q)
+                        (emit/move! (mut out) (mut error) bits rd t))))))))))
+
+(defn emit! [(out (mut code/Buffer)) (cx context/Context) (reference i32)
+             (position i64) (tile select/Tile)] (-> (Result i32 (slice u8)))
+  (match (emit/destination cx reference position)
+    (Err [message] (Err message))
+    (Ok [rd]
+        (let [rule (.rule tile)
+              (mut error) ""]
+          (cond (= rule RULE-POWER-MASK)
+                  (power-mask! (mut out) (mut error) cx position tile rd)
+                (= rule RULE-POWER-SIGNED)
+                  (power-signed! (mut out) (mut error) cx position tile rd)
+                (= rule RULE-MAGIC) (magic! (mut out) (mut error) cx position tile rd)
+                :else (set! error "x86-64 backend: unknown reciprocal division rule"))
+          (if (= error "") (Ok 0) (Err error))))))

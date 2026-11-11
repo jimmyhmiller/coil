@@ -1,0 +1,486 @@
+;;; Integer operands for x86-64 emitters: widths, constants and registers.
+;;;
+;;; Representation of integer values in general registers (the a64 backend's
+;;; rule, adapted to x86-64 facts):
+;;;
+;;; * A value of type T is defined in the low `8 * size(T)` bits of its
+;;;   register. Every higher bit is UNSPECIFIED: an emitter that depends on
+;;;   higher bits extends first. This holds for 32-bit values too (their upper
+;;;   half is unspecified even though most 32-bit instructions happen to zero
+;;;   it), for parameters (a callee never trusts a caller's extension) and for
+;;;   values moved through spill slots.
+;;; * BOOL is a byte holding 0 or 1. Producers write exactly 0 or 1 into the
+;;;   low byte; consumers that branch test the whole low byte.
+;;; * Arithmetic whose low result bits depend only on low operand bits (ADD,
+;;;   SUB, MUL, AND, OR, XOR, NOT, NEG, SHL, moves) runs at `operation-bits`:
+;;;   32 bits for every type of at most four bytes, 64 bits otherwise.
+;;; * Operations that read high bits of their operands (compares, SHR, SAR,
+;;;   ROL, ROR, the truth test) run at the type's own width (`type-bits`),
+;;;   using the 8- and 16-bit instruction forms, which leave bits above the
+;;;   operand width unchanged. DIV and MOD extend narrow operands to 32 bits.
+;;; * Results handed to a caller are extended to 32 bits by signedness
+;;;   (`extend!`), matching the a64 backend's return normalization.
+;;;
+;;; Constants are graph references below zero. A numeric constant is rebuilt
+;;; where it is used with `mov`, which never writes flags; `xor` zeroing is not
+;;; used here. A named constant (FUNC, SYM, STR) is rebuilt the same way from
+;;; its RIP-relative reference (stogir.x64.code/reference-address!: `mov` from
+;;; the symbol's address slot, or `lea` of a string), which records a pending
+;;; relocation in the code buffer and writes no flags either.
+;;;
+;;; A static frame object is a value without a register: its location is the
+;;; rematerialized address of its frame slot, rebuilt with `lea`.
+(module stogir.x64.value)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.symbols" :as symbols)
+(import "stogir.locations" :as loc)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.frame-address" :as frame)
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+;;; Width in bits of an integer type's own storage: 8, 16, 32 or 64; 0 for
+;;; anything that is not an integer type.
+(defn type-bits [(ty i32)] (-> i32)
+  (if (types/integer? ty) (* 8 (types/scalar-size ty 8)) 0))
+
+;;; Width at which low-bit arithmetic and register moves of the type run.
+(defn operation-bits [(ty i32)] (-> i32)
+  (let [bits (type-bits ty)]
+    (if (= bits 0) 0 (if (< bits 32) 32 bits))))
+
+(defn mask [(bits i32)] (-> u64)
+  (if (>= bits 64)
+      (: 0xFFFFFFFFFFFFFFFF u64)
+      (- (<< (: 1 u64) (cast u64 bits)) 1)))
+
+;;; The type of a graph value, or -1 when the reference names nothing.
+(defn type-of [(graph g/Graph) (reference i32)] (-> i32)
+  (match (g/lookup graph reference)
+    (None [] -1)
+    (Some [node] (cast i32 (n/type-id node)))))
+
+;;; The bits of a numeric integer constant, masked to its type's width.
+;;; None for instructions, named constants and non-integer constants.
+(defn constant-bits [(graph g/Graph) (reference i32)] (-> (Option u64))
+  (if (>= reference 0)
+      (None)
+      (match (g/lookup graph reference)
+        (None [] (None))
+        (Some [node]
+              (let [ty (cast i32 (n/type-id node))]
+                (if (and (symbols/numeric? node) (types/integer? ty))
+                    (Some (& (n/constant-bits node) (mask (type-bits ty))))
+                    (None)))))))
+
+;;; `raw` as the immediate of a `bits`-wide instruction: the low `bits` bits
+;;; read as signed. A 64-bit instruction only takes a sign-extended 32-bit
+;;; immediate, so wider values yield None.
+(defn immediate-of [(raw u64) (bits i32)] (-> (Option i64))
+  (let [value (encode/sign-extend bits (cast i64 (& raw (mask bits))))]
+    (if (and (= bits 64) (not (encode/fits32? (cast i64 raw))))
+        (None)
+        (Some (if (= bits 64) (cast i64 raw) value)))))
+
+;;; The constant operand `reference` as an immediate of a `bits`-wide
+;;; instruction, when it is a numeric integer constant that fits.
+(defn immediate [(graph g/Graph) (reference i32) (bits i32)] (-> (Option i64))
+  (match (constant-bits graph reference)
+    (None [] (None))
+    (Some [raw] (immediate-of raw bits))))
+
+;;; mov destination, bits. Never writes flags. The value is zero-extended from
+;;; `bits` (8..64) into the whole register.
+(defn bits! [(out (mut code/Buffer)) (destination i32) (raw u64) (bits i32)]
+  (-> (Result i32 (slice u8)))
+  (let [begin (len (.text out))]
+    (match (encode/mov-ri (mut (.text out)) 64 destination
+                          (cast i64 (& raw (mask bits))))
+      (Err [message] (Err message))
+      (Ok [_] (Ok (cast i32 (- (len (.text out)) begin)))))))
+
+;;; Build the integer constant `reference`, numeric or named, in general
+;;; register `destination` with `mov` (or `lea` for a string). Flags are
+;;; untouched.
+(defn constant! [(out (mut code/Buffer)) (graph g/Graph) (reference i32) (destination i32)]
+  (-> (Result i32 (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "constant operand missing"))
+    (Some [node]
+          (let [ty (cast i32 (n/type-id node))]
+            (cond (>= reference 0) (Err "constant operand is not a constant reference")
+                  (not (registers/gpr? destination))
+                    (Err "x86-64 backend: constants of this register class are not implemented yet (floating/vector families)")
+                  (not (types/integer? ty))
+                    (Err "x86-64 backend: floating and vector constants are not implemented yet (floating/vector families)")
+                  (not (symbols/numeric? node))
+                    (code/reference-address! (mut out) graph reference destination)
+                  :else
+                    (bits! (mut out) destination (n/constant-bits node) (type-bits ty)))))))
+
+;;; The memory operand of spill `location` (kind 1).
+(defn spill [(location loc/Location) (base frame/Base)] (-> (Result encode/Mem (slice u8)))
+  (if (!= (.kind location) 1)
+      (Err "spill operand requires a frame slot")
+      (frame/slot base (.value location))))
+
+;;; Where the integer value `reference` is at `position`: its register, or
+;;; `scratch` after loading a spilled value or building a constant there.
+;;; Only `mov` is emitted, so flags survive. `scratch` must be r10 or r11.
+(defn register-with-locations! [(out (mut code/Buffer))
+                                (graph g/Graph)
+                                (parts loc/View)
+                                (base frame/Base)
+                                (reference i32)
+                                (position i64)
+                                (scratch i32)] (-> (Result i32 (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "scalar operand missing"))
+    (Some [node]
+          (let [ty (cast i32 (n/type-id node))]
+            (cond (not (types/integer? ty))
+                    (Err "x86-64 backend: floating and vector operands are not implemented yet (floating/vector families)")
+                  (< reference 0)
+                    (match (constant! (mut out) graph reference scratch)
+                      (Err [message] (Err message))
+                      (Ok [_] (Ok scratch)))
+                  :else
+                    (match (loc/resolve parts reference position)
+                      (Err [message] (Err message))
+                      (Ok [location]
+                          (cond (loc/constant? location)
+                                  (match (constant! (mut out) graph (cast i32 (.value location)) scratch)
+                                    (Err [message] (Err message))
+                                    (Ok [_] (Ok scratch)))
+                                (loc/rematerialized? location)
+                                  (match (frame/slot base (.value location))
+                                    (Err [message] (Err message))
+                                    (Ok [m]
+                                        (match (encode/lea (mut (.text out)) 64 scratch m)
+                                          (Err [message] (Err message))
+                                          (Ok [_] (Ok scratch)))))
+                                (= (.kind location) 1)
+                                  (match (spill location base)
+                                    (Err [message] (Err message))
+                                    (Ok [m]
+                                        (match (encode/mov-rm (mut (.text out))
+                                                              (operation-bits ty) scratch m)
+                                          (Err [message] (Err message))
+                                          (Ok [_] (Ok scratch)))))
+                                (and (= (.kind location) 0)
+                                     (registers/allocatable? ty (cast i32 (.value location))))
+                                  (Ok (cast i32 (.value location)))
+                                :else (Err "scalar operand requires a general register")))))))))
+
+;;; The general register that holds the integer result of `reference`, defined
+;;; at `position + 1`.
+(defn destination [(graph g/Graph) (parts loc/View) (reference i32) (position i64)]
+  (-> (Result i32 (slice u8)))
+  (match (loc/resolve parts reference (+ position 1))
+    (Err [message] (Err message))
+    (Ok [location]
+        (if (and (= (.kind location) 0)
+                 (registers/allocatable? (type-of graph reference) (cast i32 (.value location)))
+                 (registers/gpr? (cast i32 (.value location))))
+            (Ok (cast i32 (.value location)))
+            (Err "integer result requires a general register")))))
+
+;;; Copy the integer value `reference` (register, spill slot or constant) into
+;;; general register `destination` with one `mov`. Flags are untouched.
+(defn into! [(out (mut code/Buffer))
+             (graph g/Graph)
+             (parts loc/View)
+             (base frame/Base)
+             (reference i32)
+             (position i64)
+             (destination i32)] (-> (Result i32 (slice u8)))
+  (let [begin (len (.text out))]
+    (match (register-with-locations! (mut out) graph parts base reference position destination)
+      (Err [message] (Err message))
+      (Ok [source]
+          (if (= source destination)
+              (Ok (cast i32 (- (len (.text out)) begin)))
+              (match (encode/mov-rr (mut (.text out))
+                                    (operation-bits (type-of graph reference))
+                                    destination source)
+                (Err [message] (Err message))
+                (Ok [_] (Ok (cast i32 (- (len (.text out)) begin))))))))))
+
+;;; Copy the whole register of integer value `reference` into general
+;;; register `destination`: all 64 bits from a register or a spill slot, or
+;;; the constant. For the views COPY, BITCAST and TRUNC (stogir.x64.coalesce):
+;;; a view may share its register group with a wider source that lives on,
+;;; and the bits above the view's own type are that source's. A spill slot
+;;; is eight bytes; what a narrow value left above its extent is as
+;;; unspecified as the bits above it in a register. Flags are untouched.
+(defn whole-into! [(out (mut code/Buffer))
+                   (graph g/Graph)
+                   (parts loc/View)
+                   (base frame/Base)
+                   (reference i32)
+                   (position i64)
+                   (destination i32)] (-> (Result i32 (slice u8)))
+  (let [begin (len (.text out))
+        ; A register or an integer spill slot is copied here; a constant and
+        ; every other location is `into!`'s.
+        location (if (> reference 0)
+                     (match (loc/resolve parts reference position)
+                       (Err [_] (None))
+                       (Ok [found] (Some found)))
+                     (None))
+        source (match location
+                 (Some [found]
+                       (if (and (= (.kind found) 0) (registers/gpr? (cast i32 (.value found))))
+                           (cast i32 (.value found))
+                           -1))
+                 (None [] -1))
+        slot (match location
+               (Some [found]
+                     (and (= (.kind found) 1) (types/integer? (type-of graph reference))))
+               (None [] false))]
+    (cond (= source destination) (Ok 0)
+          (>= source 0)
+            (match (encode/mov-rr (mut (.text out)) 64 destination source)
+              (Err [message] (Err message))
+              (Ok [_] (Ok (cast i32 (- (len (.text out)) begin)))))
+          slot
+            (match location
+              (None [] (Err "spill operand missing"))
+              (Some [found]
+                    (match (spill found base)
+                      (Err [message] (Err message))
+                      (Ok [m]
+                          (match (encode/mov-rm (mut (.text out)) 64 destination m)
+                            (Err [message] (Err message))
+                            (Ok [_] (Ok (cast i32 (- (len (.text out)) begin)))))))))
+          :else (into! (mut out) graph parts base reference position destination))))
+
+;;; Extend the low `type-bits` of `source` into at least 32 bits of
+;;; `destination` by the type's signedness (BOOL and ADDR are unsigned).
+;;; Types of four or eight bytes are copied at their width.
+(defn extend! [(out (mut code/Buffer)) (ty i32) (destination i32) (source i32)]
+  (-> (Result i32 (slice u8)))
+  (let [bits (type-bits ty)
+        begin (len (.text out))]
+    (match (cond (= bits 0) (Err [i64 (slice u8)] "integer extension of a non-integer type")
+                 (>= bits 32)
+                   (if (= destination source)
+                       (Ok [i64 (slice u8)] -1)
+                       (encode/mov-rr (mut (.text out)) bits destination source))
+                 (types/signed? ty)
+                   (encode/movsx-rr (mut (.text out)) 32 bits destination source)
+                 :else (encode/movzx-rr (mut (.text out)) 32 bits destination source))
+      (Err [message] (Err message))
+      (Ok [_] (Ok (cast i32 (- (len (.text out)) begin)))))))
+
+;;; The general register holding value `reference` at `position`, or -1 when
+;;; it is a constant, spilled or otherwise not in a register. Emits nothing.
+(defn register-of [(graph g/Graph) (parts loc/View) (reference i32) (position i64)] (-> i32)
+  (if (<= reference 0)
+      -1
+      (match (loc/resolve parts reference position)
+        (Err [_] -1)
+        (Ok [location]
+            (if (and (= (.kind location) 0) (registers/gpr? (cast i32 (.value location))))
+                (cast i32 (.value location))
+                -1)))))
+
+;;; ---- Floating values (f32, f64) in XMM registers --------------------------
+;;;
+;;; A FLOAT or DOUBLE lives in the low 4 or 8 bytes of an XMM register; the
+;;; rest of the register is unspecified. Register copies are `movaps`, loads
+;;; and stores `movss`/`movsd`. None of these, and no SSE logic instruction
+;;; (`xorps`, `andps`, `pcmpeqd`, ...), writes EFLAGS, so every helper below
+;;; may sit between a flag producer and its consumer.
+;;;
+;;; Constants: +0.0 is `xorps x, x`. Any other value is loaded from the
+;;; function's constant pool with `movss/movsd x, [rip + disp32]`, as
+;;; compilers do: the instruction is emitted with a zero displacement and a
+;;; pending stogir.x64.code/Reference (kind PC32, addend -4, target the
+;;; constant's graph reference), which stogir.x64.pool resolves when the
+;;; function's text is complete. No image relocation is involved.
+
+;;; Whether the scalar floating type is DOUBLE (FLOAT otherwise).
+(defn double? [(ty i32)] (-> bool)
+  (= ty 12))
+
+;;; The scalar load/store move of a floating type.
+(defn float-move [(ty i32)] (-> i32)
+  (if (double? ty) encode/MOVSD encode/MOVSS))
+
+;;; The bits of a numeric floating constant (the low 32 for a FLOAT), None
+;;; for anything else.
+(defn float-constant-bits [(graph g/Graph) (reference i32)] (-> (Option u64))
+  (if (>= reference 0)
+      (None)
+      (match (g/lookup graph reference)
+        (None [] (None))
+        (Some [node]
+              (let [ty (cast i32 (n/type-id node))]
+                (if (and (symbols/numeric? node) (types/floating? ty))
+                    (Some (if (double? ty)
+                              (n/constant-bits node)
+                              (& (n/constant-bits node) 0xFFFFFFFF)))
+                    (None)))))))
+
+;;; Build the floating constant `reference` in XMM register `destination`.
+;;; Flags are untouched.
+(defn float-constant! [(out (mut code/Buffer)) (graph g/Graph) (reference i32)
+                       (destination i32)] (-> (Result i32 (slice u8)))
+  (let [begin (len (.text out))]
+    (if (not (registers/simd? destination))
+        (Err "floating constant requires an XMM register")
+        (match (float-constant-bits graph reference)
+          (None [] (Err "floating constant operand is not a numeric floating constant"))
+          (Some [raw]
+                (match (if (= raw 0)
+                           (encode/sse-rr (mut (.text out)) encode/XORPS destination destination)
+                           (encode/sse-mov-rm (mut (.text out))
+                                              (float-move (type-of graph reference))
+                                              destination (encode/mem-rip 0)))
+                  (Err [message] (Err message))
+                  (Ok [field]
+                      (when (!= raw 0)
+                        (push! (mut (.references out))
+                               (code/Reference :offset field :kind 5 :target reference
+                                               :addend -4)))
+                      (Ok (cast i32 (- (len (.text out)) begin))))))))))
+
+;;; Where the floating value `reference` is at `position`: its XMM register,
+;;; or `scratch` (xmm14 or xmm15) after loading a spilled value or building a
+;;; constant there. Flags are untouched.
+(defn float-register! [(out (mut code/Buffer))
+                       (graph g/Graph)
+                       (parts loc/View)
+                       (base frame/Base)
+                       (reference i32)
+                       (position i64)
+                       (scratch i32)] (-> (Result i32 (slice u8)))
+  (let [ty (type-of graph reference)]
+    (cond (not (types/floating? ty)) (Err "floating operand has no scalar floating type")
+          (< reference 0)
+            (match (float-constant! (mut out) graph reference scratch)
+              (Err [message] (Err message))
+              (Ok [_] (Ok scratch)))
+          :else
+            (match (loc/resolve parts reference position)
+              (Err [message] (Err message))
+              (Ok [location]
+                  (cond (loc/constant? location)
+                          (match (float-constant! (mut out) graph (cast i32 (.value location))
+                                                  scratch)
+                            (Err [message] (Err message))
+                            (Ok [_] (Ok scratch)))
+                        (= (.kind location) 1)
+                          (match (spill location base)
+                            (Err [message] (Err message))
+                            (Ok [m]
+                                (match (encode/sse-mov-rm (mut (.text out)) (float-move ty)
+                                                          scratch m)
+                                  (Err [message] (Err message))
+                                  (Ok [_] (Ok scratch)))))
+                        (and (= (.kind location) 0)
+                             (registers/simd? (cast i32 (.value location)))
+                             (registers/allocatable? ty (cast i32 (.value location))))
+                          (Ok (cast i32 (.value location)))
+                        :else (Err "floating operand requires an XMM register")))))))
+
+;;; The XMM register that holds the floating result of `reference`, defined
+;;; at `position + 1`.
+(defn float-destination [(graph g/Graph) (parts loc/View) (reference i32) (position i64)]
+  (-> (Result i32 (slice u8)))
+  (match (loc/resolve parts reference (+ position 1))
+    (Err [message] (Err message))
+    (Ok [location]
+        (if (and (= (.kind location) 0)
+                 (types/floating? (type-of graph reference))
+                 (registers/simd? (cast i32 (.value location)))
+                 (registers/allocatable? (type-of graph reference) (cast i32 (.value location))))
+            (Ok (cast i32 (.value location)))
+            (Err "floating result requires an XMM register")))))
+
+;;; `movaps destination, source`, nothing when they are one register.
+(defn float-move! [(out (mut code/Buffer)) (destination i32) (source i32)]
+  (-> (Result i32 (slice u8)))
+  (if (= destination source)
+      (Ok 0)
+      (match (encode/sse-mov-rr (mut (.text out)) encode/MOVAPS destination source)
+        (Err [message] (Err message))
+        (Ok [_] (Ok 0)))))
+
+;;; Copy the floating value `reference` (register, spill slot or constant)
+;;; into XMM register `destination`. Flags are untouched.
+(defn float-into! [(out (mut code/Buffer))
+                   (graph g/Graph)
+                   (parts loc/View)
+                   (base frame/Base)
+                   (reference i32)
+                   (position i64)
+                   (destination i32)] (-> (Result i32 (slice u8)))
+  (match (float-register! (mut out) graph parts base reference position destination)
+    (Err [message] (Err message))
+    (Ok [source] (float-move! (mut out) destination source))))
+
+;;; The XMM register holding floating value `reference` at `position`, or -1
+;;; when it is a constant, spilled or otherwise not in a register.
+(defn float-register-of [(graph g/Graph) (parts loc/View) (reference i32) (position i64)]
+  (-> i32)
+  (if (<= reference 0)
+      -1
+      (match (loc/resolve parts reference position)
+        (Err [_] -1)
+        (Ok [location]
+            (if (and (= (.kind location) 0) (registers/simd? (cast i32 (.value location))))
+                (cast i32 (.value location))
+                -1)))))
+
+;;; `op destination, value-of(reference)` for an SSE operation whose second
+;;; operand may be a register or a scalar in memory (the arithmetic and
+;;; compare instructions: they read exactly the scalar's bytes and need no
+;;; alignment). A constant other than +0.0 is read from the pool and a
+;;; spilled value from its slot, without a load into a scratch register;
+;;; +0.0 is built in `scratch`. Nothing but `op` writes flags.
+(defn float-apply! [(out (mut code/Buffer))
+                    (graph g/Graph)
+                    (parts loc/View)
+                    (base frame/Base)
+                    (op i32)
+                    (destination i32)
+                    (reference i32)
+                    (position i64)
+                    (scratch i32)] (-> (Result i32 (slice u8)))
+  (let [location (if (< reference 0)
+                     (Ok [loc/Location (slice u8)]
+                         (loc/Location :kind 4 :value (cast i64 reference)))
+                     (loc/resolve parts reference position))]
+    (match location
+      (Err [message] (Err message))
+      (Ok [place]
+          (cond (and (loc/constant? place)
+                     (match (float-constant-bits graph (cast i32 (.value place)))
+                       (None [] false)
+                       (Some [raw] (!= raw 0))))
+                  (match (encode/sse-rm (mut (.text out)) op destination (encode/mem-rip 0))
+                    (Err [message] (Err message))
+                    (Ok [field]
+                        (push! (mut (.references out))
+                               (code/Reference :offset field :kind 5
+                                               :target (cast i32 (.value place)) :addend -4))
+                        (Ok 0)))
+                (and (= (.kind place) 1) (types/floating? (type-of graph reference)))
+                  (match (spill place base)
+                    (Err [message] (Err message))
+                    (Ok [m]
+                        (match (encode/sse-rm (mut (.text out)) op destination m)
+                          (Err [message] (Err message))
+                          (Ok [_] (Ok 0)))))
+                :else
+                  (match (float-register! (mut out) graph parts base reference position scratch)
+                    (Err [message] (Err message))
+                    (Ok [source]
+                        (match (encode/sse-rr (mut (.text out)) op destination source)
+                          (Err [message] (Err message))
+                          (Ok [_] (Ok 0))))))))))

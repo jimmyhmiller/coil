@@ -1,0 +1,269 @@
+;;; x86-64 register constraints over a matched schedule: what each scheduled
+;;; node needs from the allocator.
+;;;
+;;; Positions follow stogir.live-ranges: scheduled node i reads its operands
+;;; at 2i and defines its result at 2i + 1. The vocabulary and the x86-64
+;;; additions (clobbers, hints) are described in stogir.x64.uses.
+;;;
+;;; Core rules
+;;;   * Operands and results of integer instructions are in registers.
+;;;   * Two-address results hint the register of their first operand.
+;;;   * Fixed registers are clobbers, not fixed uses. A fixed use at an even
+;;;     position cannot always be allocated: when the operand lives on past
+;;;     the instruction and the fixed register is already promised from the
+;;;     definition position (the result's joined PHI group holds it), the
+;;;     operand would have to change register at an odd position, which only
+;;;     calls lower. A clobber over [2i, 2i + 1) keeps every operand and live
+;;;     value out of the register; the emitter copies the operand in.
+;;;   * A variable shift clobbers rcx while its operands are read. The result
+;;;     may be rcx; the emitter handles that.
+;;;   * DIV and MOD clobber rax and rdx while the operands are read; the
+;;;     register that does not hold the result stays clobbered over the
+;;;     definition, and the result prefers the other.
+;;;   * Register parameters are fixed definitions; RETURN's value may be
+;;;     anywhere and prefers rax.
+;;;
+;;;   * A tile with a fused load as its memory operand (the memory family's
+;;;     RULE-*-RM/MR/MI) needs the load's selected base and index in
+;;;     registers instead of the load.
+;;;
+;;; Every other node is constrained by its operation family
+;;; (stogir.x64.families/constrain!); a rematerialized node (a static frame
+;;; object) by stogir.x64.families/constrain-recipe!.
+(module stogir.x64.constraints)
+(import "stogir.graph" :as g)
+(import "stogir.matched-uses" :as machine)
+(import "stogir.constraints" :as c)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.types" :as types)
+(import "stogir.copy" :as copy)
+(import "stogir.conditional" :as conditional)
+(import "stogir.conversion" :as conversion)
+(import "stogir.terminal" :as terminal)
+(import "stogir.schedule" :as schedule)
+(import "stogir.x64.address" :as address)
+(import "stogir.x64.families" :as families)
+(import "stogir.x64.incoming" :as incoming)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.reciprocal" :as reciprocal)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.select" :as select)
+(import "stogir.x64.switch" :as switch)
+(import "stogir.x64.uses" :as uses)
+(import "stogir.call-results" :as results)
+(import "stogir.x64.return-values" :as return-values)
+(import "stogir.native.private-types" :as private)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(const CONFLICT "conflicting x86-64 register constraints")
+
+(defn require! [(error (mut (slice u8))) (accepted bool)] (-> void)
+  (when (and (not accepted) (= error "")) (set! error CONFLICT)))
+
+;;; The operands of a comparison or memory-operand tile are in registers at
+;;; `position`: its register operands, and the base and index of the load it
+;;; reads as a memory operand (stogir.x64.address).
+(defn operands! [(set (mut uses/Set)) (error (mut (slice u8))) (graph g/Graph)
+                 (matched plan/Plan) (tile select/Tile) (position i64)] (-> void)
+  (let [read (address/tile-operands matched graph tile)]
+    (require! (mut error) (uses/use! (mut set) (.first read) position))
+    (require! (mut error) (uses/use! (mut set) (.second read) position))
+    (require! (mut error) (uses/use! (mut set) (.third read) position))))
+
+;;; Requirements of a node selected as `tile` whose result is `reference`.
+(defn tile! [(set (mut uses/Set)) (error (mut (slice u8))) (graph g/Graph)
+             (matched plan/Plan) (reference i32) (position i64) (tile select/Tile)]
+  (-> void)
+  (let [rule (.rule tile)]
+    (cond (select/reciprocal-rule? rule)
+            (match (reciprocal/constrain! (mut set) graph matched reference position tile)
+              (Err [message] (when (= error "") (set! error message)))
+              (Ok [_] 0))
+          (= rule select/RULE-NONE)
+            (when (= error "") (set! error "instruction has no selected x86-64 rule"))
+          (!= (select/memory-operand tile) 0)
+            (do
+              (operands! (mut set) (mut error) graph matched tile position)
+              (require! (mut error) (uses/define! (mut set) reference position))
+              (unless (select/comparison-rule? rule)
+                (uses/hint! (mut set) reference (.left tile))))
+          :else
+            (do
+              (require! (mut error) (uses/use! (mut set) (.left tile) position))
+              (require! (mut error) (uses/define! (mut set) reference position))
+              (cond (or (= rule select/RULE-SHIFT-RC) (= rule select/RULE-SHIFT-MASKED))
+                      (do
+                        (require! (mut error) (uses/use! (mut set) (.right tile) position))
+                        (uses/clobber! (mut set) registers/RCX position (+ position 1)))
+                    (= rule select/RULE-DIVIDE)
+                      (let [quotient (= (.operation tile) select/DIVIDE-QUOTIENT)]
+                        (require! (mut error) (uses/use! (mut set) (.right tile) position))
+                        (uses/clobber! (mut set) registers/RAX position (+ position 1))
+                        (uses/clobber! (mut set) registers/RDX position (+ position 1))
+                        (uses/clobber! (mut set)
+                                       (if quotient (: registers/RDX i32) registers/RAX)
+                                       (+ position 1) (+ position 2))
+                        (uses/prefer! (mut set) reference
+                                      (if quotient (: registers/RAX i32) registers/RDX)))
+                    :else
+                      (require! (mut error) (uses/use! (mut set) (.right tile) position)))
+              (unless (or (select/comparison-rule? rule) (= rule select/RULE-DIVIDE))
+                (uses/hint! (mut set) reference (.left tile)))))))
+
+;;; Whether every RETURN the function executes carries its result pieces as
+;;; values (stogir.x64.return-values): the frame buffer is then not needed.
+(defn direct-returns? [(graph g/Graph) (scheduled schedule/Schedule) (matched plan/Plan)]
+  (-> bool)
+  (let [(mut direct) false
+        (mut buffered) false]
+    (for reference (.nodes scheduled)
+      (when (and (= (n/opcode (get (.instructions graph) (cast i64 reference))) 120)
+                 (not (plan/omitted? matched reference)))
+        (if (> (return-values/pieces graph (.operands matched) reference) 0)
+            (set! direct true)
+            (set! buffered true))))
+    (and direct (not buffered))))
+
+(defn build-matched [(graph g/Graph)
+                     (scheduled schedule/Schedule)
+                     (matched plan/Plan)
+                     (context private/Context)
+                     (allocator (dyn Allocator))]
+  (-> (Result uses/Set (slice u8)))
+  (let [(mut set) (uses/create allocator)
+        (mut error) ""]
+    (set! (.private set) context)
+    (for [i 0 (len (.instructions graph))]
+      (push! (mut (.values set))
+             (uses/Value
+               :uses (ArrayList::new [c/Use] allocator)
+               :parameter (incoming/absent)
+               :rematerialized (machine/rematerialized? (.operands matched) (cast i32 i)))))
+    (if (= (len (.nodes scheduled)) 0)
+        (set! error "empty function schedule")
+        (match (incoming/build graph (get (.nodes scheduled) 0) allocator)
+          (Err [message] (set! error message))
+          (Ok [parameters]
+              (let [(mut owned) parameters]
+                (for parameter owned
+                  (set! (.parameter (elem (mut (.values set)) (cast i64 (.reference parameter))))
+                        parameter))
+                (free! (mut owned))))))
+    ; The function's own result role (call family): register pieces are
+    ; returned from a private frame buffer whose address PARAM 0 is; an
+    ; indirect result's pointer is saved in a frame slot until RETURN. Both
+    ; objects are owned by the entry node.
+    (when (= error "")
+      (match (incoming/result-role graph)
+        (Err [message] (set! error message))
+        (Ok [role]
+            (cond (and (= (.kind role) 1) (direct-returns? graph scheduled matched)) 0
+                  (= (.kind role) 1)
+                    (push! (mut (.locals set))
+                           (uses/Local :owner (get (.nodes scheduled) 0)
+                                       :size (results/size role) :alignment 8))
+                  (= (.kind role) 2)
+                    (push! (mut (.locals set))
+                           (uses/Local :owner (get (.nodes scheduled) 0) :size 8 :alignment 8))
+                  :else 0))))
+    (for reference (.nodes scheduled)
+      (when (registers/simd-type? (cast i32 (n/type-id (get (.instructions graph)
+                                                            (cast i64 reference)))))
+        (set! (.floating set) true)))
+    (for [i 0 (len (.nodes scheduled))]
+      (when (= error "")
+        (let [reference (get (.nodes scheduled) i)
+              node (get (.instructions graph) (cast i64 reference))
+              opcode (cast i32 (n/opcode node))
+              ty (cast i32 (n/type-id node))
+              position (* i 2)
+              family (plan/family matched reference)]
+          (cond (machine/rematerialized? (.operands matched) reference)
+                  (match (families/constrain-recipe! (mut set) graph reference)
+                    (Err [message] (set! error message))
+                    (Ok [_] 0))
+                (plan/omitted? matched reference) 0
+                (= family families/SWITCH)
+                  (match (switch/constrain! (mut set) graph matched reference position)
+                    (Err [message] (set! error message))
+                    (Ok [_] 0))
+                (!= family families/CORE)
+                  (match (families/constrain! (mut set) graph matched reference position family)
+                    (Err [message] (set! error message))
+                    (Ok [_] 0))
+                (or (op/block-start? opcode) (= opcode 114) (= opcode 115) (= opcode 67)) 0
+                (or (= opcode 96) (= opcode 121))
+                  (match (terminal/validate graph reference)
+                    (Err [message] (set! error message))
+                    (Ok [_] 0))
+                (= opcode 71)
+                  (let [parameter (.parameter (at (.values set) (cast i64 reference)))]
+                    ; Register parameters are fixed definitions; stack
+                    ; parameters and the addresses of the result buffer and
+                    ; of MEMORY aggregates are produced into any register.
+                    (cond (or (= (.kind parameter) 0) (= (.kind parameter) 2))
+                            (require! (mut error)
+                                      (uses/define-fixed! (mut set) reference position
+                                                          (.register parameter)))
+                          (or (= (.kind parameter) 1) (= (.kind parameter) 3)
+                              (= (.kind parameter) 4))
+                            (require! (mut error) (uses/define! (mut set) reference position))
+                          :else (set! error "x86-64 PARAM has no declared parameter")))
+                (and (= opcode 120) (> (return-values/pieces graph (.operands matched) reference) 0))
+                  ; A direct return: the pieces go to rax and rdx.
+                  (for [k 0 (return-values/pieces graph (.operands matched) reference)]
+                    (let [value (return-values/piece (.operands matched) reference k)]
+                      (require! (mut error) (uses/use-anywhere! (mut set) value position))
+                      (uses/prefer! (mut set) value
+                                    (if (= k 0) (: registers/RAX i32) registers/RDX))))
+                (= opcode 120)
+                  (when (!= ty 0)
+                    (require! (mut error) (uses/use-anywhere! (mut set) (.op2 node) position))
+                    (uses/prefer! (mut set) (.op2 node)
+                                  (if (types/floating? ty)
+                                      (: registers/XMM0 i32)
+                                      registers/RAX)))
+                (= opcode 116)
+                  (if (plan/fused? matched reference)
+                      (operands! (mut set) (mut error) graph matched
+                                 (plan/condition-tile matched reference) position)
+                      (require! (mut error) (uses/use! (mut set) (.op2 node) position)))
+                (= opcode 60)
+                  (match (conditional/validate graph reference)
+                    (Err [message] (set! error message))
+                    (Ok [_]
+                        (if (plan/fused? matched reference)
+                            (operands! (mut set) (mut error) graph matched
+                                       (plan/condition-tile matched reference) position)
+                            (require! (mut error) (uses/use! (mut set) (.op1 node) position)))
+                        (require! (mut error) (uses/use! (mut set) (.op2 node) position))
+                        (require! (mut error) (uses/use! (mut set) (.op3 node) position))
+                        (require! (mut error) (uses/define! (mut set) reference position))
+                        ; The emitter moves the false arm into rd first.
+                        (uses/hint! (mut set) reference (.op3 node))))
+                (= opcode 68)
+                  (match (copy/validate graph reference)
+                    (Err [message] (set! error message))
+                    (Ok [_]
+                        (require! (mut error) (uses/use-anywhere! (mut set) (.op1 node) position))
+                        (require! (mut error) (uses/define! (mut set) reference position))
+                        (uses/hint! (mut set) reference (.op1 node))))
+                (and (>= opcode 33) (<= opcode 36))
+                  (match (conversion/validate graph reference 8)
+                    (Err [message] (set! error message))
+                    (Ok [_]
+                        (require! (mut error) (uses/use! (mut set) (.op1 node) position))
+                        (require! (mut error) (uses/define! (mut set) reference position))
+                        (uses/hint! (mut set) reference (.op1 node))))
+                (or (= opcode 31) (= opcode 45))
+                  (do
+                    (require! (mut error) (uses/use! (mut set) (.op1 node) position))
+                    (require! (mut error) (uses/define! (mut set) reference position))
+                    (uses/hint! (mut set) reference (.op1 node)))
+                :else
+                  (tile! (mut set) (mut error) graph matched reference position
+                         (get (.tiles matched) (cast i64 reference)))))))
+    (if (= error "") (Ok set) (do (uses/release! (mut set)) (Err error)))))

@@ -1,0 +1,342 @@
+;;; x86-64 code bytes and the pending graph references that travel with them.
+;;;
+;;; The a64 Buffer is not shared: its text is a sequence of 4-byte words
+;;; (alignment checks, word peephole bookkeeping), while x86-64 text is bytes
+;;; and its relocations carry explicit addends.
+;;;
+;;; References to named constants (the memory family's machinery, used by
+;;; every emitter through stogir.x64.value/constant!)
+;;;
+;;;   reference-address! out graph reference register
+;;;       The address a FUNC, SYM or STR constant names, in a general
+;;;       register. A function or data symbol is read from a private 8-byte
+;;;       address slot, `mov r64, [rip + slot]`; a string is addressed in
+;;;       place, `lea r64, [rip + bytes]`. One PC32 reference, addend -4.
+;;;       No flags are written.
+;;;   long-address! out graph reference register
+;;;       `lea r64, [rip + payload]` of a LONG_CONST (vector families).
+;;;   direct-call! / direct-jump! out graph reference
+;;;       `call rel32` / `jmp rel32` to a named FUNC, one PLT32 reference,
+;;;       addend -4. For the call family; only the image layer is tested
+;;;       here.
+;;;   rip-reference! out field target
+;;;       Record a PC32 reference for an instruction just encoded with a
+;;;       `mem-rip` operand whose patchable field the encoder returned (any
+;;;       instruction: a load fused into an ALU operand, a `movsd` from a
+;;;       constant). The addend accounts for an immediate after the field.
+;;;
+;;; stogir.x64.image/finish! turns each Reference into an image relocation:
+;;; PC32 to a FUNC or SYM goes to that symbol's address slot (one slot per
+;;; symbol and image, relocated ABS64 against the symbol), PC32 to a STR or
+;;; LONG_CONST to its private data, PLT32 to the function symbol itself.
+;;;
+;;; Every instruction encoder returns `(Result i64 (slice u8))`. Emitters keep
+;;; one `(mut error)` string and feed each encoder result through `accept!`,
+;;; which records the first failure; the caller discards the bytes on error.
+(module stogir.x64.code)
+(import "stogir.alignment" :as alignment)
+(import "stogir.bytes" :as bytes)
+(import "stogir.graph" :as g)
+(import "stogir.image" :as image)
+(import "stogir.long-constant" :as long)
+(import "stogir.node" :as n)
+(import "stogir.symbols" :as symbols)
+(import "stogir.text-data" :as text-data)
+(import "stogir.x64.encode" :as encode)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; A pending image relocation of 4 bytes at `offset`: `kind` is an image
+;;; relocation kind (5 PC32, 6 PLT32), `target` a negative graph constant
+;;; reference, and `addend` the explicit addend (-4 when the field ends the
+;;; instruction; see stogir.x64.encode's header). A PLT32 reference may
+;;; instead name a runtime routine the backend itself calls: `target` is then
+;;; one of the positive RUNTIME-* ids below and the image names its symbol.
+(defstruct Reference [(offset i64) (kind i32) (target i32) (addend i64)])
+
+;;; `written` is the set of registers the code may write, one bit per library
+;;; register (general 0..15, XMM 32..47), and `calls` whether it executes a
+;;; call or a tail jump. The driver records every allocated register, every
+;;; declared clobber, the scratches and the result registers; an emitter that
+;;; writes any other register must record it with `wrote!`. A function that
+;;; makes no call is a leaf whose write set stogir.x64.private-leaf uses to
+;;; narrow the clobbers of direct calls to it.
+;;; What the last instruction in the text left in the flags, when an emitter
+;;; knows it exactly. The record holds while `at` is the text length: any
+;;; byte appended afterwards makes it stale, and the driver clears it wherever
+;;; control can arrive from elsewhere (a block start) and wherever bytes are
+;;; taken back out of the text.
+;;;
+;;; `register` was written at `bits` wide by that instruction and ZF and SF
+;;; describe its new value at that width. `kind` says what else holds:
+;;;   FLAGS-LOGIC   CF = OF = 0: exactly the flags of `test r, r`
+;;;                 (AND, OR, XOR)
+;;;   FLAGS-RESULT  only ZF and SF may be read (ADD, SUB, NEG, INC, DEC, a
+;;;                 shift by a nonzero constant): CF and OF are the
+;;;                 operation's own, or unchanged
+;;;   FLAGS-EXACT   as FLAGS-RESULT with OF = 0 guaranteed: an ADD or SUB
+;;;                 proven not to overflow as a signed operation
+;;; Instructions whose ZF or SF do not describe the result (MOV, LEA, IMUL,
+;;; rotates, a shift whose count may be zero) never leave a record.
+(defstruct Flags [(at i64) (register i32) (bits i32) (kind i32)])
+
+(const FLAGS-NONE 0)
+
+(const FLAGS-LOGIC 1)
+
+(const FLAGS-RESULT 2)
+
+(const FLAGS-EXACT 3)
+
+;;; Counts of what the driver emitted for one function, for tests and
+;;; measurements.
+;;;   conditional, unconditional  `jcc` and `jmp` instructions
+;;;   short          how many of those are rel8 after relaxation
+;;;   padding        bytes of alignment padding
+;;;   loops          loop tops that a jump goes back to and the layout asked
+;;;                  to align
+;;;   aligned-loops  how many of those ended on their boundary
+;;;   tables         jump tables
+;;;   stubs          edge stubs behind the function body
+;;;   entries        edges whose moves run at the entry of their block
+;;;   fused-tests    compares with zero that a flags record made unnecessary
+(defstruct Summary
+  [(conditional i64) (unconditional i64) (short i64) (padding i64) (loops i64)
+   (aligned-loops i64) (tables i64) (stubs i64) (entries i64) (fused-tests i64)])
+
+(defstruct Buffer
+  [(alignment i64)
+   (text (ArrayList u8))
+   (references (ArrayList Reference))
+   (text-data (ArrayList text-data/Range))
+   (flags Flags)
+   (summary Summary)
+   (written u64)
+   (calls bool)])
+
+;;; libm's `double fma(double, double, double)`.
+(const RUNTIME-FMA 1)
+
+;;; libm's `float fmaf(float, float, float)`.
+(const RUNTIME-FMAF 2)
+
+(defn runtime? [(reference Reference)] (-> bool)
+  (and (= (.kind reference) image/X64-PLT32)
+       (or (= (.target reference) RUNTIME-FMA) (= (.target reference) RUNTIME-FMAF))))
+
+;;; `call rel32` to runtime routine `routine` (a RUNTIME-* id), PLT32.
+(defn runtime-call! [(output (mut Buffer)) (routine i32)] (-> (Result i32 (slice u8)))
+  (match (encode/call-rel32 (mut (.text output)) 0)
+    (Err [message] (Err message))
+    (Ok [field]
+        (let [pending (Reference
+                        :offset field
+                        :kind image/X64-PLT32
+                        :target routine
+                        :addend (- 0 (encode/field-to-end (.text output) field)))]
+          (if (runtime? pending)
+              (do (push! (mut (.references output)) pending) (Ok 5))
+              (Err "unknown x86-64 runtime routine"))))))
+
+(defn create [(allocator (dyn Allocator))] (-> Buffer)
+  (Buffer
+    :alignment 1
+    :text (ArrayList::new [u8] allocator)
+    :references (ArrayList::new [Reference] allocator)
+    :text-data (ArrayList::new [text-data/Range] allocator)
+    :flags (Flags :at -1 :register -1 :bits 0 :kind FLAGS-NONE)
+    :summary (Summary :conditional 0 :unconditional 0 :short 0 :padding 0 :loops 0
+                      :aligned-loops 0 :tables 0 :stubs 0 :entries 0 :fused-tests 0)
+    :written 0
+    :calls false))
+
+;;; Record that the code may write `register`.
+(defn wrote! [(buffer (mut Buffer)) (register i32)] (-> void)
+  (when (and (>= register 0) (< register 48))
+    (set! (.written buffer) (| (.written buffer) (<< (: 1 u64) (cast u64 register))))))
+
+;;; Record that the code executes a call or a tail jump.
+(defn called! [(buffer (mut Buffer))] (-> void)
+  (set! (.calls buffer) true))
+
+;;; Record that the instruction just appended wrote `register` at `bits`
+;;; and left flags of `kind` for its value.
+(defn note-flags! [(buffer (mut Buffer)) (register i32) (bits i32) (kind i32)] (-> void)
+  (set! (.flags buffer)
+        (Flags :at (len (.text buffer)) :register register :bits bits :kind kind)))
+
+(defn clear-flags! [(buffer (mut Buffer))] (-> void)
+  (set! (.flags buffer) (Flags :at -1 :register -1 :bits 0 :kind FLAGS-NONE)))
+
+;;; The ADD or SUB just recorded is known not to overflow as a signed
+;;; operation: its flags are FLAGS-EXACT.
+(defn exact-flags! [(buffer (mut Buffer))] (-> void)
+  (when (and (= (.at (.flags buffer)) (len (.text buffer)))
+             (= (.kind (.flags buffer)) FLAGS-RESULT))
+    (set! (.kind (.flags buffer)) FLAGS-EXACT)))
+
+;;; The kind of flags the text's last instruction left for `register` at
+;;; `bits`, or FLAGS-NONE.
+(defn flags-for [(buffer Buffer) (register i32) (bits i32)] (-> i32)
+  (let [flags (.flags buffer)]
+    (if (and (= (.at flags) (len (.text buffer)))
+             (= (.register flags) register)
+             (= (.bits flags) bits))
+        (.kind flags)
+        FLAGS-NONE)))
+
+(defn release! [(buffer (mut Buffer))] (-> void)
+  (free! (mut (.text buffer)))
+  (free! (mut (.references buffer)))
+  (free! (mut (.text-data buffer))))
+
+(defn take-text! [(buffer (mut Buffer)) (allocator (dyn Allocator))]
+  (-> (ArrayList u8))
+  (let [text (load (mut (.text buffer)))]
+    (store! (mut (.text buffer)) (ArrayList::new [u8] allocator))
+    text))
+
+;;; Record the first encoder failure in `error`.
+(defn accept! [(error (mut (slice u8))) (result (Result i64 (slice u8)))] (-> void)
+  (match result
+    (Err [message] (when (= error "") (set! error message)))
+    (Ok [_] 0)))
+
+;;; As accept! for the i32 results of emitters built on the encoders.
+(defn accept-count! [(error (mut (slice u8))) (result (Result i32 (slice u8)))]
+  (-> void)
+  (match result
+    (Err [message] (when (= error "") (set! error message)))
+    (Ok [_] 0)))
+
+;;; Append a distinct temporary buffer, rebasing its references and data
+;;; ranges. False (and no change) when `source` shares storage with `output`
+;;; or carries an invalid reference.
+(defn append! [(output (mut Buffer)) (source Buffer)] (-> bool)
+  (let [base (len (.text output))
+        (mut valid?)
+          (not (or (and (> (len (.references source)) 0)
+                        (= (primitive/cast usize (.data (.references source)))
+                           (primitive/cast usize (.data (.references output)))))
+                   (and (> (len (.text-data source)) 0)
+                        (= (primitive/cast usize (.data (.text-data source)))
+                           (primitive/cast usize (.data (.text-data output)))))))]
+    (unless (and (alignment/valid? (.alignment source))
+                 (alignment/valid? (.alignment output)))
+      (set! valid? false))
+    (for reference (.references source)
+      (when (or (< (.offset reference) 0)
+                (> (.offset reference) (- (len (.text source)) 4))
+                (and (>= (.target reference) 0) (not (runtime? reference)))
+                (< (.kind reference) 5)
+                (> (.kind reference) 6))
+        (set! valid? false)))
+    (if (or (not valid?)
+            (not (bytes/append-slice! (mut (.text output)) (slice (.text source)))))
+        false
+        (do
+          (set! (.alignment output)
+                (alignment/maximum (.alignment output) (.alignment source)))
+          (set! (.written output) (| (.written output) (.written source)))
+          (when (.calls source) (set! (.calls output) true))
+          (for range (.text-data source)
+            (push! (mut (.text-data output))
+                   (text-data/Range
+                     :offset (+ base (.offset range))
+                     :length (.length range)
+                     :kind (.kind range))))
+          (for reference (.references source)
+            (push! (mut (.references output))
+                   (Reference
+                     :offset (+ base (.offset reference))
+                     :kind (.kind reference)
+                     :target (.target reference)
+                     :addend (.addend reference))))
+          true))))
+
+;;; Record a PC32 reference to constant `target` at the RIP-relative
+;;; displacement `field` of the instruction that ends at the end of the text.
+(defn rip-reference! [(output (mut Buffer)) (field i64) (target i32)] (-> (Result i32 (slice u8)))
+  (if (or (>= target 0) (< field 0) (> field (- (len (.text output)) 4)))
+      (Err "invalid x86-64 RIP-relative reference")
+      (do
+        (push! (mut (.references output))
+               (Reference
+                 :offset field
+                 :kind image/X64-PC32
+                 :target target
+                 :addend (- 0 (encode/field-to-end (.text output) field))))
+        (Ok 0))))
+
+;;; The address named constant `reference` (FUNC, SYM or STR) stands for, in
+;;; general register `register`. Flags are untouched.
+(defn reference-address! [(output (mut Buffer)) (graph g/Graph) (reference i32)
+                          (register i32)] (-> (Result i32 (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "named constant missing"))
+    (Some [node]
+          (if (or (>= reference 0)
+                  (not (symbols/named? (n/opcode node)))
+                  (not (symbols/validate graph node)))
+              (Err "invalid x86-64 named address constant")
+              (let [begin (len (.text output))]
+                (match (if (= (n/opcode node) 77)
+                           (encode/lea (mut (.text output)) 64 register (encode/mem-rip 0))
+                           (encode/mov-rm (mut (.text output)) 64 register (encode/mem-rip 0)))
+                  (Err [message] (Err message))
+                  (Ok [field]
+                      (match (rip-reference! (mut output) field reference)
+                        (Err [message] (Err message))
+                        (Ok [_] (Ok (cast i32 (- (len (.text output)) begin))))))))))))
+
+;;; lea register, [rip + payload] of LONG_CONST `reference`.
+(defn long-address! [(output (mut Buffer)) (graph g/Graph) (reference i32) (register i32)]
+  (-> (Result i32 (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "long constant missing"))
+    (Some [node]
+          (if (or (>= reference 0)
+                  (not (long/valid-header? node 8))
+                  (<= (g/long-size graph reference) 0))
+              (Err "invalid long constant address")
+              (let [begin (len (.text output))]
+                (match (encode/lea (mut (.text output)) 64 register (encode/mem-rip 0))
+                  (Err [message] (Err message))
+                  (Ok [field]
+                      (match (rip-reference! (mut output) field reference)
+                        (Err [message] (Err message))
+                        (Ok [_] (Ok (cast i32 (- (len (.text output)) begin))))))))))))
+
+(defn direct-branch! [(output (mut Buffer)) (graph g/Graph) (reference i32) (link bool)]
+  (-> (Result i32 (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "call target missing"))
+    (Some [node]
+          (if (or (>= reference 0)
+                  (!= (n/opcode node) 74)
+                  (not (symbols/validate graph node)))
+              (Err "direct call requires named FUNC constant")
+              (match (if link
+                         (encode/call-rel32 (mut (.text output)) 0)
+                         (encode/jmp-rel32 (mut (.text output)) 0))
+                (Err [message] (Err message))
+                (Ok [field]
+                    (push! (mut (.references output))
+                           (Reference
+                             :offset field
+                             :kind image/X64-PLT32
+                             :target reference
+                             :addend (- 0 (encode/field-to-end (.text output) field))))
+                    (Ok 5)))))))
+
+;;; call rel32 to named function `reference` (PLT32).
+(defn direct-call! [(output (mut Buffer)) (graph g/Graph) (reference i32)]
+  (-> (Result i32 (slice u8)))
+  (direct-branch! (mut output) graph reference true))
+
+;;; jmp rel32 to named function `reference` (PLT32).
+(defn direct-jump! [(output (mut Buffer)) (graph g/Graph) (reference i32)]
+  (-> (Result i32 (slice u8)))
+  (direct-branch! (mut output) graph reference false))

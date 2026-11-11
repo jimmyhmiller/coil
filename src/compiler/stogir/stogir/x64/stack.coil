@@ -1,0 +1,229 @@
+;;; x86-64 dynamic stack, static frame objects and the frame address.
+;;;
+;;; Operations: ALLOCA, AFREE, BLOCK_BEGIN, BLOCK_END (81..84) and FRAME_ADDR
+;;; (66) (stogir.stack).
+;;;
+;;; Static frame objects (stogir.stack/frame-object?) define no register:
+;;; `object!` requests their frame slot, stogir.x64.allocate indexes the
+;;; slot's address as a rematerialized location, and each use rebuilds it
+;;; with `lea` or folds it into a memory operand (stogir.x64.value,
+;;; stogir.x64.address). They need no anchored frame unless they are
+;;; over-aligned.
+;;;
+;;; Every other operation here moves rsp or reads the anchor, so it asks for
+;;; an anchored frame (`(.anchored set)`; stogir.x64.frame-address shows the
+;;; prologue). The stack below the frame then looks like this, as on AArch64:
+;;;
+;;;     frame objects, spills, saved registers     [rbp - N + L]
+;;;     dynamic objects, newest lowest
+;;;     outgoing call area (`outgoing-size` bytes)  [rsp + k]
+;;;
+;;;   ALLOCA n       rsp -= round(n); result = rsp + outgoing-size
+;;;   AFREE n        rsp += round(n)
+;;;   BLOCK_BEGIN    result = rsp
+;;;   BLOCK_END s    rsp = s
+;;;   FRAME_ADDR     the anchor: the address holding the caller's rbp, with
+;;;                  the return address above it
+;;;
+;;; round(n) rounds up to the frame alignment, which is 16 or the largest
+;;; alignment any ALLOCA, frame object or VAR of the function asks for. A
+;;; runtime count that is negative (signed types) or would overflow the
+;;; rounding traps with `ud2` before rsp changes, as the a64 backend traps
+;;; with BRK; constant counts are validated when the graph is built.
+;;;
+;;; Only r10 and r11 are written besides rsp and the result. `add`, `and`,
+;;; `sub` and `cmp` write flags, which are dead between nodes.
+;;;
+;;; The a64 module of this name is not shared: it is AArch64 encodings over
+;;; the same layout.
+;;;
+;;; Interface (called through stogir.x64.families; see docs/X86_FAMILIES.md):
+;;; `select!`, `object!`, `constrain!`, `emit!`.
+(module stogir.x64.stack)
+(import "stogir.frame" :as frame-layout)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.stack" :as stack)
+(import "stogir.types" :as types)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.frame-address" :as frame)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.uses" :as uses)
+(import "stogir.x64.value" :as value)
+(import "coil.result" :use [Result Ok Err])
+
+(const CONFLICT "conflicting x86-64 register constraints")
+
+(defn select! [(state (mut plan/Matching)) (graph g/Graph) (reference i32)]
+  (-> (Result i32 (slice u8)))
+  (match (stack/validate graph reference)
+    (Err [message] (Err message))
+    (Ok [_] (Ok 0))))
+
+;;; The frame slot of static frame object `reference`: its constant size
+;;; rounded to 16 bytes, aligned to 16 or to the object's own larger
+;;; alignment.
+(defn object! [(set (mut uses/Set)) (graph g/Graph) (reference i32)]
+  (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions graph) (cast i64 reference))]
+    (if (not (stack/frame-object? node))
+        (Err "x86-64 backend: only static frame objects are rematerialized values")
+        (match (stack/validate graph reference)
+          (Err [message] (Err message))
+          (Ok [_]
+              (match (stack/constant-size graph (.op2 node))
+                (Err [message] (Err message))
+                (Ok [size]
+                    (let [alignment (if (> (.op3 node) 16) (cast i64 (.op3 node)) (: 16 i64))]
+                      (if (or (<= size 0) (not (frame-layout/valid-alignment? alignment)))
+                          (Err "invalid static frame object")
+                          (do
+                            (push! (mut (.locals set))
+                                   (uses/Local :owner reference :size size
+                                               :alignment alignment))
+                            (Ok 0)))))))))))
+
+(defn constrain! [(set (mut uses/Set)) (graph g/Graph) (matched plan/Plan)
+                  (reference i32) (position i64)] (-> (Result i32 (slice u8)))
+  (match (stack/validate graph reference)
+    (Err [message] (Err message))
+    (Ok [_]
+        (let [node (get (.instructions graph) (cast i64 reference))
+              opcode (cast i32 (n/opcode node))
+              (mut accepted) true
+              (mut error) ""]
+          (set! (.anchored set) true)
+          (cond (or (= opcode 66) (= opcode 83))
+                  (set! accepted (uses/define! (mut set) reference position))
+                (= opcode 84) (set! accepted (uses/use! (mut set) (.op2 node) position))
+                (= opcode 82) (set! accepted (uses/use! (mut set) (.op2 node) position))
+                :else
+                  (let [requested (cast i64 (.op3 node))]
+                    (when (> requested (.alignment set))
+                      (if (frame-layout/valid-alignment? requested)
+                          (set! (.alignment set) requested)
+                          (set! error "invalid ALLOCA alignment")))
+                    (set! accepted (and (uses/use! (mut set) (.op2 node) position)
+                                        (uses/define! (mut set) reference position)))))
+          (cond (!= error "") (Err error)
+                accepted (Ok 0)
+                :else (Err CONFLICT))))))
+
+;;; rsp -= bytes (or += when `release`), `bytes` a multiple of 16.
+(defn adjust! [(out (mut code/Buffer)) (error (mut (slice u8))) (bytes i64) (release bool)]
+  (-> void)
+  (let [operation (if release (: encode/ADD i32) encode/SUB)]
+    (cond (= bytes 0) 0
+          (encode/fits32? bytes)
+            (code/accept! (mut error)
+                          (encode/alu-ri (mut (.text out)) operation 64 registers/RSP bytes))
+          :else
+            (do
+              (code/accept! (mut error)
+                            (encode/mov-ri (mut (.text out)) 64 registers/SCRATCH-GPR bytes))
+              (code/accept! (mut error)
+                            (encode/alu-rr (mut (.text out)) operation 64 registers/RSP
+                                           registers/SCRATCH-GPR))))))
+
+;;; rsp -= round(count) (or += when `release`) for a runtime `count`, after
+;;; the trap for a negative or overflowing one.
+(defn dynamic! [(out (mut code/Buffer)) (cx context/Context) (error (mut (slice u8)))
+                (count i32) (position i64) (release bool)] (-> void)
+  (let [ty (value/type-of (.graph cx) count)
+        bits (value/type-bits ty)
+        alignment (.alignment cx)
+        scratch (: registers/SCRATCH-GPR i32)]
+    (if (or (= bits 0) (not (encode/fits32? alignment)))
+        (set! error "invalid dynamic stack count or frame alignment")
+        (match (value/register-with-locations! (mut out) (.graph cx) (.parts cx) (.base cx)
+                                               count position scratch)
+          (Err [message] (set! error message))
+          (Ok [source]
+              ; The count as a 64-bit number, by its type's signedness.
+              (cond (and (= bits 64) (= source scratch)) 0
+                    (= bits 64)
+                      (code/accept! (mut error)
+                                    (encode/mov-rr (mut (.text out)) 64 scratch source))
+                    (types/signed? ty)
+                      (code/accept! (mut error)
+                                    (encode/movsx-rr (mut (.text out)) 64 bits scratch source))
+                    :else
+                      (code/accept! (mut error)
+                                    (encode/movzx-rr (mut (.text out)) 64 bits scratch source)))
+              ; Unsigned above the largest count that still rounds: trap.
+              (when (or (= bits 64) (types/signed? ty))
+                (code/accept! (mut error)
+                              (encode/mov-ri (mut (.text out)) 64 registers/SCRATCH-GPR-2
+                                             (- (: 0x7FFFFFFFFFFFFFFF i64) (- alignment 1))))
+                (code/accept! (mut error)
+                              (encode/alu-rr (mut (.text out)) encode/CMP 64 scratch
+                                             registers/SCRATCH-GPR-2))
+                ; Skip the two bytes of ud2.
+                (code/accept! (mut error) (encode/jcc-rel8 (mut (.text out)) encode/CC-BE 2))
+                (code/accept! (mut error) (encode/ud2 (mut (.text out)))))
+              (code/accept! (mut error)
+                            (encode/alu-ri (mut (.text out)) encode/ADD 64 scratch
+                                           (- alignment 1)))
+              (code/accept! (mut error)
+                            (encode/alu-ri (mut (.text out)) encode/AND 64 scratch
+                                           (- 0 alignment)))
+              (code/accept! (mut error)
+                            (encode/alu-rr (mut (.text out))
+                                           (if release (: encode/ADD i32) encode/SUB)
+                                           64 registers/RSP scratch)))))))
+
+(defn emit! [(out (mut code/Buffer)) (cx context/Context) (reference i32) (position i64)]
+  (-> (Result i32 (slice u8)))
+  (match (stack/validate (.graph cx) reference)
+    (Err [message] (Err message))
+    (Ok [_]
+        (let [node (get (.instructions (.graph cx)) (cast i64 reference))
+              opcode (cast i32 (n/opcode node))
+              (mut error) ""]
+          (cond (not (frame/anchored? (.base cx)))
+                  (set! error "x86-64 dynamic stack operation requires an anchored frame")
+                (or (< (.outgoing-size cx) 0)
+                    (!= (% (.outgoing-size cx) (.alignment cx)) 0)
+                    (and (= opcode 81) (> (cast i64 (.op3 node)) (.alignment cx))))
+                  (set! error "x86-64 dynamic stack found an unsupported frame alignment")
+                (= opcode 66)
+                  (match (value/destination (.graph cx) (.parts cx) reference position)
+                    (Err [message] (set! error message))
+                    (Ok [rd]
+                        (code/accept-count! (mut error)
+                                            (frame/anchor! (mut (.text out)) (.base cx) rd))))
+                (= opcode 83)
+                  (match (value/destination (.graph cx) (.parts cx) reference position)
+                    (Err [message] (set! error message))
+                    (Ok [rd]
+                        (code/accept! (mut error)
+                                      (encode/mov-rr (mut (.text out)) 64 rd registers/RSP))))
+                (= opcode 84)
+                  (match (value/register-with-locations! (mut out) (.graph cx) (.parts cx)
+                                                         (.base cx) (.op2 node) position
+                                                         registers/SCRATCH-GPR)
+                    (Err [message] (set! error message))
+                    (Ok [saved]
+                        (code/accept! (mut error)
+                                      (encode/mov-rr (mut (.text out)) 64 registers/RSP saved))))
+                :else
+                  (do
+                    (if (< (.op2 node) 0)
+                        (match (stack/constant-size-aligned (.graph cx) (.op2 node)
+                                                            (.alignment cx))
+                          (Err [message] (set! error message))
+                          (Ok [bytes] (adjust! (mut out) (mut error) bytes (= opcode 82))))
+                        (dynamic! (mut out) cx (mut error) (.op2 node) position (= opcode 82)))
+                    (when (and (= error "") (= opcode 81))
+                      (match (value/destination (.graph cx) (.parts cx) reference position)
+                        (Err [message] (set! error message))
+                        (Ok [rd]
+                            (match (frame/outgoing (.outgoing-size cx))
+                              (Err [message] (set! error message))
+                              (Ok [m]
+                                  (code/accept! (mut error)
+                                                (encode/lea (mut (.text out)) 64 rd m)))))))))
+          (if (= error "") (Ok 0) (Err error))))))

@@ -1,0 +1,313 @@
+;;; x86-64 integer instruction selection: one Tile per graph node.
+;;;
+;;; A tile records what the emitter (stogir.x64.emit) will produce for a node
+;;; and which operands it reads, before liveness. Selection is a pure function
+;;; of the graph; the matcher (stogir.x64.match) stores the tiles and decides
+;;; fusion. A new rule is added here (constant and selection), constrained in
+;;; stogir.x64.constraints and emitted in stogir.x64.emit.
+;;;
+;;; Tile fields
+;;;   rule       one of the RULE-* constants; RULE-NONE means "not selected"
+;;;   operation  rule-specific: an encode ALU operation, an encode shift kind,
+;;;              a condition code, or DIVIDE-QUOTIENT / DIVIDE-REMAINDER
+;;;   bits       the width the instruction runs at (stogir.x64.value)
+;;;   left       first operand reference
+;;;   right      second operand reference, 0 when `immediate` replaces it
+;;;   immediate  the encoded immediate, or rule-specific data
+;;; A `left`/`right` below zero is a constant that did not fit an immediate;
+;;; the emitter builds it in a scratch register with `mov`.
+(module stogir.x64.select)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.integer-binary" :as binary)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.value" :as value)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defstruct Tile
+  [(rule i32) (operation i32) (bits i32) (left i32) (right i32) (immediate i64)])
+
+(const RULE-NONE 0)
+
+;;; rd = left OP right, OP in ADD SUB AND OR XOR (`operation`).
+(const RULE-ALU-RR 1)
+
+;;; rd = left OP immediate.
+(const RULE-ALU-RI 2)
+
+;;; rd = left * right (two-operand imul).
+(const RULE-MUL-RR 3)
+
+;;; rd = left * immediate (three-operand imul).
+(const RULE-MUL-RI 4)
+
+;;; rd = left SHIFT immediate; `operation` is the encode shift kind and
+;;; `immediate` the count already reduced modulo the type's width.
+(const RULE-SHIFT-RI 5)
+
+;;; rd = left SHIFT right by a variable count, for 32- and 64-bit values:
+;;; the hardware reduces the count in cl modulo the width. rcx is clobbered
+;;; while the operands are read and the emitter copies the count into it.
+(const RULE-SHIFT-RC 6)
+
+;;; As RULE-SHIFT-RC for 8- and 16-bit values: the hardware would reduce the
+;;; count modulo 32, so the emitter also masks the copy with `immediate`
+;;; (width - 1).
+(const RULE-SHIFT-MASKED 7)
+
+;;; rd = left / right or left % right through rax:rdx (`operation` is
+;;; DIVIDE-QUOTIENT or DIVIDE-REMAINDER, `immediate` 1 when signed). Both
+;;; registers are reserved across the instruction.
+(const RULE-DIVIDE 8)
+
+;;; Flags of `cmp left, right` read by condition `operation`.
+(const RULE-COMPARE-RR 9)
+
+;;; Flags of `cmp left, immediate`.
+(const RULE-COMPARE-RI 10)
+
+;;; Flags of `test left, left`: the comparison of `left` with zero.
+(const RULE-COMPARE-ZERO 11)
+
+;;; rd = left + (right << operation) + immediate: an address-form sum
+;;; (stogir.x64.lea, which selects, fuses and emits it). `left` or `right`
+;;; is 0 when the term is absent.
+(const RULE-LEA 12)
+
+;;; Rules with a fused LOAD as a memory operand (the memory family's
+;;; stogir.x64.memory/fuse! replaces a register rule with one of these; the
+;;; operand's address is the load's entry in the plan's address tables, read
+;;; with stogir.x64.address/operand!). `bits` is the load's own width.
+
+;;; rd = left OP [right]: `right` is the fused load.
+(const RULE-ALU-RM 20)
+
+;;; rd = left * [right] (two-operand imul; 16, 32 or 64 bits).
+(const RULE-MUL-RM 21)
+
+;;; Flags of `cmp left, [right]`.
+(const RULE-COMPARE-RM 22)
+
+;;; Flags of `cmp [left], right`: `left` is the fused load.
+(const RULE-COMPARE-MR 23)
+
+;;; Flags of `cmp [left], immediate`.
+(const RULE-COMPARE-MI 24)
+
+;;; A STORE that is a read-modify-write of its own address: `op [m], right`
+;;; (`operation` is the encode ALU operation, `left` the absorbed load).
+(const RULE-STORE-ALU-MR 25)
+
+;;; `op [m], immediate`.
+(const RULE-STORE-ALU-MI 26)
+
+;;; `not [m]` / `neg [m]` (`operation` is encode/NOT or encode/NEG).
+(const RULE-STORE-UNARY-M 27)
+
+;;; Rules of the reciprocal-division family (stogir.x64.reciprocal).
+(const RULE-RECIPROCAL-FIRST 100)
+
+(const RULE-RECIPROCAL-LAST 119)
+
+;;; Flags of `ucomiss/ucomisd left, right` (stogir.x64.fcompare): `operation`
+;;; is an extended condition (a condition code, possibly combined with the
+;;; parity flag), `bits` 32 or 64, and `left`/`right` are already in the
+;;; order the instruction takes them.
+(const RULE-FCOMPARE 200)
+
+(defn reciprocal-rule? [(rule i32)] (-> bool)
+  (and (>= rule RULE-RECIPROCAL-FIRST) (<= rule RULE-RECIPROCAL-LAST)))
+
+(const DIVIDE-QUOTIENT 0)
+
+(const DIVIDE-REMAINDER 1)
+
+(defn none [] (-> Tile)
+  (Tile :rule RULE-NONE :operation 0 :bits 0 :left 0 :right 0 :immediate 0))
+
+(defn comparison-rule? [(rule i32)] (-> bool)
+  (or (and (>= rule RULE-COMPARE-RR) (<= rule RULE-COMPARE-ZERO))
+      (and (>= rule RULE-COMPARE-RM) (<= rule RULE-COMPARE-MI))
+      (= rule RULE-FCOMPARE)))
+
+;;; The fused LOAD a tile reads as its memory operand, 0 when it has none.
+(defn memory-operand [(tile Tile)] (-> i32)
+  (let [rule (.rule tile)]
+    (cond (or (= rule RULE-ALU-RM) (= rule RULE-MUL-RM) (= rule RULE-COMPARE-RM)) (.right tile)
+          (or (= rule RULE-COMPARE-MR) (= rule RULE-COMPARE-MI)) (.left tile)
+          :else 0)))
+
+;;; The operand a memory-operand tile reads from a register (or builds as a
+;;; constant), 0 when it has none.
+(defn register-operand [(tile Tile)] (-> i32)
+  (let [rule (.rule tile)]
+    (cond (or (= rule RULE-ALU-RM) (= rule RULE-MUL-RM) (= rule RULE-COMPARE-RM)) (.left tile)
+          (= rule RULE-COMPARE-MR) (.right tile)
+          :else 0)))
+
+;;; A comparison with one register input: repeating it at each consumer never
+;;; lengthens more than that one live range.
+(defn immediate-comparison? [(tile Tile)] (-> bool)
+  (or (= (.rule tile) RULE-COMPARE-RI) (= (.rule tile) RULE-COMPARE-ZERO)))
+
+;;; The x86 condition code of an integer comparison opcode (EQ .. UGT).
+(defn condition-code [(opcode i32)] (-> i32)
+  (case opcode
+    14 encode/CC-E
+    15 encode/CC-NE
+    16 encode/CC-L
+    17 encode/CC-GE
+    18 encode/CC-LE
+    19 encode/CC-G
+    20 encode/CC-B
+    21 encode/CC-AE
+    22 encode/CC-BE
+    23 encode/CC-A
+    -1))
+
+;;; The condition that holds for (b, a) exactly when `cc` holds for (a, b).
+(defn swapped-condition [(cc i32)] (-> i32)
+  (cond (= cc encode/CC-L) encode/CC-G
+        (= cc encode/CC-G) encode/CC-L
+        (= cc encode/CC-GE) encode/CC-LE
+        (= cc encode/CC-LE) encode/CC-GE
+        (= cc encode/CC-B) encode/CC-A
+        (= cc encode/CC-A) encode/CC-B
+        (= cc encode/CC-AE) encode/CC-BE
+        (= cc encode/CC-BE) encode/CC-AE
+        :else cc))
+
+(defn alu-operation [(opcode i32)] (-> i32)
+  (case opcode
+    26 encode/ADD
+    27 encode/SUB
+    46 encode/OR
+    47 encode/AND
+    48 encode/XOR
+    -1))
+
+(defn shift-kind [(opcode i32)] (-> i32)
+  (case opcode
+    49 encode/SHL
+    50 encode/SHR
+    51 encode/SAR
+    52 encode/ROL
+    53 encode/ROR
+    -1))
+
+(defn commutative? [(opcode i32)] (-> bool)
+  (or (= opcode 26) (= opcode 28) (= opcode 46) (= opcode 47) (= opcode 48)))
+
+;;; Whether `node` is an integer comparison (EQ .. UGT of integer operands).
+(defn integer-comparison? [(graph g/Graph) (node n/Node)] (-> bool)
+  (let [opcode (cast i32 (n/opcode node))]
+    (and (>= opcode 14)
+         (<= opcode 23)
+         (types/integer? (value/type-of graph (.op1 node)))
+         (types/integer? (value/type-of graph (.op2 node))))))
+
+;;; Whether `node` is integer arithmetic selected by `arithmetic`: ADD SUB MUL
+;;; DIV MOD OR AND XOR SHL SHR SAR ROL ROR of an integer type.
+(defn integer-arithmetic? [(node n/Node)] (-> bool)
+  (let [opcode (cast i32 (n/opcode node))]
+    (and (types/integer? (cast i32 (n/type-id node)))
+         (or (and (>= opcode 26) (<= opcode 30))
+             (and (>= opcode 46) (<= opcode 53))))))
+
+(defn arithmetic [(graph g/Graph) (reference i32)] (-> (Result Tile (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "arithmetic instruction missing"))
+    (Some [node]
+          (let [opcode (cast i32 (n/opcode node))
+                ty (cast i32 (n/type-id node))
+                wide (value/operation-bits ty)
+                own (value/type-bits ty)
+                swap (and (commutative? opcode) (< (.op1 node) 0) (> (.op2 node) 0))
+                left (if swap (.op2 node) (.op1 node))
+                right (if swap (.op1 node) (.op2 node))]
+            (cond (or (not (integer-arithmetic? node))
+                      (not (binary/valid-type? opcode ty))
+                      ; DIV and MOD carry a third, optional control guard.
+                      (!= (get (.arities graph) (cast i64 reference))
+                          (if (or (= opcode 29) (= opcode 30)) 3 2)))
+                    (Err "invalid x86-64 integer arithmetic instruction")
+                  (or (!= (value/type-of graph (.op1 node)) ty)
+                      (not (types/integer? (value/type-of graph (.op2 node))))
+                      ; Operands share the result type, except a shift count
+                      ; (any integer) and the 64-bit offset of address
+                      ; arithmetic (ADDR +/- U64 or I64), as stogir.verify.
+                      (and (< opcode 49)
+                           (!= (value/type-of graph (.op2 node)) ty)
+                           (not (and (= ty 6)
+                                     (or (= opcode 26) (= opcode 27))
+                                     (or (= (value/type-of graph (.op2 node)) 5)
+                                         (= (value/type-of graph (.op2 node)) 11))))))
+                    (Err "x86-64 integer arithmetic operand type mismatch")
+                  (>= (alu-operation opcode) 0)
+                    (match (value/immediate graph right wide)
+                      (Some [imm]
+                            (Ok (Tile :rule RULE-ALU-RI :operation (alu-operation opcode)
+                                      :bits wide :left left :right 0 :immediate imm)))
+                      (None []
+                            (Ok (Tile :rule RULE-ALU-RR :operation (alu-operation opcode)
+                                      :bits wide :left left :right right :immediate 0))))
+                  (= opcode 28)
+                    (match (value/immediate graph right wide)
+                      (Some [imm]
+                            (Ok (Tile :rule RULE-MUL-RI :operation 0 :bits wide
+                                      :left left :right 0 :immediate imm)))
+                      (None []
+                            (Ok (Tile :rule RULE-MUL-RR :operation 0 :bits wide
+                                      :left left :right right :immediate 0))))
+                  (or (= opcode 29) (= opcode 30))
+                    (Ok (Tile :rule RULE-DIVIDE
+                              :operation (if (= opcode 29) DIVIDE-QUOTIENT DIVIDE-REMAINDER)
+                              :bits wide :left left :right right
+                              :immediate (if (types/signed? ty) 1 0)))
+                  :else
+                    ; SHL only moves low bits upward, so it runs at the
+                    ; arithmetic width; the others read the value's top bits.
+                    (let [bits (if (= opcode 49) wide own)]
+                      (match (value/constant-bits graph right)
+                        (Some [count]
+                              (Ok (Tile :rule RULE-SHIFT-RI :operation (shift-kind opcode)
+                                        :bits bits :left left :right 0
+                                        :immediate (cast i64 (& count (cast u64 (- own 1)))))))
+                        (None []
+                              (Ok (Tile :rule (if (>= own 32) RULE-SHIFT-RC RULE-SHIFT-MASKED)
+                                        :operation (shift-kind opcode) :bits bits
+                                        :left left :right right
+                                        :immediate (cast i64 (- own 1))))))))))))
+
+;;; The flags recipe of an integer comparison. A constant first operand is
+;;; moved to the right with the condition swapped, so an immediate form is
+;;; chosen whenever one operand is an encodable constant.
+(defn comparison [(graph g/Graph) (reference i32)] (-> (Result Tile (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "comparison instruction missing"))
+    (Some [node]
+          (let [opcode (cast i32 (n/opcode node))
+                ty (value/type-of graph (.op1 node))
+                bits (value/type-bits ty)
+                swap (and (< (.op1 node) 0) (> (.op2 node) 0))
+                left (if swap (.op2 node) (.op1 node))
+                right (if swap (.op1 node) (.op2 node))
+                cc (if swap (swapped-condition (condition-code opcode)) (condition-code opcode))]
+            (cond (or (not (integer-comparison? graph node))
+                      (!= (get (.arities graph) (cast i64 reference)) 2)
+                      (!= (n/type-id node) 1))
+                    (Err "invalid x86-64 integer comparison instruction")
+                  (!= (value/type-bits (value/type-of graph (.op2 node))) bits)
+                    (Err "x86-64 integer comparison operand width mismatch")
+                  :else
+                    (match (value/immediate graph right bits)
+                      (Some [imm]
+                            (Ok (Tile :rule (if (and (= imm 0) (> left 0))
+                                                RULE-COMPARE-ZERO
+                                                RULE-COMPARE-RI)
+                                      :operation cc :bits bits :left left :right 0
+                                      :immediate imm)))
+                      (None []
+                            (Ok (Tile :rule RULE-COMPARE-RR :operation cc :bits bits
+                                      :left left :right right :immediate 0)))))))))

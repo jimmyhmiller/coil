@@ -1,0 +1,464 @@
+;;; Control-flow edges of an allocated x86-64 function: the moves an edge
+;;; needs, branches to blocks, and out-of-line edge stubs.
+;;;
+;;; An edge from the block ending at `source-position` into block `target`
+;;; reconciles every value live into the target (where the allocator put it at
+;;; the end of the source and at the start of the target) and writes the
+;;; target's PHIs, as one simultaneous group through the neutral move
+;;; resolver. Cycles go through the reserved holder register. PHI inputs that
+;;; are constants are built afterwards with `mov`, and inputs that are static
+;;; frame objects with `lea`. Only moves are emitted, so
+;;; an edge never disturbs flags.
+;;;
+;;; An unconditional edge runs its moves in line. A conditional edge with
+;;; moves needs a block of its own: the branch targets an edge stub, emitted
+;;; after the function body, which runs the moves and jumps to the target.
+;;;
+;;; This is the driver's control-flow interface for the switch family
+;;; (stogir.x64.switch), which is why it is not part of stogir.x64.function.
+;;;
+;;; The a64 driver holds the same logic inline, mixed with shrink-wrapping
+;;; and spill-home planning that x86-64 does not have yet; that is why it is
+;;; written again here rather than shared.
+(module stogir.x64.edges)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.types" :as types)
+(import "stogir.schedule" :as schedule)
+(import "stogir.uses" :as uses)
+(import "stogir.register-live" :as live)
+(import "stogir.edge-moves" :as edges)
+(import "stogir.allocation" :as allocation)
+(import "stogir.locations" :as locations)
+(import "stogir.text-data" :as text-data)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.fcompare" :as fcompare)
+(import "stogir.x64.fixups" :as fixups)
+(import "stogir.x64.frame-address" :as frame)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.transfers" :as transfers)
+(import "stogir.x64.typed-transfers" :as typed-transfers)
+(import "stogir.x64.value" :as value)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Borrowed, immutable facts about the function being emitted.
+;;;   selected[r]  node r is scheduled
+;;;   aliases[b]   the block that block b forwards to when layout skipped b
+;;;                (b itself otherwise)
+(defstruct Flow
+  [(graph g/Graph)
+   (scheduled schedule/Schedule)
+   (analysis live/Analysis)
+   (parts (ArrayList allocation/Part))
+   (locations locations/Index)
+   (base frame/Base)
+   (users uses/Uses)
+   (selected (ArrayList bool))
+   (aliases (ArrayList i32))])
+
+;;; Moves of one conditional edge with a jump to `target` behind them. They
+;;; are emitted after the function body under `label`, or, with label
+;;; ENTRY-PENDING, at the start of block `target` itself (the block's only
+;;; way in is this edge; see entry-placeable?), which then becomes
+;;; ENTRY-PLACED.
+(defstruct EdgeStub [(label i32) (target i32) (body code/Buffer)])
+
+(const ENTRY-PENDING -1)
+
+(const ENTRY-PLACED -2)
+
+;;; A jump table of `count` words, whose targets are
+;;; `table-targets[first ..]`, placed under `label` after the function body.
+(defstruct Table [(label i32) (first i64) (count i64)])
+
+;;; The mutable branch state of one function.
+(defstruct Control
+  [(labels (ArrayList i64))
+   (branches (ArrayList fixups/Branch))
+   (relatives (ArrayList fixups/Relative))
+   (stubs (ArrayList EdgeStub))
+   (tables (ArrayList Table))
+   (table-targets (ArrayList i32))
+   (alignments (ArrayList fixups/Alignment))])
+
+(defn create-control [(allocator (dyn Allocator))] (-> Control)
+  (Control
+    :labels (ArrayList::new [i64] allocator)
+    :branches (ArrayList::new [fixups/Branch] allocator)
+    :relatives (ArrayList::new [fixups/Relative] allocator)
+    :stubs (ArrayList::new [EdgeStub] allocator)
+    :tables (ArrayList::new [Table] allocator)
+    :table-targets (ArrayList::new [i32] allocator)
+    :alignments (ArrayList::new [fixups/Alignment] allocator)))
+
+(defn release-control! [(control (mut Control))] (-> void)
+  (for [i 0 (len (.stubs control))]
+    (code/release! (mut (.body (elem (mut (.stubs control)) i)))))
+  (free! (mut (.stubs control)))
+  (free! (mut (.labels control)))
+  (free! (mut (.branches control)))
+  (free! (mut (.relatives control)))
+  (free! (mut (.tables control)))
+  (free! (mut (.table-targets control)))
+  (free! (mut (.alignments control))))
+
+;;; The block that `entered` stands for once skipped (empty) blocks are
+;;; followed to the block that is actually emitted.
+(defn resolve-alias [(aliases (ArrayList i32)) (entered i32)] (-> i32)
+  (let [(mut target) entered
+        (mut steps) (: 0 i64)]
+    (while (and (> target 0)
+                (< (cast i64 target) (len aliases))
+                (!= (get aliases (cast i64 target)) target)
+                (< steps (len aliases)))
+      (set! target (get aliases (cast i64 target)))
+      (set! steps (+ steps 1)))
+    target))
+
+;;; The transfer extent of a graph value: 4 bytes for every integer of at
+;;; most four bytes (the arithmetic width), else the type's size.
+(defn extent [(graph g/Graph) (reference i32)] (-> i32)
+  (match (g/lookup graph reference)
+    (None [] 0)
+    (Some [node]
+          (let [size (types/size (cast i32 (n/type-id node)) 8)]
+            (if (< size 4) 4 size)))))
+
+;;; Emit simultaneous copies of values of mixed widths (split boundaries and
+;;; CFG edges). All copies belong to one position.
+(defn typed-group! [(output (mut (ArrayList u8)))
+                    (graph g/Graph)
+                    (copies (slice locations/Transfer))
+                    (allocator (dyn Allocator))
+                    (base frame/Base)] (-> (Result i32 (slice u8)))
+  (let [(mut typed) (ArrayList::new [typed-transfers/Copy] allocator)
+        (mut error) ""]
+    (for copy copies
+      (let [size (extent graph (.parent copy))]
+        (if (not (or (= size 4) (= size 8) (= size 16)))
+            (set! error "unsupported graph transfer extent")
+            (push! (mut typed) (typed-transfers/Copy :transfer copy :size size)))))
+    (let [result (if (= error "")
+                     (typed-transfers/parallel-frame! (mut output) (slice typed) allocator base)
+                     (Err [i32 (slice u8)] error))]
+      (free! (mut typed))
+      result)))
+
+;;; The scheduled block-start user of block end `reference`: the block it
+;;; enters. Zero when there is none.
+(defn successor [(flow Flow) (reference i32)] (-> i32)
+  (let [range (get (.ranges (.users flow)) (cast i64 reference))
+        (mut target) (: 0 i32)]
+    (for [i 0 (.count range)]
+      (let [user (.user (get (.edges (.users flow)) (+ (.offset range) i)))]
+        (when (and (get (.selected flow) (cast i64 user))
+                   (op/block-start? (cast i32 (n/opcode (get (.instructions (.graph flow))
+                                                             (cast i64 user))))))
+          (set! target user))))
+    target))
+
+;;; The successor of `reference` whose canonical block is `next`, the block
+;;; laid out directly after it; zero when the next block is not a successor.
+(defn next-successor [(flow Flow) (reference i32) (next i32)] (-> i32)
+  (let [range (get (.ranges (.users flow)) (cast i64 reference))
+        (mut result) (: 0 i32)]
+    (when (> next 0)
+      (for [i 0 (.count range)]
+        (let [user (.user (get (.edges (.users flow)) (+ (.offset range) i)))]
+          (when (and (get (.selected flow) (cast i64 user))
+                     (op/block-start? (cast i32 (n/opcode (get (.instructions (.graph flow))
+                                                               (cast i64 user)))))
+                     (= (get (.aliases flow) (cast i64 user)) next))
+            (set! result user)))))
+    result))
+
+;;; Emit the moves of the edge from the block whose end is at
+;;; `source-position - 1` (so `source-position` is its odd exit position)
+;;; into block `target`. Flags are untouched.
+(defn edge! [(out (mut code/Buffer))
+             (flow Flow)
+             (target i32)
+             (source-position i64)
+             (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [graph (.graph flow)
+        state-index (get (.indices (.analysis flow)) (cast i64 target))
+        range (get (.ranges (.scheduled flow)) (cast i64 target))
+        source-ref (get (.nodes (.scheduled flow)) (/ source-position 2))
+        count (get (.arities graph) (cast i64 target))
+        (mut ordinal) (: 0 i32)]
+    (for [i 1 (+ (cast i64 count) 1)]
+      (match (g/operand graph target (cast i32 i))
+        (None [] 0)
+        (Some [value] (when (= value source-ref) (set! ordinal (cast i32 i))))))
+    (if (< state-index 0)
+        (Err "edge target has no liveness state")
+        (match (edges/ordinary-indexed (.parts flow)
+                                       (.locations flow)
+                                       (.input (at (.states (.analysis flow)) state-index))
+                                       source-position
+                                       (* (.offset range) 2)
+                                       allocator)
+          (Err [message] (Err message))
+          (Ok [moves]
+              (let [(mut owned) moves
+                    (mut recipes) (ArrayList::new [locations/Transfer] allocator)
+                    (mut error) ""]
+                (match (edges/phis-indexed graph (.scheduled flow) (.parts flow)
+                                           (.locations flow) target ordinal
+                                           source-position allocator)
+                  (Err [message] (set! error message))
+                  (Ok [group]
+                      (let [(mut phis) group]
+                        ; A PHI input that is a static frame object has no
+                        ; location to move from: its address is rebuilt
+                        ; after the group, like a constant.
+                        (for move (.moves phis)
+                          (if (locations/rematerialized? (.source move))
+                              (push! (mut recipes) move)
+                              (push! (mut owned) move)))
+                        (match (typed-group! (mut (.text out)) graph (slice owned)
+                                             allocator (.base flow))
+                          (Err [message] (set! error message))
+                          (Ok [_] 0))
+                        (for move recipes
+                          (when (= error "")
+                            (let [destination (.destination move)
+                                  register (if (= (.kind destination) 0)
+                                               (cast i32 (.value destination))
+                                               registers/SCRATCH-GPR)]
+                              (match (frame/slot (.base flow) (.value (.source move)))
+                                (Err [message] (set! error message))
+                                (Ok [m]
+                                    (match (encode/lea (mut (.text out)) 64 register m)
+                                      (Err [message] (set! error message))
+                                      (Ok [_] 0))))
+                              (when (and (= error "") (= (.kind destination) 1))
+                                (match (transfers/emit-with!
+                                         (mut (.text out))
+                                         (locations/Location :kind 0 :value (cast i64 register))
+                                         destination 8 (.base flow) true)
+                                  (Err [message] (set! error message))
+                                  (Ok [_] 0))))))
+                        ; Constants are written after the group has consumed
+                        ; every physical source.
+                        (for literal (.literals phis)
+                          (when (= error "")
+                            (let [destination (.destination literal)
+                                  floating? (types/floating?
+                                              (value/type-of graph (.reference literal)))
+                                  ; A floating constant for a spill slot is
+                                  ; its bits in r10: no XMM register and no
+                                  ; pool load are needed.
+                                  register (if (= (.kind destination) 0)
+                                               (cast i32 (.value destination))
+                                               registers/SCRATCH-GPR)]
+                              (match (cond (not floating?)
+                                             (value/constant! (mut out) graph
+                                                              (.reference literal) register)
+                                           (registers/simd? register)
+                                             (value/float-constant! (mut out) graph
+                                                                    (.reference literal)
+                                                                    register)
+                                           :else
+                                             (match (value/float-constant-bits
+                                                      graph (.reference literal))
+                                               (None [] (Err [i32 (slice u8)]
+                                                             "floating PHI constant is not numeric"))
+                                               (Some [raw]
+                                                     (value/bits! (mut out) register raw 64))))
+                                (Err [message] (set! error message))
+                                (Ok [_] 0))
+                              (when (and (= error "") (= (.kind destination) 1))
+                                (match (transfers/emit-with!
+                                         (mut (.text out))
+                                         (locations/Location :kind 0 :value (cast i64 register))
+                                         destination
+                                         (extent graph (.reference literal))
+                                         (.base flow)
+                                         true)
+                                  (Err [message] (set! error message))
+                                  (Ok [_] 0))))))
+                        (edges/release-phis! (mut phis)))))
+                (free! (mut owned))
+                (free! (mut recipes))
+                (if (= error "") (Ok 0) (Err error))))))))
+
+;;; The label a branch along the edge into `target` goes to: the block
+;;; itself when the edge has no moves, otherwise a new edge stub after the
+;;; function body.
+(defn stub-or-target! [(flow Flow)
+                       (control (mut Control))
+                       (target i32)
+                       (source-position i64)
+                       (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [(mut transfer) (code/create allocator)]
+    (match (edge! (mut transfer) flow target source-position allocator)
+      (Err [message] (code/release! (mut transfer)) (Err message))
+      (Ok [_]
+          (if (= (len (.text transfer)) 0)
+              (do (code/release! (mut transfer)) (Ok target))
+              (let [id (cast i32 (len (.labels control)))]
+                (push! (mut (.labels control)) -1)
+                (push! (mut (.stubs control))
+                       (EdgeStub :label id :target target :body transfer))
+                (Ok id)))))))
+
+;;; An IF projection has exactly one predecessor, its IF. When it is emitted
+;;; later as its own block, the moves of the taken edge into it can run at
+;;; its entry instead of in an out-of-line stub, which saves a taken jump.
+;;; Not for a block the layout skipped, one already emitted, or one that
+;;; already has entry code.
+(defn entry-placeable? [(flow Flow) (control Control) (target i32)] (-> bool)
+  (and (> target 0)
+       (< (cast i64 target) (len (.aliases flow)))
+       (= (get (.aliases flow) (cast i64 target)) target)
+       (< (get (.labels control) (cast i64 target)) 0)
+       (let [opcode (n/opcode (get (.instructions (.graph flow)) (cast i64 target)))]
+         (or (= opcode 107) (= opcode 108)))
+       (let [(mut free) true]
+         (for stub (.stubs control)
+           (when (and (= (.label stub) ENTRY-PENDING) (= (.target stub) target))
+             (set! free false)))
+         free)))
+
+;;; Branch to `target` when `condition` holds (-1: always). An edge without
+;;; moves branches straight to the block. With moves, the branch goes to the
+;;; block when the moves can be its entry code (`entry`: the caller allows
+;;; it, and entry-placeable? holds), otherwise to a new edge stub.
+(defn branch-edge! [(out (mut code/Buffer))
+                    (flow Flow)
+                    (control (mut Control))
+                    (target i32)
+                    (source-position i64)
+                    (condition i32)
+                    (entry bool)
+                    (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [(mut transfer) (code/create allocator)]
+    (match (edge! (mut transfer) flow target source-position allocator)
+      (Err [message] (code/release! (mut transfer)) (Err message))
+      (Ok [_]
+          (cond (= (len (.text transfer)) 0)
+                  (do
+                    (code/release! (mut transfer))
+                    (fixups/jump! (mut out) (mut (.branches control)) target condition))
+                (and entry (entry-placeable? flow control target))
+                  (do
+                    (push! (mut (.stubs control))
+                           (EdgeStub :label ENTRY-PENDING :target target :body transfer))
+                    (fixups/jump! (mut out) (mut (.branches control)) target condition))
+                :else
+                  (let [id (cast i32 (len (.labels control)))]
+                    (push! (mut (.labels control)) -1)
+                    (push! (mut (.stubs control))
+                           (EdgeStub :label id :target target :body transfer))
+                    (fixups/jump! (mut out) (mut (.branches control)) id condition)))))))
+
+;;; Append the entry code waiting for block `target`, whose label was just
+;;; bound.
+(defn place-entry! [(out (mut code/Buffer)) (control (mut Control)) (target i32)]
+  (-> (Result i32 (slice u8)))
+  (let [(mut error) ""]
+    (for [i 0 (len (.stubs control))]
+      (let [stub (get (.stubs control) i)]
+        (when (and (= error "") (= (.label stub) ENTRY-PENDING) (= (.target stub) target))
+          (unless (code/append! (mut out) (.body stub))
+            (set! error "invalid deferred entry code"))
+          (set! (.entries (.summary out)) (+ (.entries (.summary out)) 1))
+          (set! (.label (elem (mut (.stubs control)) i)) ENTRY-PLACED))))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; As branch-edge! for an extended condition (stogir.x64.fcompare), which
+;;; may need the parity flag as well as a condition code:
+;;;   cc or parity       jp target; jcc target
+;;;   cc and not parity  jp skip; jcc target; skip:
+;;; `skip` is a label of its own in the branch table, so the jumps stay
+;;; ordinary fixup records. `entry` is as for branch-edge!; the two-jump
+;;; forms always use an edge stub.
+(defn branch-edge-parity! [(out (mut code/Buffer))
+                           (flow Flow)
+                           (control (mut Control))
+                           (target i32)
+                           (source-position i64)
+                           (condition i32)
+                           (entry bool)
+                           (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (if (or (= condition -1) (fcompare/simple? condition))
+      (branch-edge! (mut out) flow (mut control) target source-position condition entry
+                    allocator)
+      (let [(mut transfer) (code/create allocator)]
+        (match (edge! (mut transfer) flow target source-position allocator)
+          (Err [message] (code/release! (mut transfer)) (Err message))
+          (Ok [_]
+              (let [(mut label) target
+                    (mut error) ""]
+                (if (= (len (.text transfer)) 0)
+                    (code/release! (mut transfer))
+                    (do
+                      (set! label (cast i32 (len (.labels control))))
+                      (push! (mut (.labels control)) -1)
+                      (push! (mut (.stubs control))
+                             (EdgeStub :label label :target target :body transfer))))
+                (if (fcompare/or-p? condition)
+                    (do
+                      (code/accept-count! (mut error)
+                                          (fixups/jump! (mut out) (mut (.branches control))
+                                                        label encode/CC-P))
+                      (code/accept-count! (mut error)
+                                          (fixups/jump! (mut out) (mut (.branches control))
+                                                        label (fcompare/code-of condition))))
+                    (let [skip (cast i32 (len (.labels control)))]
+                      (push! (mut (.labels control)) -1)
+                      (code/accept-count! (mut error)
+                                          (fixups/jump! (mut out) (mut (.branches control))
+                                                        skip encode/CC-P))
+                      (code/accept-count! (mut error)
+                                          (fixups/jump! (mut out) (mut (.branches control))
+                                                        label (fcompare/code-of condition)))
+                      (set! (mut (.labels control)) (cast i64 skip) (len (.text out)))))
+                (if (= error "") (Ok 0) (Err error))))))))
+
+;;; Append every out-of-line edge stub: its moves, then a jump to its target.
+(defn finish-stubs! [(out (mut code/Buffer)) (control (mut Control))]
+  (-> (Result i32 (slice u8)))
+  (let [(mut error) ""]
+    (for [i 0 (len (.stubs control))]
+      (when (= error "")
+        (let [stub (get (.stubs control) i)]
+          (cond (= (.label stub) ENTRY-PLACED) 0
+                (= (.label stub) ENTRY-PENDING)
+                  (set! error "edge moves placed at a block entry that was never emitted")
+                :else
+                  (do
+                    (set! (mut (.labels control)) (cast i64 (.label stub)) (len (.text out)))
+                    (set! (.stubs (.summary out)) (+ (.stubs (.summary out)) 1))
+                    (if (code/append! (mut out) (.body stub))
+                        (match (fixups/jump! (mut out) (mut (.branches control))
+                                             (.target stub) -1)
+                          (Err [message] (set! error message))
+                          (Ok [_] 0))
+                        (set! error "invalid deferred edge code")))))))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; Append every jump table after the code: zero words now, one Relative
+;;; record per word, a text-data range, and a request to align the table to
+;;; its word size (the relaxation pass inserts the padding).
+(defn finish-tables! [(out (mut code/Buffer)) (control (mut Control))] (-> void)
+  (for table (.tables control)
+    (let [base (len (.text out))]
+      (set! (mut (.labels control)) (cast i64 (.label table)) base)
+      (push! (mut (.alignments control))
+             (fixups/Alignment :label (.label table) :boundary 4 :limit 3 :loop false))
+      (for [slot 0 (.count table)]
+        (push! (mut (.relatives control))
+               (fixups/Relative
+                 :offset (len (.text out))
+                 :base base
+                 :label (get (.table-targets control) (+ (.first table) slot))))
+        (for [k 0 4] (push! (mut (.text out)) 0)))
+      (push! (mut (.text-data out))
+             (text-data/Range :offset base :length (* (.count table) 4) :kind 4))
+      (set! (.tables (.summary out)) (+ (.tables (.summary out)) 1)))))

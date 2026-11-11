@@ -1,0 +1,140 @@
+;;; One physical move between two locations on x86-64.
+;;;
+;;; Every instruction emitted here is a plain move (`mov`, `movaps`, `movups`,
+;;; `movss`, `movsd`, `movd`, `movq`): none writes flags, so transfers may sit
+;;; between a flag producer and its consumer (docs/X86_PORT.md, "Flags").
+;;;
+;;; Location kinds are those of stogir.locations: 0 register (general 0..15,
+;;; XMM 32..47), 1 spill slot at a logical frame offset. Read-only locations
+;;; (frame addresses, constant recipes) are not moved here: their readers
+;;; rebuild them (stogir.x64.value for operands, stogir.x64.edges for PHI
+;;; inputs).
+;;;
+;;; `size` is the transfer extent in bytes: 4 or 8 for general and scalar
+;;; floating values, 16 for vectors. A memory-to-memory move goes through the
+;;; data scratch, r10 or xmm14, which therefore may not be a source or
+;;; destination. r11 and xmm15 are the cycle holders of typed-transfers.
+;;;
+;;; The a64 module of this name is not shared: it is AArch64 encodings.
+(module stogir.x64.transfers)
+(import "stogir.locations" :as loc)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.frame-address" :as frame)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+(defn register? [(location loc/Location)] (-> bool)
+  (and (= (.kind location) 0)
+       (or (registers/gpr? (cast i32 (.value location)))
+           (registers/simd? (cast i32 (.value location))))))
+
+;;; Whether `location` can hold a value of `size` bytes.
+(defn width-location? [(location loc/Location) (size i32)] (-> bool)
+  (cond (= (.kind location) 1) (and (>= (.value location) 0)
+                                    (or (= size 4) (= size 8) (= size 16)))
+        (not (register? location)) false
+        (registers/gpr? (cast i32 (.value location))) (or (= size 4) (= size 8))
+        :else (or (= size 4) (= size 8) (= size 16))))
+
+;;; The scratch registers no transfer may name: r10 r11 xmm14 xmm15.
+(defn reserved? [(location loc/Location)] (-> bool)
+  (and (= (.kind location) 0)
+       (or (= (.value location) (cast i64 registers/SCRATCH-GPR))
+           (= (.value location) (cast i64 registers/SCRATCH-GPR-2))
+           (= (.value location) (cast i64 registers/SCRATCH-SIMD))
+           (= (.value location) (cast i64 registers/SCRATCH-SIMD-2)))))
+
+(defn load-op [(size i32)] (-> i32)
+  (case size 4 encode/MOVSS 8 encode/MOVSD encode/MOVUPS))
+
+;;; register <- register
+(defn register-move! [(out (mut (ArrayList u8))) (error (mut (slice u8)))
+                      (destination i32) (source i32) (size i32)] (-> void)
+  (let [bits (if (= size 4) (: 32 i32) 64)]
+    (cond (= destination source) 0
+          (and (registers/gpr? destination) (registers/gpr? source))
+            (code/accept! (mut error) (encode/mov-rr (mut out) bits destination source))
+          (and (registers/simd? destination) (registers/simd? source))
+            (code/accept! (mut error)
+                          (encode/sse-mov-rr (mut out) encode/MOVAPS destination source))
+          (and (registers/simd? destination) (registers/gpr? source) (<= size 8))
+            (code/accept! (mut error) (encode/movd-xr (mut out) bits destination source))
+          (and (registers/gpr? destination) (registers/simd? source) (<= size 8))
+            (code/accept! (mut error) (encode/movd-rx (mut out) bits destination source))
+          :else (when (= error "") (set! error "invalid x86-64 register transfer")))))
+
+;;; register <- [m]
+(defn spill-load! [(out (mut (ArrayList u8))) (error (mut (slice u8)))
+             (destination i32) (m encode/Mem) (size i32)] (-> void)
+  (cond (and (registers/gpr? destination) (<= size 8))
+          (code/accept! (mut error)
+                        (encode/mov-rm (mut out) (if (= size 4) 32 64) destination m))
+        (registers/simd? destination)
+          (code/accept! (mut error)
+                        (encode/sse-mov-rm (mut out) (load-op size) destination m))
+        :else (when (= error "") (set! error "invalid x86-64 spill load"))))
+
+;;; [m] <- register
+(defn spill-store! [(out (mut (ArrayList u8))) (error (mut (slice u8)))
+              (m encode/Mem) (source i32) (size i32)] (-> void)
+  (cond (and (registers/gpr? source) (<= size 8))
+          (code/accept! (mut error)
+                        (encode/mov-mr (mut out) (if (= size 4) 32 64) m source))
+        (registers/simd? source)
+          (code/accept! (mut error)
+                        (encode/sse-mov-mr (mut out) (load-op size) m source))
+        :else (when (= error "") (set! error "invalid x86-64 spill store"))))
+
+;;; Move `size` bytes from `source` to `destination`. `allow-reserved` admits
+;;; the cycle holders (typed-transfers passes them; ordinary callers do not).
+;;; On error nothing is appended.
+(defn emit-with! [(output (mut (ArrayList u8)))
+                  (source loc/Location)
+                  (destination loc/Location)
+                  (size i32)
+                  (base frame/Base)
+                  (allow-reserved bool)] (-> (Result i32 (slice u8)))
+  (let [begin (len output)
+        (mut error) ""]
+    (cond (or (loc/rematerialized? source) (loc/constant? source))
+            (set! error "x86-64 transfer source is a recipe, not a location")
+          (or (not (width-location? source size)) (not (width-location? destination size)))
+            (set! error "invalid x86-64 transfer location or extent")
+          (and (not allow-reserved) (or (reserved? source) (reserved? destination)))
+            (set! error "x86-64 transfer names a reserved scratch register")
+          (and (= (.kind source) 0) (= (.kind destination) 0))
+            (register-move! (mut output) (mut error)
+                            (cast i32 (.value destination)) (cast i32 (.value source)) size)
+          (= (.kind source) 0)
+            (match (frame/slot base (.value destination))
+              (Err [message] (set! error message))
+              (Ok [m] (spill-store! (mut output) (mut error) m (cast i32 (.value source)) size)))
+          (= (.kind destination) 0)
+            (match (frame/slot base (.value source))
+              (Err [message] (set! error message))
+              (Ok [m] (spill-load! (mut output) (mut error) (cast i32 (.value destination)) m size)))
+          (= (.value source) (.value destination)) 0
+          :else
+            (let [scratch (if (= size 16) (: registers/SCRATCH-SIMD i32) registers/SCRATCH-GPR)]
+              (match (frame/slot base (.value source))
+                (Err [message] (set! error message))
+                (Ok [from]
+                    (match (frame/slot base (.value destination))
+                      (Err [message] (set! error message))
+                      (Ok [to]
+                          (spill-load! (mut output) (mut error) scratch from size)
+                          (spill-store! (mut output) (mut error) to scratch size)))))))
+    (if (= error "")
+        (Ok (cast i32 (- (len output) begin)))
+        (do
+          (while (> (len output) begin) (pop! (mut output)))
+          (Err error)))))
+
+(defn emit! [(output (mut (ArrayList u8)))
+             (source loc/Location)
+             (destination loc/Location)
+             (size i32)
+             (base frame/Base)] (-> (Result i32 (slice u8)))
+  (emit-with! (mut output) source destination size base false))

@@ -1,0 +1,150 @@
+;;; Floating LOAD/STORE and floating local variables on x86-64: the minimal
+;;; forms the floating family needs until the memory and locals families
+;;; (stogir.x64.memory, stogir.x64.locals) handle every type.
+;;;
+;;;   LOAD, LOAD_v (91, 92) of a FLOAT or DOUBLE    movss/movsd rd, [address]
+;;;   STORE, STORE_v (93, 94) of one                movss/movsd [address], value
+;;;   VAR (72) of a floating type                   a frame object
+;;;   VLOAD, VLOAD_v (85, 86) of a floating type    movss/movsd rd, [slot]
+;;;   VSTORE, VSTORE_v (87, 88) of a floating value movss/movsd [slot], value
+;;;
+;;; The address of a LOAD or STORE is the addressing mode the memory family
+;;; selected for it (stogir.x64.memory/fuse!: base, index, scale and
+;;; displacement in the plan's address tables, for accesses of every value
+;;; class): its base and index are the access's register operands and
+;;; stogir.x64.address/operand! is its memory operand. The address operand
+;;; of the node itself may have been absorbed and must not be read.
+;;; A local access addresses its VAR's slot from the frame base; a VAR that
+;;; is not of a floating type belongs to the locals family, which requests
+;;; its slot.
+;;;
+;;; `claims?` is what stogir.x64.families asks to route a node here.
+(module stogir.x64.float-memory)
+(import "stogir.graph" :as g)
+(import "stogir.locals" :as local)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.x64.address" :as address)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.emit" :as emit)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.frame-address" :as frame-address)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.uses" :as uses)
+(import "stogir.x64.value" :as value)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(const CONFLICT "conflicting x86-64 register constraints")
+
+(defn operation? [(opcode i32)] (-> bool)
+  (or (= opcode 72) (and (>= opcode 85) (<= opcode 88)) (and (>= opcode 91) (<= opcode 94))))
+
+(defn load? [(opcode i32)] (-> bool)
+  (or (= opcode 85) (= opcode 86) (= opcode 91) (= opcode 92)))
+
+(defn local? [(opcode i32)] (-> bool)
+  (and (>= opcode 85) (<= opcode 88)))
+
+;;; The type an access moves: the node's own for a load or VAR, the stored
+;;; value's for a store.
+(defn accessed-type [(graph g/Graph) (node n/Node)] (-> i32)
+  (let [opcode (cast i32 (n/opcode node))]
+    (if (or (load? opcode) (= opcode 72))
+        (cast i32 (n/type-id node))
+        (value/type-of graph (.op3 node)))))
+
+;;; Whether scheduled node `reference` is one of this module's operations on
+;;; a FLOAT or DOUBLE.
+(defn claims? [(graph g/Graph) (reference i32)] (-> bool)
+  (let [node (get (.instructions graph) (cast i64 reference))]
+    (and (operation? (cast i32 (n/opcode node)))
+         (types/floating? (accessed-type graph node)))))
+
+;;; Shape of a LOAD or STORE of a floating value; the accessed type.
+(defn validate [(graph g/Graph) (reference i32)] (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions graph) (cast i64 reference))
+        opcode (cast i32 (n/opcode node))
+        ty (accessed-type graph node)]
+    (cond (or (< opcode 91) (> opcode 94)
+              (!= (get (.arities graph) (cast i64 reference)) (if (load? opcode) 2 3)))
+            (Err "invalid memory instruction")
+          (!= (value/type-of graph (.op2 node)) 6) (Err "memory address must be ADDR")
+          (and (not (load? opcode)) (!= (n/type-id node) 0)) (Err "store must be void")
+          (not (types/floating? ty)) (Err "floating memory access of another type")
+          :else (Ok ty))))
+
+(defn select! [(state (mut plan/Matching)) (graph g/Graph) (reference i32)]
+  (-> (Result i32 (slice u8)))
+  (Ok 0))
+
+(defn constrain! [(set (mut uses/Set)) (graph g/Graph) (matched plan/Plan)
+                  (reference i32) (position i64)] (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions graph) (cast i64 reference))
+        opcode (cast i32 (n/opcode node))
+        (mut error) ""]
+    (cond (= opcode 72)
+            (match (local/shape graph reference 8)
+              (Err [message] (set! error message))
+              (Ok [shape]
+                  (when (> (.alignment shape) (.alignment set))
+                    (set! (.alignment set) (.alignment shape)))
+                  (push! (mut (.locals set))
+                         (uses/Local :owner reference :size (.size shape)
+                                     :alignment (.alignment shape)))))
+          (local? opcode)
+            (match (local/validate graph reference 8)
+              (Err [message] (set! error message))
+              (Ok [_] 0))
+          :else
+            (match (validate graph reference)
+              (Err [message] (set! error message))
+              (Ok [_]
+                  (let [selected (address/parts matched graph reference)]
+                    (unless (and (uses/use! (mut set) (.base selected) position)
+                                 (uses/use! (mut set) (.index selected) position))
+                      (set! error CONFLICT))))))
+    (when (and (= error "") (!= opcode 72))
+      (unless (if (load? opcode)
+                  (uses/define! (mut set) reference position)
+                  (uses/use! (mut set) (.op3 node) position))
+        (set! error CONFLICT)))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; The memory operand of local variable `variable`'s frame slot.
+(defn slot [(cx context/Context) (variable i32)] (-> (Result encode/Mem (slice u8)))
+  (match (get (.locals (.frame cx)) variable)
+    (None [] (Err "x86-64 backend: local variable has no frame slot (a floating access to a variable of another type needs the locals family)"))
+    (Some [index]
+          (if (or (< index 0) (>= index (len (.slots (.frame cx)))))
+              (Err "invalid local frame slot index")
+              (frame-address/slot (.base cx) (.offset (get (.slots (.frame cx)) index)))))))
+
+(defn emit! [(out (mut code/Buffer)) (cx context/Context) (reference i32) (position i64)]
+  (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions (.graph cx)) (cast i64 reference))
+        opcode (cast i32 (n/opcode node))
+        ty (accessed-type (.graph cx) node)
+        (mut error) ""]
+    (when (!= opcode 72)
+      (match (if (local? opcode)
+                 (slot cx (.op2 node))
+                 (address/operand! (mut out) cx reference position))
+        (Err [message] (set! error message))
+        (Ok [m]
+            (if (load? opcode)
+                (match (value/float-destination (.graph cx) (.parts cx) reference position)
+                  (Err [message] (set! error message))
+                  (Ok [rd]
+                      (code/accept! (mut error)
+                                    (encode/sse-mov-rm (mut (.text out)) (value/float-move ty)
+                                                       rd m))))
+                (match (value/float-register! (mut out) (.graph cx) (.parts cx) (.base cx)
+                                              (.op3 node) position registers/SCRATCH-SIMD)
+                  (Err [message] (set! error message))
+                  (Ok [source]
+                      (code/accept! (mut error)
+                                    (encode/sse-mov-mr (mut (.text out)) (value/float-move ty)
+                                                       m source))))))))
+    (if (= error "") (Ok 0) (Err error))))

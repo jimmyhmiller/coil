@@ -1,0 +1,279 @@
+;;; x86-64 remaining integer operations: ABS (32), BSWAP (54), CTPOP (55),
+;;; CTLZ (56), CTTZ (57), MIN (58) and MAX (59) on baseline x86-64 (no
+;;; POPCNT, LZCNT, TZCNT or BMI).
+;;;
+;;; Results match the AArch64 backend (stogir.a64.unary), including the
+;;; inputs the IR leaves undefined:
+;;;   CTLZ(0) = the type's width;
+;;;   CTTZ(0) = the width the operation runs at: 64 for 64-bit types and 32
+;;;             for every narrower type (AArch64 counts in a W register);
+;;;   ABS(minimum) = minimum.
+;;;
+;;; Sequences (rd is the result, r10/r11 the scratches)
+;;;   ABS    mov rd, x (sign-extended when narrow); mov r10, rd; neg rd;
+;;;          cmovs rd, r10
+;;;   BSWAP  mov rd, x; bswap rd            16 bits: rol rd16, 8
+;;;   CTPOP  the SWAR population count in rd with r10 and r11; 8- and 16-bit
+;;;          values are zero-extended and counted at 32 bits
+;;;   CTLZ   bsr rd, x; mov r11d, 2W-1; cmovz rd, r11; xor rd, W-1
+;;;          (narrow x is zero-extended and 32 - width subtracted)
+;;;   CTTZ   bsf rd, x; mov r11d, W; cmovz rd, r11
+;;;   MIN, MAX
+;;;          cmp a, b at the type's own width; mov rd, a; cmovcc rd, b
+;;;          (the move is dropped, or the roles swapped, when rd is a or b)
+;;; bsf and bsr leave their destination undefined for a zero source and set
+;;; ZF; the cmovz that follows supplies the result. Between each flag
+;;; producer and its cmovcc only `mov` is emitted.
+;;;
+;;; Narrow values: bits above the type's width are unspecified
+;;; (stogir.x64.value), so every operation that would read them extends its
+;;; operand first; MIN and MAX compare with the 8- and 16-bit `cmp`.
+;;;
+;;; Interface: select!, constrain!, emit! (docs/X86_FAMILIES.md). Nothing is
+;;; selected before liveness; a constant operand of MIN or MAX is built in a
+;;; scratch register, because cmovcc takes no immediate.
+(module stogir.x64.bits)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.integer-binary" :as binary)
+(import "stogir.integer-unary" :as unary)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.emit" :as emit)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.uses" :as uses)
+(import "stogir.x64.value" :as value)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(const CONFLICT "conflicting x86-64 register constraints")
+
+(defn extremum? [(opcode i32)] (-> bool)
+  (or (= opcode 58) (= opcode 59)))
+
+;;; The node's type when it is a well-formed operation of this family.
+(defn validate [(graph g/Graph) (reference i32)] (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions graph) (cast i64 reference))
+        opcode (cast i32 (n/opcode node))
+        ty (cast i32 (n/type-id node))
+        arity (get (.arities graph) (cast i64 reference))]
+    (cond (extremum? opcode)
+            (if (or (not (binary/valid-type? opcode ty))
+                    (!= arity 2)
+                    (!= (value/type-of graph (.op1 node)) ty)
+                    (!= (value/type-of graph (.op2 node)) ty))
+                (Err "invalid x86-64 integer MIN/MAX instruction")
+                (Ok ty))
+          (or (= opcode 32) (and (>= opcode 54) (<= opcode 57)))
+            (if (or (not (unary/valid-type? opcode ty))
+                    (!= arity 1)
+                    (!= (value/type-of graph (.op1 node)) ty))
+                (Err "invalid x86-64 integer unary instruction")
+                (Ok ty))
+          :else (Err "x86-64 backend: operation does not belong to the integer bits family"))))
+
+(defn select! [(state (mut plan/Matching)) (graph g/Graph) (reference i32)]
+  (-> (Result i32 (slice u8)))
+  (match (validate graph reference)
+    (Err [message] (Err message))
+    (Ok [_] (Ok 0))))
+
+(defn constrain! [(set (mut uses/Set)) (graph g/Graph) (matched plan/Plan)
+                  (reference i32) (position i64)] (-> (Result i32 (slice u8)))
+  (match (validate graph reference)
+    (Err [message] (Err message))
+    (Ok [_]
+        (let [node (get (.instructions graph) (cast i64 reference))
+              (mut accepted) (uses/use! (mut set) (.op1 node) position)]
+          (when (extremum? (cast i32 (n/opcode node)))
+            (unless (uses/use! (mut set) (.op2 node) position) (set! accepted false)))
+          (unless (uses/define! (mut set) reference position) (set! accepted false))
+          (uses/hint! (mut set) reference (.op1 node))
+          (if accepted (Ok 0) (Err CONFLICT))))))
+
+;;; rd = the operand of unary node `node` at the operation width: copied when
+;;; the type is at least 32 bits wide, otherwise extended to 32 bits by
+;;; `signed`.
+(defn widened! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+                (reference i32) (position i64) (signed bool) (rd i32)] (-> void)
+  (let [ty (value/type-of (.graph cx) reference)
+        own (value/type-bits ty)]
+    (match (emit/operand! (mut out) cx reference position registers/SCRATCH-GPR)
+      (Err [message] (when (= error "") (set! error message)))
+      (Ok [source]
+          (cond (>= own 32) (emit/move! (mut out) (mut error) own rd source)
+                signed
+                  (code/accept! (mut error)
+                                (encode/movsx-rr (mut (.text out)) 32 own rd source))
+                :else
+                  (code/accept! (mut error)
+                                (encode/movzx-rr (mut (.text out)) 32 own rd source)))))))
+
+;;; `op rd, mask` at `bits`, with the mask in r11 when it is no immediate.
+(defn mask! [(out (mut code/Buffer)) (error (mut (slice u8))) (bits i32) (rd i32)
+             (mask u64)] (-> void)
+  (match (value/immediate-of mask bits)
+    (Some [imm]
+          (code/accept! (mut error) (encode/alu-ri (mut (.text out)) encode/AND bits rd imm)))
+    (None []
+          (do
+            (code/accept-count! (mut error)
+                                (value/bits! (mut out) registers/SCRATCH-GPR-2 mask 64))
+            (code/accept! (mut error)
+                          (encode/alu-rr (mut (.text out)) encode/AND bits rd
+                                         registers/SCRATCH-GPR-2))))))
+
+;;; rd = population count of rd at `bits` (32 or 64), through r10 and r11:
+;;;   x -= (x >> 1) & 0x55..;  x = (x & 0x33..) + ((x >> 2) & 0x33..);
+;;;   x = (x + (x >> 4)) & 0x0F..;  x = (x * 0x01..) >> (bits - 8)
+(defn population! [(out (mut code/Buffer)) (error (mut (slice u8))) (bits i32) (rd i32)]
+  (-> void)
+  (let [temporary (: registers/SCRATCH-GPR i32)
+        full (value/mask bits)
+        fives (& (: 0x5555555555555555 u64) full)
+        threes (& (: 0x3333333333333333 u64) full)
+        nibbles (& (: 0x0F0F0F0F0F0F0F0F u64) full)
+        ones (& (: 0x0101010101010101 u64) full)]
+    (emit/move! (mut out) (mut error) bits temporary rd)
+    (code/accept! (mut error) (encode/shift-ri (mut (.text out)) encode/SHR bits temporary 1))
+    (mask! (mut out) (mut error) bits temporary fives)
+    (code/accept! (mut error) (encode/alu-rr (mut (.text out)) encode/SUB bits rd temporary))
+    (emit/move! (mut out) (mut error) bits temporary rd)
+    (code/accept! (mut error) (encode/shift-ri (mut (.text out)) encode/SHR bits temporary 2))
+    ; One constant serves both masks of the 64-bit form.
+    (if (= bits 64)
+        (do
+          (code/accept-count! (mut error)
+                              (value/bits! (mut out) registers/SCRATCH-GPR-2 threes 64))
+          (code/accept! (mut error)
+                        (encode/alu-rr (mut (.text out)) encode/AND bits temporary
+                                       registers/SCRATCH-GPR-2))
+          (code/accept! (mut error)
+                        (encode/alu-rr (mut (.text out)) encode/AND bits rd
+                                       registers/SCRATCH-GPR-2)))
+        (do
+          (mask! (mut out) (mut error) bits temporary threes)
+          (mask! (mut out) (mut error) bits rd threes)))
+    (code/accept! (mut error) (encode/alu-rr (mut (.text out)) encode/ADD bits rd temporary))
+    (emit/move! (mut out) (mut error) bits temporary rd)
+    (code/accept! (mut error) (encode/shift-ri (mut (.text out)) encode/SHR bits temporary 4))
+    (code/accept! (mut error) (encode/alu-rr (mut (.text out)) encode/ADD bits rd temporary))
+    (mask! (mut out) (mut error) bits rd nibbles)
+    (if (= bits 64)
+        (do
+          (code/accept-count! (mut error)
+                              (value/bits! (mut out) registers/SCRATCH-GPR-2 ones 64))
+          (code/accept! (mut error)
+                        (encode/imul-rr (mut (.text out)) bits rd registers/SCRATCH-GPR-2)))
+        (code/accept! (mut error)
+                      (encode/imul-rri (mut (.text out)) bits rd rd
+                                       (encode/sign-extend 32 (cast i64 ones)))))
+    (code/accept! (mut error)
+                  (encode/shift-ri (mut (.text out)) encode/SHR bits rd (- bits 8)))))
+
+(defn unary! [(out (mut code/Buffer)) (cx context/Context) (node n/Node) (position i64)
+              (rd i32)] (-> (Result i32 (slice u8)))
+  (let [opcode (cast i32 (n/opcode node))
+        ty (cast i32 (n/type-id node))
+        own (value/type-bits ty)
+        wide (value/operation-bits ty)
+        (mut error) ""]
+    (cond (= opcode 32)
+            (do
+              (widened! (mut out) (mut error) cx (.op1 node) position true rd)
+              (emit/move! (mut out) (mut error) wide registers/SCRATCH-GPR rd)
+              (code/accept! (mut error) (encode/unary-r (mut (.text out)) encode/NEG wide rd))
+              (code/accept! (mut error)
+                            (encode/cmov-rr (mut (.text out)) encode/CC-S wide rd
+                                            registers/SCRATCH-GPR)))
+          (= opcode 54)
+            (do
+              (code/accept-count! (mut error) (emit/into! (mut out) cx (.op1 node) position rd))
+              (code/accept! (mut error)
+                            (if (= own 16)
+                                (encode/shift-ri (mut (.text out)) encode/ROL 16 rd 8)
+                                (encode/bswap (mut (.text out)) own rd))))
+          (= opcode 55)
+            (do
+              (widened! (mut out) (mut error) cx (.op1 node) position false rd)
+              (population! (mut out) (mut error) wide rd))
+          :else
+            ; CTLZ and CTTZ. A narrow operand is zero-extended into rd first,
+            ; and a wide one is scanned where it is.
+            (match (if (< own 32)
+                       (do
+                         (widened! (mut out) (mut error) cx (.op1 node) position false rd)
+                         (Ok [i32 (slice u8)] rd))
+                       (emit/operand! (mut out) cx (.op1 node) position registers/SCRATCH-GPR))
+              (Err [message] (set! error message))
+              (Ok [source]
+                  (let [forward (= opcode 57)
+                        zero (if forward (cast u64 wide) (cast u64 (- (* 2 wide) 1)))]
+                    (code/accept! (mut error)
+                                  (encode/scan-rr (mut (.text out))
+                                                  (if forward encode/BSF encode/BSR)
+                                                  wide rd source))
+                    (code/accept-count! (mut error)
+                                        (value/bits! (mut out) registers/SCRATCH-GPR-2 zero 64))
+                    (code/accept! (mut error)
+                                  (encode/cmov-rr (mut (.text out)) encode/CC-E wide rd
+                                                  registers/SCRATCH-GPR-2))
+                    (unless forward
+                      (code/accept! (mut error)
+                                    (encode/alu-ri (mut (.text out)) encode/XOR wide rd
+                                                   (cast i64 (- wide 1))))
+                      (when (< own 32)
+                        (code/accept! (mut error)
+                                      (encode/alu-ri (mut (.text out)) encode/SUB wide rd
+                                                     (cast i64 (- 32 own))))))))))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; rd = MIN or MAX of the two operands. `replace` holds when the second
+;;; operand must replace the first: a > b for MIN, a < b for MAX.
+(defn extremum! [(out (mut code/Buffer)) (cx context/Context) (node n/Node) (position i64)
+                 (rd i32)] (-> (Result i32 (slice u8)))
+  (let [ty (cast i32 (n/type-id node))
+        own (value/type-bits ty)
+        wide (value/operation-bits ty)
+        minimum (= (n/opcode node) 58)
+        replace (if (types/signed? ty)
+                    (if minimum (: encode/CC-G i32) encode/CC-L)
+                    (if minimum (: encode/CC-A i32) encode/CC-B))
+        (mut error) ""]
+    (match (emit/operand! (mut out) cx (.op1 node) position registers/SCRATCH-GPR)
+      (Err [message] (set! error message))
+      (Ok [ra]
+          (match (emit/operand! (mut out) cx (.op2 node) position registers/SCRATCH-GPR-2)
+            (Err [message] (set! error message))
+            (Ok [rb]
+                (code/accept! (mut error) (encode/alu-rr (mut (.text out)) encode/CMP own ra rb))
+                (cond (= rd ra)
+                        (code/accept! (mut error)
+                                      (encode/cmov-rr (mut (.text out)) replace wide rd rb))
+                      (= rd rb)
+                        ; rd holds b: a replaces it unless b must replace a.
+                        (code/accept! (mut error)
+                                      (encode/cmov-rr (mut (.text out)) (encode/invert replace)
+                                                      wide rd ra))
+                      :else
+                        (do
+                          (emit/move! (mut out) (mut error) wide rd ra)
+                          (code/accept! (mut error)
+                                        (encode/cmov-rr (mut (.text out)) replace wide rd
+                                                        rb))))))))
+    (if (= error "") (Ok 0) (Err error))))
+
+(defn emit! [(out (mut code/Buffer)) (cx context/Context) (reference i32) (position i64)]
+  (-> (Result i32 (slice u8)))
+  (match (validate (.graph cx) reference)
+    (Err [message] (Err message))
+    (Ok [_]
+        (let [node (get (.instructions (.graph cx)) (cast i64 reference))]
+          (match (emit/destination cx reference position)
+            (Err [message] (Err message))
+            (Ok [rd]
+                (if (extremum? (cast i32 (n/opcode node)))
+                    (extremum! (mut out) cx node position rd)
+                    (unary! (mut out) cx node position rd))))))))

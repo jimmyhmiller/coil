@@ -1,0 +1,254 @@
+;;; x86-64 address-form arithmetic: sums of registers, a scaled register and
+;;; a constant as one `lea`, and multiplication by small constants without
+;;; `imul`. Register-only forms; folding memory operands into instructions
+;;; belongs to the memory family.
+;;;
+;;; RULE-LEA tile (stogir.x64.select)
+;;;   rd = left + (right << operation) + immediate
+;;;   left       base value, 0 when there is none
+;;;   right      index value, 0 when there is none
+;;;   operation  log2 of the index scale, 0..3
+;;;   immediate  the displacement, a sign-extended 32-bit value
+;;;   bits       32 or 64; a 32-bit lea computes the low bits of narrow types
+;;;
+;;; Selection follows upstream's rules (ir_x86.dasc, IR_LEA_* and
+;;; IR_MUL_PWR2) in two steps.
+;;; `strength`, when a tile is selected:
+;;;   MUL(x, 2)            RULE-LEA x + x
+;;;   MUL(x, 3 | 5 | 9)    RULE-LEA x + x * (2 | 4 | 8)
+;;;   MUL(x, 2^k)          RULE-SHIFT-RI shl k
+;;; Other multiplications keep the three-operand imul.
+;;; `fuse!`, after the memory family chose its memory operands (an ADD it
+;;; gave a memory operand, or absorbed into an address or a read-modify-write
+;;; store, is no longer a register sum and is left alone):
+;;;   ADD(x, y)            RULE-LEA x + y
+;;;   ADD(x, c), SUB(x, c) RULE-LEA x + c, x - c
+;;;
+;;; `fuse!` then lets the RULE-LEA node absorb a producer that is read only by
+;;; it, in its own block and not observed, when the sum still has at most a
+;;; base, one scaled index and a 32-bit displacement:
+;;;   x + (y << k), x + y * (2 | 4 | 8)     k = 1..3     base + index * scale
+;;;   (x + y) + c, (x + (y << k)) + c                    ... + displacement
+;;;   (x + c) + y, (x + c) + (y << k)
+;;;   x * (3 | 5 | 9) + c
+;;; The absorbed node is omitted: it emits nothing and defines no register,
+;;; and the consumer reads its inputs (the matcher rebuilds the consumer's
+;;; machine inputs from the tile).
+;;;
+;;; `emit!` uses the shorter two-address form when the allocator gave the
+;;; result the register of an operand (`add rd, c`, `add rd, r`), and `lea`
+;;; otherwise: no move is needed and the operands stay intact. `lea` writes
+;;; no flags and leaves no flags record; the two-address forms record their
+;;; result's flags as the core's ADD does, so a compare with zero behind an
+;;; in-place decrement still reads them (stogir.x64.code/Flags).
+(module stogir.x64.lea)
+(import "stogir.graph" :as g)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.emit" :as emit)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.select" :as select)
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+(defn tile [(bits i32) (base i32) (index i32) (shift i32) (displacement i64)] (-> select/Tile)
+  (select/Tile :rule select/RULE-LEA :operation shift :bits bits :left base :right index
+               :immediate displacement))
+
+;;; `value` as the displacement of a `bits`-wide lea: the sum wraps at 32
+;;; bits, and must fit a sign-extended 32-bit field at 64.
+(defn displacement [(bits i32) (value i64)] (-> (Option i64))
+  (cond (= bits 32) (Some (encode/sign-extend 32 value))
+        (encode/fits32? value) (Some value)
+        :else (None)))
+
+(defn power-of-two? [(value u64)] (-> bool)
+  (and (!= value 0) (= (& value (- value 1)) 0)))
+
+(defn exponent [(value u64)] (-> i32)
+  (let [(mut bits) value
+        (mut result) (: 0 i32)]
+    (while (> bits 1)
+      (set! bits (>> bits 1))
+      (set! result (+ result 1)))
+    result))
+
+;;; The address or shift form of a multiplication by a constant, or the
+;;; tile itself.
+(defn strength [(selected select/Tile)] (-> select/Tile)
+  (let [bits (.bits selected)
+        left (.left selected)
+        full (if (= bits 64) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)
+        factor (& (cast u64 (.immediate selected)) full)]
+    (cond (or (<= left 0) (not (or (= bits 32) (= bits 64)))
+              (!= (.rule selected) select/RULE-MUL-RI))
+            selected
+          (= factor 2) (tile bits left left 0 0)
+          (or (= factor 3) (= factor 5) (= factor 9))
+            (tile bits left left (exponent (- factor 1)) 0)
+          (power-of-two? factor)
+            (select/Tile :rule select/RULE-SHIFT-RI :operation encode/SHL :bits bits
+                         :left left :right 0 :immediate (cast i64 (exponent factor)))
+          :else selected)))
+
+;;; The address form of a register sum (ADD of two registers, ADD or SUB of
+;;; a register and an immediate), or the tile itself.
+(defn sum [(selected select/Tile)] (-> select/Tile)
+  (let [rule (.rule selected)
+        bits (.bits selected)
+        left (.left selected)]
+    (cond (or (<= left 0) (not (or (= bits 32) (= bits 64)))) selected
+          (and (= rule select/RULE-ALU-RR) (= (.operation selected) encode/ADD)
+               (> (.right selected) 0))
+            (tile bits left (.right selected) 0 0)
+          ; SUB of the minimum stays a `sub`: its negation wraps, and
+          ; `add rd, minimum` would not leave the overflow flag of the
+          ; subtraction, which a flags record may promise (FLAGS-EXACT).
+          (and (= rule select/RULE-ALU-RI)
+               (or (= (.operation selected) encode/ADD)
+                   (and (= (.operation selected) encode/SUB)
+                        (!= (encode/sign-extend bits (.immediate selected))
+                            (encode/sign-extend bits (- 0 (.immediate selected)))))))
+            (match (displacement bits (if (= (.operation selected) encode/ADD)
+                                          (.immediate selected)
+                                          (- 0 (.immediate selected))))
+              (None [] selected)
+              (Some [value] (tile bits left 0 0 value)))
+          :else selected)))
+
+;;; Whether node `producer` may be absorbed by node `reference`: a core node
+;;; read only by it, in its block, that nothing else observes.
+(defn absorbable? [(state plan/Matching) (reference i32) (producer i32)] (-> bool)
+  (and (> producer 0)
+       (let [index (cast i64 producer)]
+         (and (not (get (.omitted state) index))
+              ; families/CORE; that module is above this one.
+              (= (get (.families state) index) 0)
+              (= (get (.counts state) index) 1)
+              (not (get (.protected state) index))
+              (= (get (.blocks state) index) (get (.blocks state) (cast i64 reference)))))))
+
+;;; `whole` with its unscaled term `term` replaced by what `part` computes,
+;;; when the sum keeps the address form. `other` is the remaining register
+;;; term of `whole` (0 when there is none) with its scale `other-shift`.
+(defn combined [(whole select/Tile) (part select/Tile) (other i32) (other-shift i32)]
+  (-> (Option select/Tile))
+  (let [bits (.bits whole)]
+    (cond (!= (.bits part) bits) (None)
+          ; part = y << k
+          (and (= (.rule part) select/RULE-SHIFT-RI) (= (.operation part) encode/SHL)
+               (>= (.immediate part) 1) (<= (.immediate part) 3) (> (.left part) 0)
+               (= other-shift 0))
+            (Some (tile bits other (.left part) (cast i32 (.immediate part))
+                        (.immediate whole)))
+          (!= (.rule part) select/RULE-LEA) (None)
+          :else
+            (match (displacement bits (+ (.immediate whole) (.immediate part)))
+              (None [] (None))
+              (Some [sum]
+                    (cond
+                      ; part = base + (index << k) + c: nothing else fits.
+                      (and (> (.left part) 0) (> (.right part) 0))
+                        (if (= other 0)
+                            (Some (tile bits (.left part) (.right part) (.operation part) sum))
+                            (None))
+                      ; part = base + c: the other term keeps its scale.
+                      (> (.left part) 0)
+                        (Some (tile bits (.left part) other other-shift sum))
+                      :else (None)))))))
+
+;;; Give core node `reference` the address form when it is a register sum,
+;;; and with `absorb` let an address-form node take in its producers while
+;;; the form holds. Called in schedule order after the memory family's
+;;; fusion, so a producer's own form and absorptions are already in its
+;;; tile. An omitted node is left alone: whoever absorbed it reads its
+;;; operands as they are.
+(defn fuse! [(state (mut plan/Matching)) (graph g/Graph) (reference i32) (absorb bool)]
+  (-> void)
+  (let [cell (cast i64 reference)
+        ; families/CORE; that module is above this one.
+        live (and (= (get (.families state) cell) 0) (not (get (.omitted state) cell)))
+        (mut progress) false]
+    (when live
+      (set! (mut (.tiles state)) cell (sum (get (.tiles state) cell)))
+      (set! progress (and absorb (= (.rule (get (.tiles state) cell)) select/RULE-LEA))))
+    (while progress
+      (set! progress false)
+      (let [whole (get (.tiles state) (cast i64 reference))
+            base (.left whole)
+            index (.right whole)
+            shift (.operation whole)]
+        ; The base is unscaled; so is an index of scale one. A value that is
+        ; both terms (x + x * 2) stays: the tile would still read it.
+        (when (and (!= index base) (absorbable? state reference base))
+          (match (combined whole (get (.tiles state) (cast i64 base)) index shift)
+            (None [] 0)
+            (Some [merged]
+                  (set! (mut (.omitted state)) (cast i64 base) true)
+                  (set! (mut (.tiles state)) (cast i64 reference) merged)
+                  (set! progress true))))
+        (when (and (not progress) (= shift 0) (!= index base) (absorbable? state reference index))
+          (match (combined whole (get (.tiles state) (cast i64 index)) base 0)
+            (None [] 0)
+            (Some [merged]
+                  (set! (mut (.omitted state)) (cast i64 index) true)
+                  (set! (mut (.tiles state)) (cast i64 reference) merged)
+                  (set! progress true))))))))
+
+(defn emit! [(out (mut code/Buffer)) (cx context/Context) (reference i32) (position i64)
+             (selected select/Tile)] (-> (Result i32 (slice u8)))
+  (match (emit/destination cx reference position)
+    (Err [message] (Err message))
+    (Ok [rd]
+        (let [bits (.bits selected)
+              shift (.operation selected)
+              offset (.immediate selected)
+              (mut error) ""
+              (mut base) (: encode/NO-REG i32)
+              (mut index) (: encode/NO-REG i32)]
+          (when (> (.left selected) 0)
+            (match (emit/operand! (mut out) cx (.left selected) position registers/SCRATCH-GPR)
+              (Err [message] (set! error message))
+              (Ok [register] (set! base register))))
+          (when (> (.right selected) 0)
+            (match (emit/operand! (mut out) cx (.right selected) position
+                                  registers/SCRATCH-GPR-2)
+              (Err [message] (set! error message))
+              (Ok [register] (set! index register))))
+          ; Flags (stogir.x64.code/Flags). `lea` and `mov` leave no record,
+          ; so a compare with zero behind them tests the value. The `add`
+          ; forms record their result like the core's ADD. A sum that emits
+          ; nothing (rd = rd + 0) drops whatever record the instruction
+          ; before it left: the driver may otherwise promote that record
+          ; for this node (code/exact-flags!).
+          (code/clear-flags! (mut out))
+          (cond (!= error "") 0
+                (or (< shift 0) (> shift 3) (not (encode/fits32? offset))
+                    (and (< base 0) (< index 0)))
+                  (set! error "x86-64 backend: malformed address-form tile")
+                ; rd = rd + c
+                (and (= rd base) (< index 0))
+                  (when (!= offset 0)
+                    (code/accept! (mut error)
+                                  (encode/alu-ri (mut (.text out)) encode/ADD bits rd offset))
+                    (code/note-flags! (mut out) rd bits code/FLAGS-RESULT))
+                ; rd = rd + r
+                (and (= rd base) (= shift 0) (= offset 0))
+                  (do
+                    (code/accept! (mut error)
+                                  (encode/alu-rr (mut (.text out)) encode/ADD bits rd index))
+                    (code/note-flags! (mut out) rd bits code/FLAGS-RESULT))
+                (and (= rd index) (= shift 0) (= offset 0) (>= base 0))
+                  (do
+                    (code/accept! (mut error)
+                                  (encode/alu-rr (mut (.text out)) encode/ADD bits rd base))
+                    (code/note-flags! (mut out) rd bits code/FLAGS-RESULT))
+                ; rd = r
+                (and (< index 0) (= offset 0)) (emit/move! (mut out) (mut error) bits rd base)
+                :else
+                  (code/accept! (mut error)
+                                (encode/lea (mut (.text out)) bits rd
+                                            (encode/mem-index base index (<< (: 1 i32) shift)
+                                                              offset))))
+          (if (= error "") (Ok 0) (Err error))))))

@@ -1,0 +1,182 @@
+;;; Floating comparisons on x86-64: `ucomiss/ucomisd` and the conditions that
+;;; read its flags.
+;;;
+;;; `ucomisd a, b` sets ZF PF CF to 1 1 1 when either operand is a NaN
+;;; (unordered), 0 0 0 when a > b, 0 0 1 when a < b and 1 0 0 when a = b.
+;;; As upstream's ir_emit_cmp_fp (dstogov/ir ir_x86.dasc) does, each predicate
+;;; picks the operand order whose single condition code is already right for
+;;; unordered operands; only equality needs the parity flag as well:
+;;;
+;;;   EQ   ucomis a, b   E and not P      NE   ucomis a, b   NE or P
+;;;   LT   ucomis b, a   A                GE   ucomis a, b   AE
+;;;   LE   ucomis b, a   AE               GT   ucomis a, b   A
+;;;   ULT  ucomis a, b   B                UGE  ucomis b, a   BE
+;;;   ULE  ucomis a, b   BE               UGT  ucomis b, a   B
+;;;   ORDERED  ucomis a, b   NP           UNORDERED  ucomis a, b   P
+;;;
+;;; (LT GE LE GT are false and ULT UGE ULE UGT true for unordered operands;
+;;; EQ is false and NE true.)
+;;;
+;;; Extended conditions. Every flag consumer of the backend (IF, COND, the
+;;; BOOL result) takes a condition as one i32: a plain condition code 0..15,
+;;; or a code combined with parity:
+;;;   AND-NP + cc   cc holds and PF is clear   (EQ)
+;;;   OR-P + cc     cc holds or PF is set      (NE, and the truth of a value)
+;;; `invert` maps each kind to the other. Consumers handle the two-flag forms
+;;; with two branches, two `setcc` or two `cmovcc` (stogir.x64.edges
+;;; /branch-edge-parity!, `boolean!` here, stogir.x64.conditional).
+;;;
+;;; Flags: operands are loaded before the compare; `ucomis` is the last
+;;; instruction `flags!` emits.
+(module stogir.x64.fcompare)
+(import "stogir.floating" :as floating)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.local" :as local)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.select" :as select)
+(import "stogir.x64.value" :as value)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(const AND-NP (: 16 i32))
+
+(const OR-P (: 32 i32))
+
+;;; A plain condition code, readable by one jcc/setcc/cmovcc.
+(defn simple? [(condition i32)] (-> bool)
+  (and (>= condition 0) (< condition 16)))
+
+(defn and-np? [(condition i32)] (-> bool)
+  (= (& condition 48) AND-NP))
+
+(defn or-p? [(condition i32)] (-> bool)
+  (= (& condition 48) OR-P))
+
+;;; The condition code of an extended condition.
+(defn code-of [(condition i32)] (-> i32)
+  (& condition 15))
+
+;;; The condition that holds exactly when `condition` does not.
+(defn invert [(condition i32)] (-> i32)
+  (cond (simple? condition) (encode/invert condition)
+        (and-np? condition) (+ OR-P (encode/invert (code-of condition)))
+        :else (+ AND-NP (encode/invert (code-of condition)))))
+
+;;; The compare instruction of a floating type's width.
+(defn compare-op [(bits i32)] (-> i32)
+  (if (= bits 64) encode/UCOMISD encode/UCOMISS))
+
+;;; The flags recipe of floating comparison `reference` (EQ .. UNORDERED of
+;;; two FLOAT or two DOUBLE operands).
+(defn tile [(graph g/Graph) (reference i32)] (-> (Result select/Tile (slice u8)))
+  (match (floating/validate graph reference)
+    (Err [message] (Err message))
+    (Ok [ty]
+        (let [node (get (.instructions graph) (cast i64 reference))
+              opcode (cast i32 (n/opcode node))
+              a (.op1 node)
+              b (.op2 node)
+              bits (if (value/double? ty) (: 64 i32) 32)
+              ; Symmetric predicates keep a constant on the right.
+              flip (and (< a 0) (> b 0))
+              swapped (or (= opcode 16) (= opcode 18) (= opcode 21) (= opcode 23)
+                          (and flip (or (= opcode 14) (= opcode 15) (= opcode 24)
+                                        (= opcode 25))))
+              condition
+                (case opcode
+                  14 (+ AND-NP (: encode/CC-E i32))
+                  15 (+ OR-P encode/CC-NE)
+                  16 encode/CC-A
+                  17 encode/CC-AE
+                  18 encode/CC-AE
+                  19 encode/CC-A
+                  20 encode/CC-B
+                  21 encode/CC-BE
+                  22 encode/CC-BE
+                  23 encode/CC-B
+                  24 encode/CC-NP
+                  25 encode/CC-P
+                  -1)]
+          (if (or (not (floating/comparison? opcode)) (< condition 0))
+              (Err "invalid x86-64 floating comparison")
+              (Ok (select/Tile :rule select/RULE-FCOMPARE :operation condition :bits bits
+                               :left (if swapped b a) :right (if swapped a b)
+                               :immediate 0)))))))
+
+;;; Emit the flags of floating comparison `tile`, reading its operands at
+;;; `position`; the result is the extended condition that holds when the
+;;; comparison is true. xmm14 and xmm15 carry constants and reloads.
+(defn flags! [(out (mut code/Buffer)) (cx context/Context) (position i64)
+              (tile select/Tile)] (-> (Result i32 (slice u8)))
+  (if (!= (.rule tile) select/RULE-FCOMPARE)
+      (Err "x86-64 floating flags requested from a tile that is not a floating comparison")
+      (match (value/float-register! (mut out) (.graph cx) (.parts cx) (.base cx)
+                                    (.left tile) position registers/SCRATCH-SIMD)
+        (Err [message] (Err message))
+        (Ok [xa]
+            ; The right operand is compared where it is (register, spill slot
+            ; or constant pool).
+            (match (value/float-apply! (mut out) (.graph cx) (.parts cx) (.base cx)
+                                       (compare-op (.bits tile)) xa (.right tile) position
+                                       registers/SCRATCH-SIMD-2)
+              (Err [message] (Err message))
+              (Ok [_] (Ok (.operation tile))))))))
+
+;;; Flags for "floating value `reference` is not zero": true for a NaN, false
+;;; for either signed zero (stogir.conditional/truth-value). The result is
+;;; the extended condition NE or P.
+(defn truth-flags! [(out (mut code/Buffer)) (cx context/Context) (reference i32)
+                    (position i64)] (-> (Result i32 (slice u8)))
+  (let [ty (value/type-of (.graph cx) reference)]
+    (if (not (types/floating? ty))
+        (Err "x86-64 floating truth test of a value that is not floating")
+        (match (value/float-register! (mut out) (.graph cx) (.parts cx) (.base cx)
+                                      reference position registers/SCRATCH-SIMD)
+          (Err [message] (Err message))
+          (Ok [x]
+              (let [(mut error) ""]
+                (code/accept! (mut error)
+                              (encode/sse-rr (mut (.text out)) encode/XORPS
+                                             registers/SCRATCH-SIMD-2 registers/SCRATCH-SIMD-2))
+                (code/accept! (mut error)
+                              (encode/sse-rr (mut (.text out))
+                                             (compare-op (if (value/double? ty) 64 32))
+                                             x registers/SCRATCH-SIMD-2))
+                (if (= error "") (Ok (+ OR-P encode/CC-NE)) (Err error))))))))
+
+;;; rd = 1 when the extended `condition` holds, else 0 (a canonical BOOL).
+;;; `setcc` and `movzx` keep the flags; the combining `and`/`or` comes after
+;;; both flags are read. r11 is the second byte.
+(defn boolean! [(out (mut code/Buffer)) (condition i32) (rd i32)] (-> (Result i32 (slice u8)))
+  (let [(mut error) ""
+        cc (code-of condition)]
+    (code/accept! (mut error) (encode/setcc-r (mut (.text out)) cc rd))
+    (unless (simple? condition)
+      (code/accept! (mut error)
+                    (encode/setcc-r (mut (.text out))
+                                    (if (and-np? condition) encode/CC-NP encode/CC-P)
+                                    registers/SCRATCH-GPR-2))
+      (code/accept! (mut error)
+                    (encode/alu-rr (mut (.text out))
+                                   (if (and-np? condition) encode/AND encode/OR)
+                                   8 rd registers/SCRATCH-GPR-2)))
+    (code/accept! (mut error) (encode/movzx-rr (mut (.text out)) 32 8 rd rd))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; Jump to local label `target` when the extended `condition` holds.
+(defn jump-if! [(out (mut code/Buffer)) (error (mut (slice u8))) (jumps (mut local/Jumps))
+                (condition i32) (target i64)] (-> void)
+  (cond (simple? condition) (local/jump! (mut out) (mut error) (mut jumps) condition target)
+        (or-p? condition)
+          (do
+            (local/jump! (mut out) (mut error) (mut jumps) encode/CC-P target)
+            (local/jump! (mut out) (mut error) (mut jumps) (code-of condition) target))
+        :else
+          (let [skip (local/label! (mut jumps))]
+            (local/jump! (mut out) (mut error) (mut jumps) encode/CC-P skip)
+            (local/jump! (mut out) (mut error) (mut jumps) (code-of condition) target)
+            (local/bind! (mut out) (mut jumps) skip))))

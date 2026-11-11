@@ -1,0 +1,151 @@
+;;; The x86-64 memory operand of an access: [base + index * scale + disp32].
+;;;
+;;; This is the one address-mode helper of the backend. Every emitter that
+;;; reads or writes memory through a LOAD or STORE node uses it, whatever the
+;;; value's class: the integer accesses and fused operands of the memory
+;;; family, and the floating and vector accesses of their families.
+;;;
+;;;   (parts matched graph access)
+;;;       What selection decided for LOAD/STORE `access` (or for a LOAD that
+;;;       was fused into its consumer): base reference, displacement, index
+;;;       reference (0: none) and log2 scale, from the plan's `addresses`,
+;;;       `offsets`, `indices` and `index-shifts` tables
+;;;       (stogir.x64.memory/fuse! fills them). An access without an entry
+;;;       reads its address operand as the base.
+;;;   (operand! out cx access position)
+;;;       The encode/Mem of `access` with its base and index read at
+;;;       `position`. Emits only `mov` and `lea`, so flags survive.
+;;;   (tile-operands matched graph tile)
+;;;       The values a tile reads from registers, with a fused load replaced
+;;;       by its base and index: what a constraints builder must `use!`.
+;;;   (collapse! out m)
+;;;       `lea r10, m`; the operand becomes [r10]. For an emitter that is
+;;;       about to overwrite a register the operand names.
+;;;
+;;; Scratch contract of `operand!`: it may write r10 and r11, and the operand
+;;; it returns names allocated registers, rsp, rbp and at most r10. r11 is
+;;; therefore free for the caller's other operand afterwards (a constant or
+;;; reloaded store value, the register side of a compare).
+;;;
+;;; Base forms
+;;;   * a value in a register: [reg + ...];
+;;;   * a static frame object (rematerialized frame address): its frame slot
+;;;     is folded into the displacement, [rsp/rbp + slot + disp];
+;;;   * a constant (numeric or named) or a spilled value: built in r10.
+;;; The matcher guarantees a displacement that fits 32 bits before the frame
+;;; slot is added; a sum that does not fit is an error, not a wrong address.
+;;;
+;;; The a64 address module is not shared: it selects [base, #imm] and
+;;; [base, index, lsl #log2(width)] under AArch64 encodability rules.
+(module stogir.x64.address)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.locations" :as loc)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.frame-address" :as frame)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.select" :as select)
+(import "stogir.x64.value" :as value)
+(import "coil.result" :use [Result Ok Err])
+
+(defstruct Parts [(base i32) (offset i64) (index i32) (shift i32)])
+
+(defn parts [(matched plan/Plan) (graph g/Graph) (access i32)] (-> Parts)
+  (let [slot (cast i64 access)
+        base (get (.addresses matched) slot)]
+    (if (= base 0)
+        (Parts :base (.op2 (get (.instructions graph) slot)) :offset 0 :index 0 :shift 0)
+        (Parts :base base
+               :offset (get (.offsets matched) slot)
+               :index (get (.indices matched) slot)
+               :shift (get (.index-shifts matched) slot)))))
+
+;;; The values a comparison or memory-operand tile needs in registers: both
+;;; operands of a register tile; the register operand and the fused load's
+;;; base and index of a tile with a memory operand. 0 stands for none (and a
+;;; constant needs no register). Every constraints builder that reads a tile
+;;; some other node selected (the condition of an IF or COND) uses this
+;;; rather than the tile's `left` and `right`, which may name an omitted load.
+(defstruct Read [(first i32) (second i32) (third i32)])
+
+(defn tile-operands [(matched plan/Plan) (graph g/Graph) (tile select/Tile)] (-> Read)
+  (let [fused (select/memory-operand tile)]
+    (if (= fused 0)
+        (Read :first (.left tile) :second (.right tile) :third 0)
+        (let [selected (parts matched graph fused)]
+          (Read :first (select/register-operand tile) :second (.base selected)
+                :third (.index selected))))))
+
+;;; Whether memory operand `m` names general register `register`.
+(defn names? [(m encode/Mem) (register i32)] (-> bool)
+  (or (= (.base m) register) (and (!= (.index m) encode/NO-REG) (= (.index m) register))))
+
+;;; lea r10, m: the operand as [r10].
+(defn collapse! [(out (mut code/Buffer)) (m encode/Mem)] (-> (Result encode/Mem (slice u8)))
+  (match (encode/lea (mut (.text out)) 64 registers/SCRATCH-GPR m)
+    (Err [message] (Err message))
+    (Ok [_] (Ok (encode/mem registers/SCRATCH-GPR 0)))))
+
+;;; The memory operand of selected address `selected`, read at `position`.
+(defn of-parts! [(out (mut code/Buffer)) (cx context/Context) (selected Parts)
+                 (position i64)] (-> (Result encode/Mem (slice u8)))
+  (let [(mut error) ""
+        (mut base) (: -1 i32)
+        (mut displacement) (.offset selected)
+        (mut index) (: encode/NO-REG i32)
+        folded
+          (if (> (.base selected) 0)
+              (match (loc/resolve (.parts cx) (.base selected) position)
+                (Err [_] false)
+                (Ok [location] (loc/rematerialized? location)))
+              false)]
+    (cond (or (< (.shift selected) 0) (> (.shift selected) 3)
+              (and (= (.index selected) 0) (!= (.shift selected) 0)))
+            (set! error "invalid selected x86-64 address scale")
+          folded
+            (match (loc/resolve (.parts cx) (.base selected) position)
+              (Err [message] (set! error message))
+              (Ok [location]
+                  (match (frame/slot (.base cx) (.value location))
+                    (Err [message] (set! error message))
+                    (Ok [slot]
+                        (set! base (.base slot))
+                        (set! displacement (+ displacement (.disp slot)))))))
+          :else
+            (match (value/register-with-locations! (mut out) (.graph cx) (.parts cx) (.base cx)
+                                                   (.base selected) position
+                                                   registers/SCRATCH-GPR)
+              (Err [message] (set! error message))
+              (Ok [register] (set! base register))))
+    (when (and (= error "") (!= (.index selected) 0))
+      (match (value/register-with-locations! (mut out) (.graph cx) (.parts cx) (.base cx)
+                                             (.index selected) position
+                                             registers/SCRATCH-GPR-2)
+        (Err [message] (set! error message))
+        (Ok [register] (set! index register))))
+    (cond (!= error "") (Err error)
+          (not (encode/fits32? displacement))
+            (Err "x86-64 memory operand displacement exceeds 32 bits")
+          (= index encode/NO-REG) (Ok (encode/mem base displacement))
+          ; A scratch index is folded away so that r11 stays free for the
+          ; caller.
+          (= index registers/SCRATCH-GPR-2)
+            (collapse! (mut out)
+                       (encode/mem-index base index (<< (: 1 i32) (.shift selected))
+                                         displacement))
+          :else
+            (Ok (encode/mem-index base index (<< (: 1 i32) (.shift selected)) displacement)))))
+
+;;; The memory operand of LOAD/STORE `access` (see the module comment).
+(defn operand! [(out (mut code/Buffer)) (cx context/Context) (access i32) (position i64)]
+  (-> (Result encode/Mem (slice u8)))
+  (of-parts! (mut out) cx (parts (.matched cx) (.graph cx) access) position))
+
+;;; The memory operand [address + 0] of a node that takes its address as a
+;;; plain operand `address` (atomics, bulk helpers).
+(defn plain! [(out (mut code/Buffer)) (cx context/Context) (address i32) (position i64)]
+  (-> (Result encode/Mem (slice u8)))
+  (of-parts! (mut out) cx (Parts :base address :offset 0 :index 0 :shift 0) position))

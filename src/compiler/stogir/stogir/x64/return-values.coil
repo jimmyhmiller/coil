@@ -1,0 +1,152 @@
+;;; Direct register returns of integer result pieces on x86-64.
+;;;
+;;; A function whose result role is one or two U64/I64 register pieces
+;;; normally fills a private frame buffer (PARAM 0 is its address) that RETURN
+;;; loads into rax/rdx. When memory promotion can eliminate that buffer
+;;; entirely, each RETURN instead reads the piece values themselves: they are
+;;; moved straight into rax and rdx and the function needs no buffer.
+;;;
+;;; The graph transformation is the target-neutral one of
+;;; stogir.a64.return-values (`lower`: the place becomes a private frame
+;;; object, each RETURN gets loads of the pieces, mem2ssa promotes the object
+;;; away or the attempt is dropped). This module is what a backend adds: which
+;;; PARAM is the private place under System V (stogir.x64.incoming, kind 3),
+;;; the machine uses of the pieces at each RETURN, and the fallback when the
+;;; lowered copy would need a constant the caller's graph does not have.
+;;; Mixed and floating pairs keep the buffer.
+(module stogir.x64.return-values)
+(import "stogir.a64.return-values" :as shared)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.stack" :as stack)
+(import "stogir.calls" :as calls)
+(import "stogir.liveness" :as live)
+(import "stogir.matched-uses" :as machine)
+(import "stogir.placement" :as placement)
+(import "stogir.verify" :as verify)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.incoming" :as incoming)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+;;; The lowered copy of `graph`, or None when the role is not one or two
+;;; integer pieces, the frame can be observed, or promotion is incomplete.
+;;; `graph` and `roots` are never edited.
+(defn prepare [(graph g/Graph) (entry i32) (roots (slice i32)) (validated bool)
+               (a (dyn Allocator))] (-> (Result (Option shared/Lowered) (slice u8)))
+  (match (calls/function-result graph)
+    (Err [message] (Err message))
+    (Ok [spec]
+        (if (not (and (= (.kind spec) 1) (= (.second spec) 0)
+                      (or (= (.ty spec) 5) (= (.ty spec) 11))
+                      (>= (.count spec) 1) (<= (.count spec) 2)))
+            (Ok (None))
+            (match (if validated
+                       (verify/native-input-after-validate graph entry roots)
+                       (verify/native-input graph entry roots))
+              (Err [message] (Err message))
+              (Ok [_]
+                  (match (incoming/build graph entry a)
+                    (Err [message] (Err message))
+                    (Ok [parameters]
+                        (let [(mut parameters) parameters
+                              (mut place) (: 0 i32)
+                              (mut safe) true
+                              (mut r) (: 1 i64)
+                              (mut marked) (live/mark graph roots a)]
+                          (for parameter parameters
+                            (when (= (.kind parameter) 3) (set! place (.reference parameter))))
+                          (free! (mut parameters))
+                          ; Raw stack operations and opaque assembly can
+                          ; observe the frame's geometry.
+                          (while (< r (len (.instructions graph)))
+                            (let [node (get (.instructions graph) r)
+                                  opcode (cast i32 (n/opcode node))
+                                  count (get (.arities graph) r)]
+                              (when (or (= opcode 66)
+                                        (and (= opcode 81) (not (stack/frame-object? node)))
+                                        (and (>= opcode 82) (<= opcode 84))
+                                        (and (>= opcode 122) (<= opcode 124)))
+                                (set! safe false))
+                              (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+                          (let [answer (if (or (<= place 0) (not safe))
+                                           (Ok (None))
+                                           (shared/lower graph entry roots place spec marked a))]
+                            (free! (mut marked))
+                            answer))))))))))
+
+;;; Each direct return's pieces as uses located at that RETURN, for placement.
+(defn anchors [(returns (slice shared/Return)) (a (dyn Allocator))]
+  (-> (ArrayList placement/Anchor))
+  (let [(mut result) (ArrayList::new [placement/Anchor] a)]
+    (for item returns
+      (when (> (.low item) 0)
+        (push! (mut result) (placement/Anchor :value (.low item) :user (.reference item))))
+      (when (> (.high item) 0)
+        (push! (mut result) (placement/Anchor :value (.high item) :user (.reference item)))))
+    result))
+
+;;; Give each direct RETURN its pieces as machine inputs, after its original
+;;; (void) input: liveness, constraints and emission read them from there.
+(defn install-uses! [(graph g/Graph) (returns (slice shared/Return))
+                     (plan (mut machine/Plan)) (count i32)] (-> (Result i32 (slice u8)))
+  (let [(mut error) ""]
+    (for item returns
+      (when (= error "")
+        (let [ref (.reference item)
+              node (get (.instructions graph) (cast i64 ref))
+              range (get (.ranges plan) (cast i64 ref))
+              offset (len (.inputs plan))
+              original (if (= (.count range) 1) (get (.inputs plan) (.offset range)) 0)]
+          (if (not (and (= (n/opcode node) 120) (= (n/type-id node) 0)
+                        (or (= (.count range) 0) (= (.count range) 1))
+                        (not (get (.omitted plan) (cast i64 ref)))))
+              (set! error "invalid or duplicate direct return site")
+              (do
+                (push! (mut (.inputs plan)) original)
+                (for [k 0 (cast i64 count)]
+                  (let [piece (if (= k 0) (.low item) (.high item))]
+                    (match (g/lookup graph piece)
+                      (None [] (set! error "direct return value missing"))
+                      (Some [_] 0))
+                    (push! (mut (.inputs plan)) piece)))
+                (set! (mut (.ranges plan)) (cast i64 ref)
+                      (machine/Range :offset offset :count (+ (cast i64 count) 1))))))))
+    (if (= error "") (Ok (cast i32 (len returns))) (Err error))))
+
+;;; Number of direct pieces RETURN `reference` carries (0: it returns through
+;;; the frame buffer or is an ordinary return).
+(defn pieces [(graph g/Graph) (plan machine/Plan) (reference i32)] (-> i64)
+  (let [node (get (.instructions graph) (cast i64 reference))
+        range (get (.ranges plan) (cast i64 reference))]
+    (if (and (= (n/opcode node) 120) (= (n/type-id node) 0) (> (.count range) 1))
+        (- (.count range) 1)
+        0)))
+
+;;; Direct piece `index` of RETURN `reference`.
+(defn piece [(plan machine/Plan) (reference i32) (index i64)] (-> i32)
+  (get (.inputs plan) (+ (.offset (get (.ranges plan) (cast i64 reference))) 1 index)))
+
+;;; Whether every constant `text` refers to means the same in `source` as in
+;;; the lowered copy it was generated from, so the caller can finish the code
+;;; against the graph it supplied.
+(defn shared-references? [(source g/Graph) (lowered g/Graph) (text code/Buffer)] (-> bool)
+  (let [(mut good) true]
+    (for pending (.references text)
+      (unless (code/runtime? pending)
+        (let [ref (.target pending)]
+          (if (>= ref 0)
+              (set! good false)
+              (match (g/lookup source ref)
+                (None [] (set! good false))
+                (Some [before]
+                      (match (g/lookup lowered ref)
+                        (None [] (set! good false))
+                        (Some [after]
+                              (unless (and (= (.header before) (.header after))
+                                           (= (.op1 before) (.op1 after))
+                                           (= (.op2 before) (.op2 after))
+                                           (= (.op3 before) (.op3 after)))
+                                (set! good false))))))))))
+    good))

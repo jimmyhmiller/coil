@@ -1,0 +1,123 @@
+;;; Fixed-frame addressing for x86-64.
+;;;
+;;; Logical frame offsets are measured upward from rsp after the prologue, as
+;;; on AArch64 (docs/X86_PORT.md, "Frame"): outgoing area, locals, spills,
+;;; callee-saved area. With the stack base a logical offset is the rsp
+;;; displacement itself.
+;;;
+;;; An anchored frame (dynamic stack or an alignment above 16; the stack
+;;; family) addresses the same offsets from rbp, because rsp moves under
+;;; ALLOCA: `bias` is the logical offset rbp points at, which is the frame's
+;;; size N, so logical offset L is at [rbp - N + L].
+;;;
+;;;   ordinary anchored frame          over-aligned anchored frame (A > 16)
+;;;     push rbp                         push rbp
+;;;     mov  rbp, rsp                    mov  rbp, rsp
+;;;     sub  rsp, N                      sub  rsp, N
+;;;                                      and  rsp, -A
+;;;                                      mov  [rsp + entry-slot], rbp
+;;;                                      lea  rbp, [rsp + N]
+;;;
+;;; In the ordinary form rbp is the anchor itself: [rbp] is the caller's rbp,
+;;; [rbp + 8] the return address and the first stack parameter is at
+;;; [rbp + 16]. In the over-aligned form the gap between the anchor and the
+;;; aligned frame is unknown, so the anchor is kept in the frame's entry slot
+;;; (`entry-slot`, a logical offset; -1 when there is none) and rbp points at
+;;; the aligned frame top; N is then a multiple of A, which keeps every
+;;; aligned logical offset aligned in memory.
+;;;
+;;; Two things are NOT at [rbp - N + L] in an anchored frame:
+;;;   * the outgoing call area (logical offsets below the function's
+;;;     outgoing size): it is the bottom of the stack wherever rsp is, so it
+;;;     is addressed with `outgoing`;
+;;;   * stack parameters: use `parameter!`.
+;;;
+;;; The a64 module of this name is not shared: it encodes AArch64 immediates
+;;; and its base registers are x29/sp.
+(module stogir.x64.frame-address)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.registers" :as registers)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+(defstruct Base [(reg i32) (bias i64) (entry-slot i64)])
+
+(defn stack-base [] (-> Base)
+  (Base :reg registers/RSP :bias 0 :entry-slot -1))
+
+;;; The base of an anchored frame of `size` bytes (the prologue's `sub`).
+;;; `entry-slot` is the logical offset of the saved anchor of an
+;;; over-aligned frame, -1 for an ordinary anchored frame.
+(defn anchored-base [(size i64) (entry-slot i64)] (-> Base)
+  (Base :reg registers/RBP :bias size :entry-slot entry-slot))
+
+(defn anchored? [(base Base)] (-> bool)
+  (= (.reg base) registers/RBP))
+
+(defn valid-base? [(base Base)] (-> bool)
+  (or (and (= (.reg base) registers/RSP) (= (.bias base) 0) (< (.entry-slot base) 0))
+      (and (= (.reg base) registers/RBP)
+           (>= (.bias base) 0)
+           (= (% (.bias base) 16) 0)
+           (or (< (.entry-slot base) 0)
+               (<= (.entry-slot base) (- (.bias base) 8))))))
+
+;;; The memory operand of the frame bytes at logical `offset`.
+(defn slot [(base Base) (offset i64)] (-> (Result encode/Mem (slice u8)))
+  (if (or (not (valid-base? base)) (< offset 0))
+      (Err "invalid x86-64 frame base or offset")
+      (let [displacement (- offset (.bias base))]
+        (if (not (encode/fits32? displacement))
+            (Err "x86-64 frame offset exceeds a 32-bit displacement")
+            (Ok (encode/mem (.reg base) displacement))))))
+
+;;; The memory operand of outgoing call-area bytes at `offset`: always the
+;;; bottom of the stack, also in an anchored frame after ALLOCA moved rsp.
+(defn outgoing [(offset i64)] (-> (Result encode/Mem (slice u8)))
+  (if (or (< offset 0) (not (encode/fits32? offset)))
+      (Err "invalid x86-64 outgoing call-area offset")
+      (Ok (encode/mem registers/RSP offset))))
+
+;;; mov destination, anchor: the address of the saved caller rbp (the value
+;;; rbp had after `push rbp; mov rbp, rsp`). Only for anchored frames. Flags
+;;; are untouched.
+(defn anchor! [(output (mut (ArrayList u8))) (base Base) (destination i32)]
+  (-> (Result i32 (slice u8)))
+  (let [begin (len output)]
+    (if (or (not (valid-base? base)) (not (anchored? base)))
+        (Err "x86-64 frame anchor requested from a frame that has none")
+        (match (if (< (.entry-slot base) 0)
+                   (encode/mov-rr (mut output) 64 destination registers/RBP)
+                   (match (slot base (.entry-slot base))
+                     (Err [message] (Err [i64 (slice u8)] message))
+                     (Ok [m] (encode/mov-rm (mut output) 64 destination m))))
+          (Err [message] (Err message))
+          (Ok [_] (Ok (cast i32 (- (len output) begin))))))))
+
+;;; The memory operand of the stack-parameter bytes at `offset` from the
+;;; first stack argument (entry rsp + 8). `frame-size` is the prologue's rsp
+;;; adjustment. An over-aligned frame first loads its anchor into `scratch`
+;;; (a general register the caller owns; the operand then uses it as base);
+;;; the other forms emit nothing. Flags are untouched.
+(defn parameter! [(output (mut (ArrayList u8))) (base Base) (frame-size i64)
+                  (offset i64) (scratch i32)] (-> (Result encode/Mem (slice u8)))
+  (cond (or (not (valid-base? base)) (< offset 0) (< frame-size 0))
+          (Err "invalid x86-64 stack parameter base or offset")
+        (not (anchored? base))
+          (if (encode/fits32? (+ frame-size 8 offset))
+              (Ok (encode/mem registers/RSP (+ frame-size 8 offset)))
+              (Err "x86-64 stack parameter offset exceeds a 32-bit displacement"))
+        (not (encode/fits32? (+ 16 offset)))
+          (Err "x86-64 stack parameter offset exceeds a 32-bit displacement")
+        (< (.entry-slot base) 0) (Ok (encode/mem registers/RBP (+ 16 offset)))
+        :else
+          (match (anchor! (mut output) base scratch)
+            (Err [message] (Err message))
+            (Ok [_] (Ok (encode/mem scratch (+ 16 offset)))))))
+
+;;; rsp-relative bytes this function's frame occupies below the return
+;;; address: the frame contents rounded up so that rsp is 16-byte aligned after
+;;; the prologue (entry rsp + 8 + N is a multiple of 16). Zero stays zero: a
+;;; function with no frame contents is frameless.
+(defn allocation-size [(aligned-contents i64)] (-> i64)
+  (if (= aligned-contents 0) 0 (+ aligned-contents 8)))

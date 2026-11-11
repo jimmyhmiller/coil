@@ -1,0 +1,659 @@
+;;; x86-64 memory accesses: LOAD and STORE of integer values, address-mode
+;;; selection, loads fused into their consumer, and read-modify-write stores.
+;;;
+;;; Operations: LOAD, LOAD_v, STORE, STORE_v (91..94) of every integer type.
+;;; Floating and vector accesses belong to their own families; their
+;;; addresses are selected here like any other and read with
+;;; stogir.x64.address/operand!. RLOAD/RSTORE (89, 90) and TLS_ADDR (95) are
+;;; not implemented and report a clear error.
+;;;
+;;; Named constants (FUNC, SYM, STR) are not this module's nodes: they are
+;;; ordinary operands rebuilt by stogir.x64.value/constant! through
+;;; stogir.x64.code/reference-address!, and stogir.x64.image resolves them.
+;;;
+;;; Values (stogir.x64.value): a LOAD of 4 or 8 bytes is `mov`; a narrower
+;;; one extends to 32 bits by its type's signedness (`movsx`/`movzx`), which
+;;; satisfies "bits above the type are unspecified" and avoids a partial
+;;; register write. A STORE writes exactly the type's bytes; a constant that
+;;; fits is stored as an immediate (`mov m, imm32`).
+;;;
+;;; Selection (`fuse!`, after the core's own tiles and comparison fusion)
+;;;
+;;;   1. Addresses. The address of every LOAD and STORE is matched as
+;;;      base + index * 2^shift + disp32 through 64-bit ADD, SHL by 1..3,
+;;;      MUL by 2, 4 or 8 and word BITCAST nodes, and recorded in the plan's
+;;;      `addresses`, `offsets`, `indices` and `index-shifts` tables. As in
+;;;      upstream's ir_match_fuse_addr, an address expression is absorbed
+;;;      only when every use of it is the address of a LOAD or STORE (inner
+;;;      nodes: when their one use is the expression being absorbed); it
+;;;      then emits nothing and its inputs are read by the accesses.
+;;;   2. Read-modify-write. STORE(a, OP(LOAD(a), x)) whose control input is
+;;;      that LOAD (nothing can come between them), with the LOAD and the OP
+;;;      otherwise unused, becomes `op [a], x` for ADD SUB AND OR XOR with a
+;;;      register or immediate, and `not [a]` / `neg [a]`.
+;;;   3. Load fusion. A LOAD with exactly one use is folded as the memory
+;;;      operand of that use when it is an ADD SUB AND OR XOR MUL or an
+;;;      integer comparison, the consumer is emitted in the load's block and
+;;;      exactly once (a comparison fused into several branches is repeated,
+;;;      so it never takes a memory operand), and nothing that may write
+;;;      memory or release stack is scheduled between the load and the place
+;;;      the consumer is emitted (upstream's ir_match_has_mem_deps, with the
+;;;      wider `barrier?`). Volatile loads are
+;;;      never fused: each stays the one access it is.
+;;;
+;;; A fused LOAD and an absorbed address expression are `omitted`. Their
+;;; consumers' machine inputs are rebuilt by `inputs!` so that liveness sees
+;;; the base and index where they are really read.
+;;;
+;;; Interface (called through stogir.x64.families; see docs/X86_FAMILIES.md):
+;;; `select!`, `fuse!`, `inputs!`, `constrain!`, `emit!`. The fused consumer
+;;; tiles (stogir.x64.select, RULE-ALU-RM .. RULE-COMPARE-MI) are constrained
+;;; and emitted by the core's tile paths (stogir.x64.constraints,
+;;; stogir.x64.emit).
+(module stogir.x64.memory)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.types" :as types)
+(import "stogir.schedule" :as schedule)
+(import "stogir.matched-uses" :as machine)
+(import "stogir.x64.address" :as address)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.select" :as select)
+(import "stogir.x64.uses" :as uses)
+(import "stogir.x64.value" :as value)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+(const UNSUPPORTED "x86-64 backend: RLOAD, RSTORE and TLS_ADDR are not implemented; see docs/X86_FAMILIES.md")
+
+(const OTHER-CLASS "x86-64 backend: floating and vector LOAD/STORE are not implemented yet (floating/vector families; address them with stogir.x64.address/operand!)")
+
+(const CONFLICT "conflicting x86-64 register constraints")
+
+(defn access? [(opcode i32)] (-> bool)
+  (and (>= opcode 91) (<= opcode 94)))
+
+(defn load? [(opcode i32)] (-> bool)
+  (or (= opcode 91) (= opcode 92)))
+
+;;; The type of the value LOAD/STORE `reference` moves, after checking the
+;;; node's shape; any class (integer, floating, vector).
+(defn value-type [(graph g/Graph) (reference i32)] (-> (Result i32 (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "memory node missing"))
+    (Some [node]
+          (let [opcode (cast i32 (n/opcode node))]
+            (cond (or (<= reference 0)
+                      (not (access? opcode))
+                      (!= (get (.arities graph) (cast i64 reference)) (if (load? opcode) 2 3)))
+                    (Err "invalid memory instruction")
+                  (!= (value/type-of graph (.op2 node)) 6) (Err "memory address must be ADDR")
+                  (and (not (load? opcode)) (!= (n/type-id node) 0)) (Err "store must be void")
+                  :else
+                    (let [ty (if (load? opcode)
+                                 (cast i32 (n/type-id node))
+                                 (value/type-of graph (.op3 node)))]
+                      (if (or (types/integer? ty) (types/floating? ty)
+                              (types/short-vector? ty 8))
+                          (Ok ty)
+                          (Err "unsupported memory value type"))))))))
+
+(defn select! [(state (mut plan/Matching)) (graph g/Graph) (reference i32)]
+  (-> (Result i32 (slice u8)))
+  (if (access? (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference)))))
+      (match (value-type graph reference)
+        (Err [message] (Err message))
+        (Ok [_] (Ok 0)))
+      (Err UNSUPPORTED)))
+
+;; ---------------------------------------------------------------------------
+;; Selection
+;; ---------------------------------------------------------------------------
+
+;;; Per-function tables of the fusion pass, indexed by graph reference.
+;;;   data-uses     data operand edges that read the node, from every
+;;;                 scheduled node
+;;;   address-uses  how many of them are the address of a LOAD or STORE that
+;;;                 is still emitted
+;;;   order         the node's index in the schedule
+;;;   consumers     for a comparison: how many IF/COND read its flags, and
+;;;   consumer      the last of them
+(defstruct Facts
+  [(data-uses (ArrayList i64))
+   (address-uses (ArrayList i64))
+   (order (ArrayList i64))
+   (consumers (ArrayList i32))
+   (consumer (ArrayList i32))])
+
+(defn release-facts! [(facts (mut Facts))] (-> void)
+  (free! (mut (.data-uses facts)))
+  (free! (mut (.address-uses facts)))
+  (free! (mut (.order facts)))
+  (free! (mut (.consumers facts)))
+  (free! (mut (.consumer facts))))
+
+(defn facts [(state plan/Matching) (graph g/Graph) (scheduled schedule/Schedule)
+             (a (dyn Allocator))] (-> Facts)
+  (let [cells (len (.instructions graph))
+        (mut result)
+          (Facts
+            :data-uses (ArrayList::new [i64] a)
+            :address-uses (ArrayList::new [i64] a)
+            :order (ArrayList::new [i64] a)
+            :consumers (ArrayList::new [i32] a)
+            :consumer (ArrayList::new [i32] a))]
+    (extend-zeroed! (mut (.data-uses result)) cells)
+    (extend-zeroed! (mut (.address-uses result)) cells)
+    (extend-zeroed! (mut (.order result)) cells)
+    (extend-zeroed! (mut (.consumers result)) cells)
+    (extend-zeroed! (mut (.consumer result)) cells)
+    (for [i 0 (len (.nodes scheduled))]
+      (let [reference (get (.nodes scheduled) i)
+            index (cast i64 reference)
+            node (get (.instructions graph) index)
+            opcode (cast i32 (n/opcode node))
+            source (get (.comparisons state) index)]
+        (set! (mut (.order result)) index i)
+        (when (> source 0)
+          (set! (mut (.consumers result)) (cast i64 source)
+                (+ (get (.consumers result) (cast i64 source)) 1))
+          (set! (mut (.consumer result)) (cast i64 source) reference))
+        (for [j 1 (+ (cast i64 (get (.arities graph) index)) 1)]
+          (when (machine/data-code? (op/operand-code opcode (cast i32 j)))
+            (match (g/operand graph reference (cast i32 j))
+              (None [] 0)
+              (Some [input]
+                    (when (> input 0)
+                      (set! (mut (.data-uses result)) (cast i64 input)
+                            (+ (get (.data-uses result) (cast i64 input)) 1))
+                      (when (and (= j 2) (access? opcode) (not (get (.omitted state) index)))
+                        (set! (mut (.address-uses result)) (cast i64 input)
+                              (+ (get (.address-uses result) (cast i64 input)) 1))))))))))
+    result))
+
+;;; U64, ADDR and I64: the types whose values are whole addresses.
+(defn word? [(ty i32)] (-> bool)
+  (or (= ty 5) (= ty 6) (= ty 11)))
+
+;;; The bits of a numeric word constant.
+(defn word-constant [(graph g/Graph) (reference i32)] (-> (Option i64))
+  (if (word? (value/type-of graph reference))
+      (match (value/constant-bits graph reference)
+        (None [] (None))
+        (Some [raw] (Some (cast i64 raw))))
+      (None)))
+
+;;; Whether address expression `reference` may be absorbed: nothing the
+;;; caller observes, and every use is an access address (`top`), or its one
+;;; use is the expression being absorbed.
+(defn absorbable? [(state plan/Matching) (known Facts) (reference i32) (top bool)] (-> bool)
+  (and (> reference 0)
+       (not (get (.protected state) (cast i64 reference)))
+       (not (get (.omitted state) (cast i64 reference)))
+       (if top
+           (and (> (get (.data-uses known) (cast i64 reference)) 0)
+                (= (get (.data-uses known) (cast i64 reference))
+                   (get (.address-uses known) (cast i64 reference))))
+           (= (get (.data-uses known) (cast i64 reference)) 1))))
+
+;;; `reference` as index * 2^shift: SHL by 1..3 or MUL by 2, 4 or 8 of a
+;;; word. `index` is 0 when it has no such form.
+(defstruct Scaled [(index i32) (shift i32)])
+
+(defn scaled [(graph g/Graph) (reference i32)] (-> Scaled)
+  (let [none (Scaled :index 0 :shift 0)]
+    (if (<= reference 0)
+        none
+        (let [node (get (.instructions graph) (cast i64 reference))
+              opcode (cast i32 (n/opcode node))]
+          (cond (not (word? (cast i32 (n/type-id node)))) none
+                (= opcode 49)
+                  (match (value/constant-bits graph (.op2 node))
+                    (None [] none)
+                    (Some [count]
+                          (if (and (>= count 1) (<= count 3) (> (.op1 node) 0)
+                                   (word? (value/type-of graph (.op1 node))))
+                              (Scaled :index (.op1 node) :shift (cast i32 count))
+                              none)))
+                (= opcode 28)
+                  (let [left (word-constant graph (.op1 node))
+                        right (word-constant graph (.op2 node))
+                        factor (match right
+                                 (Some [c] c)
+                                 (None [] (match left (Some [c] c) (None [] 0))))
+                        other (match right
+                                (Some [_] (.op1 node))
+                                (None [] (.op2 node)))
+                        shift (case factor 2 (: 1 i32) 4 2 8 3 0)]
+                    (if (and (> shift 0) (> other 0))
+                        (Scaled :index other :shift shift)
+                        none))
+                :else none)))))
+
+;;; Match the address `reference` of an access. Every node the address
+;;; absorbs is pushed on `absorbed`.
+(defn match-address [(state plan/Matching) (known Facts) (graph g/Graph) (reference i32)
+                     (absorbed (mut (ArrayList i32)))] (-> address/Parts)
+  (let [(mut current) reference
+        (mut offset) (: 0 i64)
+        (mut index) (: 0 i32)
+        (mut shift) (: 0 i32)
+        (mut top) true
+        (mut steps) 0
+        (mut done) false]
+    (while (and (not done) (< steps 8))
+      (set! steps (+ steps 1))
+      (if (not (absorbable? state known current top))
+          (set! done true)
+          (let [node (get (.instructions graph) (cast i64 current))
+                opcode (cast i32 (n/opcode node))]
+            (cond (not (word? (cast i32 (n/type-id node)))) (set! done true)
+                  ; A full-width view is the same bits.
+                  (and (= opcode 36) (word? (value/type-of graph (.op1 node))))
+                    (do (push! (mut absorbed) current) (set! current (.op1 node)))
+                  (= opcode 26)
+                    (let [right (word-constant graph (.op2 node))
+                          left (word-constant graph (.op1 node))
+                          constant (match right
+                                     (Some [c] (Some c))
+                                     (None [] left))
+                          rest (match right
+                                 (Some [_] (.op1 node))
+                                 (None [] (.op2 node)))]
+                      (match constant
+                        (Some [c]
+                              ; The sum is checked without overflow: both
+                              ; terms are within 33 bits here.
+                              (if (and (encode/fits32? c) (encode/fits32? (+ offset c)))
+                                  (do
+                                    (push! (mut absorbed) current)
+                                    (set! offset (+ offset c))
+                                    (set! current rest))
+                                  (set! done true)))
+                        (None []
+                              (if (or (!= index 0) (and (<= (.op1 node) 0) (<= (.op2 node) 0)))
+                                  (set! done true)
+                                  (let [second (if (absorbable? state known (.op2 node) false)
+                                                   (scaled graph (.op2 node))
+                                                   (Scaled :index 0 :shift 0))
+                                        first (if (absorbable? state known (.op1 node) false)
+                                                  (scaled graph (.op1 node))
+                                                  (Scaled :index 0 :shift 0))]
+                                    (push! (mut absorbed) current)
+                                    (cond (> (.index second) 0)
+                                            (do
+                                              (push! (mut absorbed) (.op2 node))
+                                              (set! index (.index second))
+                                              (set! shift (.shift second))
+                                              (set! current (.op1 node)))
+                                          (> (.index first) 0)
+                                            (do
+                                              (push! (mut absorbed) (.op1 node))
+                                              (set! index (.index first))
+                                              (set! shift (.shift first))
+                                              (set! current (.op2 node)))
+                                          (> (.op2 node) 0)
+                                            (do (set! index (.op2 node))
+                                                (set! current (.op1 node)))
+                                          :else
+                                            (do (set! index (.op1 node))
+                                                (set! current (.op2 node)))))))))
+                  :else (set! done true))
+            (set! top false))))
+    (address/Parts :base current :offset offset :index index :shift shift)))
+
+;;; Whether a load may not be moved past scheduled node `opcode`. Data nodes
+;;; never matter. Of the nodes on the control chain only those known to
+;;; leave memory alone are passed: loads of any kind, ALLOCA and BLOCK_BEGIN
+;;; (they only lower rsp). Everything else is a barrier: stores, calls,
+;;; atomic writes and fences, VA_* and inline assembly, and AFREE and
+;;; BLOCK_END, after which the released stack may be overwritten by a signal
+;;; handler.
+(defn barrier? [(opcode i32)] (-> bool)
+  (and (= (op/operand-code opcode 1) op/OPERAND-SRC)
+       (not (or (= opcode 91) (= opcode 92) (= opcode 85) (= opcode 86) (= opcode 126)
+                (= opcode 81) (= opcode 83)))))
+
+;;; Whether LOAD `load` can be read where node `site` is emitted instead:
+;;; same block and nothing in between writes memory.
+(defn movable? [(state plan/Matching) (known Facts) (graph g/Graph)
+                (scheduled schedule/Schedule) (load i32) (site i32)] (-> bool)
+  (let [from (get (.order known) (cast i64 load))
+        to (get (.order known) (cast i64 site))
+        (mut clear) (and (= (get (.blocks state) (cast i64 load))
+                            (get (.blocks state) (cast i64 site)))
+                         (< from to))]
+    (when clear
+      (for [i (+ from 1) to]
+        (when (barrier? (cast i32 (n/opcode (get (.instructions graph)
+                                                 (cast i64 (get (.nodes scheduled) i))))))
+          (set! clear false))))
+    clear))
+
+;;; Whether `load` is an integer LOAD nothing but one data operand reads.
+(defn fusable-load? [(state plan/Matching) (known Facts) (graph g/Graph) (load i32)] (-> bool)
+  (and (> load 0)
+       (let [node (get (.instructions graph) (cast i64 load))]
+         (and (= (n/opcode node) 91)
+              (types/integer? (cast i32 (n/type-id node)))
+              (not (get (.omitted state) (cast i64 load)))
+              (not (get (.protected state) (cast i64 load)))
+              (= (get (.data-uses known) (cast i64 load)) 1)))))
+
+;;; STORE `reference` as a read-modify-write of its own address, when it has
+;;; that shape.
+(defn modify! [(state (mut plan/Matching)) (known Facts) (graph g/Graph) (reference i32)]
+  (-> void)
+  (let [store (get (.instructions graph) (cast i64 reference))
+        result (.op3 store)
+        load (.op1 store)]
+    (when (and (= (n/opcode store) 93)
+               (> result 0)
+               (fusable-load? state known graph load)
+               (= (.op2 (get (.instructions graph) (cast i64 load))) (.op2 store))
+               (not (get (.omitted state) (cast i64 result)))
+               (not (get (.protected state) (cast i64 result)))
+               (= (get (.data-uses known) (cast i64 result)) 1)
+               (= (get (.blocks state) (cast i64 result)) (get (.blocks state) (cast i64 reference)))
+               (= (get (.blocks state) (cast i64 load)) (get (.blocks state) (cast i64 reference))))
+      (let [node (get (.instructions graph) (cast i64 result))
+            opcode (cast i32 (n/opcode node))
+            ty (cast i32 (n/type-id node))
+            own (value/type-bits ty)
+            tile (get (.tiles state) (cast i64 result))
+            rule (.rule tile)
+            (mut chosen) (select/none)]
+        (when (and (types/integer? ty)
+                   (= ty (cast i32 (n/type-id (get (.instructions graph) (cast i64 load))))))
+          (cond (and (= rule select/RULE-ALU-RI) (= (.left tile) load))
+                  (match (value/immediate-of (cast u64 (.immediate tile)) own)
+                    (None [] 0)
+                    (Some [imm]
+                          (set! chosen
+                                (select/Tile :rule select/RULE-STORE-ALU-MI
+                                             :operation (.operation tile) :bits own
+                                             :left load :right 0 :immediate imm))))
+                (and (= rule select/RULE-ALU-RR) (= (.left tile) load) (!= (.right tile) load))
+                  (set! chosen
+                        (select/Tile :rule select/RULE-STORE-ALU-MR :operation (.operation tile)
+                                     :bits own :left load :right (.right tile) :immediate 0))
+                (and (= rule select/RULE-ALU-RR) (= (.right tile) load) (!= (.left tile) load)
+                     (!= (.operation tile) encode/SUB))
+                  (set! chosen
+                        (select/Tile :rule select/RULE-STORE-ALU-MR :operation (.operation tile)
+                                     :bits own :left load :right (.left tile) :immediate 0))
+                ; NOT of a BOOL flips bit 0, keeping the byte 0 or 1.
+                (and (= opcode 45) (= ty 1) (= (.op1 node) load))
+                  (set! chosen
+                        (select/Tile :rule select/RULE-STORE-ALU-MI :operation encode/XOR
+                                     :bits own :left load :right 0 :immediate 1))
+                (and (or (= opcode 45) (= opcode 31)) (= (.op1 node) load))
+                  (set! chosen
+                        (select/Tile :rule select/RULE-STORE-UNARY-M
+                                     :operation (if (= opcode 45) (: encode/NOT i32) encode/NEG)
+                                     :bits own :left load :right 0 :immediate 0))
+                :else 0))
+        (when (!= (.rule chosen) select/RULE-NONE)
+          (set! (mut (.tiles state)) (cast i64 reference) chosen)
+          (set! (mut (.omitted state)) (cast i64 result) true)
+          (set! (mut (.omitted state)) (cast i64 load) true))))))
+
+;;; Give the tile of `reference` a memory operand when one of its operands
+;;; is a load that may move to where the tile is emitted.
+(defn operand-load! [(state (mut plan/Matching)) (known Facts) (graph g/Graph)
+                     (scheduled schedule/Schedule) (reference i32)] (-> void)
+  (let [index (cast i64 reference)
+        tile (get (.tiles state) index)
+        rule (.rule tile)
+        comparison (and (>= rule select/RULE-COMPARE-RR) (<= rule select/RULE-COMPARE-ZERO))
+        omitted (get (.omitted state) index)
+        readers (get (.consumers known) index)
+        ; Where the tile's instruction is emitted; 0 when that is not one
+        ; place.
+        site (cond (and (not omitted) (= readers 0)) reference
+                   (and comparison omitted (= readers 1)) (get (.consumer known) index)
+                   :else 0)
+        left-ok (and (> site 0) (fusable-load? state known graph (.left tile))
+                     (movable? state known graph scheduled (.left tile) site))
+        right-ok (and (> site 0) (!= (.right tile) (.left tile))
+                      (fusable-load? state known graph (.right tile))
+                      (movable? state known graph scheduled (.right tile) site))
+        right-bits (if right-ok
+                       (value/type-bits (value/type-of graph (.right tile)))
+                       0)
+        left-bits (if left-ok (value/type-bits (value/type-of graph (.left tile))) 0)
+        (mut chosen) (select/none)]
+    (cond (= rule select/RULE-ALU-RR)
+            (cond right-ok
+                    (set! chosen
+                          (select/Tile :rule select/RULE-ALU-RM :operation (.operation tile)
+                                       :bits right-bits :left (.left tile)
+                                       :right (.right tile) :immediate 0))
+                  (and left-ok (!= (.operation tile) encode/SUB))
+                    (set! chosen
+                          (select/Tile :rule select/RULE-ALU-RM :operation (.operation tile)
+                                       :bits left-bits :left (.right tile)
+                                       :right (.left tile) :immediate 0))
+                  :else 0)
+          ; There is no two-operand byte multiply.
+          (= rule select/RULE-MUL-RR)
+            (cond (and right-ok (>= right-bits 16))
+                    (set! chosen
+                          (select/Tile :rule select/RULE-MUL-RM :operation 0 :bits right-bits
+                                       :left (.left tile) :right (.right tile) :immediate 0))
+                  (and left-ok (>= left-bits 16))
+                    (set! chosen
+                          (select/Tile :rule select/RULE-MUL-RM :operation 0 :bits left-bits
+                                       :left (.right tile) :right (.left tile) :immediate 0))
+                  :else 0)
+          (= rule select/RULE-COMPARE-RR)
+            (cond right-ok
+                    (set! chosen
+                          (select/Tile :rule select/RULE-COMPARE-RM :operation (.operation tile)
+                                       :bits (.bits tile) :left (.left tile)
+                                       :right (.right tile) :immediate 0))
+                  left-ok
+                    (set! chosen
+                          (select/Tile :rule select/RULE-COMPARE-MR :operation (.operation tile)
+                                       :bits (.bits tile) :left (.left tile)
+                                       :right (.right tile) :immediate 0))
+                  :else 0)
+          (or (= rule select/RULE-COMPARE-RI) (= rule select/RULE-COMPARE-ZERO))
+            (when left-ok
+              (set! chosen
+                    (select/Tile :rule select/RULE-COMPARE-MI :operation (.operation tile)
+                                 :bits (.bits tile) :left (.left tile) :right 0
+                                 :immediate (.immediate tile))))
+          :else 0)
+    (when (!= (.rule chosen) select/RULE-NONE)
+      (set! (mut (.tiles state)) index chosen)
+      (set! (mut (.omitted state)) (cast i64 (select/memory-operand chosen)) true))))
+
+;;; The memory family's selection over a whole function (see the module
+;;; comment). Runs after the core's tiles and comparison fusion.
+(defn fuse! [(state (mut plan/Matching)) (graph g/Graph) (scheduled schedule/Schedule)
+             (a (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [(mut known) (facts state graph scheduled a)
+        (mut absorbed) (ArrayList::new [i32] a)]
+    ; Addresses first: every decision reads the use counts as they were.
+    (for reference (.nodes scheduled)
+      (let [index (cast i64 reference)
+            node (get (.instructions graph) index)]
+        (when (and (access? (cast i32 (n/opcode node))) (not (get (.omitted state) index)))
+          (let [chosen (match-address state known graph (.op2 node) (mut absorbed))]
+            (set! (mut (.addresses state)) index (.base chosen))
+            (set! (mut (.offsets state)) index (.offset chosen))
+            (set! (mut (.indices state)) index (.index chosen))
+            (set! (mut (.index-shifts state)) index (.shift chosen))))))
+    (for reference absorbed
+      (set! (mut (.omitted state)) (cast i64 reference) true))
+    (free! (mut absorbed))
+    (for reference (.nodes scheduled)
+      (when (= (n/opcode (get (.instructions graph) (cast i64 reference))) 93)
+        (modify! (mut state) known graph reference)))
+    (for reference (.nodes scheduled)
+      (let [rule (.rule (get (.tiles state) (cast i64 reference)))]
+        (when (or (= rule select/RULE-ALU-RR) (= rule select/RULE-MUL-RR)
+                  (and (>= rule select/RULE-COMPARE-RR) (<= rule select/RULE-COMPARE-ZERO)))
+          (operand-load! (mut state) known graph scheduled reference))))
+    (release-facts! (mut known))
+    (Ok 0)))
+
+;;; Rebuild the machine inputs of every node whose operands selection
+;;; changed: an access reads its selected base and index (and a STORE its
+;;; value, a read-modify-write its register operand); a tile with a memory
+;;; operand, or the IF/COND that reads its flags, reads the tile's register
+;;; operand and the fused load's base and index. Call it on the plan
+;;; stogir.matched-uses built, before any other patch of the same ranges.
+(defn inputs! [(operands (mut machine/Plan)) (state plan/Matching) (graph g/Graph)
+               (scheduled schedule/Schedule)] (-> void)
+  (for reference (.nodes scheduled)
+    (let [index (cast i64 reference)
+          node (get (.instructions graph) index)
+          opcode (cast i32 (n/opcode node))
+          source (get (.comparisons state) index)
+          tile (get (.tiles state) (if (> source 0) (cast i64 source) index))
+          fused (select/memory-operand tile)
+          access (if (access? opcode) reference fused)]
+      (when (and (not (get (.omitted state) index))
+                 (> access 0)
+                 (!= (get (.addresses state) (cast i64 access)) 0))
+        (let [start (len (.inputs operands))
+              rule (.rule (get (.tiles state) index))]
+          (when (and (not (access? opcode)) (!= (select/register-operand tile) 0))
+            (push! (mut (.inputs operands)) (select/register-operand tile)))
+          (push! (mut (.inputs operands)) (get (.addresses state) (cast i64 access)))
+          (when (> (get (.indices state) (cast i64 access)) 0)
+            (push! (mut (.inputs operands)) (get (.indices state) (cast i64 access))))
+          (when (or (= opcode 93) (= opcode 94))
+            (cond (= rule select/RULE-STORE-ALU-MR)
+                    (push! (mut (.inputs operands)) (.right (get (.tiles state) index)))
+                  (or (= rule select/RULE-STORE-ALU-MI) (= rule select/RULE-STORE-UNARY-M)) 0
+                  :else (push! (mut (.inputs operands)) (.op3 node))))
+          (set! (mut (.ranges operands)) index
+                (machine/Range :offset start :count (- (len (.inputs operands)) start))))))))
+
+;; ---------------------------------------------------------------------------
+;; Constraints
+;; ---------------------------------------------------------------------------
+
+(defn require! [(error (mut (slice u8))) (accepted bool)] (-> void)
+  (when (and (not accepted) (= error "")) (set! error CONFLICT)))
+
+;;; The base and index of the selected address of `access` are in registers
+;;; at `position` (a constant or a frame object needs none).
+(defn address-uses! [(set (mut uses/Set)) (error (mut (slice u8))) (graph g/Graph)
+                     (matched plan/Plan) (access i32) (position i64)] (-> void)
+  (let [selected (address/parts matched graph access)]
+    (require! (mut error) (uses/use! (mut set) (.base selected) position))
+    (require! (mut error) (uses/use! (mut set) (.index selected) position))))
+
+;;; Whether STORE of `value` (of `bits`) writes an immediate.
+(defn stored-immediate [(graph g/Graph) (value i32) (bits i32)] (-> (Option i64))
+  (value/immediate graph value bits))
+
+(defn constrain! [(set (mut uses/Set)) (graph g/Graph) (matched plan/Plan)
+                  (reference i32) (position i64)] (-> (Result i32 (slice u8)))
+  (match (value-type graph reference)
+    (Err [message] (Err message))
+    (Ok [ty]
+        (let [node (get (.instructions graph) (cast i64 reference))
+              opcode (cast i32 (n/opcode node))
+              tile (get (.tiles matched) (cast i64 reference))
+              (mut error) ""]
+          (if (not (types/integer? ty))
+              (Err OTHER-CLASS)
+              (do
+                (address-uses! (mut set) (mut error) graph matched reference position)
+                (cond (load? opcode)
+                        (require! (mut error) (uses/define! (mut set) reference position))
+                      (= (.rule tile) select/RULE-STORE-ALU-MR)
+                        (require! (mut error) (uses/use! (mut set) (.right tile) position))
+                      (!= (.rule tile) select/RULE-NONE) 0
+                      :else
+                        (match (stored-immediate graph (.op3 node) (value/type-bits ty))
+                          (Some [_] 0)
+                          (None []
+                                (require! (mut error)
+                                          (uses/use! (mut set) (.op3 node) position)))))
+                (if (= error "") (Ok 0) (Err error))))))))
+
+;; ---------------------------------------------------------------------------
+;; Emission
+;; ---------------------------------------------------------------------------
+
+;;; rd = [m] for an integer of type `ty`: narrow values are extended to 32
+;;; bits by signedness.
+(defn read! [(out (mut code/Buffer)) (ty i32) (rd i32) (m encode/Mem)]
+  (-> (Result i64 (slice u8)))
+  (let [bits (value/type-bits ty)]
+    (cond (= bits 0) (Err "integer load of a non-integer type")
+          (>= bits 32) (encode/mov-rm (mut (.text out)) bits rd m)
+          (types/signed? ty) (encode/movsx-rm (mut (.text out)) 32 bits rd m)
+          :else (encode/movzx-rm (mut (.text out)) 32 bits rd m))))
+
+;;; [m] = value of integer type `ty`: an immediate when the constant fits,
+;;; else from its register, with a constant or frame address built in r11.
+;;; `m` must not name r11 (stogir.x64.address/operand! guarantees that).
+(defn write! [(out (mut code/Buffer)) (cx context/Context) (ty i32) (m encode/Mem)
+              (stored i32) (position i64)] (-> (Result i32 (slice u8)))
+  (let [bits (value/type-bits ty)
+        (mut error) ""]
+    (match (stored-immediate (.graph cx) stored bits)
+      (Some [imm] (code/accept! (mut error) (encode/mov-mi (mut (.text out)) bits m imm)))
+      (None []
+            (match (value/register-with-locations! (mut out) (.graph cx) (.parts cx) (.base cx)
+                                                   stored position registers/SCRATCH-GPR-2)
+              (Err [message] (set! error message))
+              (Ok [source]
+                  (code/accept! (mut error) (encode/mov-mr (mut (.text out)) bits m source))))))
+    (if (= error "") (Ok 0) (Err error))))
+
+(defn emit! [(out (mut code/Buffer)) (cx context/Context) (reference i32) (position i64)]
+  (-> (Result i32 (slice u8)))
+  (match (value-type (.graph cx) reference)
+    (Err [message] (Err message))
+    (Ok [ty]
+        (if (not (types/integer? ty))
+            (Err OTHER-CLASS)
+            (let [node (get (.instructions (.graph cx)) (cast i64 reference))
+                  opcode (cast i32 (n/opcode node))
+                  tile (get (.tiles (.matched cx)) (cast i64 reference))
+                  rule (.rule tile)
+                  (mut error) ""]
+              (match (address/operand! (mut out) cx reference position)
+                (Err [message] (set! error message))
+                (Ok [m]
+                    (cond (load? opcode)
+                            (match (value/destination (.graph cx) (.parts cx) reference position)
+                              (Err [message] (set! error message))
+                              (Ok [rd] (code/accept! (mut error) (read! (mut out) ty rd m))))
+                          (= rule select/RULE-STORE-ALU-MR)
+                            (match (value/register-with-locations!
+                                     (mut out) (.graph cx) (.parts cx) (.base cx) (.right tile)
+                                     position registers/SCRATCH-GPR-2)
+                              (Err [message] (set! error message))
+                              (Ok [source]
+                                  (code/accept! (mut error)
+                                                (encode/alu-mr (mut (.text out)) (.operation tile)
+                                                               (.bits tile) m source))))
+                          (= rule select/RULE-STORE-ALU-MI)
+                            (code/accept! (mut error)
+                                          (encode/alu-mi (mut (.text out)) (.operation tile)
+                                                         (.bits tile) m (.immediate tile)))
+                          (= rule select/RULE-STORE-UNARY-M)
+                            (code/accept! (mut error)
+                                          (encode/unary-m (mut (.text out)) (.operation tile)
+                                                          (.bits tile) m))
+                          (!= rule select/RULE-NONE)
+                            (set! error "x86-64 backend: store tile has no emitter")
+                          :else
+                            (code/accept-count! (mut error)
+                                                (write! (mut out) cx ty m (.op3 node) position)))))
+              (if (= error "") (Ok 0) (Err error)))))))

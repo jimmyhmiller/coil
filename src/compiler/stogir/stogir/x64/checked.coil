@@ -1,0 +1,240 @@
+;;; x86-64 overflow-checked arithmetic: ADD_OV, SUB_OV, MUL_OV (41..43) and
+;;; their OVERFLOW projection (44), signed and unsigned at 8, 16, 32 and 64
+;;; bits.
+;;;
+;;; How the flag travels. The schedule keeps an OVERFLOW directly after its
+;;; producer (stogir.checked-schedule; the driver validates it). The producer
+;;; ends with the instruction that sets the flag, followed only by `mov`, and
+;;; OVERFLOW reads it with `setcc`. Between the two nodes the driver emits at
+;;; most allocator transfers, which are moves and preserve flags
+;;; (docs/X86_PORT.md, "Flags"). This is the one flag value that crosses a
+;;; node boundary, exactly as NZCV does in stogir.a64.checked. A producer
+;;; always computes the flag; an OVERFLOW of anything else is the constant 0.
+;;; OVERFLOW is never fused into a branch (neither is it on AArch64): the IF
+;;; tests the materialized Boolean.
+;;;
+;;; Sequences and the condition that means "overflowed" (`condition`)
+;;;   ADD, SUB   the 8/16/32/64-bit instruction at the type's own width:
+;;;              signed O, unsigned B (carry or borrow). A constant right
+;;;              operand is an immediate when it fits.
+;;;   MUL  signed 16/32/64    two-operand imul at the own width: O
+;;;        signed 8           both operands sign-extended, 32-bit imul in
+;;;                           r10, then cmp with the sign-extended low byte:
+;;;                           NE
+;;;        unsigned 8/16      both zero-extended, 32-bit imul in r10, then
+;;;                           test of the bits above the width: NE
+;;;        unsigned 32        both zero-extended, 64-bit imul in r10, then
+;;;                           shr r10, 32: NE
+;;;        unsigned 64        one-operand mul: rax and rdx are clobbers, the
+;;;                           left operand is copied into rax, the result
+;;;                           prefers rax: O
+;;; The narrow instruction forms leave the bits above the width unchanged,
+;;; which the value representation allows (stogir.x64.value).
+(module stogir.x64.checked)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.checked" :as checked)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.emit" :as emit)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.uses" :as uses)
+(import "stogir.x64.value" :as value)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(const CONFLICT "conflicting x86-64 register constraints")
+
+;;; MUL_OV of an unsigned 64-bit type: the only form that needs rdx:rax.
+(defn wide-unsigned-product? [(opcode i32) (ty i32)] (-> bool)
+  (and (= opcode 43) (not (types/signed? ty)) (= (value/type-bits ty) 64)))
+
+;;; MUL_OV forms computed in the scratch registers with a separate check.
+(defn scratch-product? [(opcode i32) (ty i32)] (-> bool)
+  (and (= opcode 43)
+       (if (types/signed? ty)
+           (= (value/type-bits ty) 8)
+           (< (value/type-bits ty) 64))))
+
+;;; The condition code that holds after producer `opcode` of `ty` exactly
+;;; when the operation overflowed.
+(defn condition [(opcode i32) (ty i32)] (-> i32)
+  (cond (scratch-product? opcode ty) encode/CC-NE
+        (or (= opcode 43) (types/signed? ty)) encode/CC-O
+        :else encode/CC-B))
+
+(defn validate [(graph g/Graph) (reference i32)] (-> (Result i32 (slice u8)))
+  (if (= (n/opcode (get (.instructions graph) (cast i64 reference))) 44)
+      (checked/validate-projection graph reference)
+      (checked/validate graph reference)))
+
+(defn select! [(state (mut plan/Matching)) (graph g/Graph) (reference i32)]
+  (-> (Result i32 (slice u8)))
+  (match (validate graph reference)
+    (Err [message] (Err message))
+    (Ok [_] (Ok 0))))
+
+(defn constrain! [(set (mut uses/Set)) (graph g/Graph) (matched plan/Plan)
+                  (reference i32) (position i64)] (-> (Result i32 (slice u8)))
+  (match (validate graph reference)
+    (Err [message] (Err message))
+    (Ok [ty]
+        (let [node (get (.instructions graph) (cast i64 reference))
+              opcode (cast i32 (n/opcode node))]
+          (if (= opcode 44)
+              ; The projection reads flags, not its producer's register.
+              (if (uses/define! (mut set) reference position) (Ok 0) (Err CONFLICT))
+              (let [(mut accepted) (uses/use! (mut set) (.op1 node) position)]
+                (unless (uses/use! (mut set) (.op2 node) position) (set! accepted false))
+                (unless (uses/define! (mut set) reference position) (set! accepted false))
+                (if (wide-unsigned-product? opcode ty)
+                    (do
+                      (uses/clobber! (mut set) registers/RAX position (+ position 1))
+                      (uses/clobber! (mut set) registers/RDX position (+ position 2))
+                      (uses/prefer! (mut set) reference registers/RAX))
+                    (uses/hint! (mut set) reference (.op1 node)))
+                (if accepted (Ok 0) (Err CONFLICT))))))))
+
+;;; `target` = operand `reference` extended to `to` bits by `signed`.
+(defn extended! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+                 (reference i32) (position i64) (signed bool) (to i32) (target i32)]
+  (-> void)
+  (let [own (value/type-bits (value/type-of (.graph cx) reference))]
+    (match (emit/operand! (mut out) cx reference position target)
+      (Err [message] (when (= error "") (set! error message)))
+      (Ok [source]
+          (code/accept! (mut error)
+                        (if signed
+                            (encode/movsx-rr (mut (.text out)) to own target source)
+                            (encode/movzx-rr (mut (.text out)) to own target source)))))))
+
+;;; MUL_OV in r10 and r11 (`scratch-product?`); the check leaves ZF clear
+;;; when the product does not fit the type.
+(defn scratch-product! [(out (mut code/Buffer)) (error (mut (slice u8)))
+                        (cx context/Context) (node n/Node) (position i64) (rd i32)]
+  (-> void)
+  (let [ty (cast i32 (n/type-id node))
+        own (value/type-bits ty)
+        signed (types/signed? ty)
+        product (if (= own 32) (: 64 i32) 32)
+        low (: registers/SCRATCH-GPR i32)
+        other (: registers/SCRATCH-GPR-2 i32)]
+    (extended! (mut out) (mut error) cx (.op1 node) position signed product low)
+    (extended! (mut out) (mut error) cx (.op2 node) position signed product other)
+    (code/accept! (mut error) (encode/imul-rr (mut (.text out)) product low other))
+    (emit/move! (mut out) (mut error) (value/operation-bits ty) rd low)
+    (cond signed
+            (do
+              (code/accept! (mut error) (encode/movsx-rr (mut (.text out)) 32 own other low))
+              (code/accept! (mut error)
+                            (encode/alu-rr (mut (.text out)) encode/CMP 32 other low)))
+          (= own 32)
+            (code/accept! (mut error) (encode/shift-ri (mut (.text out)) encode/SHR 64 low 32))
+          :else
+            (code/accept! (mut error)
+                          (encode/test-ri (mut (.text out)) 32 low
+                                          (cast i64 (^ (value/mask own) 0xFFFFFFFF)))))))
+
+;;; `op rd, rb` at `bits`: ADD or SUB (an encode ALU operation), or the
+;;; two-operand imul when `operation` is below zero.
+(defn apply! [(out (mut code/Buffer)) (error (mut (slice u8))) (operation i32)
+              (bits i32) (rd i32) (rb i32)] (-> void)
+  (code/accept! (mut error)
+                (if (< operation 0)
+                    (encode/imul-rr (mut (.text out)) bits rd rb)
+                    (encode/alu-rr (mut (.text out)) operation bits rd rb))))
+
+;;; rd = left OP right with the flag-setting instruction at the type's own
+;;; width, for every aliasing of rd with the operands.
+(defn flagged! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+                (node n/Node) (position i64) (rd i32)] (-> void)
+  (let [opcode (cast i32 (n/opcode node))
+        ty (cast i32 (n/type-id node))
+        own (value/type-bits ty)
+        wide (value/operation-bits ty)
+        operation (cond (= opcode 41) (: encode/ADD i32)
+                        (= opcode 42) encode/SUB
+                        :else -1)
+        immediate (if (= opcode 43)
+                      (None [i64])
+                      (value/immediate (.graph cx) (.op2 node) own))]
+    (match immediate
+      (Some [imm]
+            (do
+              (code/accept-count! (mut error) (emit/into! (mut out) cx (.op1 node) position rd))
+              (code/accept! (mut error)
+                            (encode/alu-ri (mut (.text out)) operation own rd imm))))
+      (None []
+            (match (emit/operand! (mut out) cx (.op1 node) position registers/SCRATCH-GPR)
+              (Err [message] (when (= error "") (set! error message)))
+              (Ok [ra]
+                  (match (emit/operand! (mut out) cx (.op2 node) position
+                                        registers/SCRATCH-GPR-2)
+                    (Err [message] (when (= error "") (set! error message)))
+                    (Ok [rb]
+                        (cond (= rd ra) (apply! (mut out) (mut error) operation own rd rb)
+                              (and (= rd rb) (!= opcode 42))
+                                (apply! (mut out) (mut error) operation own rd ra)
+                              (= rd rb)
+                                ; rd holds the subtrahend: subtract beside it
+                                ; and move the difference in; `mov` keeps the
+                                ; flags.
+                                (let [temporary (if (= ra registers/SCRATCH-GPR)
+                                                    (: registers/SCRATCH-GPR i32)
+                                                    registers/SCRATCH-GPR-2)]
+                                  (emit/move! (mut out) (mut error) wide temporary ra)
+                                  (apply! (mut out) (mut error) operation own temporary rb)
+                                  (emit/move! (mut out) (mut error) wide rd temporary))
+                              :else
+                                (do
+                                  (emit/move! (mut out) (mut error) wide rd ra)
+                                  (apply! (mut out) (mut error) operation own rd rb)))))))))))
+
+;;; Unsigned 64-bit MUL_OV: rdx:rax = rax * right. rax and rdx are reserved
+;;; while the operands are read, so neither holds an operand or a live value.
+(defn wide-product! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
+                     (node n/Node) (position i64) (rd i32)] (-> void)
+  (match (emit/operand! (mut out) cx (.op1 node) position registers/SCRATCH-GPR)
+    (Err [message] (when (= error "") (set! error message)))
+    (Ok [ra]
+        (match (emit/operand! (mut out) cx (.op2 node) position registers/SCRATCH-GPR-2)
+          (Err [message] (when (= error "") (set! error message)))
+          (Ok [rb]
+              (if (or (= ra registers/RAX) (= ra registers/RDX)
+                      (= rb registers/RAX) (= rb registers/RDX))
+                  (when (= error "")
+                    (set! error "x86-64 checked multiply found an operand in reserved rax/rdx"))
+                  (do
+                    (emit/move! (mut out) (mut error) 64 registers/RAX ra)
+                    (code/accept! (mut error)
+                                  (encode/unary-r (mut (.text out)) encode/MUL 64 rb))
+                    (emit/move! (mut out) (mut error) 64 rd registers/RAX))))))))
+
+(defn emit! [(out (mut code/Buffer)) (cx context/Context) (reference i32) (position i64)]
+  (-> (Result i32 (slice u8)))
+  (match (validate (.graph cx) reference)
+    (Err [message] (Err message))
+    (Ok [ty]
+        (let [node (get (.instructions (.graph cx)) (cast i64 reference))
+              opcode (cast i32 (n/opcode node))]
+          (match (emit/destination cx reference position)
+            (Err [message] (Err message))
+            (Ok [rd]
+                (let [(mut error) ""]
+                  (cond (and (= opcode 44) (= ty 0))
+                          (code/accept-count! (mut error) (value/bits! (mut out) rd 0 8))
+                        (= opcode 44)
+                          (let [producer (get (.instructions (.graph cx)) (cast i64 (.op1 node)))]
+                            (code/accept-count! (mut error)
+                                                (emit/set-condition!
+                                                  (mut out)
+                                                  (condition (cast i32 (n/opcode producer)) ty)
+                                                  rd)))
+                        (wide-unsigned-product? opcode ty)
+                          (wide-product! (mut out) (mut error) cx node position rd)
+                        (scratch-product? opcode ty)
+                          (scratch-product! (mut out) (mut error) cx node position rd)
+                        :else (flagged! (mut out) (mut error) cx node position rd))
+                  (if (= error "") (Ok 0) (Err error)))))))))

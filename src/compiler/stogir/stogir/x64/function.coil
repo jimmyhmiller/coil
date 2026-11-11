@@ -1,0 +1,939 @@
+;;; The x86-64 emission driver: walks an allocated, scheduled function in its
+;;; physical block order and produces its code.
+;;;
+;;; Per scheduled node i (allocation positions 2i and 2i + 1):
+;;;   1. a block start binds its label;
+;;;   2. the allocator's transfers at 2i (reloads, register changes) and at
+;;;      2i + 1 (spill stores that preserve a value the node is about to
+;;;      overwrite) are emitted, each as one simultaneous group, before the
+;;;      node's own code;
+;;;   3. the node is emitted: control flow and the core operations here, every
+;;;      other operation by its family (stogir.x64.families/emit!).
+;;; Afterwards the edge stubs and jump tables are appended, jumps are relaxed
+;;; to their short forms with loop headers aligned (stogir.x64.fixups), and
+;;; the displacements are patched and verified.
+;;;
+;;; Flags: no flag value is live between two nodes. Inside a node only moves
+;;; separate a flag producer from its consumer; allocator transfers and edge
+;;; moves are moves, so they may precede a branch or follow a compare. What
+;;; the last instruction left in the flags is recorded with the buffer
+;;; (stogir.x64.code/Flags), so that a compare with zero directly behind the
+;;; instruction that produced the value emits nothing; the record is cleared
+;;; at every block start, where control may arrive from elsewhere.
+;;;
+;;; Frame: `sub rsp, N` and the used preserved registers stored with `mov`
+;;; at entry; every RETURN reloads them, `add rsp, N` and `ret`
+;;; (docs/X86_PORT.md). A function without frame contents is frameless. A
+;;; function with dynamic stack or an over-aligned frame is anchored on rbp
+;;; (stogir.x64.frame-address).
+;;;
+;;; Block shapes, as the a64 driver emits them over the neutral block layout
+;;; (stogir.block-layout; docs/CONTROL.md):
+;;;   * blocks of only PHIs and an END with an empty outgoing edge are
+;;;     skipped, and branches to them go to the block they forward to;
+;;;   * an END whose target is laid out next falls through;
+;;;   * an END that enters a return tail (PHIs and a RETURN) returns in place
+;;;     instead of jumping to it;
+;;;   * an END that enters a test block (PHIs, an IF and whatever its
+;;;     condition needs that emits nothing) runs that IF in place: a loop
+;;;     whose header holds the test and is laid out first gets its test at
+;;;     the bottom, one conditional jump per iteration;
+;;;   * an IF jumps on the edge that does not fall through; a taken edge with
+;;;     moves runs them at the entry of its projection block when that block
+;;;     is still to be emitted, else in an edge stub behind the function;
+;;;   * UNREACHABLE is `ud2` with nothing behind it.
+;;;
+;;; Not ported from the a64 driver (tuning): shrink-wrapping and spill-home
+;;; planning.
+;;;
+;;; The a64 driver is not shared: its node walk is interleaved with those
+;;; features and with 4-byte word emission. The pieces that are neutral are
+;;; reused as they are: block layout, transfer indexing, edge move
+;;; construction, the parallel-move resolver.
+(module stogir.x64.function)
+(import "stogir.allocation-transfers" :as allocation-transfers)
+(import "stogir.fill" :as fill)
+(import "stogir.graph" :as g)
+(import "stogir.matched-uses" :as machine)
+(import "stogir.nonnegative" :as nonnegative)
+(import "stogir.block-layout" :as layout)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.adjacency" :as adj)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.schedule" :as schedule)
+(import "stogir.checked-schedule" :as checked-schedule)
+(import "stogir.locations" :as locations)
+(import "stogir.transfer-index" :as transfer-index)
+(import "stogir.uses" :as graph-uses)
+(import "stogir.register-live" :as live)
+(import "stogir.x64.allocate" :as allocate)
+(import "stogir.x64.abi-arguments" :as arguments)
+(import "stogir.x64.call" :as call)
+(import "stogir.x64.call-abi" :as abi)
+(import "stogir.call-results" :as results)
+(import "stogir.x64.callee-saved" :as callee)
+(import "stogir.x64.coalesce" :as coalesce)
+(import "stogir.x64.floating" :as floating)
+(import "stogir.floating" :as floating-ops)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.conditional" :as conditional)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.convert" :as convert)
+(import "stogir.x64.edges" :as edges)
+(import "stogir.x64.emit" :as emit)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.families" :as families)
+(import "stogir.x64.fcompare" :as fcompare)
+(import "stogir.x64.fixups" :as fixups)
+(import "stogir.x64.frame-address" :as frame-address)
+(import "stogir.native.private-types" :as private)
+(import "stogir.x64.return-values" :as return-values)
+(import "stogir.x64.incoming" :as incoming)
+(import "stogir.x64.lea" :as lea)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.pool" :as pool)
+(import "stogir.x64.reciprocal" :as reciprocal)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.select" :as select)
+(import "stogir.x64.switch" :as switch)
+(import "stogir.x64.truth" :as truth)
+(import "stogir.x64.unary" :as unary)
+(import "stogir.x64.uses" :as uses)
+(import "stogir.x64.value" :as value)
+(import "stogir.types" :as types)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; The allocator's transfers at split boundaries. Adjacent ranges of a
+;;; joined PHI group may belong to different SSA definitions: a split at the
+;;; birth of a new value has no old value to carry and is dropped. So is a
+;;; split at the definition of a COPY or BITCAST in the group: its emitter
+;;; moves the value from where the source is to where the result is.
+(defn split-moves [(graph g/Graph) (scheduled schedule/Schedule)
+                   (assigned allocate/Assigned) (matched plan/Plan)
+                   (allocator (dyn Allocator))] (-> (ArrayList locations/Transfer))
+  (let [(mut moves) (locations/contiguous-indexed (.parts assigned) (.locations assigned)
+                                                  allocator)
+        (mut kept) 0]
+    (when (.coalesced (.locations assigned))
+      (for [i 0 (len moves)]
+        (let [move (get moves i)]
+          (unless (or (allocation-transfers/redefined? graph scheduled (.parts assigned)
+                                                       (.locations assigned) (.operands matched)
+                                                       (.parent move) (.position move))
+                      (coalesce/view-defined? graph scheduled (.parts assigned)
+                                              (.locations assigned) (.parent move)
+                                              (.position move)))
+            (set! (mut moves) kept move)
+            (set! kept (+ kept 1)))))
+      (while (> (len moves) kept) (pop! (mut moves))))
+    moves))
+
+;;; Whether scheduled node `reference` lowers the allocator's transfers at its
+;;; own definition position: calls, and FMA, which is a call to libm.
+(defn self-lowered? [(graph g/Graph) (matched plan/Plan) (reference i32)] (-> bool)
+  (let [opcode (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference))))]
+    (or (= opcode 79) (= opcode 80)
+        (and (floating-ops/ternary? opcode)
+             (= (plan/family matched reference) families/FLOATING)
+             (not (machine/rematerialized? (.operands matched) reference))
+             (not (plan/omitted? matched reference))))))
+
+;;; The function's result role and the logical frame offset of the object it
+;;; needs: the buffer of register result pieces (kind 1) or the save slot of
+;;; the indirect result pointer (kind 2); -1 for an ordinary result.
+(defstruct Role [(spec results/Spec) (slot i64)])
+
+;;; sub rsp, N and the preserved-register stores; an indirect result's hidden
+;;; pointer (rdi) is saved for RETURN. Nothing for a frameless function. An anchored frame first establishes rbp
+;;; (stogir.x64.frame-address shows both forms).
+(defn prologue! [(out (mut code/Buffer)) (assigned allocate/Assigned) (frame-size i64)
+                 (role Role)] (-> (Result i32 (slice u8)))
+  (let [(mut error) ""
+        base (.base assigned)]
+    (if (frame-address/anchored? base)
+        (do
+          (code/accept! (mut error) (encode/push-r (mut (.text out)) registers/RBP))
+          (code/accept! (mut error)
+                        (encode/mov-rr (mut (.text out)) 64 registers/RBP registers/RSP))
+          (when (> frame-size 0)
+            (code/accept! (mut error)
+                          (encode/alu-ri (mut (.text out)) encode/SUB 64 registers/RSP
+                                         frame-size)))
+          (when (>= (.entry-slot base) 0)
+            (code/accept! (mut error)
+                          (encode/alu-ri (mut (.text out)) encode/AND 64 registers/RSP
+                                         (- 0 (.alignment assigned))))
+            (code/accept! (mut error)
+                          (encode/mov-mr (mut (.text out)) 64
+                                         (encode/mem registers/RSP (.entry-slot base))
+                                         registers/RBP))
+            (code/accept! (mut error)
+                          (encode/lea (mut (.text out)) 64 registers/RBP
+                                      (encode/mem registers/RSP frame-size))))
+          (code/accept-count! (mut error)
+                              (callee/emit! (mut (.text out)) (.callee assigned) false base)))
+        (when (> frame-size 0)
+          (code/accept! (mut error)
+                        (encode/alu-ri (mut (.text out)) encode/SUB 64 registers/RSP frame-size))
+          (code/accept-count! (mut error)
+                              (callee/emit! (mut (.text out)) (.callee assigned) false base))))
+    (when (= (.kind (.spec role)) 2)
+      (if (< (.slot role) 0)
+          (set! error "indirect result pointer has no frame slot")
+          (match (frame-address/slot base (.slot role))
+            (Err [message] (set! error message))
+            (Ok [slot]
+                (code/accept! (mut error)
+                              (encode/mov-mr (mut (.text out)) 64 slot registers/RDI))))))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; The preserved-register reloads and the release of the frame: rsp is back
+;;; at the return address. An
+;;; anchored frame restores rsp from its anchor, wherever ALLOCA left it.
+;;; Only moves, `add` and `pop` are emitted and rax/rdx/xmm0/xmm1 are kept.
+(defn release-frame! [(out (mut code/Buffer)) (assigned allocate/Assigned) (frame-size i64)]
+  (-> (Result i32 (slice u8)))
+  (let [(mut error) ""
+        base (.base assigned)]
+    (if (frame-address/anchored? base)
+        (do
+          (code/accept-count! (mut error)
+                              (callee/emit! (mut (.text out)) (.callee assigned) true base))
+          (code/accept-count! (mut error)
+                              (frame-address/anchor! (mut (.text out)) base registers/RSP))
+          (code/accept! (mut error) (encode/pop-r (mut (.text out)) registers/RBP)))
+        (when (> frame-size 0)
+          (code/accept-count! (mut error)
+                              (callee/emit! (mut (.text out)) (.callee assigned) true base))
+          (code/accept! (mut error)
+                        (encode/alu-ri (mut (.text out)) encode/ADD 64 registers/RSP
+                                       frame-size))))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; release-frame! and ret.
+(defn epilogue! [(out (mut code/Buffer)) (assigned allocate/Assigned) (frame-size i64)]
+  (-> (Result i32 (slice u8)))
+  (let [(mut error) ""]
+    (code/accept-count! (mut error) (release-frame! (mut out) assigned frame-size))
+    (code/accept! (mut error) (encode/ret (mut (.text out))))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; RETURN, by the function's result role (System V):
+;;;   ordinary  the value (register, spill slot or constant) goes to rax,
+;;;             extended to 32 bits by its type's signedness, or to xmm0;
+;;;   pieces    each register piece is loaded from the frame buffer: integer
+;;;             pieces into rax then rdx, floating ones into xmm0 then xmm1;
+;;;             or, for a direct return (stogir.x64.return-values), the piece
+;;;             values themselves are moved into rax and rdx;
+;;;   indirect  the saved hidden pointer is returned in rax.
+;;; Then the epilogue.
+(defn return! [(out (mut code/Buffer)) (cx context/Context) (assigned allocate/Assigned)
+               (role Role) (reference i32) (position i64)] (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions (.graph cx)) (cast i64 reference))
+        ty (cast i32 (n/type-id node))
+        spec (.spec role)
+        direct (return-values/pieces (.graph cx) (.operands (.matched cx)) reference)
+        allocator (.alc (.instructions (.graph cx)))
+        (mut error) ""]
+    (cond
+      (> direct 0)
+        (code/accept-count! (mut error)
+                            (call/return-pieces! (mut out) cx position
+                                                 (return-values/piece (.operands (.matched cx))
+                                                                      reference 0)
+                                                 (if (> direct 1)
+                                                     (return-values/piece
+                                                       (.operands (.matched cx)) reference 1)
+                                                     0)
+                                                 allocator))
+      (= (.kind spec) 0)
+        (when (!= ty 0)
+          (code/accept-count! (mut error)
+                              (call/load! (mut out) cx (.op2 node) position
+                                          (call/result-register ty)))
+          (code/accept-count! (mut error) (abi/normalize! (mut out) ty registers/RAX)))
+      (< (.slot role) 0) (set! error "aggregate result has no frame slot")
+      (= (.kind spec) 2)
+        (match (frame-address/slot (.base cx) (.slot role))
+          (Err [message] (set! error message))
+          (Ok [slot]
+              (code/accept! (mut error)
+                            (encode/mov-rm (mut (.text out)) 64 registers/RAX slot))))
+      :else
+        (for [i 0 (cast i64 (.count spec))]
+          (let [piece (cast i32 i)
+                register (arguments/result-register spec piece)]
+            (match (frame-address/slot (.base cx) (+ (.slot role) (results/piece-offset spec piece)))
+              (Err [message] (when (= error "") (set! error message)))
+              (Ok [slot]
+                  (code/accept! (mut error)
+                                (cond (registers/gpr? register)
+                                        (encode/mov-rm (mut (.text out)) 64 register slot)
+                                      (= (results/piece-type spec piece) 13)
+                                        (encode/sse-mov-rm (mut (.text out)) encode/MOVSS register
+                                                           slot)
+                                      :else
+                                        (encode/sse-mov-rm (mut (.text out)) encode/MOVSD register
+                                                           slot))))))))
+    (code/accept-count! (mut error) (epilogue! (mut out) assigned (.frame-size cx)))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; CALL and TAILCALL by their selected mode (stogir.x64.tail-plan).
+;;;   0  the call, results captured (stogir.x64.call/emit-call!).
+;;;   2  the call, then this function's epilogue: the callee's result
+;;;      registers are this function's own.
+;;;   1  a jump. The arguments are installed as for a call; the stack
+;;;      arguments, built in the outgoing area, are moved over the ones this
+;;;      function received (the selection proved they fit), highest slot
+;;;      first because the destination lies above the source and may overlap
+;;;      it; the frame is released, which leaves rsp at the return address
+;;;      (an anchored frame restores it from rbp, wherever ALLOCA left it);
+;;;      then `jmp rel32` or `jmp rax`. The move uses r10, and r11 for the
+;;;      anchor of an over-aligned frame: the argument registers and an
+;;;      indirect target (rax) are already in place.
+(defn call-node! [(out (mut code/Buffer)) (cx context/Context) (assigned allocate/Assigned)
+                  (reference i32) (position i64) (preserve (slice locations/Transfer))
+                  (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [graph (.graph cx)
+        node (get (.instructions graph) (cast i64 reference))
+        mode (plan/tail-mode (.matched cx) reference)
+        frame-size (.frame-size cx)
+        (mut error) ""]
+    (cond
+      (and (= (n/opcode node) 80) (= mode 0)) (Err "TAILCALL has no selected lowering")
+      (= mode 0) (call/emit-call! (mut out) cx reference position preserve 0 allocator)
+      :else
+        (do
+          (code/accept-count! (mut error)
+                              (call/emit-call! (mut out) cx reference position preserve mode
+                                               allocator))
+          (if (= mode 2)
+              (code/accept-count! (mut error) (epilogue! (mut out) assigned frame-size))
+              (match (abi/layout graph reference allocator)
+                (Err [message] (when (= error "") (set! error message)))
+                (Ok [planned]
+                    (let [(mut planned) planned
+                          (mut offset) (.passed planned)]
+                      (while (> offset 0)
+                        (set! offset (- offset 8))
+                        (code/accept! (mut error)
+                                      (encode/mov-rm (mut (.text out)) 64 registers/SCRATCH-GPR
+                                                     (encode/mem registers/RSP offset)))
+                        ; The incoming slot is found through the frame base
+                        ; (rbp in an anchored frame, whose rsp ALLOCA may
+                        ; have moved); r11 carries an over-aligned frame's
+                        ; anchor and is free: a jump is never variadic.
+                        (match (frame-address/parameter! (mut (.text out)) (.base cx) frame-size
+                                                         offset registers/SCRATCH-GPR-2)
+                          (Err [message] (when (= error "") (set! error message)))
+                          (Ok [incoming]
+                              (code/accept! (mut error)
+                                            (encode/mov-mr (mut (.text out)) 64 incoming
+                                                           registers/SCRATCH-GPR)))))
+                      (code/accept-count! (mut error)
+                                          (release-frame! (mut out) assigned frame-size))
+                      (if (abi/direct-callee? graph (.op2 node))
+                          (code/accept-count! (mut error)
+                                              (code/direct-jump! (mut out) graph (.op2 node)))
+                          (code/accept! (mut error)
+                                        (encode/jmp-r (mut (.text out))
+                                                      (call/target-register planned))))
+                      (code/called! (mut out))
+                      (abi/release! (mut planned))))))
+          (if (= error "") (Ok 0) (Err error))))))
+
+;;; The IF_TRUE and IF_FALSE projections of IF `reference`.
+(defstruct Arms [(yes i32) (no i32)])
+
+(defn arms [(flow edges/Flow) (reference i32)] (-> Arms)
+  (let [range (get (.ranges (.users flow)) (cast i64 reference))
+        (mut yes) (: 0 i32)
+        (mut no) (: 0 i32)]
+    (for [r 0 (.count range)]
+      (let [edge (get (.edges (.users flow)) (+ (.offset range) r))
+            user (.user edge)
+            opcode (n/opcode (get (.instructions (.graph flow)) (cast i64 user)))]
+        (when (and (= (.operand edge) 1) (get (.selected flow) (cast i64 user)))
+          (when (= opcode 107) (set! yes user))
+          (when (= opcode 108) (set! no user)))))
+    (Arms :yes yes :no no)))
+
+;;; IF: the flags of its fused comparison or of its condition value, a
+;;; conditional jump on the edge that does not fall through, the
+;;; fall-through edge's moves, and a jump when that block is not next.
+;;; `next` is the projection laid out directly behind, or zero. A floating
+;;; comparison or condition value gives an extended condition
+;;; (stogir.x64.fcompare), which may take two jumps.
+(defn conditional-branch! [(out (mut code/Buffer)) (cx context/Context) (flow edges/Flow)
+                           (control (mut edges/Control)) (reference i32) (position i64)
+                           (next i32) (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions (.graph cx)) (cast i64 reference))
+        sides (arms flow reference)]
+    (if (or (= (.yes sides) 0) (= (.no sides) 0))
+        (Err "IF requires both projections")
+        (match (if (plan/fused? (.matched cx) reference)
+                   (emit/flags! (mut out) cx position
+                                (plan/condition-tile (.matched cx) reference))
+                   (truth/flags! (mut out) cx (.op2 node) position))
+          (Err [message] (Err message))
+          (Ok [cc]
+              (let [fallthrough (if (= next (.yes sides)) (.yes sides) (.no sides))
+                    taken (if (= next (.yes sides)) (.no sides) (.yes sides))
+                    condition (if (= next (.yes sides)) (fcompare/invert cc) cc)]
+                (match (edges/branch-edge-parity! (mut out) flow (mut control) taken
+                                                  (+ position 1) condition true allocator)
+                  (Err [message] (Err message))
+                  (Ok [_]
+                      (match (edges/edge! (mut out) flow fallthrough (+ position 1) allocator)
+                        (Err [message] (Err message))
+                        (Ok [_]
+                            (if (= fallthrough next)
+                                (Ok 0)
+                                (fixups/jump! (mut out) (mut (.branches control))
+                                              fallthrough fixups/JUMP))))))))))))
+
+;;; Whether both edges out of IF `branch` (at `position`) are without moves.
+;;; Only then may the IF be emitted a second time (a test block run in place
+;;; at an END): moves placed at a projection's entry assume the IF is that
+;;; block's only way in.
+(defn quiet-projections? [(flow edges/Flow) (branch i32) (position i64)
+                          (allocator (dyn Allocator))] (-> bool)
+  (let [sides (arms flow branch)
+        (mut quiet) (and (> (.yes sides) 0) (> (.no sides) 0))]
+    (for [k 0 2]
+      (when quiet
+        (let [(mut scratch) (code/create allocator)]
+          (match (edges/edge! (mut scratch) flow (if (= k 0) (.yes sides) (.no sides))
+                              (+ position 1) allocator)
+            (Err [_] (set! quiet false))
+            (Ok [_] (when (> (len (.text scratch)) 0) (set! quiet false))))
+          (code/release! (mut scratch)))))
+    quiet))
+
+;;; What the driver knows about blocks before it emits them.
+;;;   tails[b]  block b is a return tail: its start, nodes that emit nothing
+;;;             (PHIs, omitted nodes), a RETURN, and no allocator transfer
+;;;             inside. An END entering it may return in place.
+;;;   tests[b]  the IF of test block b, else 0: its start, nodes that emit
+;;;             nothing and an IF, at most eight nodes, no transfer inside.
+;;;             An END entering it may run the IF in place.
+;;;   exact     ADD/SUB nodes proven not to overflow as signed operations
+;;;             (exact-decrements); usually empty.
+(defstruct Shapes [(tails (ArrayList bool)) (tests (ArrayList i32)) (exact (ArrayList i32))])
+
+(defn release-shapes! [(shapes (mut Shapes))] (-> void)
+  (free! (mut (.tails shapes)))
+  (free! (mut (.tests shapes))))
+
+(defn block-shapes [(graph g/Graph) (scheduled schedule/Schedule) (matched plan/Plan)
+                    (move-index transfer-index/Index) (exact (ArrayList i32))
+                    (allocator (dyn Allocator))] (-> Shapes)
+  (let [(mut tails) (ArrayList::new [bool] allocator)
+        (mut tests) (ArrayList::new [i32] allocator)]
+    (fill/append! (mut tails) (len (.instructions graph)) false)
+    (fill/append! (mut tests) (len (.instructions graph)) 0)
+    (for reference (.nodes scheduled)
+      (let [opcode (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference))))]
+        (when (op/block-start? opcode)
+          (let [range (get (.ranges scheduled) (cast i64 reference))
+                count (.count range)
+                last (get (.nodes scheduled) (- (+ (.offset range) count) 1))
+                last-op (cast i32 (n/opcode (get (.instructions graph) (cast i64 last))))
+                begin (* (.offset range) 2)
+                (mut silent) (>= count 2)
+                (mut plain) true]
+            (when (and silent (or (= last-op 120) (= last-op 116)))
+              ; PHIs and nodes the plan omits or rebuilds at their uses emit
+              ; nothing inside the block. A return tail's value must not be
+              ; one of the latter: RETURN reads it where it was placed.
+              (for [k 1 (- count 1)]
+                (let [inner (get (.nodes scheduled) (+ (.offset range) k))
+                      phi (= (n/opcode (get (.instructions graph) (cast i64 inner))) 67)
+                      omitted (plan/omitted? matched inner)]
+                  (unless (or phi omitted (machine/rematerialized? (.operands matched) inner))
+                    (set! silent false))
+                  (unless (or phi omitted) (set! plain false))))
+              (for [at begin (+ begin (* count 2))]
+                (when (and (< at (len (.heads move-index))) (>= (get (.heads move-index) at) 0))
+                  (set! silent false)))
+              (when (and silent plain (= last-op 120))
+                (set! (mut tails) (cast i64 reference) true))
+              (when (and silent (= last-op 116) (<= count 8)
+                         (or (= opcode 106) (= opcode 112) (= opcode 113)))
+                (set! (mut tests) (cast i64 reference) last)))))))
+    (Shapes :tails tails :tests tests :exact exact)))
+
+;;; ADD/SUB-of-a-literal nodes that an IF compares with zero through `>` or
+;;; `<=`, directly or as an input of the PHI it tests, and that are proven
+;;; not to overflow as signed operations (stogir.nonnegative: the source is
+;;; non-negative where the node is computed). Their `sub`/`add` leaves OF = 0,
+;;; so those conditions can read its flags (stogir.x64.code/FLAGS-EXACT).
+;;; `==`, `!=`, `<` and `>=` with zero need no proof.
+(const EXACT-LIMIT 0x7FFFFFFF)
+
+(defn exact-decrements [(graph g/Graph) (prepared pipeline/Prepared) (matched plan/Plan)
+                        (allocator (dyn Allocator))] (-> (ArrayList i32))
+  (let [scheduled (.schedule prepared)
+        (mut exact) (ArrayList::new [i32] allocator)
+        (mut blocks) (ArrayList::new [i32] allocator)]
+    (for reference (.nodes scheduled)
+      (when (and (= (n/opcode (get (.instructions graph) (cast i64 reference))) 116)
+                 (plan/fused? matched reference))
+        (let [tile (plan/condition-tile matched reference)]
+          (when (and (= (.rule tile) select/RULE-COMPARE-ZERO)
+                     (or (= (.operation tile) encode/CC-G) (= (.operation tile) encode/CC-LE))
+                     (> (.left tile) 0))
+            ; The block of every node, built for the first candidate only.
+            (when (= (len blocks) 0)
+              (extend-zeroed! (mut blocks) (len (.instructions graph)))
+              (let [(mut block) (: 0 i32)]
+                (for scheduled-node (.nodes scheduled)
+                  (when (op/block-start? (cast i32 (n/opcode (get (.instructions graph)
+                                                                  (cast i64 scheduled-node)))))
+                    (set! block scheduled-node))
+                  (set! (mut blocks) (cast i64 scheduled-node) block))))
+            (let [value (.left tile)]
+              (if (= (n/opcode (get (.instructions graph) (cast i64 value))) 67)
+                  (for [slot 2 (+ (cast i64 (get (.arities graph) (cast i64 value))) 1)]
+                    (match (g/operand graph value (cast i32 slot))
+                      (None [] 0)
+                      (Some [input]
+                            (when (and (> input 0)
+                                       (> (get blocks (cast i64 input)) 0)
+                                       (nonnegative/decrement-exact?
+                                         graph (.idom prepared) (get blocks (cast i64 input))
+                                         input EXACT-LIMIT))
+                              (push! (mut exact) input)))))
+                  (when (and (> (get blocks (cast i64 value)) 0)
+                             (nonnegative/decrement-exact?
+                               graph (.idom prepared) (get blocks (cast i64 value)) value
+                               EXACT-LIMIT))
+                    (push! (mut exact) value))))))))
+    (free! (mut blocks))
+    exact))
+
+;;; Whether the block starting at `reference` may be the top of a loop: a
+;;; LOOP_BEGIN, or a block the layout found at the head of a cycle (it marks
+;;; those in functions of more than three and at most 257 blocks only).
+;;; Candidates get an alignment request; the relaxation pass honours it only
+;;; for a label that some jump really goes back to, and only when the
+;;; padding is small (stogir.x64.fixups/loop-alignment).
+(defn loop-top-candidate? [(graph g/Graph) (alignment (ArrayList i32)) (reference i32)]
+  (-> bool)
+  (or (= (n/opcode (get (.instructions graph) (cast i64 reference))) 113)
+      (> (get alignment (cast i64 reference)) 4)))
+
+;;; END and LOOP_END. `next` is the block laid out directly behind (zero
+;;; when none). In order of preference: fall through into the entered block;
+;;; return in place when it is a return tail; run its IF in place when it is
+;;; a test block; jump to it. The edge's moves come first in every case.
+(defn block-end! [(out (mut code/Buffer)) (cx context/Context) (flow edges/Flow)
+                  (control (mut edges/Control)) (assigned allocate/Assigned)
+                  (shapes Shapes) (role Role) (alignment (ArrayList i32)) (reference i32)
+                  (position i64) (next i32) (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [entered (edges/successor flow reference)
+        block (edges/resolve-alias (.aliases flow) entered)]
+    (if (or (= entered 0) (<= block 0))
+        (Err "block end has no scheduled successor")
+        (match (edges/edge! (mut out) flow entered (+ position 1) allocator)
+          (Err [message] (Err message))
+          (Ok [_]
+              (let [range (get (.ranges (.scheduled flow)) (cast i64 block))
+                    last-index (- (+ (.offset range) (.count range)) 1)
+                    test (get (.tests shapes) (cast i64 block))]
+                (cond (= block next) (Ok 0)
+                      ; After this END's edge moves nothing else happens
+                      ; before the tail's RETURN: a forwarded block's own
+                      ; edge is empty and the tail holds no code but it.
+                      (get (.tails shapes) (cast i64 block))
+                        (return! (mut out) cx assigned role
+                                 (get (.nodes (.scheduled flow)) last-index) (* last-index 2))
+                      ; Likewise the registers are exactly those at the test
+                      ; block's IF.
+                      (and (> test 0) (quiet-projections? flow test (* last-index 2) allocator))
+                        (do
+                          ; The loop's top is now whichever projection the IF
+                          ; jumps back to, not its header.
+                          (when (loop-top-candidate? (.graph cx) alignment block)
+                            (let [sides (arms flow test)]
+                              (push! (mut (.alignments control))
+                                     (fixups/loop-alignment (.yes sides)))
+                              (push! (mut (.alignments control))
+                                     (fixups/loop-alignment (.no sides)))))
+                          (conditional-branch! (mut out) cx flow (mut control) test
+                                               (* last-index 2)
+                                               (edges/next-successor flow test next)
+                                               allocator))
+                      :else
+                        (fixups/jump! (mut out) (mut (.branches control)) entered
+                                      fixups/JUMP))))))))
+
+;;; Blocks the layout may skip: a block of only its start, PHIs and an END,
+;;; with one successor, no transfer inside and an empty outgoing edge. A
+;;; branch to it then goes to its successor instead. Entry blocks stay.
+(defn empty-blocks [(graph g/Graph)
+                    (prepared pipeline/Prepared)
+                    (flow edges/Flow)
+                    (moves (ArrayList locations/Transfer))
+                    (allocator (dyn Allocator))]
+  (-> (Result (ArrayList bool) (slice u8)))
+  (let [(mut result) (ArrayList::new [bool] allocator)
+        (mut successors) (adj/build (.blocks prepared) false allocator)
+        scheduled (.schedule prepared)
+        (mut error) ""]
+    (fill/append! (mut result) (len (.instructions graph)) false)
+    (for reference (.order prepared)
+      (let [range (get (.ranges scheduled) (cast i64 reference))
+            outgoing (get (.ranges successors) (cast i64 reference))
+            opcode (n/opcode (get (.instructions graph) (cast i64 reference)))]
+        (when (and (= error "")
+                   (>= (.count range) 2)
+                   (= (.count outgoing) 1)
+                   (!= opcode 104)
+                   (!= opcode 105))
+          (let [ending (get (.nodes scheduled) (+ (.offset range) (- (.count range) 1)))
+                end-op (n/opcode (get (.instructions graph) (cast i64 ending)))
+                target (.to (get (.edges (.blocks prepared))
+                                 (get (.edges successors) (.offset outgoing))))
+                begin (* (.offset range) 2)
+                end (+ begin (* (.count range) 2))
+                (mut plain) (or (= end-op 114) (= end-op 115))]
+            (for [k 1 (- (.count range) 1)]
+              (unless (= (n/opcode (get (.instructions graph)
+                                        (cast i64 (get (.nodes scheduled) (+ (.offset range) k)))))
+                         67)
+                (set! plain false)))
+            ; Only candidates pay for the scan of the transfer list.
+            (when plain
+              (for move moves
+                (when (and (> (.position move) begin) (< (.position move) end))
+                  (set! plain false))))
+            (when (and plain
+                       (!= target reference)
+                       (> (.count (get (.ranges scheduled) (cast i64 target))) 0)
+                       (>= (get (.indices (.analysis flow)) (cast i64 target)) 0))
+              (let [(mut transfer) (code/create allocator)]
+                (match (edges/edge! (mut transfer) flow target (- end 1) allocator)
+                  (Err [message] (set! error message))
+                  (Ok [_]
+                      (when (= (len (.text transfer)) 0)
+                        (set! (mut result) (cast i64 reference) true))))
+                (code/release! (mut transfer))))))))
+    (adj/release! (mut successors))
+    (if (= error "") (Ok result) (do (free! (mut result)) (Err error)))))
+
+;;; How one function is emitted, beyond what its graph says.
+;;;   prune-default  a SWITCH default that only reaches UNREACHABLE gives its
+;;;                  place to the last case (stogir.x64.switch/pruned-default)
+;;;   predict        blocks are ordered by static branch prediction
+;;;                  (stogir.block-layout/predict!)
+;;;   private        the private-leaf context of this compilation: the call
+;;;                  family narrows the clobbers of direct calls to its leaves
+(defstruct Options [(prune-default bool) (predict bool) (private private/Context)])
+
+(defn default-options [] (-> Options)
+  (Options :prune-default false :predict false :private (private/no-context)))
+
+;;; Functions start on a 16-byte boundary, as LLVM and GCC place them on
+;;; x86-64. An image aligns its text to the largest alignment of its parts.
+(const FUNCTION-ALIGNMENT 16)
+
+;;; Emit the function in `physical` order. `moves` are the allocator's split
+;;; transfers; `users` the use lists of this exact graph.
+(defn body-ordered [(graph g/Graph)
+                    (scheduled schedule/Schedule)
+                    (assigned allocate/Assigned)
+                    (analysis live/Analysis)
+                    (set uses/Set)
+                    (matched plan/Plan)
+                    (physical layout/Plan)
+                    (moves (ArrayList locations/Transfer))
+                    (users graph-uses/Uses)
+                    (selected (ArrayList bool))
+                    (exact (ArrayList i32))
+                    (options Options)
+                    (allocator (dyn Allocator))]
+  (-> (Result code/Buffer (slice u8)))
+  (let [frame-size (allocate/frame-size assigned)
+        cx (context/Context
+             :graph graph
+             :parts (locations/indexed-view (.parts assigned) (.locations assigned))
+             :base (.base assigned)
+             :matched matched
+             :frame (.frame assigned)
+             :frame-size frame-size
+             :outgoing-size (.outgoing-size assigned)
+             :alignment (.alignment assigned))
+        flow (edges/Flow
+               :graph graph
+               :scheduled scheduled
+               :analysis analysis
+               :parts (.parts assigned)
+               :locations (.locations assigned)
+               :base (.base assigned)
+               :users users
+               :selected selected
+               :aliases (.aliases physical))
+        (mut output) (code/create allocator)
+        (mut control) (edges/create-control allocator)
+        (mut group) (ArrayList::new [locations/Transfer] allocator)
+        (mut move-index) (transfer-index/create allocator)
+        (mut role) (Role :spec (results/ordinary) :slot -1)
+        (mut error) ""]
+    (set! (.alignment output) FUNCTION-ALIGNMENT)
+    (match (incoming/result-role graph)
+      (Err [message] (set! error message))
+      (Ok [spec]
+          (set! role (Role :spec spec
+                           :slot (if (and (!= (.kind spec) 0) (> (len (.nodes scheduled)) 0))
+                                     (abi/local-offset (.frame assigned)
+                                                       (get (.nodes scheduled) 0))
+                                     -1)))))
+    (match (checked-schedule/validate graph scheduled)
+      (Err [message] (set! error message))
+      (Ok [_] 0))
+    (match (transfer-index/build (slice moves) (* (len (.nodes scheduled)) 2) allocator)
+      (Err [message] (set! error message))
+      (Ok [index] (set! move-index index)))
+    (fill/append! (mut (.labels control)) (len (.instructions graph)) -1)
+    ; A transfer at an odd (definition) position runs before the node. That
+    ; is right for a store into a spill slot, which preserves the register's
+    ; old value; any other odd transfer needs lowering by the node's own
+    ; emitter. Calls announce their position and lower every transfer there
+    ; inside their own parallel group (call-node!).
+    (for move moves
+      (when (and (= error "")
+                 (!= (% (.position move) 2) 0)
+                 (not (and (= (.kind (.source move)) 0) (= (.kind (.destination move)) 1))))
+        (let [(mut announced) false]
+          (for position (.definition-moves set)
+            (when (= position (.position move)) (set! announced true)))
+          (unless announced
+            (set! error "odd split boundary needs instruction-specific lowering")))))
+    (let [(mut shapes) (if (= error "")
+                           (block-shapes graph scheduled matched move-index exact allocator)
+                           (Shapes :tails (ArrayList::new [bool] allocator)
+                                   :tests (ArrayList::new [i32] allocator)
+                                   :exact exact))]
+      (when (= error "")
+        (match (prologue! (mut output) assigned frame-size role)
+          (Err [message] (set! error message))
+          (Ok [_] 0)))
+      (for [cursor 0 (len (.indices physical))]
+        (when (= error "")
+          (let [i (get (.indices physical) cursor)
+                reference (get (.nodes scheduled) i)
+                node (get (.instructions graph) (cast i64 reference))
+                opcode (cast i32 (n/opcode node))
+                position (* i 2)
+                start? (op/block-start? opcode)
+                next (get (.next physical) i)]
+            (when start?
+              ; Control may arrive here from elsewhere: nothing is known
+              ; about the flags.
+              (code/clear-flags! (mut output))
+              (set! (mut (.labels control)) (cast i64 reference) (len (.text output)))
+              (when (loop-top-candidate? graph (.alignment physical) reference)
+                (push! (mut (.alignments control)) (fixups/loop-alignment reference)))
+              (match (edges/place-entry! (mut output) (mut control) reference)
+                (Err [message] (set! error message))
+                (Ok [_] 0)))
+            ; The use and definition positions are ordered phases: a reload at
+            ; the even position completes before an odd spill store. Incoming
+            ; edges already put values where a block start expects them, so the
+            ; linear-layout boundary before a block start is not replayed.
+            (for [phase 0 2]
+              (clear! (mut group))
+              (when (and (= error "") (or (!= phase 0) (not start?)))
+                (let [(mut at) (get (.heads move-index) (+ position phase))]
+                  (while (>= at 0)
+                    (push! (mut group) (get moves at))
+                    (set! at (get (.next move-index) at))))
+                ; A call lowers its definition-position transfers itself.
+                (when (and (> (len group) 0)
+                           (not (and (= phase 1) (self-lowered? graph matched reference))))
+                  (match (edges/typed-group! (mut (.text output)) graph (slice group)
+                                             allocator (.base assigned))
+                    (Err [message] (set! error message))
+                    (Ok [_] 0)))))
+            (when (= error "")
+              (match
+                (cond (or (machine/rematerialized? (.operands matched) reference)
+                          (plan/omitted? matched reference)
+                          start?
+                          (= opcode 67))
+                        (Ok [i32 (slice u8)] 0)
+                      (or (= opcode 114) (= opcode 115))
+                        (block-end! (mut output) cx flow (mut control) assigned shapes role
+                                    (.alignment physical) reference position next allocator)
+                      (= opcode 117)
+                        (switch/emit! (mut output) cx flow (mut control) reference position
+                                      (edges/next-successor flow reference next)
+                                      (.prune-default options) allocator)
+                      (or (= opcode 79) (= opcode 80))
+                        (call-node! (mut output) cx assigned reference position (slice group)
+                                    allocator)
+                      (self-lowered? graph matched reference)
+                        (floating/fma! (mut output) cx reference position (slice group)
+                                       allocator)
+                      ; A family's node, except the floating forms of PARAM,
+                      ; RETURN and IF, which need the driver's state and are
+                      ; emitted by the cases below.
+                      (and (!= (plan/family matched reference) families/CORE)
+                           (not (and (= (plan/family matched reference) families/FLOATING)
+                                     (or (= opcode 71) (= opcode 116) (= opcode 120)))))
+                        (families/emit! (mut output) cx reference position
+                                        (plan/family matched reference))
+                      (= opcode 71)
+                        (incoming/emit-entry-with-locations!
+                          (mut output) graph (.parts cx)
+                          (.parameter (at (.values set) (cast i64 reference)))
+                          position frame-size (.base cx) (.slot role))
+                      (or (= opcode 96) (= opcode 121))
+                        (match (encode/ud2 (mut (.text output)))
+                          (Err [message] (Err [i32 (slice u8)] message))
+                          (Ok [_] (Ok 0)))
+                      (= opcode 120) (return! (mut output) cx assigned role reference position)
+                      (= opcode 116)
+                        (conditional-branch! (mut output) cx flow (mut control) reference position
+                                             (edges/next-successor flow reference next)
+                                             allocator)
+                      (= opcode 60) (conditional/emit! (mut output) cx reference position)
+                      (= opcode 68) (emit/copy! (mut output) cx reference position)
+                      (and (>= opcode 33) (<= opcode 36))
+                        (convert/emit! (mut output) cx reference position)
+                      (or (= opcode 31) (= opcode 45))
+                        (unary/emit! (mut output) cx reference position)
+                      :else
+                        (let [tile (get (.tiles matched) (cast i64 reference))]
+                          (cond (select/reciprocal-rule? (.rule tile))
+                                  (reciprocal/emit! (mut output) cx reference position tile)
+                                (= (.rule tile) select/RULE-LEA)
+                                  (lea/emit! (mut output) cx reference position tile)
+                                :else (emit/tile! (mut output) cx reference position tile))))
+                (Err [message] (set! error message))
+                (Ok [_] 0))
+              ; The `add`/`sub` this node just emitted cannot overflow.
+              (for proven (.exact shapes)
+                (when (= proven reference) (code/exact-flags! (mut output))))))))
+      (release-shapes! (mut shapes)))
+    ; A skipped block's label is its forwarding target's.
+    (when (= error "")
+      (for [reference 1 (len (.aliases physical))]
+        (let [target (get (.aliases physical) reference)]
+          (when (!= target (cast i32 reference))
+            (set! (mut (.labels control)) reference
+                  (get (.labels control) (cast i64 target)))))))
+    (when (= error "")
+      (match (edges/finish-stubs! (mut output) (mut control))
+        (Err [message] (set! error message))
+        (Ok [_] 0)))
+    (when (= error "")
+      (edges/finish-tables! (mut output) (mut control))
+      (match (fixups/relax! (mut output) (mut (.labels control)) (mut (.branches control))
+                            (mut (.relatives control)) (.alignments control))
+        (Err [message] (set! error message))
+        (Ok [_] 0)))
+    (when (= error "")
+      (match (fixups/apply! (mut (.text output)) (.labels control) (.branches control))
+        (Err [message] (set! error message))
+        (Ok [_] 0)))
+    (when (= error "")
+      (match (fixups/apply-relative! (mut (.text output)) (.labels control)
+                                     (.relatives control))
+        (Err [message] (set! error message))
+        (Ok [_] 0)))
+    (when (= error "")
+      (match (fixups/verify (.text output) (.labels control) (.branches control)
+                            (.relatives control))
+        (Err [message] (set! error message))
+        (Ok [_] 0))
+      (for branch (.branches control)
+        (cond (= (.condition branch) fixups/ADDRESS) 0
+              (= (.condition branch) fixups/JUMP)
+                (set! (.unconditional (.summary output))
+                      (+ (.unconditional (.summary output)) 1))
+              :else
+                (set! (.conditional (.summary output))
+                      (+ (.conditional (.summary output)) 1)))
+        (when (.short branch)
+          (set! (.short (.summary output)) (+ (.short (.summary output)) 1)))))
+    ; The floating constant pool follows the code and the jump tables; its
+    ; loads are patched now that nothing before it can move any more
+    ; (relaxation has already moved their reference offsets).
+    (when (= error "")
+      (match (pool/finish! (mut output) graph allocator)
+        (Err [message] (set! error message))
+        (Ok [_] 0)))
+    ; The registers this code may write (stogir.x64.code): every allocated
+    ; register, every declared clobber, the scratches and the result
+    ; registers of the function's role.
+    (for part (.parts assigned) (code/wrote! (mut output) (.register part)))
+    (for clobber (.clobbers set) (code/wrote! (mut output) (.register clobber)))
+    (for scratch [(: registers/SCRATCH-GPR i32) registers/SCRATCH-GPR-2
+                  registers/SCRATCH-SIMD registers/SCRATCH-SIMD-2 registers/RAX
+                  registers/XMM0]
+      (code/wrote! (mut output) scratch))
+    (when (= (.kind (.spec role)) 1)
+      (for [i 0 (cast i64 (.count (.spec role)))]
+        (code/wrote! (mut output) (arguments/result-register (.spec role) (cast i32 i)))))
+    (edges/release-control! (mut control))
+    (free! (mut group))
+    (transfer-index/release! (mut move-index))
+    (if (= error "")
+        (Ok output)
+        (do (code/release! (mut output)) (Err error)))))
+
+;;; Emit an allocated function. Allocation positions are fixed before the
+;;; physical block order is chosen.
+(defn body-prepared [(graph g/Graph)
+                     (prepared pipeline/Prepared)
+                     (assigned allocate/Assigned)
+                     (analysis live/Analysis)
+                     (set uses/Set)
+                     (matched plan/Plan)
+                     (options Options)
+                     (allocator (dyn Allocator))]
+  (-> (Result code/Buffer (slice u8)))
+  (let [scheduled (.schedule prepared)
+        (mut moves) (split-moves graph scheduled assigned matched allocator)
+        (mut selected) (ArrayList::new [bool] allocator)
+        (mut identity) (ArrayList::new [i32] allocator)
+        (mut exact) (exact-decrements graph prepared matched allocator)]
+    (extend-zeroed! (mut selected) (len (.instructions graph)))
+    (for reference (.nodes scheduled)
+      (set! (mut selected) (cast i64 reference) true))
+    (for [r 0 (len (.instructions graph))] (push! (mut identity) (cast i32 r)))
+    (let [probe (edges/Flow
+                  :graph graph
+                  :scheduled scheduled
+                  :analysis analysis
+                  :parts (.parts assigned)
+                  :locations (.locations assigned)
+                  :base (.base assigned)
+                  :users (.users prepared)
+                  :selected selected
+                  :aliases identity)
+          result
+            (match (empty-blocks graph prepared probe moves allocator)
+              (Err [message] (Err [code/Buffer (slice u8)] message))
+              (Ok [candidates]
+                  (let [(mut empty) candidates
+                        (mut physical) (layout/build graph prepared empty (.predict options)
+                                                     allocator)
+                        emitted (body-ordered graph scheduled assigned analysis set matched
+                                              physical moves (.users prepared) selected
+                                              exact options allocator)]
+                    (layout/release! (mut physical))
+                    (free! (mut empty))
+                    emitted)))]
+      (free! (mut moves))
+      (free! (mut selected))
+      (free! (mut identity))
+      (free! (mut exact))
+      result)))

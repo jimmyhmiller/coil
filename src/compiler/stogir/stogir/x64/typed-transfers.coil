@@ -1,0 +1,128 @@
+;;; Mixed-width simultaneous physical copies on x86-64: all widths share one
+;;; cycle plan (stogir.moves). Used for allocator split boundaries, CFG edges
+;;; and PHI copies. Only moves are emitted, so flags survive a group.
+;;;
+;;; Scratch registers: a memory-to-memory copy goes through r10 (xmm14 for 16
+;;; bytes); a cycle is broken by saving one value in r11, or in xmm15 when
+;;; that value comes from an XMM register or is 16 bytes. None of r10 r11
+;;; xmm14 xmm15 may be an input.
+;;;
+;;; The a64 module of this name is not shared: its validation and holder
+;;; choice are written against the AArch64 register numbering and scratches
+;;; (x16/x17, v30/v31). The cycle solver itself is the neutral stogir.moves.
+(module stogir.x64.typed-transfers)
+(import "stogir.x64.transfers" :as transfers)
+(import "stogir.x64.frame-address" :as frame)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.locations" :as loc)
+(import "stogir.moves" :as moves)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.hashmap" :use [HashMap])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defstruct Copy [(transfer loc/Transfer) (size i32)])
+
+;;; The abstract holder id handed to the cycle solver. Register ids are below
+;;; 64 and spill identities start at 64, so 63 (no x86-64 register) is free.
+(const HOLDER 63)
+
+;;; Registers keep their number; each distinct spill slot gets a dense id
+;;; from 64 so the solver is independent of byte offsets.
+(defn identity! [(location loc/Location)
+                 (slots (mut (ArrayList loc/Location)))
+                 (indices (mut (HashMap i64 i32)))] (-> i32)
+  (if (= (.kind location) 0)
+      (cast i32 (.value location))
+      (match (get indices (.value location))
+        (Some [id] id)
+        (None []
+              (let [id (cast i32 (+ 64 (len slots)))]
+                (push! (mut slots) location)
+                (set! (mut indices) (.value location) id)
+                id)))))
+
+(defn location [(id i32) (holder i32) (slots (ArrayList loc/Location))] (-> loc/Location)
+  (cond (= id HOLDER) (loc/Location :kind 0 :value (cast i64 holder))
+        (< id 64) (loc/Location :kind 0 :value (cast i64 id))
+        :else (get slots (cast i64 (- id 64)))))
+
+;;; Emit `copies` as one simultaneous group. All belong to one position.
+;;; Validation and emission are transactional with respect to output bytes.
+(defn parallel-frame! [(output (mut (ArrayList u8)))
+                       (copies (slice Copy))
+                       (allocator (dyn Allocator))
+                       (base frame/Base)]
+  (-> (Result i32 (slice u8)))
+  (let [(mut abstract) (ArrayList::new [moves/SizedMove] allocator)
+        (mut slots) (ArrayList::new [loc/Location] allocator)
+        (mut extents) (ArrayList::new [i32] allocator)
+        (mut indices) (HashMap::new-scalar [i64 i32] allocator)
+        (mut temporary) (ArrayList::new [u8] allocator)
+        (mut error) (if (frame/valid-base? base) "" "invalid typed transfer frame base")]
+    (for copy copies
+      (let [size (.size copy)
+            transfer (.transfer copy)]
+        (when (!= (.position transfer) (.position (.transfer (get copies 0))))
+          (set! error "typed parallel copies belong to different positions"))
+        (when (or (not (transfers/width-location? (.source transfer) size))
+                  (not (transfers/width-location? (.destination transfer) size))
+                  (transfers/reserved? (.source transfer))
+                  (transfers/reserved? (.destination transfer)))
+          (set! error "invalid typed transfer location or reserved scratch"))
+        (when (= error "")
+          (let [source (identity! (.source transfer) (mut slots) (mut indices))
+                destination (identity! (.destination transfer) (mut slots) (mut indices))]
+            (while (< (len extents) (len slots)) (push! (mut extents) 0))
+            (when (and (>= source 64) (> size (get extents (cast i64 (- source 64)))))
+              (set! (mut extents) (cast i64 (- source 64)) size))
+            (when (and (>= destination 64)
+                       (> size (get extents (cast i64 (- destination 64)))))
+              (set! (mut extents) (cast i64 (- destination 64)) size))
+            (push! (mut abstract)
+                   (moves/SizedMove :source source :destination destination :size size))))))
+    ; Distinct spill identities must not overlap: a wider copy into one slot
+    ; would otherwise destroy a neighbouring slot of the same group.
+    (when (= error "")
+      (for [i 0 (len slots)]
+        (for [j 0 (len slots)]
+          (let [first (.value (get slots i))
+                second (.value (get slots j))]
+            (when (and (< first second)
+                       (> (+ first (cast i64 (get extents i))) second))
+              (set! error "overlapping typed transfer stack identities"))))))
+    (when (= error "")
+      (match (moves/resolve-sized (slice abstract) HOLDER allocator)
+        (Err [message] (set! error message))
+        (Ok [plan]
+            (let [(mut plan) plan
+                  (mut holder) (: registers/SCRATCH-GPR-2 i32)]
+              (for move plan
+                ; A cycle is saved into the holder and later restored from
+                ; it, one cycle at a time. The holder of each cycle is of the
+                ; saved value's class: xmm15 for an XMM register or 16 bytes,
+                ; else r11.
+                (when (= (.destination move) HOLDER)
+                  (set! holder
+                        (if (or (> (.size move) 8)
+                                (and (< (.source move) 64) (registers/simd? (.source move))))
+                            (: registers/SCRATCH-SIMD-2 i32)
+                            registers/SCRATCH-GPR-2)))
+                (when (= error "")
+                  (match (transfers/emit-with! (mut temporary)
+                                               (location (.source move) holder slots)
+                                               (location (.destination move) holder slots)
+                                               (.size move)
+                                               base
+                                               true)
+                    (Err [message] (set! error message))
+                    (Ok [_] 0))))
+              (free! (mut plan))))))
+    (let [count (cast i32 (len temporary))]
+      (when (= error "") (for byte temporary (push! (mut output) byte)))
+      (free! (mut abstract))
+      (free! (mut slots))
+      (free! (mut extents))
+      (free! (mut indices))
+      (free! (mut temporary))
+      (if (= error "") (Ok count) (Err error)))))

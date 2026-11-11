@@ -1,0 +1,682 @@
+;;; x86-64 SWITCH dispatch.
+;;;
+;;; Operations: SWITCH (117). Its CASE_VAL, CASE_RANGE and CASE_DEFAULT
+;;; projections (109..111) are block starts and need no code of their own.
+;;; The dispatch planning is the a64 backend's (stogir.a64.switch), over the
+;;; neutral case collection (stogir.switch):
+;;;
+;;;   * cases whose edge reaches the default's address are the default;
+;;;   * singleton cases inside one 64-value window that reach at most three
+;;;     addresses: one range check and a `bt` of a mask per address;
+;;;   * at most three singleton cases: one compare and `je` each;
+;;;   * more than two singleton cases spanning less than eight values per
+;;;     case: a jump table;
+;;;   * anything else: a binary tree of compares.
+;;;
+;;; What differs from AArch64
+;;;   * No order key is built. Cases are sorted by the neutral layer in the
+;;;     selector type's own order, and the compares use that order's
+;;;     conditions directly (`jl`/`jg` for a signed type, `jb`/`ja` for an
+;;;     unsigned one) at the selector's own width, with the case value as
+;;;     immediate. A 64-bit case value outside the signed 32-bit range is
+;;;     built in r11.
+;;;   * A table index or bit number is `selector - first case`, computed into
+;;;     r10 zero-extended (`lea`, or `movsx`/`movzx` and `sub` for 8- and
+;;;     16-bit selectors); a 64-bit selector whose first case is zero is its
+;;;     own index.
+;;;   * A jump table is 32-bit `target - table` words placed after the
+;;;     function's code and edge stubs, 4-byte aligned, in a text-data range.
+;;;     The dispatch is `lea r11, [rip + table]`, `movsxd r10, [r11 + i*4]`,
+;;;     `add r10, r11`, `jmp r10`; the `lea` is an ADDRESS fixup.
+;;;   * An edge with moves gets an ordinary edge stub after the function body
+;;;     (stogir.x64.edges), so the block laid out next can still be fallen
+;;;     into when other edges have moves.
+;;;
+;;; Matching: a SWITCH on a SEXT or ZEXT of a 32-bit value into a 64-bit one
+;;; dispatches on the 32-bit source when the extension has no other reader
+;;; and every case value is the extension of its own low word; the extension
+;;; then emits nothing (`comparisons[switch]` names it, which makes the
+;;; SWITCH read the extension's operand).
+;;;
+;;; Scratch registers: r10 (selector reload, index) and r11 (wide case
+;;; value, mask, table address). Flags: nothing is live on entry; a compare
+;;; is directly followed by its jumps.
+(module stogir.x64.switch)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.schedule" :as schedule)
+(import "stogir.switch" :as switch)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.edges" :as edges)
+(import "stogir.x64.emit" :as emit)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.fixups" :as fixups)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.uses" :as uses)
+(import "stogir.x64.value" :as value)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; The 32-bit source of `selector` when it is a SEXT (33) or ZEXT (34) of an
+;;; I32 or U32 value into a 64-bit integer, else zero. A narrower source is
+;;; excluded (its extension is not a plain move) and so is an RLOAD (89),
+;;; which keeps its pinned position.
+(defn extension-source [(graph g/Graph) (selector i32)] (-> i32)
+  (if (<= selector 0)
+      0
+      (let [node (get (.instructions graph) (cast i64 selector))
+            opcode (cast i32 (n/opcode node))
+            ty (cast i32 (n/type-id node))
+            source (.op1 node)]
+        (if (or (not (or (= opcode 33) (= opcode 34)))
+                (not (or (= ty 5) (= ty 11)))
+                (<= source 0))
+            0
+            (let [input (get (.instructions graph) (cast i64 source))
+                  from (cast i32 (n/type-id input))]
+              (if (and (or (= from 4) (= from 10)) (!= (n/opcode input) 89))
+                  source
+                  0))))))
+
+;;; Whether case constant `literal` of a SWITCH on extension `selector` is
+;;; the extension of its own low word: below 2^32 for ZEXT, a signed 32-bit
+;;; value for SEXT.
+(defn word-case? [(graph g/Graph) (selector i32) (literal i32)] (-> bool)
+  (match (value/constant-bits graph literal)
+    (None [] false)
+    (Some [bits]
+          (if (= (n/opcode (get (.instructions graph) (cast i64 selector))) 34)
+              (<= bits 0xFFFFFFFF)
+              (encode/fits32? (cast i64 bits))))))
+
+;;; Matching of one SWITCH: note it when its selector is an extension that
+;;; only it reads. Whether the case values allow word dispatch is decided
+;;; once every projection has been seen (retire-extensions!).
+(defn select! [(state (mut plan/Matching)) (graph g/Graph) (reference i32)]
+  (-> (Result i32 (slice u8)))
+  (let [selector (.op2 (get (.instructions graph) (cast i64 reference)))]
+    (when (and (> (extension-source graph selector) 0)
+               (= (get (.counts state) (cast i64 selector)) 1)
+               (not (get (.protected state) (cast i64 selector)))
+               (not (get (.omitted state) (cast i64 selector))))
+      (push! (mut (.switch-extensions state)) reference))
+    (Ok 0)))
+
+;;; Retire the selector extension of every noted SWITCH all of whose case
+;;; values are word cases. Runs once after selection; a function without a
+;;; noted SWITCH pays nothing.
+(defn retire-extensions! [(state (mut plan/Matching)) (graph g/Graph)
+                          (scheduled schedule/Schedule)] (-> void)
+  (when (> (len (.switch-extensions state)) 0)
+    (for reference (.nodes scheduled)
+      (let [node (get (.instructions graph) (cast i64 reference))
+            opcode (cast i32 (n/opcode node))]
+        (when (or (= opcode 109) (= opcode 110))
+          (for [i 0 (len (.switch-extensions state))]
+            (when (= (get (.switch-extensions state) i) (.op1 node))
+              (let [selector (.op2 (get (.instructions graph) (cast i64 (.op1 node))))]
+                (unless (and (word-case? graph selector (.op2 node))
+                             (or (= opcode 109) (word-case? graph selector (.op3 node))))
+                  (set! (mut (.switch-extensions state)) i 0))))))))
+    (for reference (.switch-extensions state)
+      (when (> reference 0)
+        (let [selector (.op2 (get (.instructions graph) (cast i64 reference)))]
+          ; The SWITCH now reads the source in the extension's place, so the
+          ; source's count is unchanged.
+          (set! (mut (.omitted state)) (cast i64 selector) true)
+          (set! (mut (.counts state)) (cast i64 selector) 0)
+          (set! (mut (.comparisons state)) (cast i64 reference) selector))))))
+
+;;; The machine selector of a SWITCH: its operand, or the 32-bit source of
+;;; the extension that matching retired.
+(defn selector [(matched plan/Plan) (graph g/Graph) (reference i32)] (-> i32)
+  (let [operand (.op2 (get (.instructions graph) (cast i64 reference)))]
+    (if (and (> (get (.comparisons matched) (cast i64 reference)) 0)
+             (= (get (.comparisons matched) (cast i64 reference)) operand))
+        (.op1 (get (.instructions graph) (cast i64 operand)))
+        operand)))
+
+;;; The selector is read from a register.
+(defn constrain! [(set (mut uses/Set)) (graph g/Graph) (matched plan/Plan)
+                  (reference i32) (position i64)] (-> (Result i32 (slice u8)))
+  (if (uses/use! (mut set) (selector matched graph reference) position)
+      (Ok 0)
+      (Err "conflicting x86-64 register constraints")))
+
+;;; How the dispatch reads its selector: `register` holds it in its low
+;;; `bits` bits (anything above is unspecified) and the cases are ordered as
+;;; signed or unsigned values of that width.
+(defstruct Key [(register i32) (bits i32) (signed bool)])
+
+;;; Cases are held as order keys: the value with its sign bit flipped for a
+;;; signed order, so that keys compare unsigned (stogir.switch). `raw` is
+;;; the value itself, in the low `bits` bits.
+(defn sign-bit [(key Key)] (-> u64)
+  (if (.signed key) (<< (: 1 u64) (cast u64 (- (.bits key) 1))) 0))
+
+(defn raw [(key Key) (order u64)] (-> u64)
+  (& (^ order (sign-bit key)) (value/mask (.bits key))))
+
+(defn below [(key Key)] (-> i32)
+  (if (.signed key) encode/CC-L encode/CC-B))
+
+(defn not-above [(key Key)] (-> i32)
+  (if (.signed key) encode/CC-LE encode/CC-BE))
+
+(defn branch! [(out (mut code/Buffer)) (control (mut edges/Control)) (error (mut (slice u8)))
+               (label i32) (condition i32)] (-> void)
+  (code/accept-count! (mut error)
+                      (fixups/jump! (mut out) (mut (.branches control)) label condition)))
+
+;;; Flags of the selector compared with the case value of order key `order`.
+(defn compare! [(out (mut code/Buffer)) (error (mut (slice u8))) (key Key) (order u64)]
+  (-> void)
+  (let [bits (raw key order)
+        immediate (encode/sign-extend (.bits key) (cast i64 bits))]
+    (cond (= bits 0)
+            (code/accept! (mut error)
+                          (encode/test-rr (mut (.text out)) (.bits key) (.register key)
+                                          (.register key)))
+          (or (< (.bits key) 64) (encode/fits32? immediate))
+            (code/accept! (mut error)
+                          (encode/alu-ri (mut (.text out)) encode/CMP (.bits key)
+                                         (.register key) immediate))
+          :else
+            (do
+              (code/accept! (mut error)
+                            (encode/mov-ri (mut (.text out)) 64 registers/SCRATCH-GPR-2
+                                           immediate))
+              (code/accept! (mut error)
+                            (encode/alu-rr (mut (.text out)) encode/CMP 64 (.register key)
+                                           registers/SCRATCH-GPR-2))))))
+
+;;; The register holding `selector - value(origin)` zero-extended to 64 bits:
+;;; the distance of the selector above the case with order key `origin`,
+;;; huge for a selector below it. r10, or the selector's own register when a
+;;; 64-bit selector is measured from zero.
+(defn index! [(out (mut code/Buffer)) (error (mut (slice u8))) (key Key) (origin u64)]
+  (-> i32)
+  (let [first (raw key origin)
+        bits (.bits key)
+        target (: registers/SCRATCH-GPR i32)
+        signed-first (encode/sign-extend bits (cast i64 first))]
+    (cond (and (= bits 64) (= first 0)) (.register key)
+          (= bits 64)
+            (let [negated (primitive/isub (: 0 i64) signed-first)]
+              (if (encode/fits32? negated)
+                  (code/accept! (mut error)
+                                (encode/lea (mut (.text out)) 64 target
+                                            (encode/mem (.register key) negated)))
+                  (do
+                    ; r11 = -first; r10 = selector + r11. The selector may be
+                    ; in r10 itself (a reloaded or constant selector).
+                    (code/accept! (mut error)
+                                  (encode/mov-ri (mut (.text out)) 64 registers/SCRATCH-GPR-2
+                                                 negated))
+                    (code/accept! (mut error)
+                                  (encode/lea (mut (.text out)) 64 target
+                                              (encode/mem-index (.register key)
+                                                                registers/SCRATCH-GPR-2 1 0)))))
+              target)
+          (= bits 32)
+            (do
+              (code/accept! (mut error)
+                            (if (= first 0)
+                                (encode/mov-rr (mut (.text out)) 32 target (.register key))
+                                (encode/lea (mut (.text out)) 32 target
+                                            (encode/mem (.register key)
+                                                        (encode/sign-extend
+                                                          32
+                                                          (cast i64 (primitive/isub (: 0 u64)
+                                                                                    first)))))))
+              target)
+          :else
+            (do
+              ; The value extended by its own order, then the first case
+              ; extended the same way: their difference never wraps.
+              (code/accept! (mut error)
+                            (if (.signed key)
+                                (encode/movsx-rr (mut (.text out)) 32 bits target (.register key))
+                                (encode/movzx-rr (mut (.text out)) 32 bits target (.register key))))
+              (when (!= first 0)
+                (code/accept! (mut error)
+                              (encode/alu-ri (mut (.text out)) encode/SUB 32 target
+                                             (if (.signed key) signed-first (cast i64 first)))))
+              target))))
+
+;;; Flags of the index in `register` compared with `limit` (unsigned), which
+;;; is a table length or a window size and so far below 2^31. The distance
+;;; of a 64-bit selector is 64 bits wide; any other index is zero-extended
+;;; from 32 bits.
+(defn compare-index! [(out (mut code/Buffer)) (error (mut (slice u8))) (key Key)
+                      (register i32) (limit u64)] (-> void)
+  (if (> limit 0x7FFFFFFF)
+      (when (= error "") (set! error "x86-64 switch index limit out of range"))
+      (code/accept! (mut error)
+                    (encode/alu-ri (mut (.text out)) encode/CMP
+                                   (if (= (.bits key) 64) 64 32) register (cast i64 limit)))))
+
+;;; Half-open case interval [begin, end); recursion depth is O(log n).
+;;; The middle case is tested first; a selector below it continues at a
+;;; label behind the code for the cases above it. When no case is above the
+;;; middle one, a selector above it goes straight to the fallback and the
+;;; lower cases follow in line, with no label and no jump around them.
+(defn tree! [(out (mut code/Buffer))
+             (control (mut edges/Control))
+             (key Key)
+             (dispatch switch/Dispatch)
+             (stubs (ArrayList i32))
+             (fallback i32)
+             (begin i64)
+             (end i64)
+             (error (mut (slice u8)))] (-> void)
+  (when (= error "")
+    (if (= begin end)
+        (branch! (mut out) (mut control) (mut error) fallback fixups/JUMP)
+        (let [middle (+ begin (/ (- end begin) 2))
+              item (get (.cases dispatch) middle)
+              single (= (.low item) (.high item))]
+          (if (and (!= begin middle) (= (+ middle 1) end))
+              (do
+                (if single
+                    (do
+                      (compare! (mut out) (mut error) key (.low item))
+                      (branch! (mut out) (mut control) (mut error) (get stubs middle)
+                               encode/CC-E)
+                      (branch! (mut out) (mut control) (mut error) fallback
+                               (encode/invert (below key))))
+                    (do
+                      (compare! (mut out) (mut error) key (.high item))
+                      (branch! (mut out) (mut control) (mut error) fallback
+                               (encode/invert (not-above key)))
+                      (compare! (mut out) (mut error) key (.low item))
+                      (branch! (mut out) (mut control) (mut error) (get stubs middle)
+                               (encode/invert (below key)))))
+                (tree! (mut out) (mut control) key dispatch stubs fallback begin middle
+                       (mut error)))
+              (let [left-label (if (= begin middle)
+                                   fallback
+                                   (cast i32 (len (.labels control))))]
+                (when (!= begin middle) (push! (mut (.labels control)) -1))
+                (compare! (mut out) (mut error) key (.low item))
+                (if single
+                    (do
+                      (branch! (mut out) (mut control) (mut error) (get stubs middle)
+                               encode/CC-E)
+                      (when (!= begin middle)
+                        (branch! (mut out) (mut control) (mut error) left-label (below key))))
+                    (do
+                      (branch! (mut out) (mut control) (mut error) left-label (below key))
+                      (compare! (mut out) (mut error) key (.high item))
+                      (branch! (mut out) (mut control) (mut error) (get stubs middle)
+                               (not-above key))))
+                (tree! (mut out) (mut control) key dispatch stubs fallback (+ middle 1) end
+                       (mut error))
+                (when (!= begin middle)
+                  (set! (mut (.labels control)) (cast i64 left-label) (len (.text out)))
+                  (tree! (mut out) (mut control) key dispatch stubs fallback begin middle
+                         (mut error)))))))))
+
+(defn singletons? [(dispatch switch/Dispatch)] (-> bool)
+  (let [(mut all) true]
+    (for item (.cases dispatch)
+      (when (!= (.low item) (.high item)) (set! all false)))
+    all))
+
+;;; The pinned upstream density rule: more than two singleton cases whose
+;;; span is below eight values per case. Zero selects comparisons; the
+;;; arithmetic never wraps at full-width limits.
+(defn table-length [(dispatch switch/Dispatch)] (-> i64)
+  (let [count (len (.cases dispatch))]
+    (if (or (not (singletons? dispatch)) (<= count 2) (> count 0x7FFFFFF))
+        0
+        (let [first (.low (get (.cases dispatch) 0))
+              last (.high (get (.cases dispatch) (- count 1)))]
+          (if (or (< last first) (>= (- last first) (* (cast u64 count) 8)))
+              0
+              (cast i64 (+ (- last first) 1)))))))
+
+;;; Bounds check, then an indirect jump through a table of `target - table`
+;;; words that the driver places after the function's code.
+(defn table! [(out (mut code/Buffer))
+              (control (mut edges/Control))
+              (key Key)
+              (dispatch switch/Dispatch)
+              (stubs (ArrayList i32))
+              (fallback i32)
+              (length i64)
+              (error (mut (slice u8)))] (-> void)
+  (let [first (.low (get (.cases dispatch) 0))
+        index (index! (mut out) (mut error) key first)
+        label (cast i32 (len (.labels control)))
+        (mut case-index) (: 0 i64)]
+    (compare-index! (mut out) (mut error) key index (cast u64 (- length 1)))
+    (branch! (mut out) (mut control) (mut error) fallback encode/CC-A)
+    (push! (mut (.labels control)) -1)
+    (code/accept-count! (mut error)
+                        (fixups/address! (mut out) (mut (.branches control)) label
+                                         registers/SCRATCH-GPR-2))
+    (code/accept! (mut error)
+                  (encode/movsx-rm (mut (.text out)) 64 32 registers/SCRATCH-GPR
+                                   (encode/mem-index registers/SCRATCH-GPR-2 index 4 0)))
+    (code/accept! (mut error)
+                  (encode/alu-rr (mut (.text out)) encode/ADD 64 registers/SCRATCH-GPR
+                                 registers/SCRATCH-GPR-2))
+    (code/accept! (mut error) (encode/jmp-r (mut (.text out)) registers/SCRATCH-GPR))
+    (push! (mut (.tables control))
+           (edges/Table :label label :first (len (.table-targets control)) :count length))
+    (for [slot 0 length]
+      (let [order (+ first (cast u64 slot))
+            hit (and (< case-index (len (.cases dispatch)))
+                     (= order (.low (get (.cases dispatch) case-index))))]
+        (push! (mut (.table-targets control)) (if hit (get stubs case-index) fallback))
+        (when hit (set! case-index (+ case-index 1)))))))
+
+;;; Up to three singleton cases: one test per case, then the jump to the
+;;; fallback, with no tree-internal labels. When the last case's address
+;;; directly follows the dispatch (`next`; zero when unknown), its test is
+;;; inverted to reach the fallback and the case falls through.
+(defn linear! [(out (mut code/Buffer))
+               (control (mut edges/Control))
+               (key Key)
+               (dispatch switch/Dispatch)
+               (stubs (ArrayList i32))
+               (destinations (ArrayList i32))
+               (fallback i32)
+               (next i32)
+               (error (mut (slice u8)))] (-> void)
+  (let [count (len (.cases dispatch))
+        (mut closed) false]
+    (for [i 0 count]
+      (when (= error "")
+        (let [follows (and (= i (- count 1)) (!= next 0) (= (get destinations i) next))]
+          (when follows (set! closed true))
+          (compare! (mut out) (mut error) key (.low (get (.cases dispatch) i)))
+          (branch! (mut out) (mut control) (mut error)
+                   (if follows fallback (get stubs i))
+                   (if follows encode/CC-NE encode/CC-E)))))
+    (when (and (= error "") (not closed))
+      (branch! (mut out) (mut control) (mut error) fallback fixups/JUMP))))
+
+;;; Cases that share one code address, as bits of the selector's distance
+;;; from an origin.
+(defstruct Group [(destination i32) (stub i32) (mask u64) (count i64)])
+
+;;; Singleton cases within one 64-value window that reach at most three code
+;;; addresses: one bounds check, then `bt` of a mask per address, most cases
+;;; first. The thresholds are LLVM's (three cases for one address, five for
+;;; two, six for three). A single address covering its whole window needs
+;;; the bounds check only. `destinations` parallels the cases; `next` is the
+;;; address that follows the dispatch, or zero. Returns false, emitting
+;;; nothing, when the shape does not apply.
+;;;
+;;; The origin is zero when every case value is below 64, so that the
+;;; selector is its own bit number (`bt` reads only the low six bits of its
+;;; index register, and the bounds check has already rejected anything
+;;; above the last case, negative values included).
+(defn bit-tests! [(out (mut code/Buffer))
+                  (control (mut edges/Control))
+                  (key Key)
+                  (dispatch switch/Dispatch)
+                  (stubs (ArrayList i32))
+                  (destinations (ArrayList i32))
+                  (fallback i32)
+                  (next i32)
+                  (error (mut (slice u8)))] (-> bool)
+  (let [count (len (.cases dispatch))
+        empty (Group :destination 0 :stub 0 :mask 0 :count 0)
+        (mut groups) [empty empty empty]
+        (mut used) (: 0 i64)
+        (mut fits) (and (>= count 2) (singletons? dispatch))]
+    (when fits
+      (let [first (.low (get (.cases dispatch) 0))
+            last (.low (get (.cases dispatch) (- count 1)))
+            ; The order key of value zero.
+            zero (sign-bit key)
+            base (if (and (>= first zero) (< (- last zero) 64)) zero first)]
+        (when (>= (- last first) 64) (set! fits false))
+        (for [i 0 count]
+          (when fits
+            (let [destination (get destinations i)
+                  bit (<< (: 1 u64) (- (.low (get (.cases dispatch) i)) base))
+                  (mut slot) (: 0 i64)]
+              (while (and (< slot used) (!= (.destination (get groups slot)) destination))
+                (set! slot (+ slot 1)))
+              (cond (< slot used)
+                      (let [group (get groups slot)]
+                        (set! (mut groups) slot
+                              (Group :destination destination :stub (.stub group)
+                                     :mask (| (.mask group) bit)
+                                     :count (+ (.count group) 1))))
+                    (< used 3)
+                      (do (set! (mut groups) used
+                                (Group :destination destination :stub (get stubs i)
+                                       :mask bit :count 1))
+                          (set! used (+ used 1)))
+                    :else (set! fits false)))))
+        (let [whole (and (= used 1) (= (cast u64 count) (+ (- last first) 1)))]
+          (unless (or whole
+                      (and (= used 1) (>= count 3))
+                      (and (= used 2) (>= count 5))
+                      (and (= used 3) (>= count 6)))
+            (set! fits false))
+          (when fits
+            (let [origin (if whole first base)
+                  ; A narrow selector measured from zero is compared at its
+                  ; own width and then serves as the bit number itself.
+                  direct (= (raw key origin) 0)
+                  index (if direct
+                            (.register key)
+                            (index! (mut out) (mut error) key origin))]
+              (if direct
+                  ; Unsigned on the raw value: a negative selector is above.
+                  (compare! (mut out) (mut error)
+                            (Key :register (.register key) :bits (.bits key) :signed false)
+                            (- last origin))
+                  (compare-index! (mut out) (mut error) key index (- last origin)))
+              (if whole
+                  (if (= (.destination (get groups 0)) next)
+                      (branch! (mut out) (mut control) (mut error) fallback encode/CC-A)
+                      (do (branch! (mut out) (mut control) (mut error)
+                                   (.stub (get groups 0)) encode/CC-BE)
+                          (branch! (mut out) (mut control) (mut error) fallback fixups/JUMP)))
+                  (do
+                    (branch! (mut out) (mut control) (mut error) fallback encode/CC-A)
+                    (for [round 0 used]
+                      (let [(mut best) (: 0 i64)]
+                        (for [slot 0 used]
+                          (when (> (.count (get groups slot)) (.count (get groups best)))
+                            (set! best slot)))
+                        (let [group (get groups best)]
+                          (code/accept! (mut error)
+                                        (encode/mov-ri (mut (.text out)) 64
+                                                       registers/SCRATCH-GPR-2
+                                                       (cast i64 (.mask group))))
+                          (code/accept! (mut error)
+                                        (encode/bt-rr (mut (.text out)) encode/BT 64
+                                                      registers/SCRATCH-GPR-2 index))
+                          ; The last address can follow: branch away instead.
+                          (if (and (= round (- used 1)) (= (.destination group) next))
+                              (branch! (mut out) (mut control) (mut error) fallback
+                                       encode/CC-AE)
+                              (do (branch! (mut out) (mut control) (mut error) (.stub group)
+                                           encode/CC-B)
+                                  (when (= round (- used 1))
+                                    (branch! (mut out) (mut control) (mut error) fallback
+                                             fixups/JUMP))))
+                          (set! (mut groups) best
+                                (Group :destination (.destination group) :stub (.stub group)
+                                       :mask (.mask group) :count -1))))))))))))
+    fits))
+
+;;; One strategy for cases that all need a test.
+(defn strategy! [(out (mut code/Buffer))
+                 (control (mut edges/Control))
+                 (key Key)
+                 (dispatch switch/Dispatch)
+                 (stubs (ArrayList i32))
+                 (destinations (ArrayList i32))
+                 (fallback i32)
+                 (next i32)
+                 (error (mut (slice u8)))] (-> void)
+  (let [length (table-length dispatch)]
+    (unless (bit-tests! (mut out) (mut control) key dispatch stubs destinations fallback next
+                        (mut error))
+      (cond (and (= length 0) (<= (len (.cases dispatch)) 3) (singletons? dispatch))
+              (linear! (mut out) (mut control) key dispatch stubs destinations fallback next
+                       (mut error))
+            (= length 0)
+              (tree! (mut out) (mut control) key dispatch stubs fallback 0
+                     (len (.cases dispatch)) (mut error))
+            :else
+              (table! (mut out) (mut control) key dispatch stubs fallback length
+                      (mut error))))))
+
+;;; Emit the dispatch over sorted, disjoint cases (order keys of `key`).
+;;; `stubs` are the labels to branch to, the fallback's last; `destinations`
+;;; names the code address behind each (a forwarded block's final block, or
+;;; the stub itself): a case that reaches the fallback's address is the
+;;; fallback and needs no test. `next` is the address that directly follows
+;;; the dispatch code, or zero.
+(defn dispatch! [(out (mut code/Buffer))
+                 (control (mut edges/Control))
+                 (key Key)
+                 (dispatch switch/Dispatch)
+                 (stubs (ArrayList i32))
+                 (destinations (ArrayList i32))
+                 (next i32)
+                 (allocator (dyn Allocator))
+                 (error (mut (slice u8)))] (-> void)
+  (let [count (len (.cases dispatch))
+        fallback (get stubs count)
+        beyond (get destinations count)
+        (mut redundant) false]
+    (for [i 0 count]
+      (when (= (get destinations i) beyond) (set! redundant true)))
+    (if (not redundant)
+        (strategy! (mut out) (mut control) key dispatch stubs destinations fallback next
+                   (mut error))
+        (let [(mut cases) (ArrayList::new [switch/Case] allocator)
+              (mut kept-stubs) (ArrayList::new [i32] allocator)
+              (mut kept-destinations) (ArrayList::new [i32] allocator)]
+          (for [i 0 count]
+            (when (!= (get destinations i) beyond)
+              (push! (mut cases) (get (.cases dispatch) i))
+              (push! (mut kept-stubs) (get stubs i))
+              (push! (mut kept-destinations) (get destinations i))))
+          (strategy! (mut out) (mut control) key
+                     (switch/Dispatch :selector (.selector dispatch) :ty (.ty dispatch)
+                                      :cases cases :fallback (.fallback dispatch))
+                     kept-stubs kept-destinations fallback next (mut error))
+          (free! (mut cases))
+          (free! (mut kept-stubs))
+          (free! (mut kept-destinations))))
+    ; A closing jump to the fallback is dropped when the fallback follows.
+    ; A label bound at that jump then names the address it reached.
+    (when (and (= error "") (!= next 0) (= beyond next) (> (len (.branches control)) 0))
+      (let [closing (get (.branches control) (- (len (.branches control)) 1))]
+        (when (and (= (+ (.start closing) (fixups/long-size closing)) (len (.text out)))
+                   (= (.condition closing) fixups/JUMP)
+                   (= (.label closing) fallback))
+          (pop! (mut (.branches control)))
+          (while (> (len (.text out)) (.start closing)) (pop! (mut (.text out))))
+          (code/clear-flags! (mut out)))))))
+
+;;; An exhaustive dispatch's default reaches only UNREACHABLE: values outside
+;;; the cases cannot occur, so the last case becomes the fallback and needs
+;;; no comparison (a two-way enum match becomes one test). The unreachable
+;;; block is still emitted, without an incoming branch.
+(defn pruned-default [(graph g/Graph) (scheduled schedule/Schedule) (dispatch switch/Dispatch)]
+  (-> switch/Dispatch)
+  (let [fallback (.fallback dispatch)
+        range (get (.ranges scheduled) (cast i64 fallback))]
+    (if (and (> (len (.cases dispatch)) 0)
+             (= (.count range) 2)
+             (= (n/opcode (get (.instructions graph)
+                               (cast i64 (get (.nodes scheduled) (+ (.offset range) 1)))))
+                121))
+        (let [(mut owned) dispatch
+              last (get (.cases owned) (- (len (.cases owned)) 1))]
+          (pop! (mut (.cases owned)))
+          (set! (.fallback owned) (.target last))
+          owned)
+        dispatch)))
+
+;;; Emit the dispatch of SWITCH `reference`. `next` is the successor laid out
+;;; directly after this block (0 when none), which needs no jump. `prune`
+;;; lets a default that only reaches UNREACHABLE give its place to the last
+;;; case (pruned-default).
+(defn emit! [(out (mut code/Buffer)) (cx context/Context) (flow edges/Flow)
+             (control (mut edges/Control)) (reference i32) (position i64)
+             (next i32) (prune bool) (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (match (switch/collect (.graph cx) reference (.users flow) allocator)
+    (Err [message] (Err message))
+    (Ok [collected]
+        (let [(mut owned) (if prune
+                              (pruned-default (.graph cx) (.scheduled flow) collected)
+                              collected)
+              machine (selector (.matched cx) (.graph cx) reference)
+              word (!= machine (.selector owned))
+              own-bits (value/type-bits (.ty owned))
+              ; A retired ZEXT, or a retired SEXT into an unsigned type,
+              ; orders the source words as unsigned values; SEXT into a
+              ; signed type as signed ones.
+              bits (if word 32 own-bits)
+              signed (if word
+                         (and (= (n/opcode (get (.instructions (.graph cx))
+                                                (cast i64 (.selector owned))))
+                                 33)
+                              (types/signed? (.ty owned)))
+                         (types/signed? (.ty owned)))
+              old-sign (cast u64 (switch/sign-mask (.ty owned)))
+              (mut stubs) (ArrayList::new [i32] allocator)
+              (mut destinations) (ArrayList::new [i32] allocator)
+              (mut error) ""]
+          (when (= own-bits 0) (set! error "SWITCH requires an integer selector"))
+          ; Case keys in the order of the machine selector.
+          (when (and word (= error ""))
+            (let [new-sign (if signed (: 0x80000000 u64) 0)]
+              (for [i 0 (len (.cases owned))]
+                (let [item (get (.cases owned) i)]
+                  (set! (mut (.cases owned)) i
+                        (switch/Case
+                          :low (^ (& (^ (.low item) old-sign) 0xFFFFFFFF) new-sign)
+                          :high (^ (& (^ (.high item) old-sign) 0xFFFFFFFF) new-sign)
+                          :target (.target item)))))))
+          ; Edge transfers first: an empty one branches straight to its
+          ; block, as IF edges do; only real moves get a stub.
+          (for [i 0 (+ (len (.cases owned)) 1)]
+            (when (= error "")
+              (let [target (if (< i (len (.cases owned)))
+                               (.target (get (.cases owned) i))
+                               (.fallback owned))]
+                (if (not (get (.selected flow) (cast i64 target)))
+                    (set! error "SWITCH projection omitted by observable roots")
+                    (match (edges/stub-or-target! flow (mut control) target (+ position 1)
+                                                  allocator)
+                      (Err [message] (set! error message))
+                      (Ok [label]
+                          (push! (mut stubs) label)
+                          (push! (mut destinations)
+                                 (if (= label target)
+                                     (edges/resolve-alias (.aliases flow) target)
+                                     label))))))))
+          (when (= error "")
+            (match (emit/operand! (mut out) cx machine position registers/SCRATCH-GPR)
+              (Err [message] (set! error message))
+              (Ok [register]
+                  (dispatch! (mut out) (mut control)
+                             (Key :register register :bits bits :signed signed)
+                             owned stubs destinations
+                             (if (> next 0) (edges/resolve-alias (.aliases flow) next) 0)
+                             allocator (mut error)))))
+          (free! (mut stubs))
+          (free! (mut destinations))
+          (free! (mut (.cases owned)))
+          (if (= error "") (Ok 0) (Err error))))))

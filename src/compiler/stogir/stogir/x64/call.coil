@@ -1,0 +1,682 @@
+;;; x86-64 calls (System V): CALL (79), TAILCALL (80), ARGVAL (70), PROTO (40).
+;;;
+;;; Placement is stogir.x64.call-abi; this module is the family's three entry
+;;; points plus the call sequence itself, which the driver invokes directly
+;;; (`emit-call!`) because a call lowers the allocator's transfers at its own
+;;; definition position.
+;;;
+;;; Constraints of a call at position p (operands read at p, result at p + 1)
+;;;   * Every argument and an indirect callee may be anywhere (register or
+;;;     spill slot); they are moved into place by the call sequence.
+;;;   * Every allocatable caller-saved register is clobbered over
+;;;     [p + 1, p + 2): rax rcx rdx rsi rdi r8 r9, and xmm0..xmm13 when the
+;;;     function has floating values (all xmm are caller-saved). A direct
+;;;     call to a private leaf (stogir.x64.private-leaf) clobbers only what
+;;;     the leaf and the call's own setup write.
+;;;   * The result is a fixed definition in rax or xmm0; that register is
+;;;     clobbered only when the result is dead.
+;;;   * p + 1 is announced as a definition-move position: values that must
+;;;     leave a clobbered register do so in the call's own parallel group.
+;;;
+;;; The call sequence (`emit-call!`), every step reading the pre-call state
+;;;   1. ARGVAL bytes are copied into the outgoing stack arguments (r10, r11,
+;;;      xmm14).
+;;;   2. The result place pointer of a register-piece result is saved in the
+;;;      outgoing area (r10).
+;;;   3. Stack arguments are stored (r10, xmm14); narrow integers extended to
+;;;      32 bits, an unnamed FLOAT converted to DOUBLE.
+;;;   4. One parallel group moves the located register arguments, the indirect
+;;;      callee (into rax, which no argument uses) and the allocator's
+;;;      preservation transfers. Cycles use r11 / xmm15.
+;;;   5. Constant arguments and a constant callee are materialized.
+;;;   6. Narrow integer register arguments are extended to 32 bits; unnamed
+;;;      FLOAT register arguments are converted to DOUBLE.
+;;;   7. A variadic call sets al to the number of xmm registers used; an
+;;;      indirect callee first moves from rax to r11.
+;;;   8. `call rel32` with a PLT32 reference to the named function, or
+;;;      `call rax` / `call r11`. A builtin memmove of a literal size up to
+;;;      256 bytes and a builtin memcmp of a known count up to 16 are expanded
+;;;      inline instead (`inline-builtin!`).
+;;;   9. Register result pieces are stored through the saved place pointer
+;;;      (r11); a narrow integer result is extended to 32 bits. When the
+;;;      matcher projected the pieces (integer pieces only loaded back from a
+;;;      private frame object), they stay in rax/rdx as the definitions of
+;;;      those loads and steps 2 and 9 store nothing.
+;;; A native tail call (mode 1) stops after step 7: the driver moves the stack
+;;; arguments over the incoming ones, releases the frame and jumps.
+;;;
+;;; Flags: nothing is live across a call. The ARGVAL copy loop is the only
+;;; flag producer here and consumes its own flags.
+;;;
+;;; VA_START, VA_END, VA_COPY, VA_ARG and EXITCALL have no lowering (they
+;;; have none on AArch64 either) and report a clear error.
+(module stogir.x64.call)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.schedule" :as schedule)
+(import "stogir.locations" :as loc)
+(import "stogir.matched-uses" :as machine)
+(import "stogir.argument-value" :as argval)
+(import "stogir.call-results" :as results)
+(import "stogir.call-groups" :as groups)
+(import "stogir.calls" :as calls)
+(import "stogir.copy-forward" :as copy-forward)
+(import "stogir.known-count" :as known)
+(import "stogir.x64.block-compare" :as block-compare)
+(import "stogir.x64.block-move" :as block-move)
+(import "stogir.x64.abi-arguments" :as arguments)
+(import "stogir.x64.call-abi" :as abi)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.emit" :as emit)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.private-leaf" :as private)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.tail-plan" :as tail-plan)
+(import "stogir.x64.typed-transfers" :as typed)
+(import "stogir.x64.uses" :as uses)
+(import "stogir.x64.value" :as value)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(const CONFLICT "conflicting x86-64 call register constraints")
+
+(const VARIADIC-PENDING "x86-64 backend: VA_START, VA_END, VA_COPY and VA_ARG are not implemented (reading variadic arguments has no lowering on any target yet)")
+
+;;; ARGVAL copies of at most this many bytes are unrolled; larger ones loop.
+(const UNROLLED-COPY 64)
+
+;;; Select the function's tail calls (stogir.x64.tail-plan) before any node
+;;; is matched: an ordinary CALL that becomes a jump takes its RETURN with it.
+(defn select-tails! [(state (mut plan/Matching)) (graph g/Graph)
+                     (scheduled schedule/Schedule) (roots (slice i32))
+                     (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (match (tail-plan/select graph scheduled roots true allocator)
+    (Err [message] (Err message))
+    (Ok [selected]
+        (let [(mut selected) selected]
+          (for returning (.returns selected)
+            (let [node (get (.instructions graph) (cast i64 returning))]
+              (set! (mut (.omitted state)) (cast i64 returning) true)
+              (when (> (.op2 node) 0)
+                (set! (mut (.counts state)) (cast i64 (.op2 node))
+                      (- (get (.counts state) (cast i64 (.op2 node))) 1)))))
+          (free! (mut (.tails state)))
+          (set! (.tails state) (.modes selected))
+          (free! (mut (.returns selected)))
+          (Ok 0)))))
+
+(defn select! [(state (mut plan/Matching)) (graph g/Graph) (reference i32)]
+  (-> (Result i32 (slice u8)))
+  (let [opcode (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference))))]
+    (cond (or (= opcode 79) (= opcode 80) (= opcode 70) (= opcode 40)) (Ok 0)
+          (and (>= opcode 97) (<= opcode 100)) (Err VARIADIC-PENDING)
+          :else (Err "x86-64 backend: EXITCALL is not implemented"))))
+
+;;; The register a CALL of result type `ty` defines: rax, xmm0, or -1.
+(defn result-register [(ty i32)] (-> i32)
+  (cond (= ty 0) -1
+        (types/floating? ty) registers/XMM0
+        :else registers/RAX))
+
+(defn call-constraints! [(set (mut uses/Set)) (graph g/Graph) (matched plan/Plan)
+                         (reference i32) (position i64)] (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions graph) (cast i64 reference))
+        ty (cast i32 (n/type-id node))
+        mode (plan/tail-mode matched reference)
+        allocator (.alc (.values set))]
+    (cond
+      (and (= (n/opcode node) 80) (= mode 0)) (Err "TAILCALL has no selected lowering")
+      (not (or (= ty 0) (types/integer? ty) (types/floating? ty)))
+        (Err "x86-64 backend: vector call results are not implemented (vector family)")
+      :else
+        (match (abi/layout graph reference allocator)
+          (Err [message] (Err message))
+          (Ok [planned]
+              (let [(mut planned) planned
+                    defined (if (= mode 0) (result-register ty) (: -1 i32))
+                    mask (private/call-clobbers (.private set) graph reference mode
+                                                (slice (.arguments planned)))
+                    outgoing (arguments/round-up (.stack planned) 16)
+                    projected (machine/output-range (.operands matched) reference)
+                    (mut error) ""]
+                (for argument (.arguments planned)
+                  (when (and (> (.value argument) 0)
+                             (not (uses/use-anywhere! (mut set) (.value argument) position)))
+                    (set! error CONFLICT)))
+                (when (and (> (.op2 node) 0)
+                           (not (uses/use-anywhere! (mut set) (.op2 node) position)))
+                  (set! error CONFLICT))
+                (for [register 0 48]
+                  (when (and (!= (& mask (<< (: 1 u64) (cast u64 register))) 0)
+                             (or (< register 32) (.floating set)))
+                    (let [owner (cond (= (cast i32 register) defined) reference
+                                      (and (= register 0) (> (.count projected) 0))
+                                        (get (.outputs (.operands matched)) (.offset projected))
+                                      (and (= register 2) (> (.count projected) 1))
+                                        (get (.outputs (.operands matched))
+                                             (+ (.offset projected) 1))
+                                      :else 0)]
+                      (if (> owner 0)
+                          (uses/clobber-unless-live! (mut set) (cast i32 register)
+                                                     (+ position 1) (+ position 2) owner)
+                          (uses/clobber! (mut set) (cast i32 register)
+                                         (+ position 1) (+ position 2))))))
+                ; Projected result pieces are defined by the call itself.
+                (for [k 0 (.count projected)]
+                  (unless (uses/define-fixed! (mut set)
+                                              (get (.outputs (.operands matched))
+                                                   (+ (.offset projected) k))
+                                              position
+                                              (if (= k 0) (: registers/RAX i32) registers/RDX))
+                    (set! error CONFLICT)))
+                (when (and (>= defined 0)
+                           (not (uses/define-fixed! (mut set) reference position defined)))
+                  (set! error CONFLICT))
+                (push! (mut (.definition-moves set)) (+ position 1))
+                (when (> outgoing (.outgoing-size set)) (set! (.outgoing-size set) outgoing))
+                (when (!= mode 1) (set! (.calls set) true))
+                (abi/release! (mut planned))
+                (if (= error "") (Ok 0) (Err error))))))))
+
+(defn constrain! [(set (mut uses/Set)) (graph g/Graph) (matched plan/Plan)
+                  (reference i32) (position i64)] (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions graph) (cast i64 reference))
+        opcode (cast i32 (n/opcode node))]
+    (cond (or (= opcode 79) (= opcode 80))
+            (call-constraints! (mut set) graph matched reference position)
+          (or (= opcode 40) (= opcode 70))
+            ; PROTO and ARGVAL are the value of their first operand: the
+            ; callee address, and the address of the bytes a call copies.
+            (match (if (= opcode 70)
+                       (argval/validate graph reference)
+                       (Ok (argval/Shape :size 0 :alignment 8)))
+              (Err [message] (Err message))
+              (Ok [_]
+                  (if (and (uses/use-anywhere! (mut set) (.op1 node) position)
+                           (uses/define! (mut set) reference position))
+                      (do (uses/hint! (mut set) reference (.op1 node)) (Ok 0))
+                      (Err CONFLICT))))
+          (and (>= opcode 97) (<= opcode 100)) (Err VARIADIC-PENDING)
+          :else (Err "x86-64 backend: EXITCALL is not implemented"))))
+
+;;; Copy scalar value `reference` (register, spill slot or constant) into
+;;; `register`: a general register for an integer, an XMM register for a
+;;; FLOAT or DOUBLE (stogir.x64.value/float-into!; a nonzero floating constant
+;;; is loaded from the constant pool). Only moves are emitted.
+(defn load! [(out (mut code/Buffer)) (cx context/Context) (reference i32)
+             (position i64) (register i32)] (-> (Result i32 (slice u8)))
+  (let [ty (value/type-of (.graph cx) reference)]
+    (cond
+      (types/integer? ty)
+        (if (registers/gpr? register)
+            (emit/into! (mut out) cx reference position register)
+            (Err "integer value requires a general register"))
+      (or (not (types/floating? ty)) (not (registers/simd? register)))
+        (Err "x86-64 backend: only integer, FLOAT and DOUBLE values cross a call boundary (vector family)")
+      :else
+        (value/float-into! (mut out) (.graph cx) (.parts cx) (.base cx) reference position
+                           register))))
+
+;;; PROTO and ARGVAL: the result is the first operand's value.
+(defn emit! [(out (mut code/Buffer)) (cx context/Context) (reference i32) (position i64)]
+  (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions (.graph cx)) (cast i64 reference))
+        opcode (cast i32 (n/opcode node))]
+    (cond (or (= opcode 40) (= opcode 70))
+            (match (emit/destination cx reference position)
+              (Err [message] (Err message))
+              (Ok [destination] (emit/into! (mut out) cx (.op1 node) position destination)))
+          (or (= opcode 79) (= opcode 80))
+            (Err "x86-64 calls are emitted by the driver (stogir.x64.call/emit-call!)")
+          (and (>= opcode 97) (<= opcode 100)) (Err VARIADIC-PENDING)
+          :else (Err "x86-64 backend: EXITCALL is not implemented"))))
+
+;;; Copy `size` bytes from [r10 + k] to [rsp + offset + k] in 8-, 4-, 2- and
+;;; 1-byte moves through r11.
+(defn copy-chunks! [(out (mut code/Buffer)) (error (mut (slice u8))) (offset i64) (size i64)]
+  (-> void)
+  (let [(mut done) (: 0 i64)]
+    (while (< done size)
+      (let [chunk (cond (>= (- size done) 8) (: 8 i64)
+                        (>= (- size done) 4) 4
+                        (>= (- size done) 2) 2
+                        :else 1)
+            bits (cast i32 (* chunk 8))]
+        (code/accept! (mut error)
+                      (encode/mov-rm (mut (.text out)) bits registers/SCRATCH-GPR-2
+                                     (encode/mem registers/SCRATCH-GPR done)))
+        (code/accept! (mut error)
+                      (encode/mov-mr (mut (.text out)) bits
+                                     (encode/mem registers/RSP (+ offset done))
+                                     registers/SCRATCH-GPR-2))
+        (set! done (+ done chunk))))))
+
+;;; Copy the `size` bytes ARGVAL `argument` names into the outgoing stack
+;;; arguments at rsp + offset. Uses r10 (source address), r11 and xmm14.
+(defn argument-copy! [(out (mut code/Buffer)) (cx context/Context) (argument abi/Argument)
+                      (position i64)] (-> (Result i32 (slice u8)))
+  (let [size (.copy argument)
+        offset (.offset argument)
+        (mut error) ""]
+    (when (> size 0)
+      (code/accept-count! (mut error)
+                          (emit/into! (mut out) cx (.value argument) position
+                                      registers/SCRATCH-GPR))
+      (if (<= size UNROLLED-COPY)
+          (copy-chunks! (mut out) (mut error) offset size)
+          ; r10 = source + blocks; r11 counts from -blocks up to zero.
+          (let [blocks (& size (- 0 16))]
+            (code/accept! (mut error)
+                          (encode/lea (mut (.text out)) 64 registers/SCRATCH-GPR
+                                      (encode/mem registers/SCRATCH-GPR blocks)))
+            (code/accept! (mut error)
+                          (encode/mov-ri (mut (.text out)) 64 registers/SCRATCH-GPR-2
+                                         (- 0 blocks)))
+            (let [head (len (.text out))]
+              (code/accept! (mut error)
+                            (encode/sse-mov-rm (mut (.text out)) encode/MOVUPS
+                                               registers/SCRATCH-SIMD
+                                               (encode/mem-index registers/SCRATCH-GPR
+                                                                 registers/SCRATCH-GPR-2 1 0)))
+              (code/accept! (mut error)
+                            (encode/sse-mov-mr (mut (.text out)) encode/MOVUPS
+                                               (encode/mem-index registers/RSP
+                                                                 registers/SCRATCH-GPR-2 1
+                                                                 (+ offset blocks))
+                                               registers/SCRATCH-SIMD))
+              (code/accept! (mut error)
+                            (encode/alu-ri (mut (.text out)) encode/ADD 64
+                                           registers/SCRATCH-GPR-2 16))
+              (code/accept! (mut error)
+                            (encode/jcc-rel8 (mut (.text out)) encode/CC-NE
+                                             (- head (+ (len (.text out)) 2)))))
+            (copy-chunks! (mut out) (mut error) (+ offset blocks) (- size blocks)))))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; One stack argument: the value through r10 or xmm14 into rsp + offset.
+(defn stack-argument! [(out (mut code/Buffer)) (cx context/Context) (argument abi/Argument)
+                       (position i64)] (-> (Result i32 (slice u8)))
+  (let [ty (cast i32 (.ty argument))
+        slot (encode/mem registers/RSP (.offset argument))
+        (mut error) ""]
+    (if (types/floating? ty)
+        (do
+          (code/accept-count! (mut error)
+                              (load! (mut out) cx (.value argument) position
+                                     registers/SCRATCH-SIMD))
+          (when (.promote? argument)
+            (code/accept! (mut error)
+                          (encode/sse-rr (mut (.text out)) encode/CVTSS2SD
+                                         registers/SCRATCH-SIMD registers/SCRATCH-SIMD)))
+          (code/accept! (mut error)
+                        (encode/sse-mov-mr (mut (.text out))
+                                           (if (= (.size argument) 8)
+                                               (: encode/MOVSD i32)
+                                               encode/MOVSS)
+                                           slot registers/SCRATCH-SIMD)))
+        (do
+          (code/accept-count! (mut error)
+                              (load! (mut out) cx (.value argument) position
+                                     registers/SCRATCH-GPR))
+          (code/accept-count! (mut error)
+                              (abi/normalize! (mut out) ty registers/SCRATCH-GPR))
+          (code/accept! (mut error)
+                        (encode/mov-mr (mut (.text out)) 64 slot registers/SCRATCH-GPR))))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; Whether value `reference` is in a register or a spill slot at `position`,
+;;; so that a parallel move can carry it. A constant, and a value the
+;;; allocator rematerializes (a constant recipe or a frame address), is built
+;;; in place afterwards instead (`load!`).
+(defn located? [(cx context/Context) (reference i32) (position i64)] (-> bool)
+  (and (> reference 0)
+       (match (loc/resolve (.parts cx) reference position)
+         (Err [_] false)
+         (Ok [location] (or (= (.kind location) 0) (= (.kind location) 1))))))
+
+;;; The transfer extent of a value of type `ty`: 4, 8 or 16 bytes.
+(defn extent [(ty i32)] (-> i32)
+  (let [size (types/size ty 8)]
+    (if (< size 4) 4 size)))
+
+;;; Inline expansion of a builtin call, in place of the call instruction,
+;;; once the arguments are in rdi, rsi and rdx: BUILTIN-MOVE with a literal
+;;; size (stogir.x64.block-move) and BUILTIN-COMPARE with a count known where
+;;; the call runs (stogir.known-count, stogir.x64.block-compare). Returns
+;;; whether it emitted the expansion; when false the runtime routine is
+;;; called. The expansions write only caller-saved registers, all of which
+;;; the call's constraints clobber except the XMM bank of a function without
+;;; floating values, where nothing lives; every register they may write is
+;;; recorded for the function's write set.
+(defn inline-builtin! [(out (mut code/Buffer)) (cx context/Context) (reference i32)
+                       (planned abi/Layout)] (-> (Result bool (slice u8)))
+  (let [graph (.graph cx)
+        node (get (.instructions graph) (cast i64 reference))
+        builtin (calls/builtin-of graph reference)]
+    (if (or (= builtin 0)
+            (!= (n/opcode node) 79)
+            (!= (len (.arguments planned)) 3)
+            (!= (.register (get (.arguments planned) 0)) registers/RDI)
+            (!= (.register (get (.arguments planned) 1)) registers/RSI))
+        (Ok false)
+        (let [size (cond
+                     (= builtin groups/BUILTIN-MOVE)
+                       (match (copy-forward/move graph reference)
+                         (None [] (: -1 i64))
+                         (Some [move]
+                               (if (block-move/inline? (.size move)) (.size move) (: -1 i64))))
+                     (= builtin groups/BUILTIN-COMPARE)
+                       (match (known/known-count graph (.value (get (.arguments planned) 2))
+                                                 (.op1 node))
+                         (None [] (: -1 i64))
+                         (Some [count]
+                               (if (<= count (cast u64 (block-compare/maximum)))
+                                   (cast i64 count)
+                                   (: -1 i64))))
+                     :else (: -1 i64))]
+          (if (< size 0)
+              (Ok false)
+              (match (if (= builtin groups/BUILTIN-MOVE)
+                         (block-move/emit! (mut (.text out)) size)
+                         (block-compare/emit! (mut (.text out)) size))
+                (Err [message] (Err message))
+                (Ok [_]
+                    (for register [(: registers/RAX i32) registers/RCX registers/RDX
+                                   registers/R8]
+                      (code/wrote! (mut out) register))
+                    (when (= builtin groups/BUILTIN-MOVE)
+                      (for [register 32 48] (code/wrote! (mut out) (cast i32 register))))
+                    (code/clear-flags! (mut out))
+                    (Ok true))))))))
+
+;;; Constraints of a node lowered as a call to a runtime routine that takes
+;;; its `operands` in xmm0, xmm1, ... and returns in xmm0 (FMA through libm's
+;;; fma/fmaf): the operands may be anywhere, every caller-saved register is
+;;; clobbered across the node (the routine is ordinary C), the result is a
+;;; fixed definition in xmm0, and the node lowers its own definition-position
+;;; transfers like any call.
+(defn runtime-constraints! [(set (mut uses/Set)) (reference i32) (position i64)
+                            (operands (slice i32))] (-> (Result i32 (slice u8)))
+  (let [mask (private/full-clobbers)
+        (mut error) ""]
+    (for operand operands
+      (unless (uses/use-anywhere! (mut set) operand position) (set! error CONFLICT)))
+    (for [register 0 48]
+      (when (!= (& mask (<< (: 1 u64) (cast u64 register))) 0)
+        (if (= (cast i32 register) registers/XMM0)
+            (uses/clobber-unless-live! (mut set) (cast i32 register) (+ position 1)
+                                       (+ position 2) reference)
+            (uses/clobber! (mut set) (cast i32 register) (+ position 1) (+ position 2)))))
+    (unless (uses/define-fixed! (mut set) reference position registers/XMM0)
+      (set! error CONFLICT))
+    (push! (mut (.definition-moves set)) (+ position 1))
+    (set! (.calls set) true)
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; Emit the runtime call of `runtime-constraints!`: one parallel group moves
+;;; the located operands into xmm0.. together with the allocator's
+;;; preservation transfers, constants are materialized, then `call rel32` to
+;;; `routine` (code/RUNTIME-*). The result is in xmm0.
+(defn emit-runtime! [(out (mut code/Buffer)) (cx context/Context) (position i64)
+                     (operands (slice i32)) (routine i32)
+                     (preserve (slice loc/Transfer)) (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [graph (.graph cx)
+        (mut copies) (ArrayList::new [typed/Copy] allocator)
+        (mut error) ""]
+    (for [i 0 (len operands)]
+      (let [operand (get operands i)]
+        (when (and (= error "") (located? cx operand position))
+          (match (loc/resolve (.parts cx) operand position)
+            (Err [message] (set! error message))
+            (Ok [source]
+                (push! (mut copies)
+                       (typed/Copy
+                         :transfer (loc/Transfer
+                                     :position position
+                                     :parent operand
+                                     :source source
+                                     :destination (loc/Location
+                                                    :kind 0
+                                                    :value (+ (cast i64 registers/XMM0) i)))
+                         :size (extent (value/type-of graph operand)))))))))
+    (for copy preserve
+      (when (= error "")
+        (let [ty (value/type-of graph (.parent copy))]
+          (if (or (!= (.position copy) (+ position 1)) (<= (.parent copy) 0) (<= ty 0))
+              (set! error "runtime call preservation has an invalid position or owner")
+              (push! (mut copies)
+                     (typed/Copy
+                       :transfer (loc/Transfer
+                                   :position position
+                                   :parent (.parent copy)
+                                   :source (.source copy)
+                                   :destination (.destination copy))
+                       :size (extent ty)))))))
+    (when (and (= error "") (> (len copies) 0))
+      (code/accept-count! (mut error)
+                          (typed/parallel-frame! (mut (.text out)) (slice copies) allocator
+                                                 (.base cx))))
+    (for [i 0 (len operands)]
+      (when (and (= error "") (not (located? cx (get operands i) position)))
+        (code/accept-count! (mut error)
+                            (load! (mut out) cx (get operands i) position
+                                   (+ (: registers/XMM0 i32) (cast i32 i))))))
+    (when (= error "")
+      (code/accept-count! (mut error) (code/runtime-call! (mut out) routine))
+      (code/called! (mut out)))
+    (free! (mut copies))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; Move the integer result pieces `low` and `high` (0 for a single piece)
+;;; into rax and rdx as one simultaneous group; a constant piece is built
+;;; afterwards.
+(defn return-pieces! [(out (mut code/Buffer)) (cx context/Context) (position i64)
+                      (low i32) (high i32) (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [(mut copies) (ArrayList::new [typed/Copy] allocator)
+        values [low high]
+        targets [(: registers/RAX i32) registers/RDX]
+        (mut error) ""]
+    (for [i 0 2]
+      (when (and (= error "") (located? cx (get values i) position))
+        (match (loc/resolve (.parts cx) (get values i) position)
+          (Err [message] (set! error message))
+          (Ok [source]
+              (push! (mut copies)
+                     (typed/Copy
+                       :transfer (loc/Transfer
+                                   :position position
+                                   :parent (get values i)
+                                   :source source
+                                   :destination (loc/Location
+                                                  :kind 0
+                                                  :value (cast i64 (get targets i))))
+                       :size 8))))))
+    (when (and (= error "") (> (len copies) 0))
+      (code/accept-count! (mut error)
+                          (typed/parallel-frame! (mut (.text out)) (slice copies) allocator
+                                                 (.base cx))))
+    (for [i 0 2]
+      (when (and (= error "") (!= (get values i) 0) (not (located? cx (get values i) position)))
+        (code/accept-count! (mut error)
+                            (load! (mut out) cx (get values i) position (get targets i)))))
+    (free! (mut copies))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; The register an indirect callee is in once `emit-call!` has installed the
+;;; arguments: r11 for a variadic call (al carries the vector count), rax
+;;; otherwise.
+(defn target-register [(planned abi/Layout)] (-> i32)
+  (if (.variadic? planned) (: registers/SCRATCH-GPR-2 i32) registers/RAX))
+
+;;; Emit CALL or TAILCALL `reference`. `preserve` are the allocator's
+;;; transfers at `position + 1`. mode 0: an ordinary call with its result
+;;; captured. mode 1: arguments installed for a tail jump, no branch emitted
+;;; (an indirect callee is left in `target-register`). mode 2: the call, with
+;;; its results left in the result registers for the caller's own return.
+(defn emit-call! [(out (mut code/Buffer)) (cx context/Context) (reference i32)
+                  (position i64) (preserve (slice loc/Transfer)) (mode i32)
+                  (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (match (abi/layout (.graph cx) reference allocator)
+    (Err [message] (Err message))
+    (Ok [planned]
+        (let [(mut planned) planned
+              graph (.graph cx)
+              node (get (.instructions graph) (cast i64 reference))
+              callee (.op2 node)
+              direct? (abi/direct-callee? graph callee)
+              ; The matcher made the loads of the result pieces definitions
+              ; of this call (rax, rdx): nothing is stored to the place.
+              projected (> (.count (machine/output-range (.operands (.matched cx)) reference)) 0)
+              (mut copies) (ArrayList::new [typed/Copy] allocator)
+              (mut error) ""]
+          (when (or (< mode 0) (> mode 2)
+                    (and (= mode 0) (!= (n/opcode node) 79)))
+            (set! error "call emission mode does not match instruction"))
+          ; 1. ARGVAL bytes.
+          (for argument (.arguments planned)
+            (when (and (= error "") (> (.memory argument) 0))
+              (code/accept-count! (mut error)
+                                  (argument-copy! (mut out) cx argument position))))
+          ; 2. The result place pointer.
+          (when (and (= error "") (= mode 0) (not projected) (>= (.result-save planned) 0))
+            (code/accept-count! (mut error)
+                                (emit/into! (mut out) cx
+                                            (.value (get (.arguments planned) 0))
+                                            position registers/SCRATCH-GPR))
+            (code/accept! (mut error)
+                          (encode/mov-mr (mut (.text out)) 64
+                                         (encode/mem registers/RSP (.result-save planned))
+                                         registers/SCRATCH-GPR)))
+          ; 3. Stack arguments.
+          (for argument (.arguments planned)
+            (when (and (= error "") (= (.register argument) -1) (= (.memory argument) 0))
+              (code/accept-count! (mut error)
+                                  (stack-argument! (mut out) cx argument position))))
+          ; 4. Located register arguments, the indirect callee and the
+          ;    preservation transfers, as one simultaneous group.
+          (for argument (.arguments planned)
+            (when (and (= error "")
+                       (>= (.register argument) 0)
+                       (located? cx (.value argument) position))
+              (match (loc/resolve (.parts cx) (.value argument) position)
+                (Err [message] (set! error message))
+                (Ok [source]
+                    (push! (mut copies)
+                           (typed/Copy
+                             :transfer (loc/Transfer
+                                         :position position
+                                         :parent (.value argument)
+                                         :source source
+                                         :destination (loc/Location
+                                                        :kind 0
+                                                        :value (cast i64 (.register argument))))
+                             :size (extent (cast i32 (.ty argument)))))))))
+          (when (and (= error "") (located? cx callee position))
+            (match (loc/resolve (.parts cx) callee position)
+              (Err [message] (set! error message))
+              (Ok [source]
+                  (push! (mut copies)
+                         (typed/Copy
+                           :transfer (loc/Transfer
+                                       :position position
+                                       :parent callee
+                                       :source source
+                                       :destination (loc/Location
+                                                      :kind 0
+                                                      :value (cast i64 registers/RAX)))
+                           :size 8)))))
+          (for copy preserve
+            (when (= error "")
+              (let [ty (value/type-of graph (.parent copy))]
+                (if (or (!= (.position copy) (+ position 1)) (<= (.parent copy) 0) (<= ty 0))
+                    (set! error "call preservation has an invalid position or owner")
+                    (push! (mut copies)
+                           (typed/Copy
+                             :transfer (loc/Transfer
+                                         :position position
+                                         :parent (.parent copy)
+                                         :source (.source copy)
+                                         :destination (.destination copy))
+                             :size (extent ty)))))))
+          (when (and (= error "") (> (len copies) 0))
+            (code/accept-count! (mut error)
+                                (typed/parallel-frame! (mut (.text out)) (slice copies)
+                                                       allocator (.base cx))))
+          ; 5. Constants and rematerialized values.
+          (for argument (.arguments planned)
+            (when (and (= error "")
+                       (>= (.register argument) 0)
+                       (not (located? cx (.value argument) position)))
+              (code/accept-count! (mut error)
+                                  (load! (mut out) cx (.value argument) position
+                                         (.register argument)))))
+          (when (and (= error "") (not direct?) (not (located? cx callee position)))
+            (code/accept-count! (mut error)
+                                (emit/into! (mut out) cx callee position registers/RAX)))
+          ; 6. Caller-side extension and promotion of register arguments.
+          (for argument (.arguments planned)
+            (when (and (= error "") (>= (.register argument) 0))
+              (if (.promote? argument)
+                  (code/accept! (mut error)
+                                (encode/sse-rr (mut (.text out)) encode/CVTSS2SD
+                                               (.register argument) (.register argument)))
+                  (code/accept-count! (mut error)
+                                      (abi/normalize! (mut out) (cast i32 (.ty argument))
+                                                      (.register argument))))))
+          ; 7. al of a variadic call.
+          (when (and (= error "") (.variadic? planned))
+            (unless direct?
+              (code/accept! (mut error)
+                            (encode/mov-rr (mut (.text out)) 64 registers/SCRATCH-GPR-2
+                                           registers/RAX)))
+            (code/accept! (mut error)
+                          (encode/mov-ri (mut (.text out)) 32 registers/RAX
+                                         (cast i64 (.vectors planned)))))
+          ; 8. The call.
+          (when (and (= error "") (!= mode 1))
+            (if direct?
+                (match (inline-builtin! (mut out) cx reference planned)
+                  (Err [message] (set! error message))
+                  (Ok [inlined]
+                      (unless inlined
+                        (code/accept-count! (mut error) (code/direct-call! (mut out) graph callee))
+                        (code/called! (mut out)))))
+                (do
+                  (code/accept! (mut error)
+                                (encode/call-r (mut (.text out)) (target-register planned)))
+                  (code/called! (mut out))))
+            ; Whatever the callee left in the flags describes no register here.
+            (code/clear-flags! (mut out)))
+          ; 9. Results.
+          (when (and (= error "") (= mode 0))
+            (when (and (not projected) (>= (.result-save planned) 0))
+              (code/accept! (mut error)
+                            (encode/mov-rm (mut (.text out)) 64 registers/SCRATCH-GPR-2
+                                           (encode/mem registers/RSP (.result-save planned))))
+              (for [i 0 (cast i64 (.count (.result planned)))]
+                (let [piece (cast i32 i)
+                      register (arguments/result-register (.result planned) piece)
+                      slot (encode/mem registers/SCRATCH-GPR-2
+                                       (results/piece-offset (.result planned) piece))
+                      ty (results/piece-type (.result planned) piece)]
+                  (code/accept! (mut error)
+                                (cond (registers/gpr? register)
+                                        (encode/mov-mr (mut (.text out)) 64 slot register)
+                                      (= ty 13)
+                                        (encode/sse-mov-mr (mut (.text out)) encode/MOVSS slot
+                                                           register)
+                                      :else
+                                        (encode/sse-mov-mr (mut (.text out)) encode/MOVSD slot
+                                                           register))))))
+            (code/accept-count! (mut error)
+                                (abi/normalize! (mut out) (cast i32 (n/type-id node))
+                                                registers/RAX)))
+          (free! (mut copies))
+          (abi/release! (mut planned))
+          (if (= error "") (Ok 0) (Err error))))))

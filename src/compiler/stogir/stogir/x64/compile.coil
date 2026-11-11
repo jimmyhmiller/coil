@@ -1,69 +1,666 @@
-;;; PLACEHOLDER for the x86-64 backend's compile entry points.
+;;; Standalone x86-64 (System V, Linux) compilation entry points over the
+;;; library IR. The public entries have the names, parameters and result
+;;; types of their stogir.a64.compile namesakes, so stogir.native.compile can
+;;; forward to either backend.
 ;;;
-;;; Every function here has the signature of its `stogir.a64.compile` namesake
-;;; and fails with "x86-64 backend: NAME is not implemented yet". The real
-;;; backend replaces this file; `stogir.native.compile` forwards to it when the
-;;; program is compiled for x86-64, so the facade-level tests become its gate
-;;; one entry point at a time.
+;;; Pipeline: the graph is validated and prepared by the same neutral stages
+;;; the AArch64 path uses (pipeline/prepare-native: CFG, dominators, loop
+;;; depths, placement, local schedule; SCCP at optimization levels two and
+;;; three; tail-split), then matched (stogir.x64.match), analyzed for
+;;; liveness and live ranges (neutral), constrained (stogir.x64.constraints),
+;;; allocated (stogir.x64.allocate), emitted (stogir.x64.function) and
+;;; finished as an image (stogir.x64.image).
 ;;;
-;;; `object` and `object-with-options` are not here: the facade builds them from
-;;; `image` / `image-with-options` and `stogir.aot.native/image-object`.
+;;; Level three runs the stages of the a64 path that rewrite the graph
+;;; without creating vector operations, each as and when the a64 path runs
+;;; it: global-load forwarding, the fact fold (or the whole-graph branch
+;;; facts), select diamonds or the general if-conversion, loop-load hoisting,
+;;; loop rotation, and loop strength reduction with the x86-64 cost rule
+;;; (stogir.x64.strength-cost). The context's option switches select them as
+;;; on AArch64. The last stage, the loop vectorizer, creates vector nodes and
+;;; stays off behind LEVEL-THREE-VECTORIZE until the vector family emits them.
 ;;;
-;;; The private context types come from `stogir.native.private-types`.
+;;; Not run on x86-64 yet, each behind a named switch or absent stage:
+;;;   * LEVEL-THREE-VECTORIZE: the loop vectorizer (see above).
+;;;   * a64.constant-hoist and a64.return-values (direct aggregate returns):
+;;;     AArch64 tuning and call-family work.
+;;;   * Level zero is rejected, as on AArch64.
+;;;   * Private-leaf contexts and module publications (call family). The
+;;;     context types come from stogir.native.private-types; an inactive
+;;;     context's emission options (prune-default, predict) and level-three
+;;;     switches are honoured.
 (module stogir.x64.compile)
-(export validate text image vector-image image-with-options image-with-private image-for-private-module image-for-private-module-optimized image-with-options-optimized image-for-private-module-proven image-with-options-proven)
+(export validate generate text image vector-image image-with-options image-with-private image-for-private-module image-for-private-module-optimized image-with-options-optimized image-for-private-module-proven image-with-options-proven)
 (import "stogir.graph" :as g)
+(import "stogir.compact" :as compact)
 (import "stogir.options" :as options)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.tail-split" :as tail-split)
+(import "stogir.loop-vectorize" :as vectorize)
+(import "stogir.loop-rotate" :as rotate)
+(import "stogir.loop-load-hoist" :as load-hoist)
+(import "stogir.global-load-forward" :as global-loads)
+(import "stogir.if-convert" :as if-convert)
+(import "stogir.select-diamond" :as select-diamond)
+(import "stogir.branch-facts" :as branch-facts)
+(import "stogir.fact-fold" :as fact-fold)
+(import "stogir.x64.strength-cost" :as strength)
 (import "stogir.image" :as code)
+(import "stogir.verify" :as verify)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.register-live" :as live)
+(import "stogir.live-ranges" :as ranges)
+(import "stogir.split-position" :as split-position)
 (import "stogir.native.private-types" :as private)
+(import "stogir.x64.private-leaf" :as leaves)
+(import "stogir.x64.return-values" :as return-values)
+(import "stogir.a64.return-values" :as shared-returns)
+(import "stogir.x64.allocate" :as allocate)
+(import "stogir.x64.code" :as buffer)
+(import "stogir.x64.constraints" :as constraints)
+(import "stogir.x64.function" :as function)
+(import "stogir.x64.image" :as emitted-image)
+(import "stogir.x64.match" :as matching)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.uses" :as uses)
 (import "coil.alloc" :use [Allocator])
 (import "coil.arraylist" :use [ArrayList])
-(import "coil.result" :use [Result Ok Err])
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+;;; Whether level three ends with the loop vectorizer. It produces vector
+;;; operations, which no x86-64 family emits yet, so it is off: flip this
+;;; one switch when stogir.x64.vector exists. Every other level-three stage
+;;; runs regardless.
+(const LEVEL-THREE-VECTORIZE false)
 
 (defn validate [(graph g/Graph)] (-> (Result i32 (slice u8)))
-  (Err "x86-64 backend: validate is not implemented yet"))
+  (verify/native-operations graph))
 
-(defn text [(graph g/Graph) (entry i32) (roots (slice i32)) (allocator (dyn Allocator))]
+;;; The emission options a context carries, and the context itself.
+(defn emission-options [(context private/Context)] (-> function/Options)
+  (function/Options :prune-default (private/prune-default? context)
+                    :predict (private/predict? context)
+                    :private context))
+
+;;; Liveness through emission for a prepared, matched function.
+(defn generate-matched [(graph g/Graph)
+                        (owned pipeline/Prepared)
+                        (matched plan/Plan)
+                        (options function/Options)
+                        (allocator (dyn Allocator))]
+  (-> (Result buffer/Buffer (slice u8)))
+  (let [(mut analysis) (live/analyze-matched graph (.blocks owned) (.schedule owned)
+                                             (.order owned) (.operands matched) allocator)
+        (mut intervals) (ranges/build-matched graph (.schedule owned) analysis (.order owned)
+                                              (.operands matched) allocator)
+        result
+          (match (constraints/build-matched graph (.schedule owned) matched (.private options)
+                                            allocator)
+            (Err [message] (Err [buffer/Buffer (slice u8)] message))
+            (Ok [requirements]
+                (let [(mut set) requirements
+                      (mut split-blocks) (split-position/build (.blocks owned) (.schedule owned)
+                                                               (.idom owned) (.depths owned)
+                                                               allocator)
+                      emitted
+                        (match (allocate/build intervals set graph (.schedule owned)
+                                               (.blocks owned) (.depths owned)
+                                               (slice split-blocks) allocator)
+                          (Err [message] (Err [buffer/Buffer (slice u8)] message))
+                          (Ok [assigned]
+                              (let [(mut allocation) assigned
+                                    emitted (function/body-prepared graph owned allocation
+                                                                    analysis set matched
+                                                                    options allocator)]
+                                (allocate/release! (mut allocation))
+                                emitted)))]
+                  (free! (mut split-blocks))
+                  (uses/release! (mut set))
+                  emitted)))]
+    (ranges/release! (mut intervals))
+    (live/release-analysis! (mut analysis))
+    result))
+
+;;; Matching through emission. `reuse`, when present, is pipeline/prepare
+;;; output for exactly this graph, entry and roots; it is consumed, and the
+;;; complete native-input verification still runs before it is used.
+;;; `validated`: the graph's exact content passed sccp-rewrite/validate at
+;;; eight-byte pointers, so the part of the native-input checks that
+;;; validation covered is not repeated (as stogir.a64.compile).
+(defn generate-reusing [(graph g/Graph) (entry i32) (roots (slice i32))
+                        (options function/Options) (reuse (Option pipeline/Prepared))
+                        (validated bool) (allocator (dyn Allocator))]
+  (-> (Result buffer/Buffer (slice u8)))
+  ; Integer result pieces are returned straight from registers when the
+  ; private result buffer can be promoted away (stogir.x64.return-values).
+  (match (return-values/prepare graph entry roots validated allocator)
+    (Err [message]
+         (match reuse
+           (Some [prepared] (let [(mut unused) prepared] (pipeline/release! (mut unused)) 0))
+           (None [] 0))
+         (Err message))
+    (Ok [lowered]
+        (match lowered
+          (None [] (generate-buffered graph entry roots options reuse validated allocator))
+          (Some [owned]
+                (let [(mut owned) owned
+                      _ (match reuse
+                          (Some [prepared]
+                                (let [(mut unused) prepared] (pipeline/release! (mut unused)) 0))
+                          (None [] 0))
+                      direct (generate-direct (.graph owned) entry (slice (.roots owned))
+                                              (slice (.returns owned)) (.count (.spec owned))
+                                              options allocator)
+                      answer
+                        (match direct
+                          (Err [message] (Err [buffer/Buffer (slice u8)] message))
+                          (Ok [text]
+                              (let [(mut text) text]
+                                (if (return-values/shared-references? graph (.graph owned) text)
+                                    (Ok text)
+                                    (do
+                                      (buffer/release! (mut text))
+                                      (generate-buffered graph entry roots options
+                                                         (None [pipeline/Prepared]) false
+                                                         allocator))))))]
+                  (shared-returns/release! (mut owned))
+                  answer))))))
+
+;;; Generation of a lowered copy whose RETURNs carry their pieces as machine
+;;; uses. The copy's validation is its own: `validated` does not extend to it.
+(defn generate-direct [(graph g/Graph) (entry i32) (roots (slice i32))
+                       (returns (slice shared-returns/Return)) (count i32)
+                       (options function/Options) (allocator (dyn Allocator))]
+  (-> (Result buffer/Buffer (slice u8)))
+  (let [(mut anchors) (return-values/anchors returns allocator)
+        prepared (pipeline/prepare-native-anchored graph entry roots (slice anchors) allocator)]
+    (free! (mut anchors))
+    (match prepared
+      (Err [message] (Err message))
+      (Ok [prepared]
+          (let [(mut owned) prepared
+                result
+                  (match (matching/build graph (.schedule owned) roots allocator)
+                    (Err [message] (Err [buffer/Buffer (slice u8)] message))
+                    (Ok [selected]
+                        (let [(mut matched) selected
+                              emitted
+                                (match (return-values/install-uses! graph returns
+                                                                    (mut (.operands matched))
+                                                                    count)
+                                  (Err [message] (Err [buffer/Buffer (slice u8)] message))
+                                  (Ok [_] (generate-matched graph owned matched options
+                                                            allocator)))]
+                          (matching/release! (mut matched))
+                          emitted)))]
+            (pipeline/release! (mut owned))
+            result)))))
+
+;;; Generation of `graph` as it is: aggregate results go through the frame
+;;; buffer.
+(defn generate-buffered [(graph g/Graph) (entry i32) (roots (slice i32))
+                         (options function/Options) (reuse (Option pipeline/Prepared))
+                         (validated bool) (allocator (dyn Allocator))]
+  (-> (Result buffer/Buffer (slice u8)))
+  (match (match reuse
+           (None []
+                 (if validated
+                     (pipeline/prepare-after-validate graph entry roots true allocator)
+                     (pipeline/prepare-native graph entry roots allocator)))
+           (Some [prepared]
+                 (match (if validated
+                            (verify/native-input-after-validate graph entry roots)
+                            (verify/native-input graph entry roots))
+                   (Err [message]
+                        (let [(mut unused) prepared] (pipeline/release! (mut unused)) 0)
+                        (Err [pipeline/Prepared (slice u8)] message))
+                   (Ok [_] (Ok prepared)))))
+    (Err [message] (Err message))
+    (Ok [prepared]
+        (let [(mut owned) prepared
+              result
+                (match (matching/build graph (.schedule owned) roots allocator)
+                  (Err [message] (Err [buffer/Buffer (slice u8)] message))
+                  (Ok [selected]
+                      (let [(mut matched) selected
+                            emitted (generate-matched graph owned matched options allocator)]
+                        (matching/release! (mut matched))
+                        emitted)))]
+          (pipeline/release! (mut owned))
+          result))))
+
+;;; Owned text plus pending graph references of one function. Finish it as an
+;;; image before releasing the graph.
+(defn generate [(graph g/Graph) (entry i32) (roots (slice i32)) (allocator (dyn Allocator))]
+  (-> (Result buffer/Buffer (slice u8)))
+  (generate-reusing graph entry roots (function/default-options) (None [pipeline/Prepared])
+                    false allocator))
+
+;;; Byte-only output is valid only when no relocation remains to be resolved.
+(defn text [(graph g/Graph)
+            (entry i32)
+            (roots (slice i32))
+            (allocator (dyn Allocator))]
   (-> (Result (ArrayList u8) (slice u8)))
-  (Err "x86-64 backend: text is not implemented yet"))
+  (match (generate graph entry roots allocator)
+    (Err [message] (Err message))
+    (Ok [compiled]
+        (let [(mut owned) compiled
+              (mut runtime) false
+              result (do
+                       (for pending (.references owned)
+                         (when (buffer/runtime? pending) (set! runtime true)))
+                       (cond runtime
+                               (Err [(ArrayList u8) (slice u8)] "x86-64 backend: FMA calls libm's fma/fmaf, which needs an image; bare text cannot carry the call's relocation")
+                             (> (len (.references owned)) 0)
+                               (Err [(ArrayList u8) (slice u8)] "symbolic code requires an image")
+                             :else (Ok (buffer/take-text! (mut owned) allocator))))]
+          (buffer/release! (mut owned))
+          result))))
+
+;;; Transfer compiled text into an owned, address-independent shared image.
+;;; The symbol is an exact target object name; the image is directly JIT-able.
+;;; `reuse` and `validated` are as for generate-reusing.
+(defn image-reusing [(graph g/Graph) (entry i32) (roots (slice i32)) (symbol (slice u8))
+                     (a (dyn Allocator)) (context private/Context)
+                     (reuse (Option pipeline/Prepared)) (validated bool)]
+  (-> (Result code/Image (slice u8)))
+  (match (generate-reusing graph entry roots (emission-options context) reuse validated a)
+    (Err [message] (Err message))
+    (Ok [compiled]
+        (let [(mut owned) compiled
+              ; References to the context's leaves must carry their ABI.
+              result (match (leaves/validate-references context graph (slice (.references owned)))
+                       (Err [message] (Err [code/Image (slice u8)] message))
+                       (Ok [_] (emitted-image/finish! (mut owned) graph symbol a)))]
+          (buffer/release! (mut owned))
+          result))))
+
+;;; Append a private copy of every leaf of `context` that `result` refers to.
+(defn embedded [(result (Result code/Image (slice u8))) (context private/Context)]
+  (-> (Result code/Image (slice u8)))
+  (match result
+    (Err [message] (Err message))
+    (Ok [finished]
+        (let [(mut finished) finished]
+          (match (leaves/bind-image! context (mut finished))
+            (Err [message] (code/release! (mut finished)) (Err message))
+            (Ok [_] (Ok finished)))))))
 
 (defn image [(graph g/Graph) (entry i32) (roots (slice i32)) (symbol (slice u8))
              (a (dyn Allocator))] (-> (Result code/Image (slice u8)))
-  (Err "x86-64 backend: image is not implemented yet"))
+  (image-reusing graph entry roots symbol a (private/no-context) (None [pipeline/Prepared])
+                 false))
 
+;;; A nonzero proof is a content hash recorded when a graph passed
+;;; sccp-rewrite/validate at eight-byte pointers. This graph is that graph,
+;;; unchanged, when its own hash matches.
+(defn validated? [(graph g/Graph) (proof u128)] (-> bool)
+  (and (!= proof 0) (= (rewrite/content-hash graph 8) proof)))
+
+;;; The level-three stages, in the order and under the switches of
+;;; stogir.a64.compile (vector-image-private and the functions it leads to).
+;;; Each takes the graph of the stage before it and hands on either that
+;;; graph or its own edited copy, which it owns until the image is finished.
+;;; SEED, where present, is pipeline/prepare of exactly this graph, entry and
+;;; roots, or None; each stage consumes it, handing it on while the graph is
+;;; unchanged and releasing it as soon as a stage replaces the graph or fails.
+
+;;; The backend sizes every analysis by instruction cells. When at least an
+;;; eighth of them are dead NOPs, level three works on a compacted copy.
+(defn level-three-image [(graph g/Graph) (entry i32) (roots (slice i32))
+                         (symbol (slice u8)) (allocator (dyn Allocator))
+                         (context private/Context) (proof u128)]
+  (-> (Result code/Image (slice u8)))
+  (if (and (= entry 1)
+           (>= (* (compact/nop-cells graph) 8) (len (.instructions graph))))
+      (let [(mut compacted) (compact/compact graph roots allocator)
+            output (level-three-global-loads (.graph compacted) entry (slice (.roots compacted))
+                                             symbol allocator context false)]
+        (compact/release! (mut compacted))
+        output)
+      (level-three-global-loads graph entry roots symbol allocator context
+                                (validated? graph proof))))
+
+;;; Global-load forwarding (opt-in), then SCCP over what it exposed.
+(defn level-three-global-loads [(graph g/Graph) (entry i32) (roots (slice i32))
+                                (symbol (slice u8)) (allocator (dyn Allocator))
+                                (context private/Context) (validated bool)]
+  (-> (Result code/Image (slice u8)))
+  (if (not (private/global-loads? context))
+      (level-three-facts graph entry roots symbol allocator context validated)
+      (match (global-loads/run graph entry roots allocator)
+        (Err [message] (Err message))
+        (Ok [result]
+            (let [(mut exits) (.roots result)
+                  output
+                    (match (.graph result)
+                      (None [] (level-three-facts graph entry roots symbol allocator context
+                                                  validated))
+                      (Some [owned]
+                            (let [(mut owned) owned
+                                  cleaned (sccp/optimize owned 8 (slice exits) allocator)]
+                              (g/release! (mut owned))
+                              (match cleaned
+                                (Err [message] (Err message))
+                                (Ok [rewritten]
+                                    (let [(mut rewritten) rewritten
+                                          output (level-three-facts
+                                                   (.graph rewritten) entry
+                                                   (slice (.roots rewritten)) symbol allocator
+                                                   context false)]
+                                      (rewrite/release! (mut rewritten))
+                                      output))))))]
+              (free! (mut exits))
+              output)))))
+
+;;; The sparse fact fold always runs. The branch-facts and induction options
+;;; select the older whole-graph pass in its place; that pass prepares the
+;;; whole graph and hands its preparation on when it proves nothing.
+(defn level-three-facts [(graph g/Graph) (entry i32) (roots (slice i32))
+                         (symbol (slice u8)) (allocator (dyn Allocator))
+                         (context private/Context) (validated bool)]
+  (-> (Result code/Image (slice u8)))
+  (match (if (or (private/branch-facts? context) (private/induction? context))
+             (branch-facts/run-keeping-preparation graph entry roots allocator
+                                                   (private/induction? context))
+             (match (fact-fold/run graph entry roots validated allocator)
+               (Err [message] (Err [branch-facts/Outcome (slice u8)] message))
+               (Ok [edited]
+                   (Ok (branch-facts/Outcome :graph edited
+                                             :prepared (None [pipeline/Prepared]))))))
+    (Err [message] (Err message))
+    (Ok [outcome]
+        (match (.graph outcome)
+          (None [] (level-three-selects graph entry roots symbol allocator context validated
+                                        (.prepared outcome)))
+          (Some [working]
+                (let [(mut working) working
+                      result (sccp/optimize working 8 roots allocator)]
+                  (g/release! (mut working))
+                  (match result
+                    (Err [message] (Err message))
+                    (Ok [rewritten]
+                        (let [(mut rewritten) rewritten
+                              ; SCCP's nonzero proof says this very graph
+                              ; passed validation just now.
+                              output (level-three-selects
+                                       (.graph rewritten) entry (slice (.roots rewritten))
+                                       symbol allocator context (!= (.proof rewritten) 0)
+                                       (None [pipeline/Prepared]))]
+                          (rewrite/release! (mut rewritten))
+                          output)))))))))
+
+;;; Diamonds whose choices are nearly free become COND; the general
+;;; if-conversion is opt-in, and keep-diamonds turns both off.
+(defn level-three-selects [(graph g/Graph) (entry i32) (roots (slice i32))
+                           (symbol (slice u8)) (allocator (dyn Allocator))
+                           (context private/Context) (validated bool)
+                           (seed (Option pipeline/Prepared))]
+  (-> (Result code/Image (slice u8)))
+  (match (cond (private/if-convert? context) (if-convert/run graph entry roots allocator)
+               (private/keep-diamonds? context) (select-diamond/none roots allocator)
+               :else (select-diamond/run graph roots allocator))
+    (Err [message] (vectorize/release-preparation! seed) (Err message))
+    (Ok [result]
+        (let [(mut exits) (.roots result)
+              output
+                (match (.graph result)
+                  (None [] (level-three-loads graph entry roots symbol allocator context
+                                              validated false seed))
+                  (Some [owned]
+                        (vectorize/release-preparation! seed)
+                        (let [(mut owned) owned
+                              output (level-three-loads owned entry (slice exits) symbol
+                                                        allocator context false false
+                                                        (None [pipeline/Prepared]))]
+                          (g/release! (mut owned))
+                          output)))]
+          (free! (mut exits))
+          output))))
+
+;;; Loop-load hoisting (opt-in): header loads before rotation, so they are
+;;; not cloned into the latch; after a rotation, body loads that now must
+;;; execute move onto the guarded loop entry.
+(defn level-three-loads [(graph g/Graph) (entry i32) (roots (slice i32))
+                         (symbol (slice u8)) (allocator (dyn Allocator))
+                         (context private/Context) (validated bool)
+                         (after-rotation bool) (seed (Option pipeline/Prepared))]
+  (-> (Result code/Image (slice u8)))
+  (if (not (private/hoist-loads? context))
+      (level-three-after-loads graph entry roots symbol allocator context validated
+                               after-rotation seed)
+      (match (load-hoist/run graph entry roots allocator)
+        (Err [message] (vectorize/release-preparation! seed) (Err message))
+        (Ok [result]
+            (let [(mut exits) (.roots result)
+                  output
+                    (match (.graph result)
+                      (None [] (level-three-after-loads graph entry roots symbol allocator
+                                                        context validated after-rotation seed))
+                      (Some [owned]
+                            (vectorize/release-preparation! seed)
+                            (let [(mut owned) owned
+                                  output (level-three-after-loads
+                                           owned entry (slice exits) symbol allocator context
+                                           false after-rotation (None [pipeline/Prepared]))]
+                              (g/release! (mut owned))
+                              output)))]
+              (free! (mut exits))
+              output)))))
+
+(defn level-three-after-loads [(graph g/Graph) (entry i32) (roots (slice i32))
+                               (symbol (slice u8)) (allocator (dyn Allocator))
+                               (context private/Context) (validated bool)
+                               (after-rotation bool) (seed (Option pipeline/Prepared))]
+  (-> (Result code/Image (slice u8)))
+  (if after-rotation
+      (level-three-strength graph entry roots symbol allocator context validated seed)
+      (level-three-rotation graph entry roots symbol allocator context validated seed)))
+
+;;; Loop rotation (opt-in); a rotated graph gets its loads hoisted again.
+(defn level-three-rotation [(graph g/Graph) (entry i32) (roots (slice i32))
+                            (symbol (slice u8)) (allocator (dyn Allocator))
+                            (context private/Context) (validated bool)
+                            (seed (Option pipeline/Prepared))]
+  (-> (Result code/Image (slice u8)))
+  (if (not (private/rotate? context))
+      (level-three-strength graph entry roots symbol allocator context validated seed)
+      (match (rotate/run graph entry roots allocator)
+        (Err [message] (vectorize/release-preparation! seed) (Err message))
+        (Ok [result]
+            (let [(mut rotated-roots) (.roots result)
+                  output
+                    (match (.graph result)
+                      (None [] (level-three-strength graph entry roots symbol allocator
+                                                     context validated seed))
+                      (Some [rotated]
+                            (vectorize/release-preparation! seed)
+                            (let [(mut rotated) rotated
+                                  output (level-three-loads rotated entry (slice rotated-roots)
+                                                            symbol allocator context false true
+                                                            (None [pipeline/Prepared]))]
+                              (g/release! (mut rotated))
+                              output)))]
+              (free! (mut rotated-roots))
+              output)))))
+
+;;; Loop strength reduction (opt-in) under the x86-64 cost rule, then SCCP.
+(defn level-three-strength [(graph g/Graph) (entry i32) (roots (slice i32))
+                            (symbol (slice u8)) (allocator (dyn Allocator))
+                            (context private/Context) (validated bool)
+                            (seed (Option pipeline/Prepared))]
+  (-> (Result code/Image (slice u8)))
+  (if (not (private/strength? context))
+      (level-three-vectors graph entry roots symbol allocator context validated seed)
+      (match (strength/run graph entry roots allocator)
+        (Err [message] (vectorize/release-preparation! seed) (Err message))
+        (Ok [result]
+            (match (.graph result)
+              (None [] (level-three-vectors graph entry roots symbol allocator context
+                                            validated seed))
+              (Some [owned]
+                    (vectorize/release-preparation! seed)
+                    (let [(mut owned) owned
+                          cleaned (sccp/optimize owned 8 roots allocator)]
+                      (g/release! (mut owned))
+                      (match cleaned
+                        (Err [message] (Err message))
+                        (Ok [rewritten]
+                            (let [(mut rewritten) rewritten
+                                  output (level-three-vectors
+                                           (.graph rewritten) entry (slice (.roots rewritten))
+                                           symbol allocator context false
+                                           (None [pipeline/Prepared]))]
+                              (rewrite/release! (mut rewritten))
+                              output))))))))))
+
+;;; The loop vectorizer, when LEVEL-THREE-VECTORIZE allows it, and code
+;;; generation. The vectorizer's last structural preparation describes the
+;;; graph it returns (or the input when it made no edit); generation reuses
+;;; it, as it reuses the seed when the vectorizer does not run.
+(defn level-three-vectors [(graph g/Graph) (entry i32) (roots (slice i32))
+                           (symbol (slice u8)) (allocator (dyn Allocator))
+                           (context private/Context) (validated bool)
+                           (seed (Option pipeline/Prepared))]
+  (-> (Result code/Image (slice u8)))
+  (if (not LEVEL-THREE-VECTORIZE)
+      (image-reusing graph entry roots symbol allocator context seed validated)
+      (match (vectorize/optimize-prepared-seeded graph entry roots 2 validated seed allocator)
+        (Err [message] (Err message))
+        (Ok [result]
+            (match (.graph result)
+              (None [] (image-reusing graph entry roots symbol allocator context
+                                      (.prepared result) validated))
+              (Some [working]
+                    (let [(mut working) working
+                          output (image-reusing working entry roots symbol allocator context
+                                                (.prepared result) false)]
+                      (g/release! (mut working))
+                      output)))))))
+
+;;; The image's SCCP works on its own copy of the caller's graph. When at
+;;; least an eighth of the cells are dead NOPs, that copy is the compacted
+;;; graph, which optimization then consumes in place. (As stogir.a64.compile.)
+(defn optimize-for-image [(graph g/Graph) (roots (slice i32)) (allocator (dyn Allocator))]
+  (-> (Result rewrite/Rewritten (slice u8)))
+  (if (< (* (compact/nop-cells graph) 8) (len (.instructions graph)))
+      (sccp/optimize-memory-compacting graph 8 roots true true allocator)
+      (match (verify/structure graph)
+        (Err [message] (Err message))
+        (Ok [_]
+            (let [(mut packed) (compact/compact graph roots allocator)
+                  result (sccp/optimize-memory-owned! (.graph packed) 8 (slice (.roots packed))
+                                                      true allocator)]
+              (free! (mut (.roots packed)))
+              result)))))
+
+;;; The final graph of an image, before any structural preparation: a call
+;;; in tail position behind a return join gets its own RETURN (tail-split),
+;;; in an owned copy that lives until the image is finished. `chain` selects
+;;; the level-three stages; `proof` (see validated?) holds for an unsplit
+;;; graph only.
+(defn image-split [(graph g/Graph) (entry i32) (roots (slice i32)) (symbol (slice u8))
+                   (allocator (dyn Allocator)) (context private/Context) (chain bool)
+                   (proof u128)] (-> (Result code/Image (slice u8)))
+  (match (tail-split/run graph roots allocator)
+    (Err [message] (Err message))
+    (Ok [split]
+        (match split
+          (None []
+                (if chain
+                    (level-three-image graph entry roots symbol allocator context proof)
+                    (image-reusing graph entry roots symbol allocator context
+                                   (None [pipeline/Prepared]) false)))
+          (Some [owned]
+                (let [(mut owned) owned
+                      output
+                        (if chain
+                            (level-three-image (.graph owned) entry (slice (.roots owned))
+                                               symbol allocator context 0)
+                            (image-reusing (.graph owned) entry (slice (.roots owned)) symbol
+                                           allocator context (None [pipeline/Prepared]) false))]
+                  (tail-split/release! (mut owned))
+                  output))))))
+
+;;; Level one generates the graph as given; levels two and three run SCCP
+;;; first unless `optimized` says the caller already did, and level three
+;;; then runs its stages (level-three-image). Level zero needs a distinct
+;;; pipeline and is rejected. `proof` is the optimizer's record for an
+;;; `optimized` graph, or zero.
+(defn image-with-level [(graph g/Graph) (entry i32) (roots (slice i32)) (symbol (slice u8))
+                        (configuration options/Options) (allocator (dyn Allocator))
+                        (context private/Context) (optimized bool) (proof u128)]
+  (-> (Result code/Image (slice u8)))
+  (match (options/validate configuration)
+    (Err [message] (Err message))
+    (Ok [level]
+        (cond (= level 0) (Err "x86-64 O0 pipeline is not implemented")
+              (or (= level 1) (and optimized (= level 2)))
+                (image-split graph entry roots symbol allocator context false 0)
+              (and optimized (= level 3))
+                (image-split graph entry roots symbol allocator context true proof)
+              (!= entry 1) (Err "SCCP requires START at reference one")
+              :else
+                (match (optimize-for-image graph roots allocator)
+                  (Err [message] (Err message))
+                  (Ok [rewritten]
+                      (let [(mut rewritten) rewritten
+                            output (image-split (.graph rewritten) entry
+                                                (slice (.roots rewritten)) symbol allocator
+                                                context (= level 3) (.proof rewritten))]
+                        (rewrite/release! (mut rewritten))
+                        output)))))))
+
+;;; As image, through the level-three stages (without the entry SCCP), as
+;;; stogir.a64.compile/vector-image. The vectorizer itself waits behind
+;;; LEVEL-THREE-VECTORIZE.
 (defn vector-image [(graph g/Graph) (entry i32) (roots (slice i32)) (symbol (slice u8))
                     (a (dyn Allocator))] (-> (Result code/Image (slice u8)))
-  (Err "x86-64 backend: vector-image is not implemented yet"))
+  (level-three-image graph entry roots symbol a (private/no-context) 0))
 
 (defn image-with-options [(graph g/Graph) (entry i32) (roots (slice i32))
                           (symbol (slice u8)) (configuration options/Options)
                           (a (dyn Allocator))] (-> (Result code/Image (slice u8)))
-  (Err "x86-64 backend: image-with-options is not implemented yet"))
+  (image-with-level graph entry roots symbol configuration a (private/no-context) false 0))
 
+;;; The context's emission options and level-three switches are honoured. A
+;;; frozen context that owns private leaves narrows the clobbers of direct
+;;; calls to them, and the image gets a private copy of every leaf it uses.
 (defn image-with-private [(graph g/Graph) (entry i32) (roots (slice i32))
                           (symbol (slice u8)) (configuration options/Options)
                           (a (dyn Allocator)) (context private/Context)]
   (-> (Result code/Image (slice u8)))
-  (Err "x86-64 backend: image-with-private is not implemented yet"))
+  (embedded (image-with-level graph entry roots symbol configuration a context false 0)
+            context))
 
 (defn image-for-private-module [(graph g/Graph) (entry i32) (roots (slice i32))
                                 (symbol (slice u8)) (configuration options/Options)
                                 (a (dyn Allocator)) (context private/Context)
                                 (publication private/Publication) (scope usize)]
   (-> (Result code/Image (slice u8)))
-  (Err "x86-64 backend: image-for-private-module is not implemented yet"))
+  ; The leaf names stay undefined: the transport binds them to binding()
+  ; from this sealed publication.
+  (if (not (leaves/module-valid? context publication scope))
+      (Err "private module publication is not valid for this target")
+      (image-with-level graph entry roots symbol configuration a context false 0)))
 
 (defn image-for-private-module-optimized [(graph g/Graph) (entry i32) (roots (slice i32))
                                           (symbol (slice u8)) (configuration options/Options)
                                           (a (dyn Allocator)) (context private/Context)
                                           (publication private/Publication) (scope usize)]
   (-> (Result code/Image (slice u8)))
-  (Err "x86-64 backend: image-for-private-module-optimized is not implemented yet"))
+  (image-for-private-module-proven graph entry roots symbol configuration a context
+                                   publication scope 0))
 
+;;; As image-with-options for a graph that is already the output of
+;;; sccp/optimize-memory for these roots and unchanged since: levels two and
+;;; three skip their entry SCCP.
 (defn image-with-options-optimized [(graph g/Graph) (entry i32) (roots (slice i32))
                                     (symbol (slice u8)) (configuration options/Options)
                                     (a (dyn Allocator))] (-> (Result code/Image (slice u8)))
-  (Err "x86-64 backend: image-with-options-optimized is not implemented yet"))
+  (image-with-level graph entry roots symbol configuration a (private/no-context) true 0))
 
 (defn image-for-private-module-proven [(graph g/Graph) (entry i32) (roots (slice i32))
                                        (symbol (slice u8)) (configuration options/Options)
@@ -71,10 +668,15 @@
                                        (publication private/Publication) (scope usize)
                                        (proof u128)]
   (-> (Result code/Image (slice u8)))
-  (Err "x86-64 backend: image-for-private-module-proven is not implemented yet"))
+  (if (not (leaves/module-valid? context publication scope))
+      (Err "private module publication is not valid for this target")
+      (image-with-level graph entry roots symbol configuration a context true proof)))
 
+;;; As image-with-options-optimized, with the proof the optimizer recorded
+;;; for this graph, or zero. When the graph's content still hashes to it,
+;;; level three skips the native-input checks that validation already made.
 (defn image-with-options-proven [(graph g/Graph) (entry i32) (roots (slice i32))
                                  (symbol (slice u8)) (configuration options/Options)
                                  (a (dyn Allocator)) (proof u128)]
   (-> (Result code/Image (slice u8)))
-  (Err "x86-64 backend: image-with-options-proven is not implemented yet"))
+  (image-with-level graph entry roots symbol configuration a (private/no-context) true proof))

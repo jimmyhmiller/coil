@@ -1,0 +1,262 @@
+;;; x86-64 matching: selected tiles and fusions, built after scheduling and
+;;; before virtual-register liveness. References keep naming the original
+;;; graph nodes; nothing is rewritten.
+;;;
+;;; Core selection
+;;;   * Integer arithmetic and comparisons get a tile (stogir.x64.select).
+;;;   * Compare-and-branch fusion: an IF or an integer COND reads the flags of
+;;;     its comparison directly when the comparison is single-use, unobserved
+;;;     and in the same block; the comparison then emits nothing and its
+;;;     operands stay live up to the consumer. A comparison with an immediate
+;;;     (one register input) is repeated at every IF and COND that reads it,
+;;;     wherever it was placed, and keeps its own definition only while some
+;;;     other user needs the Boolean.
+;;;   * A floating comparison (stogir.x64.fcompare, selected by the floating
+;;;     family) fuses the same way, into IF, integer COND and floating COND.
+;;;   * Sums and small multiplications take the address form, and an address
+;;;     form absorbs single-use producers that fit it (stogir.x64.lea).
+;;;   * Every other node goes to its operation family
+;;;     (stogir.x64.families/select!).
+;;;   * Afterwards the memory family selects address modes, folds single-use
+;;;     loads into the tiles above as memory operands and forms
+;;;     read-modify-write stores (stogir.x64.families/fuse!, /inputs!).
+;;;
+;;; The a64 matcher is not shared: almost all of it is AArch64 rule selection
+;;; (logical immediates, MADD, bit tests, address modes, word views). The
+;;; machine-use plan it builds, and this one, is the neutral
+;;; stogir.matched-uses.
+(module stogir.x64.match)
+(import "stogir.fill" :as fill)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.types" :as types)
+(import "stogir.uses" :as uses)
+(import "stogir.schedule" :as schedule)
+(import "stogir.matched-uses" :as machine)
+(import "stogir.conditional" :as conditional)
+(import "stogir.x64.call" :as call)
+(import "stogir.a64.result-projections" :as result-projections)
+(import "stogir.x64.families" :as families)
+(import "stogir.x64.lea" :as lea)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.reciprocal" :as reciprocal)
+(import "stogir.x64.select" :as select)
+(import "stogir.x64.switch" :as switch)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn release-matching! [(state (mut plan/Matching))] (-> void)
+  (free! (mut (.tiles state)))
+  (free! (mut (.families state)))
+  (free! (mut (.comparisons state)))
+  (free! (mut (.addresses state)))
+  (free! (mut (.offsets state)))
+  (free! (mut (.indices state)))
+  (free! (mut (.index-shifts state)))
+  (free! (mut (.tails state)))
+  (free! (mut (.omitted state)))
+  (free! (mut (.counts state)))
+  (free! (mut (.blocks state)))
+  (free! (mut (.protected state)))
+  (free! (mut (.switch-extensions state))))
+
+;;; Let IF or COND `reference` read the flags of the comparison `source`.
+(defn fuse! [(state (mut plan/Matching)) (graph g/Graph) (reference i32) (source i32)
+             (selection bool)] (-> void)
+  (when (and (> source 0)
+             (not (get (.omitted state) (cast i64 source)))
+             (select/comparison-rule? (.rule (get (.tiles state) (cast i64 source)))))
+    (let [index (cast i64 source)
+          tile (get (.tiles state) index)]
+      (cond (and (= (get (.counts state) index) 1)
+                 (not (get (.protected state) index))
+                 (= (get (.blocks state) index) (get (.blocks state) (cast i64 reference)))
+                 (or (not selection) (conditional/movable-condition? graph source)))
+              (do
+                (set! (mut (.omitted state)) index true)
+                (set! (mut (.comparisons state)) (cast i64 reference) source))
+            (and (select/immediate-comparison? tile) (> (.left tile) 0))
+              (do
+                (set! (mut (.comparisons state)) (cast i64 reference) source)
+                (set! (mut (.counts state)) index (- (get (.counts state) index) 1))
+                (when (and (= (get (.counts state) index) 0)
+                           (not (get (.protected state) index)))
+                  (set! (mut (.omitted state)) index true)))
+            :else 0))))
+
+;;; The plan of a verified graph and schedule. `roots` are references the
+;;; caller observes: they always keep their definition. With `fuse` false no
+;;; comparison is fused (every IF and COND tests a Boolean value).
+(defn build-fusing [(graph g/Graph)
+                    (scheduled schedule/Schedule)
+                    (roots (slice i32))
+                    (fuse bool)
+                    (a (dyn Allocator))] (-> (Result plan/Plan (slice u8)))
+  (let [cells (len (.instructions graph))
+        (mut state)
+          (plan/Matching
+            :tiles (ArrayList::new [select/Tile] a)
+            :families (ArrayList::new [i32] a)
+            :comparisons (ArrayList::new [i32] a)
+            :addresses (ArrayList::new [i32] a)
+            :offsets (ArrayList::new [i64] a)
+            :indices (ArrayList::new [i32] a)
+            :index-shifts (ArrayList::new [i32] a)
+            :tails (ArrayList::new [i32] a)
+            :omitted (ArrayList::new [bool] a)
+            :counts (ArrayList::new [i64] a)
+            :blocks (ArrayList::new [i32] a)
+            :protected (ArrayList::new [bool] a)
+            :switch-extensions (ArrayList::new [i32] a))
+        (mut block) (: 0 i32)
+        (mut error) ""]
+    (fill/append! (mut (.tiles state)) cells (select/none))
+    (extend-zeroed! (mut (.families state)) cells)
+    (extend-zeroed! (mut (.comparisons state)) cells)
+    (extend-zeroed! (mut (.addresses state)) cells)
+    (extend-zeroed! (mut (.offsets state)) cells)
+    (extend-zeroed! (mut (.indices state)) cells)
+    (extend-zeroed! (mut (.index-shifts state)) cells)
+    (extend-zeroed! (mut (.omitted state)) cells)
+    (extend-zeroed! (mut (.counts state)) cells)
+    (extend-zeroed! (mut (.blocks state)) cells)
+    (extend-zeroed! (mut (.protected state)) cells)
+    (for root roots
+      (when (and (> root 0) (< (cast i64 root) cells))
+        (set! (mut (.protected state)) (cast i64 root) true)))
+    ; Blocks and use counts of every scheduled node.
+    (for reference (.nodes scheduled)
+      (let [index (cast i64 reference)
+            node (get (.instructions graph) index)
+            opcode (cast i32 (n/opcode node))]
+        (when (op/block-start? opcode) (set! block reference))
+        (set! (mut (.blocks state)) index block)
+        (for [j 1 (+ (cast i64 (get (.arities graph) index)) 1)]
+          (when (uses/edge-code? (op/operand-code opcode (cast i32 j)))
+            (match (g/operand graph reference (cast i32 j))
+              (None [] 0)
+              (Some [value]
+                    (when (> value 0)
+                      (set! (mut (.counts state)) (cast i64 value)
+                            (+ (get (.counts state) (cast i64 value)) 1)))))))))
+    ; Tail calls are selected for the whole function at once (call family).
+    (match (call/select-tails! (mut state) graph scheduled roots a)
+      (Err [message] (set! error message))
+      (Ok [_] 0))
+    ; Tiles, and the families' own selection.
+    (for reference (.nodes scheduled)
+      (when (= error "")
+        (let [index (cast i64 reference)
+              node (get (.instructions graph) index)
+              family (families/of graph reference)]
+          (set! (mut (.families state)) index family)
+          (cond (= family families/SWITCH)
+                  (match (switch/select! (mut state) graph reference)
+                    (Err [message] (set! error message))
+                    (Ok [_] 0))
+                (!= family families/CORE)
+                  (match (families/select! (mut state) graph reference family)
+                    (Err [message] (set! error message))
+                    (Ok [_] 0))
+                (select/integer-comparison? graph node)
+                  (match (select/comparison graph reference)
+                    (Err [message] (set! error message))
+                    (Ok [tile] (set! (mut (.tiles state)) index tile)))
+                (select/integer-arithmetic? node)
+                  (match (select/arithmetic graph reference)
+                    (Err [message] (set! error message))
+                    (Ok [tile]
+                        (set! (mut (.tiles state)) index
+                              (if (= (.rule tile) select/RULE-DIVIDE)
+                                  (reciprocal/select graph reference tile)
+                                  (lea/strength tile)))))
+                :else 0))))
+    ; Fusion, in schedule order.
+    (when (and fuse (= error ""))
+      (switch/retire-extensions! (mut state) graph scheduled)
+      (for reference (.nodes scheduled)
+        (let [node (get (.instructions graph) (cast i64 reference))
+              opcode (cast i32 (n/opcode node))]
+          ; Core nodes, and the floating family's COND (a floating value
+          ; selected by any comparison, or any COND or IF on a floating
+          ; value, which `fuse!` leaves alone: its condition is no comparison).
+          (when (or (= (get (.families state) (cast i64 reference)) families/CORE)
+                    (= (get (.families state) (cast i64 reference)) families/FLOATING))
+            (cond (= opcode 116) (fuse! (mut state) graph reference (.op2 node) false)
+                  (and (= opcode 60)
+                       (or (types/integer? (cast i32 (n/type-id node)))
+                           (types/floating? (cast i32 (n/type-id node)))))
+                    (fuse! (mut state) graph reference (.op1 node) true)
+                  :else 0)))))
+    ; Memory operands, once every tile and comparison fusion is final.
+    (when (and fuse (= error ""))
+      (match (families/fuse! (mut state) graph scheduled a)
+        (Err [message] (set! error message))
+        (Ok [_] 0)))
+    ; Address forms, over what is still a register sum after that.
+    (when (= error "")
+      (for reference (.nodes scheduled)
+        (lea/fuse! (mut state) graph reference fuse)))
+    (if (!= error "")
+        (do (release-matching! (mut state)) (Err error))
+        (let [(mut operands) (machine/build graph scheduled (.omitted state)
+                                            (.comparisons state) a)]
+          ; Accesses and tiles with a memory operand read their selected
+          ; base and index.
+          (families/inputs! (mut operands) state graph scheduled)
+          ; A fused COND reads its comparison's operands (which the redirect
+          ; put in place of its own inputs) and its two arms.
+          (for reference (.nodes scheduled)
+            (let [index (cast i64 reference)
+                  node (get (.instructions graph) index)]
+              (when (and (= (n/opcode node) 60) (> (get (.comparisons state) index) 0))
+                (let [range (get (.ranges operands) index)
+                      offset (len (.inputs operands))]
+                  (for [i 0 (.count range)]
+                    (push! (mut (.inputs operands))
+                           (get (.inputs operands) (+ (.offset range) i))))
+                  (push! (mut (.inputs operands)) (.op2 node))
+                  (push! (mut (.inputs operands)) (.op3 node))
+                  (set! (mut (.ranges operands)) index
+                        (machine/Range :offset offset :count (+ (.count range) 2)))))))
+          ; An address-form node reads the terms of its tile: its own
+          ; operands, or those of the producers it absorbed.
+          (for reference (.nodes scheduled)
+            (let [index (cast i64 reference)
+                  tile (get (.tiles state) index)]
+              (when (and (= (.rule tile) select/RULE-LEA) (not (get (.omitted state) index)))
+                (let [offset (len (.inputs operands))]
+                  (when (> (.left tile) 0) (push! (mut (.inputs operands)) (.left tile)))
+                  (when (> (.right tile) 0) (push! (mut (.inputs operands)) (.right tile)))
+                  (set! (mut (.ranges operands)) index
+                        (machine/Range :offset offset
+                                       :count (- (len (.inputs operands)) offset)))))))
+          ; A CALL whose integer result pieces are only loaded back from a
+          ; private frame object defines those loads itself, in rax and rdx
+          ; (the target-neutral proof of stogir.a64.result-projections).
+          (when fuse
+            (result-projections/select! graph scheduled (.blocks state) (.protected state)
+                                        (.tails state) (mut operands) a))
+          (free! (mut (.counts state)))
+          (free! (mut (.blocks state)))
+          (free! (mut (.protected state)))
+          (free! (mut (.switch-extensions state)))
+          (Ok (plan/Plan
+                :operands operands
+                :tiles (.tiles state)
+                :families (.families state)
+                :comparisons (.comparisons state)
+                :addresses (.addresses state)
+                :offsets (.offsets state)
+                :indices (.indices state)
+                :index-shifts (.index-shifts state)
+                :tails (.tails state)))))))
+
+(defn build [(graph g/Graph) (scheduled schedule/Schedule) (roots (slice i32))
+             (a (dyn Allocator))] (-> (Result plan/Plan (slice u8)))
+  (build-fusing graph scheduled roots true a))
+
+(defn release! [(matched (mut plan/Plan))] (-> void)
+  (plan/release! (mut matched)))
