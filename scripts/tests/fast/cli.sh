@@ -1979,6 +1979,29 @@ section_debuginfo() {
     pkill -f "$T/dbgv" 2>/dev/null
     rm -rf "$T/dbgv" "$T/dbgv.dSYM"
   done
+  # A variable declared after a fused aggregate snapshot (iterating an array
+  # literal copies it through a temporary the backend removes, which renumbers
+  # the stack slots behind it) is still found in its own slot.
+  printf '%s\n' '(module dbgs)' \
+    '(defstruct Stage [(name (slice u8)) (wall i64) (cpu i64)])' \
+    '(defn stage-begin :inline (Never) [(name (slice u8)) (n i64)] (-> Stage)' \
+    '  (Stage :name name :wall (+ n 41) :cpu (+ n 51)))' \
+    '(defn checkpoint :inline (Never) [(n i64)] (-> i64)' \
+    '  (let [(mut sum) 0]' \
+    '    (for v [(: 1 i64) 2 3] (set! sum (+ sum v)))' \
+    '    (let [stage (stage-begin "release" n)]' \
+    '      (set! sum (+ sum (.wall stage)))' \
+    '      (- (+ sum (.cpu stage)) 100))))' \
+    '(defn main [] (-> i64) (checkpoint 1))' > "$T/dbgs.coil"
+  "$COIL" build "$T/dbgs.coil" --backend tpde -o "$T/dbgs" >/dev/null 2>&1
+  out=$(timeout -k 5 60 "$lldb" -b "$T/dbgs" -o "breakpoint set --file dbgs.coil --line 10" -o run \
+        -o "frame variable stage.wall stage.cpu sum" -o kill 2>&1)
+  case "$out" in
+    *"stage.wall = 42"*"stage.cpu = 52"*"sum = 48"*) ok "debug info (tpde): a local declared after a fused snapshot" ;;
+    *) bad "debug info (tpde): a local declared after a fused snapshot" "$(tail -6 <<<"$out")" ;;
+  esac
+  pkill -f "$T/dbgs" 2>/dev/null
+  rm -rf "$T/dbgs" "$T/dbgs.dSYM"
   "$COIL" build "$T/dbgv.coil" --backend tpde -g0 -o "$T/dbgv" >/dev/null 2>&1
   [ ! -d "$T/dbgv.dSYM" ] && ok "-g0 turns the default debug info off" || bad "-g0 turns the default debug info off" "$T/dbgv.dSYM exists"
 }
