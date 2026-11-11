@@ -28,6 +28,8 @@
 (import "stogir.sccp-rewrite" :as rewrite)
 (import "stogir.bitqueue" :as q)
 (import "stogir.liveness" :as live)
+(import "stogir.builder" :as builder)
+(import "stogir.bulk" :as bulk)
 (import "coil.slice" :use [subslice])
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.hashmap" :use [HashMap])
@@ -1038,6 +1040,148 @@
       (free! (mut links))
       (if (and (> tail 0) (= count 1)) [tail successor] [(: 0 i32) 0]))))
 
+;;; Whether CALLEE only reads the aggregate its PARAM `parameter` addresses,
+;;; so that an inlined clone may read the caller's object where the call
+;;; would have read a private copy. All of this must hold:
+;;;   * every use of the parameter, and of every address derived from it by
+;;;     COPY, ADD (with a value not derived from it) or SUB (as the minuend),
+;;;     is the address operand of a LOAD. A store through it, a call or ARGVAL
+;;;     that receives it, a comparison (the copy's address is distinct from
+;;;     every other object; the caller's need not be), a PHI, a conversion, a
+;;;     RETURN of it and any other use all fail the proof;
+;;;   * the callee has no store, call, atomic write or opaque assembly at all:
+;;;     any of them could change the caller's object, through another pointer
+;;;     to it, between two of the clone's reads, which a copy would have
+;;;     hidden. (Stores to the callee's own VARs are not memory.);
+;;;   * the parameter is not one of the callee's observed roots.
+(defn reads-aggregate-only? [(callee g/Graph) (parameter i32) (observed (slice i32))
+                             (a (dyn Allocator))] (-> bool)
+  (let [size (len (.instructions callee))
+        (mut derived) (ArrayList::new [bool] a)
+        (mut good) true
+        (mut changed) true]
+    (fill/append! (mut derived) size false)
+    (set! (mut derived) (cast i64 parameter) true)
+    (for root observed (when (= root parameter) (set! good false)))
+    (while (and good changed)
+      (set! changed false)
+      (let [(mut r) (: 1 i64)]
+        (while (and good (< r size))
+          (let [node (get (.instructions callee) r)
+                opcode (cast i32 (n/opcode node))
+                count (cast i64 (get (.arities callee) r))]
+            (when (or (= opcode 93) (= opcode 94) (= opcode 90) (= opcode 79) (= opcode 80)
+                      (and (>= opcode 127) (<= opcode 129))
+                      (and (>= opcode 122) (<= opcode 125)))
+              (set! good false))
+            (for [i 1 (+ count 1)]
+              (when (uses/edge-code? (op/operand-code opcode (cast i32 i)))
+                (match (g/operand callee (cast i32 r) (cast i32 i))
+                  (None [] 0)
+                  (Some [input]
+                        (when (and (> input 0) (< (cast i64 input) size)
+                                   (get derived (cast i64 input)))
+                          (cond
+                            ; The address a LOAD reads.
+                            (and (or (= opcode 91) (= opcode 92)) (= i 2)) 0
+                            ; Address arithmetic: one derived term.
+                            (and (= opcode 68) (= i 1))
+                              (unless (get derived r)
+                                (set! (mut derived) r true) (set! changed true))
+                            (and (= opcode 26) (= (n/type-id node) 6) (<= i 2)
+                                 (not (and (> (.op1 node) 0) (> (.op2 node) 0)
+                                           (get derived (cast i64 (.op1 node)))
+                                           (get derived (cast i64 (.op2 node))))))
+                              (unless (get derived r)
+                                (set! (mut derived) r true) (set! changed true))
+                            (and (= opcode 27) (= (n/type-id node) 6) (= i 1)
+                                 (not (and (> (.op2 node) 0)
+                                           (get derived (cast i64 (.op2 node))))))
+                              (unless (get derived r)
+                                (set! (mut derived) r true) (set! changed true))
+                            :else (set! good false)))))))
+            (set! r (+ r (/ (+ count 4) 4)))))))
+    (free! (mut derived))
+    good))
+
+;;; The callee's PARAM projection of `ordinal`, or zero.
+(defn parameter-of [(callee g/Graph) (entry i32) (ordinal i32)] (-> i32)
+  (let [(mut found) (: 0 i32) (mut r) (: 1 i64)]
+    (while (and (= found 0) (< r (len (.instructions callee))))
+      (let [node (get (.instructions callee) r)]
+        (when (and (= (n/opcode node) 71) (= (.op1 node) entry) (= (.op3 node) ordinal))
+          (set! found (cast i32 r)))
+        (set! r (+ r (/ (+ (cast i64 (get (.arities callee) r)) 4) 4)))))
+    found))
+
+;;; Give the clone of a call a private copy of the aggregate ARGVAL `argument`
+;;; passes: a frame object of the aggregate's size and alignment appended to
+;;; the caller's entry prefix, filled from the ARGVAL's source at the call's
+;;; control position, which becomes the copy's last node. Returns the object.
+(defn private-copy! [(graph (mut g/Graph)) (reference i32) (argument n/Node)
+                     (seeds (mut (ArrayList i32))) (users (mut SiteUsers))
+                     (a (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [prefix (entry-prefix graph a)
+        tail (get prefix 0)
+        successor (get prefix 1)
+        size (cast i64 (.op2 argument))
+        first (len (.instructions graph))]
+    (if (<= tail 0)
+        (Err "inline ARGVAL copy: the caller's entry has no unique control successor to place a frame object before")
+        (match (builder/scalar-constant! (mut graph) 5 (cast u64 (if (> size 0) size 1)) 8)
+          (Err [message] (Err message))
+          (Ok [extent]
+              (match (g/append-inputs-with-aux! (mut graph) 81 6 32768
+                                                [tail extent (if (< (.op3 argument) 8)
+                                                                 (: 8 i32)
+                                                                 (.op3 argument))])
+                (None [] (Err "inline ARGVAL copy: frame object space exhausted"))
+                (Some [object]
+                      (if (not (g/set-operand! (mut graph) successor 1 object))
+                          (Err "inline ARGVAL copy: entry prefix successor rewrite failed")
+                          (let [control (.op1 (get (.instructions graph) (cast i64 reference)))]
+                            (match (bulk/copy-bytes! (mut graph) control object (.op1 argument) size)
+                              (Err [message] (Err message))
+                              (Ok [copied]
+                                  (if (not (g/set-operand! (mut graph) reference 1 copied))
+                                      (Err "inline ARGVAL copy: call control rewrite failed")
+                                      (do
+                                        ; The new nodes may read values other
+                                        ; pending sites define, and are work
+                                        ; for the cleanup that follows.
+                                        (let [(mut r) first]
+                                          (while (< r (len (.instructions graph)))
+                                            (let [node (get (.instructions graph) r)
+                                                  opcode (cast i32 (n/opcode node))
+                                                  count (cast i64 (get (.arities graph) r))]
+                                              (for [i 1 (+ count 1)]
+                                                (when (uses/edge-code?
+                                                        (op/operand-code opcode (cast i32 i)))
+                                                  (match (g/operand graph (cast i32 r) (cast i32 i))
+                                                    (None [] 0)
+                                                    (Some [input]
+                                                          (note-site-use! (mut users) (cast i32 r)
+                                                                          (cast i32 i) input)))))
+                                              (push! (mut seeds) (cast i32 r))
+                                              (set! r (+ r (/ (+ count 4) 4))))))
+                                        (Ok object))))))))))))))
+
+;;; Remove ARGVAL `argument` when no CALL or TAILCALL passes it any more: an
+;;; ARGVAL is only meaningful as a call argument.
+(defn retire-argument-value! [(graph (mut g/Graph)) (argument i32)] (-> void)
+  (let [(mut used) false (mut r) (: 1 i64)]
+    (while (and (not used) (< r (len (.instructions graph))))
+      (let [node (get (.instructions graph) r)
+            opcode (n/opcode node)
+            count (cast i64 (get (.arities graph) r))]
+        (when (or (= opcode 79) (= opcode 80))
+          (for [i 3 (+ count 1)]
+            (match (g/operand graph (cast i32 r) (cast i32 i))
+              (None [] 0)
+              (Some [input] (when (= input argument) (set! used true))))))
+        (set! r (+ r (/ (+ count 4) 4)))))
+    (unless used (g/make-nop! (mut graph) argument))))
+
 ;;; Operand slots that may name a call site this transaction has still to
 ;;; expand. heads holds, per source instruction cell, zero for a cell that is
 ;;; not a pending site, -1 for a pending site with no recorded slot, and
@@ -1115,7 +1259,34 @@
         (mut error) ""
         (mut scope) (: 0 i32)
         (mut hoisted) (ArrayList::new [bool] a)
+        ; Per call operand: the address an ARGVAL argument's PARAM maps to
+        ; (the ARGVAL's source, or a private copy), else zero.
+        (mut aggregates) (zeros (+ (cast i64 (get (.arities graph) (cast i64 reference))) 1) a)
+        (mut retired) (ArrayList::new [i32] a)
         (mut r) 1]
+    ; An ARGVAL argument is a by-value aggregate: the callee owns a copy.
+    ; When the callee provably only reads it (reads-aggregate-only?) its
+    ; PARAM maps to the caller's object; otherwise the clone gets a private
+    ; copy made where the call was. A parameter the callee never projects
+    ; needs neither.
+    (for [i 3 (+ (cast i64 (get (.arities graph) (cast i64 reference))) 1)]
+      (when (= error "")
+        (match (g/operand graph reference (cast i32 i))
+          (None [] (set! error "inline call argument missing"))
+          (Some [input]
+                (when (> input 0)
+                  (let [argument (get (.instructions graph) (cast i64 input))
+                        parameter (parameter-of callee (.entry target) (cast i32 (- i 3)))]
+                    (when (= (n/opcode argument) 70)
+                      (push! (mut retired) input)
+                      (when (> parameter 0)
+                        (if (reads-aggregate-only? callee parameter (.observed target) a)
+                            (set! (mut aggregates) i (.op1 argument))
+                            (match (private-copy! (mut graph) reference argument (mut seeds)
+                                                  (mut users) a)
+                              (Err [message] (set! error message))
+                              (Ok [object] (set! (mut aggregates) i object))))))))))))
+    (set! call (get (.instructions graph) (cast i64 reference)))
     (set! (mut mapping) (cast i64 (.entry target)) (.op1 call))
     (fill/append! (mut hoisted) (len (.instructions callee)) false)
     (when (and hoist (frame-objects-only? callee))
@@ -1157,7 +1328,10 @@
             count (get (.arities callee) r)]
         (cond (= opcode 71)
                 (match (g/operand graph reference (+ (.op3 node) 3))
-                  (Some [input]
+                  (Some [passed]
+                       (let [input (if (!= (get aggregates (cast i64 (+ (.op3 node) 3))) 0)
+                                       (get aggregates (cast i64 (+ (.op3 node) 3)))
+                                       passed)]
                         (match (g/lookup graph input)
                           (None [] (set! error "inline argument disappeared"))
                           (Some [actual]
@@ -1173,7 +1347,7 @@
                                       (Some [casted]
                                             (note-site-use! (mut users) casted 1 input)
                                             (set! (mut mapping) r casted)
-                                            (push! (mut seeds) casted)))))))
+                                            (push! (mut seeds) casted))))))))
                   (None [] (set! error "inline parameter missing")))
               (or (= opcode 0) (= opcode 104) (= opcode 120)) 0
               (get hoisted r) 0
@@ -1334,6 +1508,11 @@
                                            [value (: 0 i32)])))
                   (g/invalidate-expressions! (mut graph))
                   (push! (mut seeds) reference))))))
+    ; The call is gone: an ARGVAL no other call passes goes with it.
+    (when (= error "")
+      (for argument retired (retire-argument-value! (mut graph) argument)))
+    (free! (mut aggregates))
+    (free! (mut retired))
     (free! (mut inputs))
     (free! (mut constants))
     (free! (mut mapping))
