@@ -16,6 +16,20 @@ its own LLVM side.
 | 0 | 9471372 | first self-hosting build; adapter workarounds for defects 001 and 002 | 106.50 / 91.89 | 1.159 | 278.3 / 185.7 | 1.50 | 1.095 / 9.50 | 8.7x |
 | 1 | d278aba | defects 001-003 fixed in the library; 002 workaround removed; 001 workaround kept (defect 004) | 106.70 / 91.49 | 1.166 | 278.4 / 185.7 | 1.50 | 1.089 / 9.50 | 8.7x |
 | 2 | ded7635 | defect 004 fixed; the adapter's MEMORY-parameter template exclusion removed, so calls passing an aggregate by value are inlined | 106.74 / 92.35 | 1.156 | 277.9 / 187.4 | 1.48 | 1.097 / 9.50 | 8.7x |
+| 3 | fe07a79 (= ded7635) | merged with Coil main 628a3129 (a different, larger workload: both sides re-measured) | 139.59 / 105.84 | 1.319 | 476.1 / 234.1 | 2.03 | 1.111 / 9.34 | 8.4x |
+
+Round 3 is not a code-generation change: main's compiler does different work.
+One function accounts for the jump, `coil.compiler.closure.closure-subprogram-scoped`
+(33% of the Stogir host's instructions, 10% of the LLVM host's). Its inner
+loop is a linear scan of a list of names; LLVM's loop is four instructions per
+iteration, Stogir's about twenty-five, ten of them the stores and reloads of
+five registers around the back edge. It is the allocator finding below, on a
+loop that main now runs far more often. Generation spans (ms, 1130 total):
+emit 489, finalize 251, prepare 148, plan 76, copies 40, leaf cache 25.
+Checks on the merged tree (Linux): bootstrap reproduces, one object under
+every thread setting, 1200 parallel compiles identical, ThreadSanitizer clean,
+sweep corpus 27 of 27, demos 138 of 138, simd 6 of 6, backend 45 of 45, stdlib
+24 of 24, examples 30 of 30, library tests 1053 of 1056.
 
 Round 2 is one percentage point: inlining through MEMORY-class parameters is
 now on (the over-budget sites are declined), and it moves instructions from
