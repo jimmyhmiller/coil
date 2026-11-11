@@ -322,6 +322,11 @@ def frame_file(name: bytes, scratch: Path) -> Path | None:
         path = scratch / text[len("{tmp}/"):]
     elif text.startswith("<stdlib>/"):
         path = ROOT / "src" / "stdlib" / text[len("<stdlib>/"):]
+    elif text == "<prelude>":
+        # the toolchain's own names for the library files it reads
+        path = ROOT / "src" / "compiler" / "prelude.coil"
+    elif text.startswith("<bundled ") and text.endswith(">"):
+        path = ROOT / "src" / "stdlib" / text[len("<bundled "):-1]
     else:
         path = ROOT / text
     return path if path.is_file() else None
