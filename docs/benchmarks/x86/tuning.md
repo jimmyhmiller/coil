@@ -17,6 +17,32 @@ its own LLVM side.
 | 1 | d278aba | defects 001-003 fixed in the library; 002 workaround removed; 001 workaround kept (defect 004) | 106.70 / 91.49 | 1.166 | 278.4 / 185.7 | 1.50 | 1.089 / 9.50 | 8.7x |
 | 2 | ded7635 | defect 004 fixed; the adapter's MEMORY-parameter template exclusion removed, so calls passing an aggregate by value are inlined | 106.74 / 92.35 | 1.156 | 277.9 / 187.4 | 1.48 | 1.097 / 9.50 | 8.7x |
 | 3 | fe07a79 (= ded7635) | merged with Coil main 628a3129 (a different, larger workload: both sides re-measured) | 139.59 / 105.84 | 1.319 | 476.1 / 234.1 | 2.03 | 1.111 / 9.34 | 8.4x |
+| 4 | fe07a79 (= ded7635) | the tree that went onto Coil main (measured at bd641dfc; main is 1a107beb) | 139.49 / 106.74 | 1.307 | | 1.97 | 1.104 / 9.39 | 8.5x |
+
+Round 4 is the state on Coil `main`. It is round 3's workload and round 3's
+code generation: generation 8.5x against the 5x goal (met), runtime 1.307x
+against the 1.10x goal (not met, for the reason given under round 3).
+Generation spans (ms, 1099 total): emit 472, finalize 259, prepare 126, plan
+81, copies 42, leaf cache 22. Checks: at bd641dfc on Linux, 1200 parallel
+compiles identical, ThreadSanitizer clean, sweep corpus 27 of 27, demos 138
+of 138, simd 6 of 6, backend 45 of 45, stdlib 24 of 24, examples 30 of 30,
+library tests 1053 of 1056; at 1a107beb on Linux, the bootstrap reproduces,
+one object under every thread setting, the x64 and Stogir corpus gates 9 of 9
+each, `stogir-adapter` 5 of 5; at 1a107beb on macOS, FAST 49 of 49 and
+COMPREHENSIVE 28 of 28 (2269 s).
+
+What the merge needed besides the adapter (each is its own commit): two
+cross-build expander faults with imports produced by a macro (ec887228,
+302462cd); a stand-in adapter for compilers built for other architectures
+(c758aefe); debug-variable slots left stale by snapshot fusion in the tpde
+pipeline, which broke the x64 host fixpoint (32f980be); odd-width rotates in
+the x64 CIR backend (2d4f7827); `clock` and `sched_yield` in the wasm hosts.
+
+Cost to the gates on macOS: FAST takes 410 s where plain main took 297 s; the
+adapter's own tests are a separate `stogir-adapter` section and a
+COMPREHENSIVE step, and the rest of the difference is the Stogir rows of
+`cli/objects`. COMPREHENSIVE warns that `installed/jit-sdk` peaks at 8.14 GB
+against its 6.0 GB line; that was not compared with plain main.
 
 Round 3 is not a code-generation change: main's compiler does different work.
 One function accounts for the jump, `coil.compiler.closure.closure-subprogram-scoped`
