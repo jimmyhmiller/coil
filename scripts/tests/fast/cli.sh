@@ -1326,6 +1326,40 @@ section_cross() {
   printf '(module xshadow)\n(defn scope [(n i64)] (-> i64) (+ n 1))\n(defn main [] (-> i32) (cast i32 (scope 41)))\n' > "$T/xshadow.coil"
   expect_rc 0 "a module's own function shadows a core macro in a cross build" \
     "$COIL" emit-obj "$T/xshadow.coil" --target x86_64-unknown-linux-gnu -o "$T/xshadow.o"
+  # An import a macro was handed and gave back (a macro choosing between two
+  # imports by the target) is an import of the module under any target, also
+  # through another macro, with :as and :use. No template builds an import
+  # here: one that loads a module restarts the expansion, which hid this.
+  mkdir -p "$T/ximport/src"
+  printf '[package]\nname = "ximport"\nentry = "src/main.coil"\nsource-roots = ["src"]\n' > "$T/ximport/Coil.toml"
+  cat > "$T/ximport/src/sel.coil" <<'EOF'
+(module ximport.sel)
+(defn native-pick [(native Code) (other Code)] (-> Code)
+  (match (target-arch)
+    (Aarch64 [] native)
+    (X86_64 [] native)
+    (_ other)))
+(defn pick-again [(native Code) (other Code)] (-> Code) `(native-pick ~native ~other))
+EOF
+  printf '(module ximport.a)\n(defstruct M [(x i64)])\n(defn make [] (-> M) (M :x 40))\n' > "$T/ximport/src/a.coil"
+  printf '(module ximport.b)\n(defstruct M [(x i64)])\n(defn make [] (-> M) (M :x 0))\n(defn one [] (-> i64) 100)\n' > "$T/ximport/src/b.coil"
+  printf '(module ximport.c)\n(defn one [] (-> i64) 1)\n' > "$T/ximport/src/c.coil"
+  cat > "$T/ximport/src/main.coil" <<'EOF'
+(module ximport.main)
+(import "ximport.sel" :as sel)
+(sel/native-pick (import "ximport.a" :as m) (import "ximport.b" :as m))
+(sel/pick-again (import "ximport.c" :use [one]) (import "ximport.b" :use [one]))
+(defstruct Holder [(inner m/M)])
+(defn keep [(h Holder)] (-> m/M) (.inner h))
+(defn main [] (-> i64)
+  (- (+ (.x (keep (Holder :inner (m/make)))) (one)) 41))
+EOF
+  expect_rc 0 "an import a macro chose between (native)" \
+    "$COIL" run "$T/ximport/src/main.coil"
+  expect_rc 0 "an import a macro chose between (--target wasm64)" \
+    "$COIL" check "$T/ximport/src/main.coil" --target wasm64-unknown-unknown
+  expect_rc 0 "an import a macro chose between (--target x86_64 Linux)" \
+    "$COIL" emit-obj "$T/ximport/src/main.coil" --target x86_64-unknown-linux-gnu -o "$T/ximport.o"
   if [ "$HOST_OS" = Darwin ]; then
     local out rc kind
     # comptime code runs in the compiler, so it is compiled for this machine
