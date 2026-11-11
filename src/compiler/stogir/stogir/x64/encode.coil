@@ -1,0 +1,2020 @@
+;;; x86-64 instruction encoder. Bytes are host-independent.
+;;;
+;;; Conventions
+;;;
+;;; * Every encoder appends one instruction to `out` and returns
+;;;   `(Result i64 (slice u8))`. An `Err` names the rejected operand and leaves
+;;;   `out` untouched: operands are validated before the first byte is written.
+;;;
+;;; * The `Ok` value is the offset in `out` of the instruction's patchable field,
+;;;   or -1 when it has none. The patchable field is
+;;;     - the disp32 of a RIP-relative memory operand (4 bytes),
+;;;     - the rel8/rel32 of a jump or call (1 or 4 bytes),
+;;;     - the imm64 of a `movabs` (8 bytes).
+;;;   An instruction has at most one. A RIP-relative disp32 and a rel8/rel32 are
+;;;   relative to the END of the instruction, which is `(len out)` once the
+;;;   encoder returns, and an immediate may follow a RIP-relative disp32. So the
+;;;   value to store for a target at offset T is `T - (len out)`, and a
+;;;   PC-relative relocation at the field needs addend `-(field-to-end out f)`:
+;;;   -4 when the field is last, -5 or -8 (or -6) when an imm8 or imm32 (or
+;;;   imm16) trails it.
+;;;
+;;; * General registers are the hardware numbers 0..15. XMM registers are the
+;;;   library numbers 32..47 (stogir.x64.registers). Passing one where the
+;;;   other is expected is an `Err`.
+;;;
+;;; * `bits` is the operand width: 8, 16, 32 or 64 where the instruction has
+;;;   that form. 32-bit operations zero the upper half of the destination.
+;;;   Byte operands name the low byte of the register: spl/bpl/sil/dil get the
+;;;   REX prefix they need, and ah/ch/dh/bh are never produced.
+;;;
+;;; * Names are `<mnemonic>-<operands>`, destination first: `r` general register,
+;;;   `m` memory (a `Mem`), `i` immediate, `c` the CL count, `x` XMM register.
+;;;   Families share one function selected by a named constant: `alu-*` (ADD ..
+;;;   CMP), `unary-*` (NOT NEG MUL IMUL DIV IDIV INC DEC), `shift-*` (ROL .. SAR),
+;;;   `bt-*`, `scan-*` (BSF BSR TZCNT LZCNT POPCNT) and the `sse-*` functions,
+;;;   whose operation constants carry their prefix, opcode map and operand form.
+;;;
+;;; * The shortest encoding is chosen: imm8 forms, the accumulator short forms,
+;;;   disp8, `mov r32, imm32` for a 64-bit constant that fits unsigned. Where
+;;;   two encodings have equal length the one llvm-mc emits is used.
+(module stogir.x64.encode)
+(import "coil.result" :use [Result Ok Err])
+(import "coil.arraylist" :use [ArrayList])
+
+;;; `Mem.base` for an operand with no base register, and `Mem.index` for one
+;;; with no index register.
+(const NO-REG -1)
+
+;;; `Mem.base` for a RIP-relative operand: [rip + disp32].
+(const RIP -2)
+
+;;; A memory operand: [base + index*scale + disp].
+;;;   base   0..15, `RIP` (then no index is allowed), or `NO-REG` (absolute
+;;;          [disp32] or [index*scale + disp32]; not position independent)
+;;;   index  0..15 except rsp (4), or `NO-REG`
+;;;   scale  1, 2, 4 or 8; ignored without an index
+;;;   disp   must fit a signed 32-bit value
+(defstruct Mem [(base i32) (index i32) (scale i32) (disp i64)])
+
+;;; [base + disp]
+(defn mem [(base i32) (disp i64)] (-> Mem)
+  (Mem
+    :base base
+    :index NO-REG
+    :scale 1
+    :disp disp))
+
+;;; [base + index*scale + disp]
+(defn mem-index [(base i32) (index i32) (scale i32) (disp i64)] (-> Mem)
+  (Mem
+    :base base
+    :index index
+    :scale scale
+    :disp disp))
+
+;;; [rip + disp]; the encoder returns the offset of the disp32.
+(defn mem-rip [(disp i64)] (-> Mem)
+  (Mem
+    :base RIP
+    :index NO-REG
+    :scale 1
+    :disp disp))
+
+;;; Absolute [disp32], sign-extended to 64 bits.
+(defn mem-absolute [(disp i64)] (-> Mem)
+  (Mem
+    :base NO-REG
+    :index NO-REG
+    :scale 1
+    :disp disp))
+
+;;; Distance from a patchable field to the end of the instruction just encoded.
+(defn field-to-end [(out (ArrayList u8)) (field i64)] (-> i64)
+  (- (len out) field))
+
+;;; Condition codes: the low four bits of Jcc/SETcc/CMOVcc opcodes.
+(const CC-O 0)
+
+(const CC-NO 1)
+
+(const CC-B 2)
+
+(const CC-AE 3)
+
+(const CC-E 4)
+
+(const CC-NE 5)
+
+(const CC-BE 6)
+
+(const CC-A 7)
+
+(const CC-S 8)
+
+(const CC-NS 9)
+
+(const CC-P 10)
+
+(const CC-NP 11)
+
+(const CC-L 12)
+
+(const CC-GE 13)
+
+(const CC-LE 14)
+
+(const CC-G 15)
+
+(defn condition? [(cc i32)] (-> bool)
+  (and (>= cc 0) (<= cc 15)))
+
+;;; The condition that holds exactly when `cc` does not.
+(defn invert [(cc i32)] (-> i32)
+  (^ cc 1))
+
+(defn gpr? [(register i32)] (-> bool)
+  (and (>= register 0) (<= register 15)))
+
+(defn xmm? [(register i32)] (-> bool)
+  (and (>= register 32) (<= register 47)))
+
+;; ---------------------------------------------------------------------------
+;; Internal layer. An opcode descriptor packs
+;;   bits 0..7    the opcode byte
+;;   bits 8..9    the map: 0 one-byte, 1 0F, 2 0F 38, 3 0F 3A
+;;   bits 12..13  the mandatory prefix: 0 none, 1 66, 2 F3, 3 F2
+;; and SSE operation constants add
+;;   bits 16..19  the operand form (FORM-*)
+;;   bits 20..22  the ModRM opcode extension of an immediate shift
+;;   bits 24..25  the feature level (see `sse-feature`)
+;; ---------------------------------------------------------------------------
+
+;; Prefix flags.
+(const F-W 1)
+
+(const F-16 2)
+
+(const F-REX 4)
+
+(const F-LOCK 8)
+
+;; Allowed operand widths, as the sum of the widths themselves.
+(const SIZES-ALL 120)
+
+(const SIZES-WIDE 112)
+
+(const SIZES-LONG 96)
+
+(const SIZES-BYTE 8)
+
+(defn byte! [(out (mut (ArrayList u8))) (value i32)] (-> void)
+  (push! (mut out) (cast u8 (& value 255))))
+
+;;; Little-endian low `count` bytes of `value`.
+(defn imm! [(out (mut (ArrayList u8))) (count i32) (value i64)] (-> void)
+  (let [(mut rest) value
+        (mut i) (: 0 i32)]
+    (while (< i count)
+      (push! (mut out) (cast u8 (& rest 255)))
+      (set! rest (>> rest 8))
+      (set! i (+ i 1)))))
+
+(defn fits8? [(value i64)] (-> bool)
+  (and (>= value -128) (<= value 127)))
+
+(defn fits32? [(value i64)] (-> bool)
+  (and (>= value -2147483648) (<= value 2147483647)))
+
+;;; An immediate of an 8/16/32-bit operation may be spelled signed or unsigned;
+;;; a 64-bit operation takes a sign-extended 32-bit immediate.
+(defn immediate? [(bits i32) (value i64)] (-> bool)
+  (case bits
+    8 (and (>= value -128) (<= value 255))
+    16 (and (>= value -32768) (<= value 65535))
+    32 (and (>= value -2147483648) (<= value 4294967295))
+    64 (fits32? value)
+    false))
+
+;;; The value of the low `bits` bits of `value`, read as signed.
+(defn sign-extend [(bits i32) (value i64)] (-> i64)
+  (case bits
+    8 (let [low (& value 255)] (if (>= low 128) (- low 256) low))
+    16 (let [low (& value 65535)] (if (>= low 32768) (- low 65536) low))
+    32
+      (let [low (& value 4294967295)]
+        (if (>= low 2147483648) (- low 4294967296) low))
+    value))
+
+(defn immediate-bytes [(bits i32)] (-> i32)
+  (case bits 8 1 16 2 4))
+
+(defn width? [(sizes i32) (bits i32)] (-> bool)
+  (and (or (= bits 8) (= bits 16) (= bits 32) (= bits 64))
+       (!= (& sizes bits) 0)))
+
+(defn width-flags [(bits i32)] (-> i32)
+  (case bits 16 F-16 64 F-W 0))
+
+;;; spl/bpl/sil/dil are only reachable with a REX prefix; without one the same
+;;; register numbers name ah/ch/dh/bh.
+(defn low-byte-rex [(bits i32) (register i32)] (-> i32)
+  (if (and (= bits 8) (>= register 4) (<= register 7)) F-REX 0))
+
+;;; An instruction whose byte form is `op` has its wider forms at `op + 1`.
+(defn sized [(op i32) (sizes i32) (bits i32)] (-> i32)
+  (if (and (!= (& sizes 8) 0) (!= bits 8)) (+ op 1) op))
+
+;;; Prefixes, REX, escape bytes and the opcode byte. llvm-mc's order: operand
+;;; size, LOCK, mandatory prefix, REX.
+(defn head! [(out (mut (ArrayList u8)))
+             (op i32)
+             (flags i32)
+             (reg i32)
+             (index i32)
+             (base i32)] (-> void)
+  (let [prefix (& (>> op 12) 3)
+        map (& (>> op 8) 3)
+        rex
+          (| (if (!= (& flags F-W) 0) 8 0)
+             (<< (& (>> reg 3) 1) 2)
+             (<< (& (>> index 3) 1) 1)
+             (& (>> base 3) 1))]
+    (when (!= (& flags F-16) 0) (byte! (mut out) 0x66))
+    (when (!= (& flags F-LOCK) 0) (byte! (mut out) 0xF0))
+    (when (= prefix 1) (byte! (mut out) 0x66))
+    (when (= prefix 2) (byte! (mut out) 0xF3))
+    (when (= prefix 3) (byte! (mut out) 0xF2))
+    (when (or (!= rex 0) (!= (& flags F-REX) 0)) (byte! (mut out) (| 0x40 rex)))
+    (when (!= map 0) (byte! (mut out) 0x0F))
+    (when (= map 2) (byte! (mut out) 0x38))
+    (when (= map 3) (byte! (mut out) 0x3A))
+    (byte! (mut out) op)))
+
+;;; Register-direct ModRM. `reg` and `rm` are hardware numbers 0..15 (or `reg`
+;;; an opcode extension 0..7).
+(defn direct! [(out (mut (ArrayList u8)))
+               (op i32)
+               (flags i32)
+               (reg i32)
+               (rm i32)] (-> void)
+  (head! (mut out) op flags reg 0 rm)
+  (byte! (mut out) (| 0xC0 (<< (& reg 7) 3) (& rm 7))))
+
+;;; "" for an encodable operand, otherwise why it is not.
+(defn mem-error [(m Mem)] (-> (slice u8))
+  (let [base (.base m)
+        index (.index m)
+        scale (.scale m)]
+    (cond (not (fits32? (.disp m)))
+            "x64 memory displacement does not fit in 32 bits"
+          (and (= base RIP) (!= index NO-REG))
+            "x64 RIP-relative operand cannot have an index"
+          (and (!= base RIP) (!= base NO-REG) (not (gpr? base)))
+            "x64 memory base is not a general register"
+          (= index NO-REG) ""
+          (not (gpr? index)) "x64 memory index is not a general register"
+          (= index 4) "x64 rsp cannot be a memory index"
+          (not (or (= scale 1) (= scale 2) (= scale 4) (= scale 8)))
+            "x64 memory scale must be 1, 2, 4 or 8"
+          :else "")))
+
+;;; Prefixes, opcode, ModRM, SIB and displacement of a validated memory
+;;; operand. Returns the offset of a RIP-relative disp32, else -1.
+;;;   - rsp/r12 as base have no plain ModRM form: they take a SIB byte.
+;;;   - rbp/r13 as base have no mod=00 form: they take a zero disp8.
+;;;   - no base at all is mod=00 with SIB base 101 and a disp32.
+(defn memory! [(out (mut (ArrayList u8)))
+               (op i32)
+               (flags i32)
+               (reg i32)
+               (m Mem)] (-> i64)
+  (let [base (.base m)
+        index (.index m)
+        disp (.disp m)
+        indexed (!= index NO-REG)
+        r (<< (& reg 7) 3)
+        scale-bits (case (.scale m) 2 (: 1 i32) 4 2 8 3 0)
+        sib-index (if indexed (| (<< scale-bits 6) (<< (& index 7) 3)) 0x20)]
+    (head! (mut out) op flags reg (if indexed index 0) (if (< base 0) 0 base))
+    (cond (= base RIP)
+            (do
+              (byte! (mut out) (| r 5))
+              (let [field (len out)]
+                (imm! (mut out) 4 disp)
+                field))
+          (= base NO-REG)
+            (do
+              (byte! (mut out) (| r 4))
+              (byte! (mut out) (| sib-index 5))
+              (imm! (mut out) 4 disp)
+              -1)
+          :else
+            (let [low (& base 7)
+                  mode
+                    (cond (and (= disp 0) (!= low 5)) (: 0 i32)
+                          (fits8? disp) 1
+                          :else 2)
+                  sib (or indexed (= low 4))]
+              (byte! (mut out) (| (<< mode 6) r (if sib 4 low)))
+              (when sib (byte! (mut out) (| sib-index low)))
+              (when (= mode 1) (imm! (mut out) 1 disp))
+              (when (= mode 2) (imm! (mut out) 4 disp))
+              -1))))
+
+;;; Append an immediate after a successfully encoded head.
+(defn then-imm [(out (mut (ArrayList u8)))
+                (head (Result i64 (slice u8)))
+                (count i32)
+                (value i64)] (-> (Result i64 (slice u8)))
+  (match head
+    (Ok [field]
+        (do
+          (imm! (mut out) count value)
+          (Ok field)))
+    (Err [message] (Err message))))
+
+;;; `op flags /reg rm` with `rm` a general register and no width logic.
+(defn raw-direct [(out (mut (ArrayList u8)))
+                  (op i32)
+                  (flags i32)
+                  (reg i32)
+                  (rm i32)] (-> (Result i64 (slice u8)))
+  (if (not (gpr? rm))
+      (Err "invalid x64 general register")
+      (do
+        (direct! (mut out) op flags reg rm)
+        (Ok -1))))
+
+;;; `op flags /reg m` with no width logic.
+(defn raw-memory [(out (mut (ArrayList u8)))
+                  (op i32)
+                  (flags i32)
+                  (reg i32)
+                  (m Mem)] (-> (Result i64 (slice u8)))
+  (let [problem (mem-error m)]
+    (if (!= (len problem) 0)
+        (Err problem)
+        (Ok (memory! (mut out) op flags reg m)))))
+
+;;; An integer instruction with a register-direct r/m of width `bits`. `reg` is
+;;; a general register of the same width, or an opcode extension when `ext`.
+;;; `extra` adds prefix flags.
+(defn int-direct [(out (mut (ArrayList u8)))
+                  (op i32)
+                  (sizes i32)
+                  (bits i32)
+                  (ext bool)
+                  (reg i32)
+                  (rm i32)
+                  (extra i32)]
+  (-> (Result i64 (slice u8)))
+  (cond (not (width? sizes bits)) (Err "unsupported x64 operand width")
+        (not (and (gpr? rm) (if ext (and (>= reg 0) (<= reg 7)) (gpr? reg))))
+          (Err "invalid x64 general register")
+        :else
+          (do
+            (direct! (mut out)
+                     (sized op sizes bits)
+                     (| (width-flags bits)
+                        (if ext 0 (low-byte-rex bits reg))
+                        (low-byte-rex bits rm)
+                        extra)
+                     reg
+                     rm)
+            (Ok -1))))
+
+;;; An integer instruction with a memory r/m of width `bits`.
+(defn int-memory [(out (mut (ArrayList u8)))
+                  (op i32)
+                  (sizes i32)
+                  (bits i32)
+                  (ext bool)
+                  (reg i32)
+                  (m Mem)
+                  (extra i32)]
+  (-> (Result i64 (slice u8)))
+  (cond (not (width? sizes bits)) (Err "unsupported x64 operand width")
+        (not (if ext (and (>= reg 0) (<= reg 7)) (gpr? reg)))
+          (Err "invalid x64 general register")
+        :else
+          (raw-memory (mut out)
+                      (sized op sizes bits)
+                      (| (width-flags bits)
+                         (if ext 0 (low-byte-rex bits reg))
+                         extra)
+                      reg
+                      m)))
+
+;;; A fixed byte sequence of up to eight bytes, low byte first.
+(defn fixed [(out (mut (ArrayList u8))) (count i32) (bytes i64)]
+  (-> (Result i64 (slice u8)))
+  (imm! (mut out) count bytes)
+  (Ok -1))
+
+;; ---------------------------------------------------------------------------
+;; Moves
+;; ---------------------------------------------------------------------------
+
+;;; mov dst, src
+(defn mov-rr [(out (mut (ArrayList u8))) (bits i32) (dst i32) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (int-direct (mut out) 0x88 SIZES-ALL bits false src dst 0))
+
+;;; mov dst, [m]
+(defn mov-rm [(out (mut (ArrayList u8))) (bits i32) (dst i32) (m Mem)]
+  (-> (Result i64 (slice u8)))
+  (int-memory (mut out) 0x8A SIZES-ALL bits false dst m 0))
+
+;;; mov [m], src
+(defn mov-mr [(out (mut (ArrayList u8))) (bits i32) (m Mem) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (int-memory (mut out) 0x88 SIZES-ALL bits false src m 0))
+
+;;; movabs dst, imm64: always the ten-byte form. Returns the imm64's offset.
+(defn movabs-ri [(out (mut (ArrayList u8))) (dst i32) (imm i64)]
+  (-> (Result i64 (slice u8)))
+  (if (not (gpr? dst))
+      (Err "invalid x64 general register")
+      (do
+        (head! (mut out) (+ 0xB8 (& dst 7)) F-W 0 0 dst)
+        (let [field (len out)]
+          (imm! (mut out) 8 imm)
+          (Ok field)))))
+
+;;; mov dst, imm. Flags are untouched. A 64-bit destination takes the shortest
+;;; of `mov r32, imm32` (the value fits unsigned 32 bits), `mov r64, simm32`
+;;; and `movabs` (only then is the returned field the imm64's offset).
+(defn mov-ri [(out (mut (ArrayList u8))) (bits i32) (dst i32) (imm i64)]
+  (-> (Result i64 (slice u8)))
+  (cond (not (gpr? dst)) (Err "invalid x64 general register")
+        (not (width? SIZES-ALL bits)) (Err "unsupported x64 operand width")
+        (and (= bits 64) (>= imm 0) (<= imm 4294967295))
+          (mov-ri (mut out) 32 dst imm)
+        (and (= bits 64) (fits32? imm))
+          (then-imm (mut out) (raw-direct (mut out) 0xC7 F-W 0 dst) 4 imm)
+        (= bits 64) (movabs-ri (mut out) dst imm)
+        (not (immediate? bits imm))
+          (Err "x64 immediate does not fit the operand width")
+        :else
+          (do
+            (head! (mut out)
+                   (+ (if (= bits 8) 0xB0 0xB8) (& dst 7))
+                   (| (width-flags bits) (low-byte-rex bits dst))
+                   0
+                   0
+                   dst)
+            (imm! (mut out) (immediate-bytes bits) imm)
+            (Ok -1))))
+
+;;; mov [m], imm. A 64-bit store sign-extends a 32-bit immediate.
+(defn mov-mi [(out (mut (ArrayList u8))) (bits i32) (m Mem) (imm i64)]
+  (-> (Result i64 (slice u8)))
+  (if (not (immediate? bits imm))
+      (Err "x64 immediate does not fit the operand width")
+      (then-imm (mut out)
+                (int-memory (mut out) 0xC6 SIZES-ALL bits true 0 m 0)
+                (immediate-bytes bits)
+                imm)))
+
+;;; xor dst32, dst32: the short zeroing idiom. Unlike `mov-ri` it writes flags.
+(defn zero-r [(out (mut (ArrayList u8))) (dst i32)] (-> (Result i64 (slice u8)))
+  (int-direct (mut out) 0x30 SIZES-ALL 32 false dst dst 0))
+
+(defn extend-op [(signed bool) (dst-bits i32) (src-bits i32)] (-> i32)
+  (cond (and (= src-bits 8) (width? SIZES-WIDE dst-bits))
+          (if signed 0x01BE 0x01B6)
+        (and (= src-bits 16) (width? SIZES-LONG dst-bits))
+          (if signed 0x01BF 0x01B7)
+        (and signed (= src-bits 32) (= dst-bits 64)) 0x63
+        :else -1))
+
+;;; movzx dst, src. A 64-bit destination is encoded as the 32-bit form, which
+;;; zeroes the upper half; widening from 32 bits is `mov dst32, src32`.
+(defn movzx-rr [(out (mut (ArrayList u8)))
+                (dst-bits i32)
+                (src-bits i32)
+                (dst i32)
+                (src i32)] (-> (Result i64 (slice u8)))
+  (let [op (extend-op false dst-bits src-bits)
+        bits (if (= dst-bits 64) 32 dst-bits)]
+    (cond (and (= src-bits 32) (= dst-bits 64)) (mov-rr (mut out) 32 dst src)
+          (< op 0) (Err "unsupported x64 zero extension")
+          (not (gpr? src)) (Err "invalid x64 general register")
+          :else
+            (int-direct (mut out)
+                        op
+                        SIZES-WIDE
+                        bits
+                        false
+                        dst
+                        src
+                        (low-byte-rex src-bits src)))))
+
+;;; movzx dst, [m]
+(defn movzx-rm [(out (mut (ArrayList u8)))
+                (dst-bits i32)
+                (src-bits i32)
+                (dst i32)
+                (m Mem)] (-> (Result i64 (slice u8)))
+  (let [op (extend-op false dst-bits src-bits)
+        bits (if (= dst-bits 64) 32 dst-bits)]
+    (cond (and (= src-bits 32) (= dst-bits 64)) (mov-rm (mut out) 32 dst m)
+          (< op 0) (Err "unsupported x64 zero extension")
+          :else (int-memory (mut out) op SIZES-WIDE bits false dst m 0))))
+
+;;; movsx dst, src (movsxd from 32 bits).
+(defn movsx-rr [(out (mut (ArrayList u8)))
+                (dst-bits i32)
+                (src-bits i32)
+                (dst i32)
+                (src i32)] (-> (Result i64 (slice u8)))
+  (let [op (extend-op true dst-bits src-bits)]
+    (cond (< op 0) (Err "unsupported x64 sign extension")
+          (not (gpr? src)) (Err "invalid x64 general register")
+          :else
+            (int-direct (mut out)
+                        op
+                        SIZES-WIDE
+                        dst-bits
+                        false
+                        dst
+                        src
+                        (low-byte-rex src-bits src)))))
+
+;;; movsx dst, [m] (movsxd from 32 bits).
+(defn movsx-rm [(out (mut (ArrayList u8)))
+                (dst-bits i32)
+                (src-bits i32)
+                (dst i32)
+                (m Mem)] (-> (Result i64 (slice u8)))
+  (let [op (extend-op true dst-bits src-bits)]
+    (if (< op 0)
+        (Err "unsupported x64 sign extension")
+        (int-memory (mut out) op SIZES-WIDE dst-bits false dst m 0))))
+
+;;; lea dst, [m] (32 or 64 bits).
+(defn lea [(out (mut (ArrayList u8))) (bits i32) (dst i32) (m Mem)]
+  (-> (Result i64 (slice u8)))
+  (int-memory (mut out) 0x8D SIZES-LONG bits false dst m 0))
+
+;;; xchg a, b. The one-byte accumulator form is used when either operand is
+;;; rax, except for `xchg eax, eax`: 90 is NOP there and would not zero the
+;;; upper half. `xchg rax, rax` is that plain NOP, as llvm-mc encodes it.
+(defn xchg-rr [(out (mut (ArrayList u8))) (bits i32) (a i32) (b i32)]
+  (-> (Result i64 (slice u8)))
+  (cond (not (width? SIZES-ALL bits)) (Err "unsupported x64 operand width")
+        (not (and (gpr? a) (gpr? b))) (Err "invalid x64 general register")
+        (and (!= bits 8) (or (= a 0) (= b 0)) (not (and (= bits 32) (= a b))))
+          (let [other (if (= a 0) b a)]
+            (head! (mut out)
+                   (+ 0x90 (& other 7))
+                   (if (and (= bits 64) (= a b)) 0 (width-flags bits))
+                   0
+                   0
+                   other)
+            (Ok -1))
+        :else (int-direct (mut out) 0x86 SIZES-ALL bits false a b 0)))
+
+;;; xchg reg, [m]. Always locked by the processor.
+(defn xchg-rm [(out (mut (ArrayList u8))) (bits i32) (reg i32) (m Mem)]
+  (-> (Result i64 (slice u8)))
+  (int-memory (mut out) 0x86 SIZES-ALL bits false reg m 0))
+
+;;; bswap r (32 or 64 bits).
+(defn bswap [(out (mut (ArrayList u8))) (bits i32) (register i32)]
+  (-> (Result i64 (slice u8)))
+  (cond (not (width? SIZES-LONG bits)) (Err "unsupported x64 operand width")
+        (not (gpr? register)) (Err "invalid x64 general register")
+        :else
+          (do
+            (head! (mut out)
+                   (+ 0x01C8 (& register 7))
+                   (width-flags bits)
+                   0
+                   0
+                   register)
+            (Ok -1))))
+
+;; ---------------------------------------------------------------------------
+;; Arithmetic and logic
+;; ---------------------------------------------------------------------------
+
+;;; The eight two-operand operations of `alu-*`, in opcode order.
+(const ADD 0)
+
+(const OR 1)
+
+(const ADC 2)
+
+(const SBB 3)
+
+(const AND 4)
+
+(const SUB 5)
+
+(const XOR 6)
+
+(const CMP 7)
+
+(defn alu? [(op i32)] (-> bool)
+  (and (>= op 0) (<= op 7)))
+
+;;; op dst, src
+(defn alu-rr [(out (mut (ArrayList u8)))
+              (op i32)
+              (bits i32)
+              (dst i32)
+              (src i32)]
+  (-> (Result i64 (slice u8)))
+  (if (not (alu? op))
+      (Err "invalid x64 arithmetic operation")
+      (int-direct (mut out) (<< op 3) SIZES-ALL bits false src dst 0)))
+
+;;; op dst, [m]
+(defn alu-rm [(out (mut (ArrayList u8))) (op i32) (bits i32) (dst i32) (m Mem)]
+  (-> (Result i64 (slice u8)))
+  (if (not (alu? op))
+      (Err "invalid x64 arithmetic operation")
+      (int-memory (mut out) (| (<< op 3) 2) SIZES-ALL bits false dst m 0)))
+
+(defn alu-mr-flags [(out (mut (ArrayList u8)))
+                    (op i32)
+                    (bits i32)
+                    (m Mem)
+                    (src i32)
+                    (extra i32)] (-> (Result i64 (slice u8)))
+  (if (not (alu? op))
+      (Err "invalid x64 arithmetic operation")
+      (int-memory (mut out) (<< op 3) SIZES-ALL bits false src m extra)))
+
+;;; op [m], src
+(defn alu-mr [(out (mut (ArrayList u8))) (op i32) (bits i32) (m Mem) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (alu-mr-flags (mut out) op bits m src 0))
+
+;;; op dst, imm. Uses the sign-extended imm8 form when the value allows, else
+;;; the accumulator short form for rax, else the full immediate.
+(defn alu-ri [(out (mut (ArrayList u8)))
+              (op i32)
+              (bits i32)
+              (dst i32)
+              (imm i64)]
+  (-> (Result i64 (slice u8)))
+  (let [value (sign-extend bits imm)]
+    (cond (not (alu? op)) (Err "invalid x64 arithmetic operation")
+          (not (width? SIZES-ALL bits)) (Err "unsupported x64 operand width")
+          (not (gpr? dst)) (Err "invalid x64 general register")
+          (not (immediate? bits imm))
+            (Err "x64 immediate does not fit the operand width")
+          (and (!= bits 8) (fits8? value))
+            (then-imm (mut out)
+                      (int-direct (mut out) 0x83 SIZES-WIDE bits true op dst 0)
+                      1
+                      value)
+          (= dst 0)
+            (do
+              (head! (mut out)
+                     (sized (| (<< op 3) 4) SIZES-ALL bits)
+                     (width-flags bits)
+                     0
+                     0
+                     0)
+              (imm! (mut out) (immediate-bytes bits) value)
+              (Ok -1))
+          :else
+            (then-imm (mut out)
+                      (int-direct (mut out) 0x80 SIZES-ALL bits true op dst 0)
+                      (immediate-bytes bits)
+                      value))))
+
+(defn alu-mi-flags [(out (mut (ArrayList u8)))
+                    (op i32)
+                    (bits i32)
+                    (m Mem)
+                    (imm i64)
+                    (extra i32)] (-> (Result i64 (slice u8)))
+  (let [value (sign-extend bits imm)
+        short (and (!= bits 8) (fits8? value))]
+    (cond (not (alu? op)) (Err "invalid x64 arithmetic operation")
+          (not (immediate? bits imm))
+            (Err "x64 immediate does not fit the operand width")
+          :else
+            (then-imm (mut out)
+                      (int-memory (mut out)
+                                  (if short 0x83 0x80)
+                                  (if short SIZES-WIDE SIZES-ALL)
+                                  bits
+                                  true
+                                  op
+                                  m
+                                  extra)
+                      (if short 1 (immediate-bytes bits))
+                      value))))
+
+;;; op [m], imm
+(defn alu-mi [(out (mut (ArrayList u8))) (op i32) (bits i32) (m Mem) (imm i64)]
+  (-> (Result i64 (slice u8)))
+  (alu-mi-flags (mut out) op bits m imm 0))
+
+;;; test a, b
+(defn test-rr [(out (mut (ArrayList u8))) (bits i32) (a i32) (b i32)]
+  (-> (Result i64 (slice u8)))
+  (int-direct (mut out) 0x84 SIZES-ALL bits false b a 0))
+
+;;; test [m], reg
+(defn test-mr [(out (mut (ArrayList u8))) (bits i32) (m Mem) (reg i32)]
+  (-> (Result i64 (slice u8)))
+  (int-memory (mut out) 0x84 SIZES-ALL bits false reg m 0))
+
+;;; test reg, imm. A 64-bit test against a value with bit 31 and above clear
+;;; is encoded as the 32-bit test: the result and every flag are the same.
+(defn test-ri [(out (mut (ArrayList u8))) (bits i32) (reg i32) (imm i64)]
+  (-> (Result i64 (slice u8)))
+  (let [narrow (and (= bits 64) (>= imm 0) (<= imm 2147483647))
+        width (if narrow 32 bits)
+        value (sign-extend width imm)]
+    (cond (not (width? SIZES-ALL bits)) (Err "unsupported x64 operand width")
+          (not (gpr? reg)) (Err "invalid x64 general register")
+          (not (immediate? bits imm))
+            (Err "x64 immediate does not fit the operand width")
+          (= reg 0)
+            (do
+              (head! (mut out)
+                     (sized 0xA8 SIZES-ALL width)
+                     (width-flags width)
+                     0
+                     0
+                     0)
+              (imm! (mut out) (immediate-bytes width) value)
+              (Ok -1))
+          :else
+            (then-imm (mut out)
+                      (int-direct (mut out) 0xF6 SIZES-ALL width true 0 reg 0)
+                      (immediate-bytes width)
+                      value))))
+
+;;; test [m], imm
+(defn test-mi [(out (mut (ArrayList u8))) (bits i32) (m Mem) (imm i64)]
+  (-> (Result i64 (slice u8)))
+  (if (not (immediate? bits imm))
+      (Err "x64 immediate does not fit the operand width")
+      (then-imm (mut out)
+                (int-memory (mut out) 0xF6 SIZES-ALL bits true 0 m 0)
+                (immediate-bytes bits)
+                (sign-extend bits imm))))
+
+;;; The one-operand operations of `unary-*`. MUL/IMUL/DIV/IDIV are the
+;;; rdx:rax forms (ah:al for 8 bits).
+(const NOT 2)
+
+(const NEG 3)
+
+(const MUL 4)
+
+(const IMUL 5)
+
+(const DIV 6)
+
+(const IDIV 7)
+
+(const INC 8)
+
+(const DEC 9)
+
+(defn unary? [(kind i32)] (-> bool)
+  (and (>= kind 2) (<= kind 9)))
+
+(defn unary-op [(kind i32)] (-> i32)
+  (if (>= kind 8) 0xFE 0xF6))
+
+;;; kind reg
+(defn unary-r [(out (mut (ArrayList u8))) (kind i32) (bits i32) (reg i32)]
+  (-> (Result i64 (slice u8)))
+  (if (not (unary? kind))
+      (Err "invalid x64 unary operation")
+      (int-direct (mut out)
+                  (unary-op kind)
+                  SIZES-ALL
+                  bits
+                  true
+                  (& kind 7)
+                  reg
+                  0)))
+
+(defn unary-m-flags [(out (mut (ArrayList u8)))
+                     (kind i32)
+                     (bits i32)
+                     (m Mem)
+                     (extra i32)] (-> (Result i64 (slice u8)))
+  (if (not (unary? kind))
+      (Err "invalid x64 unary operation")
+      (int-memory (mut out)
+                  (unary-op kind)
+                  SIZES-ALL
+                  bits
+                  true
+                  (& kind 7)
+                  m
+                  extra)))
+
+;;; kind [m]
+(defn unary-m [(out (mut (ArrayList u8))) (kind i32) (bits i32) (m Mem)]
+  (-> (Result i64 (slice u8)))
+  (unary-m-flags (mut out) kind bits m 0))
+
+;;; imul dst, src (16, 32 or 64 bits)
+(defn imul-rr [(out (mut (ArrayList u8))) (bits i32) (dst i32) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (int-direct (mut out) 0x01AF SIZES-WIDE bits false dst src 0))
+
+;;; imul dst, [m]
+(defn imul-rm [(out (mut (ArrayList u8))) (bits i32) (dst i32) (m Mem)]
+  (-> (Result i64 (slice u8)))
+  (int-memory (mut out) 0x01AF SIZES-WIDE bits false dst m 0))
+
+;;; imul dst, src, imm
+(defn imul-rri [(out (mut (ArrayList u8)))
+                (bits i32)
+                (dst i32)
+                (src i32)
+                (imm i64)] (-> (Result i64 (slice u8)))
+  (let [value (sign-extend bits imm)
+        short (fits8? value)]
+    (if (not (immediate? bits imm))
+        (Err "x64 immediate does not fit the operand width")
+        (then-imm (mut out)
+                  (int-direct (mut out)
+                              (if short 0x6B 0x69)
+                              SIZES-WIDE
+                              bits
+                              false
+                              dst
+                              src
+                              0)
+                  (if short 1 (immediate-bytes bits))
+                  value))))
+
+;;; imul dst, [m], imm
+(defn imul-rmi [(out (mut (ArrayList u8)))
+                (bits i32)
+                (dst i32)
+                (m Mem)
+                (imm i64)] (-> (Result i64 (slice u8)))
+  (let [value (sign-extend bits imm)
+        short (fits8? value)]
+    (if (not (immediate? bits imm))
+        (Err "x64 immediate does not fit the operand width")
+        (then-imm (mut out)
+                  (int-memory (mut out)
+                              (if short 0x6B 0x69)
+                              SIZES-WIDE
+                              bits
+                              false
+                              dst
+                              m
+                              0)
+                  (if short 1 (immediate-bytes bits))
+                  value))))
+
+;;; Sign-extend the accumulator into rdx before a division: cwd (16), cdq (32)
+;;; or cqo (64).
+(defn sign-extend-rax-rdx [(out (mut (ArrayList u8))) (bits i32)]
+  (-> (Result i64 (slice u8)))
+  (if (not (width? SIZES-WIDE bits))
+      (Err "unsupported x64 operand width")
+      (do
+        (head! (mut out) 0x99 (width-flags bits) 0 0 0)
+        (Ok -1))))
+
+;;; cdq: edx:eax = sign-extended eax.
+(defn cdq [(out (mut (ArrayList u8)))] (-> (Result i64 (slice u8)))
+  (sign-extend-rax-rdx (mut out) 32))
+
+;;; cqo: rdx:rax = sign-extended rax.
+(defn cqo [(out (mut (ArrayList u8)))] (-> (Result i64 (slice u8)))
+  (sign-extend-rax-rdx (mut out) 64))
+
+;; ---------------------------------------------------------------------------
+;; Shifts, rotates and bit operations
+;; ---------------------------------------------------------------------------
+
+;;; The shifts and rotates of `shift-*`, by ModRM opcode extension.
+(const ROL 0)
+
+(const ROR 1)
+
+(const RCL 2)
+
+(const RCR 3)
+
+(const SHL 4)
+
+(const SHR 5)
+
+(const SAR 7)
+
+(defn shift? [(kind i32)] (-> bool)
+  (and (>= kind 0) (<= kind 7) (!= kind 6)))
+
+(defn shift-count? [(bits i32) (count i32)] (-> bool)
+  (and (>= count 0) (< count bits)))
+
+;;; kind reg, count (0 <= count < bits). A count of one uses the short form.
+(defn shift-ri [(out (mut (ArrayList u8)))
+                (kind i32)
+                (bits i32)
+                (reg i32)
+                (count i32)] (-> (Result i64 (slice u8)))
+  (cond (not (shift? kind)) (Err "invalid x64 shift operation")
+        (not (shift-count? bits count)) (Err "x64 shift count out of range")
+        (= count 1) (int-direct (mut out) 0xD0 SIZES-ALL bits true kind reg 0)
+        :else
+          (then-imm (mut out)
+                    (int-direct (mut out) 0xC0 SIZES-ALL bits true kind reg 0)
+                    1
+                    (cast i64 count))))
+
+;;; kind [m], count
+(defn shift-mi [(out (mut (ArrayList u8)))
+                (kind i32)
+                (bits i32)
+                (m Mem)
+                (count i32)] (-> (Result i64 (slice u8)))
+  (cond (not (shift? kind)) (Err "invalid x64 shift operation")
+        (not (shift-count? bits count)) (Err "x64 shift count out of range")
+        (= count 1) (int-memory (mut out) 0xD0 SIZES-ALL bits true kind m 0)
+        :else
+          (then-imm (mut out)
+                    (int-memory (mut out) 0xC0 SIZES-ALL bits true kind m 0)
+                    1
+                    (cast i64 count))))
+
+;;; kind reg, cl
+(defn shift-rc [(out (mut (ArrayList u8))) (kind i32) (bits i32) (reg i32)]
+  (-> (Result i64 (slice u8)))
+  (if (not (shift? kind))
+      (Err "invalid x64 shift operation")
+      (int-direct (mut out) 0xD2 SIZES-ALL bits true kind reg 0)))
+
+;;; kind [m], cl
+(defn shift-mc [(out (mut (ArrayList u8))) (kind i32) (bits i32) (m Mem)]
+  (-> (Result i64 (slice u8)))
+  (if (not (shift? kind))
+      (Err "invalid x64 shift operation")
+      (int-memory (mut out) 0xD2 SIZES-ALL bits true kind m 0)))
+
+(defn double-shift-ri [(out (mut (ArrayList u8)))
+                       (op i32)
+                       (bits i32)
+                       (dst i32)
+                       (src i32)
+                       (count i32)] (-> (Result i64 (slice u8)))
+  (if (not (shift-count? bits count))
+      (Err "x64 shift count out of range")
+      (then-imm (mut out)
+                (int-direct (mut out) op SIZES-WIDE bits false src dst 0)
+                1
+                (cast i64 count))))
+
+;;; shld dst, src, count: shift dst left, filling from the top of src.
+(defn shld-rri [(out (mut (ArrayList u8)))
+                (bits i32)
+                (dst i32)
+                (src i32)
+                (count i32)] (-> (Result i64 (slice u8)))
+  (double-shift-ri (mut out) 0x01A4 bits dst src count))
+
+;;; shld dst, src, cl
+(defn shld-rrc [(out (mut (ArrayList u8))) (bits i32) (dst i32) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (int-direct (mut out) 0x01A5 SIZES-WIDE bits false src dst 0))
+
+;;; shrd dst, src, count: shift dst right, filling from the bottom of src.
+(defn shrd-rri [(out (mut (ArrayList u8)))
+                (bits i32)
+                (dst i32)
+                (src i32)
+                (count i32)] (-> (Result i64 (slice u8)))
+  (double-shift-ri (mut out) 0x01AC bits dst src count))
+
+;;; shrd dst, src, cl
+(defn shrd-rrc [(out (mut (ArrayList u8))) (bits i32) (dst i32) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (int-direct (mut out) 0x01AD SIZES-WIDE bits false src dst 0))
+
+;;; The bit tests of `bt-*`: test, then leave / set / reset / complement.
+(const BT 0)
+
+(const BTS 1)
+
+(const BTR 2)
+
+(const BTC 3)
+
+(defn bit-test? [(kind i32)] (-> bool)
+  (and (>= kind 0) (<= kind 3)))
+
+;;; kind reg, index (16, 32 or 64 bits; 0 <= index < bits)
+(defn bt-ri [(out (mut (ArrayList u8)))
+             (kind i32)
+             (bits i32)
+             (reg i32)
+             (index i32)] (-> (Result i64 (slice u8)))
+  (cond (not (bit-test? kind)) (Err "invalid x64 bit test operation")
+        (not (shift-count? bits index)) (Err "x64 bit index out of range")
+        :else
+          (then-imm (mut out)
+                    (int-direct (mut out)
+                                0x01BA
+                                SIZES-WIDE
+                                bits
+                                true
+                                (+ 4 kind)
+                                reg
+                                0)
+                    1
+                    (cast i64 index))))
+
+;;; kind [m], index
+(defn bt-mi [(out (mut (ArrayList u8)))
+             (kind i32)
+             (bits i32)
+             (m Mem)
+             (index i32)] (-> (Result i64 (slice u8)))
+  (cond (not (bit-test? kind)) (Err "invalid x64 bit test operation")
+        (not (shift-count? bits index)) (Err "x64 bit index out of range")
+        :else
+          (then-imm (mut out)
+                    (int-memory (mut out)
+                                0x01BA
+                                SIZES-WIDE
+                                bits
+                                true
+                                (+ 4 kind)
+                                m
+                                0)
+                    1
+                    (cast i64 index))))
+
+;;; kind reg, index-register
+(defn bt-rr [(out (mut (ArrayList u8)))
+             (kind i32)
+             (bits i32)
+             (reg i32)
+             (index i32)] (-> (Result i64 (slice u8)))
+  (if (not (bit-test? kind))
+      (Err "invalid x64 bit test operation")
+      (int-direct (mut out)
+                  (+ 0x01A3 (<< kind 3))
+                  SIZES-WIDE
+                  bits
+                  false
+                  index
+                  reg
+                  0)))
+
+;;; kind [m], index-register. The index is not reduced modulo the width: it
+;;; addresses bits beyond the operand.
+(defn bt-mr [(out (mut (ArrayList u8)))
+             (kind i32)
+             (bits i32)
+             (m Mem)
+             (index i32)] (-> (Result i64 (slice u8)))
+  (if (not (bit-test? kind))
+      (Err "invalid x64 bit test operation")
+      (int-memory (mut out)
+                  (+ 0x01A3 (<< kind 3))
+                  SIZES-WIDE
+                  bits
+                  false
+                  index
+                  m
+                  0)))
+
+;;; The bit scans and counts of `scan-*`. BSF/BSR are baseline. TZCNT (BMI1),
+;;; LZCNT (ABM/LZCNT) and POPCNT (POPCNT) need their CPU feature; without it
+;;; TZCNT and LZCNT silently execute as BSF and BSR.
+(const BSF 0x01BC)
+
+(const BSR 0x01BD)
+
+(const TZCNT 0x21BC)
+
+(const LZCNT 0x21BD)
+
+(const POPCNT 0x21B8)
+
+(defn scan? [(op i32)] (-> bool)
+  (or (= op BSF) (= op BSR) (= op TZCNT) (= op LZCNT) (= op POPCNT)))
+
+;;; op dst, src (16, 32 or 64 bits)
+(defn scan-rr [(out (mut (ArrayList u8)))
+               (op i32)
+               (bits i32)
+               (dst i32)
+               (src i32)]
+  (-> (Result i64 (slice u8)))
+  (if (not (scan? op))
+      (Err "invalid x64 bit scan operation")
+      (int-direct (mut out) op SIZES-WIDE bits false dst src 0)))
+
+;;; op dst, [m]
+(defn scan-rm [(out (mut (ArrayList u8))) (op i32) (bits i32) (dst i32) (m Mem)]
+  (-> (Result i64 (slice u8)))
+  (if (not (scan? op))
+      (Err "invalid x64 bit scan operation")
+      (int-memory (mut out) op SIZES-WIDE bits false dst m 0)))
+
+;; ---------------------------------------------------------------------------
+;; Conditions
+;; ---------------------------------------------------------------------------
+
+;;; setcc reg8
+(defn setcc-r [(out (mut (ArrayList u8))) (cc i32) (reg i32)]
+  (-> (Result i64 (slice u8)))
+  (if (not (condition? cc))
+      (Err "invalid x64 condition code")
+      (int-direct (mut out) (+ 0x0190 cc) SIZES-BYTE 8 true 0 reg 0)))
+
+;;; setcc byte [m]
+(defn setcc-m [(out (mut (ArrayList u8))) (cc i32) (m Mem)]
+  (-> (Result i64 (slice u8)))
+  (if (not (condition? cc))
+      (Err "invalid x64 condition code")
+      (int-memory (mut out) (+ 0x0190 cc) SIZES-BYTE 8 true 0 m 0)))
+
+;;; cmovcc dst, src (16, 32 or 64 bits)
+(defn cmov-rr [(out (mut (ArrayList u8)))
+               (cc i32)
+               (bits i32)
+               (dst i32)
+               (src i32)]
+  (-> (Result i64 (slice u8)))
+  (if (not (condition? cc))
+      (Err "invalid x64 condition code")
+      (int-direct (mut out) (+ 0x0140 cc) SIZES-WIDE bits false dst src 0)))
+
+;;; cmovcc dst, [m]. The load happens whether or not the condition holds.
+(defn cmov-rm [(out (mut (ArrayList u8))) (cc i32) (bits i32) (dst i32) (m Mem)]
+  (-> (Result i64 (slice u8)))
+  (if (not (condition? cc))
+      (Err "invalid x64 condition code")
+      (int-memory (mut out) (+ 0x0140 cc) SIZES-WIDE bits false dst m 0)))
+
+;; ---------------------------------------------------------------------------
+;; Stack and control flow
+;; ---------------------------------------------------------------------------
+
+;;; push reg64
+(defn push-r [(out (mut (ArrayList u8))) (reg i32)] (-> (Result i64 (slice u8)))
+  (if (not (gpr? reg))
+      (Err "invalid x64 general register")
+      (do
+        (head! (mut out) (+ 0x50 (& reg 7)) 0 0 0 reg)
+        (Ok -1))))
+
+;;; pop reg64
+(defn pop-r [(out (mut (ArrayList u8))) (reg i32)] (-> (Result i64 (slice u8)))
+  (if (not (gpr? reg))
+      (Err "invalid x64 general register")
+      (do
+        (head! (mut out) (+ 0x58 (& reg 7)) 0 0 0 reg)
+        (Ok -1))))
+
+;;; push qword [m]
+(defn push-m [(out (mut (ArrayList u8))) (m Mem)] (-> (Result i64 (slice u8)))
+  (raw-memory (mut out) 0xFF 0 6 m))
+
+;;; pop qword [m]
+(defn pop-m [(out (mut (ArrayList u8))) (m Mem)] (-> (Result i64 (slice u8)))
+  (raw-memory (mut out) 0x8F 0 0 m))
+
+;;; push imm (sign-extended to 64 bits)
+(defn push-i [(out (mut (ArrayList u8))) (imm i64)] (-> (Result i64 (slice u8)))
+  (cond (fits8? imm) (fixed (mut out) 2 (| 0x6A (<< (& imm 255) 8)))
+        (fits32? imm)
+          (do
+            (byte! (mut out) 0x68)
+            (imm! (mut out) 4 imm)
+            (Ok -1))
+        :else (Err "x64 push immediate does not fit in 32 bits")))
+
+;;; `opcode rel32` with an optional leading 0F. Returns the rel32's offset.
+(defn relative32 [(out (mut (ArrayList u8))) (op i32) (rel i64)]
+  (-> (Result i64 (slice u8)))
+  (if (not (fits32? rel))
+      (Err "x64 rel32 displacement out of range")
+      (do
+        (head! (mut out) op 0 0 0 0)
+        (let [field (len out)]
+          (imm! (mut out) 4 rel)
+          (Ok field)))))
+
+;;; `opcode rel8`. Returns the rel8's offset.
+(defn relative8 [(out (mut (ArrayList u8))) (op i32) (rel i64)]
+  (-> (Result i64 (slice u8)))
+  (if (not (fits8? rel))
+      (Err "x64 rel8 displacement out of range")
+      (do
+        (byte! (mut out) op)
+        (let [field (len out)]
+          (imm! (mut out) 1 rel)
+          (Ok field)))))
+
+;;; call rel32. `rel` is relative to the end of the instruction.
+(defn call-rel32 [(out (mut (ArrayList u8))) (rel i64)]
+  (-> (Result i64 (slice u8)))
+  (relative32 (mut out) 0xE8 rel))
+
+;;; call reg
+(defn call-r [(out (mut (ArrayList u8))) (reg i32)] (-> (Result i64 (slice u8)))
+  (raw-direct (mut out) 0xFF 0 2 reg))
+
+;;; call qword [m]
+(defn call-m [(out (mut (ArrayList u8))) (m Mem)] (-> (Result i64 (slice u8)))
+  (raw-memory (mut out) 0xFF 0 2 m))
+
+;;; jmp rel8 (two bytes)
+(defn jmp-rel8 [(out (mut (ArrayList u8))) (rel i64)]
+  (-> (Result i64 (slice u8)))
+  (relative8 (mut out) 0xEB rel))
+
+;;; jmp rel32 (five bytes)
+(defn jmp-rel32 [(out (mut (ArrayList u8))) (rel i64)]
+  (-> (Result i64 (slice u8)))
+  (relative32 (mut out) 0xE9 rel))
+
+;;; jmp reg
+(defn jmp-r [(out (mut (ArrayList u8))) (reg i32)] (-> (Result i64 (slice u8)))
+  (raw-direct (mut out) 0xFF 0 4 reg))
+
+;;; jmp qword [m]
+(defn jmp-m [(out (mut (ArrayList u8))) (m Mem)] (-> (Result i64 (slice u8)))
+  (raw-memory (mut out) 0xFF 0 4 m))
+
+;;; jcc rel8 (two bytes)
+(defn jcc-rel8 [(out (mut (ArrayList u8))) (cc i32) (rel i64)]
+  (-> (Result i64 (slice u8)))
+  (if (not (condition? cc))
+      (Err "invalid x64 condition code")
+      (relative8 (mut out) (+ 0x70 cc) rel)))
+
+;;; jcc rel32 (six bytes)
+(defn jcc-rel32 [(out (mut (ArrayList u8))) (cc i32) (rel i64)]
+  (-> (Result i64 (slice u8)))
+  (if (not (condition? cc))
+      (Err "invalid x64 condition code")
+      (relative32 (mut out) (+ 0x0180 cc) rel)))
+
+(defn ret [(out (mut (ArrayList u8)))] (-> (Result i64 (slice u8)))
+  (fixed (mut out) 1 0xC3))
+
+(defn leave [(out (mut (ArrayList u8)))] (-> (Result i64 (slice u8)))
+  (fixed (mut out) 1 0xC9))
+
+(defn ud2 [(out (mut (ArrayList u8)))] (-> (Result i64 (slice u8)))
+  (fixed (mut out) 2 0x0B0F))
+
+(defn int3 [(out (mut (ArrayList u8)))] (-> (Result i64 (slice u8)))
+  (fixed (mut out) 1 0xCC))
+
+(defn cld [(out (mut (ArrayList u8)))] (-> (Result i64 (slice u8)))
+  (fixed (mut out) 1 0xFC))
+
+(defn mfence [(out (mut (ArrayList u8)))] (-> (Result i64 (slice u8)))
+  (fixed (mut out) 3 0xF0AE0F))
+
+(defn lfence [(out (mut (ArrayList u8)))] (-> (Result i64 (slice u8)))
+  (fixed (mut out) 3 0xE8AE0F))
+
+(defn sfence [(out (mut (ArrayList u8)))] (-> (Result i64 (slice u8)))
+  (fixed (mut out) 3 0xF8AE0F))
+
+(defn pause [(out (mut (ArrayList u8)))] (-> (Result i64 (slice u8)))
+  (fixed (mut out) 2 0x90F3))
+
+;;; One no-op instruction of `length` bytes, 1..9: the recommended multi-byte
+;;; forms (66 prefix, 0F 1F /0 with growing addressing modes).
+(defn nop [(out (mut (ArrayList u8))) (length i32)] (-> (Result i64 (slice u8)))
+  (case length
+    1 (fixed (mut out) 1 0x90)
+    2 (fixed (mut out) 2 0x9066)
+    3 (fixed (mut out) 3 0x001F0F)
+    4 (fixed (mut out) 4 0x00401F0F)
+    5 (fixed (mut out) 5 0x0000441F0F)
+    6 (fixed (mut out) 6 0x0000441F0F66)
+    7 (fixed (mut out) 7 0x00000000801F0F)
+    8 (fixed (mut out) 8 0x0000000000841F0F)
+    9
+      (do
+        (byte! (mut out) 0x66)
+        (fixed (mut out) 8 0x0000000000841F0F))
+    (Err "x64 nop length must be 1..9")))
+
+(defn string-op [(out (mut (ArrayList u8))) (op i32) (bits i32)]
+  (-> (Result i64 (slice u8)))
+  (if (not (width? SIZES-ALL bits))
+      (Err "unsupported x64 operand width")
+      (do
+        (byte! (mut out) 0xF3)
+        (head! (mut out) (sized op SIZES-ALL bits) (width-flags bits) 0 0 0)
+        (Ok -1))))
+
+;;; rep movs: copy rcx elements of `bits` width from [rsi] to [rdi].
+(defn rep-movs [(out (mut (ArrayList u8))) (bits i32)]
+  (-> (Result i64 (slice u8)))
+  (string-op (mut out) 0xA4 bits))
+
+;;; rep stos: store rcx copies of the accumulator's low `bits` at [rdi].
+(defn rep-stos [(out (mut (ArrayList u8))) (bits i32)]
+  (-> (Result i64 (slice u8)))
+  (string-op (mut out) 0xAA bits))
+
+;; ---------------------------------------------------------------------------
+;; Atomics
+;; ---------------------------------------------------------------------------
+
+;;; cmpxchg dst, src: compare rax with dst; equal stores src, else loads rax.
+(defn cmpxchg-rr [(out (mut (ArrayList u8))) (bits i32) (dst i32) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (int-direct (mut out) 0x01B0 SIZES-ALL bits false src dst 0))
+
+;;; cmpxchg [m], src (not atomic without LOCK)
+(defn cmpxchg-mr [(out (mut (ArrayList u8))) (bits i32) (m Mem) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (int-memory (mut out) 0x01B0 SIZES-ALL bits false src m 0))
+
+;;; lock cmpxchg [m], src
+(defn lock-cmpxchg-mr [(out (mut (ArrayList u8))) (bits i32) (m Mem) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (int-memory (mut out) 0x01B0 SIZES-ALL bits false src m F-LOCK))
+
+;;; xadd dst, src: src receives the old dst, dst the sum.
+(defn xadd-rr [(out (mut (ArrayList u8))) (bits i32) (dst i32) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (int-direct (mut out) 0x01C0 SIZES-ALL bits false src dst 0))
+
+;;; xadd [m], src (not atomic without LOCK)
+(defn xadd-mr [(out (mut (ArrayList u8))) (bits i32) (m Mem) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (int-memory (mut out) 0x01C0 SIZES-ALL bits false src m 0))
+
+;;; lock xadd [m], src
+(defn lock-xadd-mr [(out (mut (ArrayList u8))) (bits i32) (m Mem) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (int-memory (mut out) 0x01C0 SIZES-ALL bits false src m F-LOCK))
+
+;;; lock op [m], src. CMP does not write and cannot be locked.
+(defn lock-alu-mr [(out (mut (ArrayList u8)))
+                   (op i32)
+                   (bits i32)
+                   (m Mem)
+                   (src i32)] (-> (Result i64 (slice u8)))
+  (if (= op CMP)
+      (Err "x64 LOCK does not apply to cmp")
+      (alu-mr-flags (mut out) op bits m src F-LOCK)))
+
+;;; lock op [m], imm
+(defn lock-alu-mi [(out (mut (ArrayList u8)))
+                   (op i32)
+                   (bits i32)
+                   (m Mem)
+                   (imm i64)] (-> (Result i64 (slice u8)))
+  (if (= op CMP)
+      (Err "x64 LOCK does not apply to cmp")
+      (alu-mi-flags (mut out) op bits m imm F-LOCK)))
+
+;;; lock kind [m] for INC, DEC, NEG and NOT.
+(defn lock-unary-m [(out (mut (ArrayList u8))) (kind i32) (bits i32) (m Mem)]
+  (-> (Result i64 (slice u8)))
+  (if (not (or (= kind INC) (= kind DEC) (= kind NEG) (= kind NOT)))
+      (Err "x64 LOCK applies only to inc, dec, neg and not")
+      (unary-m-flags (mut out) kind bits m F-LOCK)))
+
+;; ---------------------------------------------------------------------------
+;; SSE. Baseline is SSE2; `sse-feature` reports what else an operation needs.
+;; ---------------------------------------------------------------------------
+
+;; Operand forms.
+(const FORM-RM 0)
+
+(const FORM-RM-IMM 1)
+
+(const FORM-SHIFT-IMM 2)
+
+(const FORM-GPR 3)
+
+(const FORM-MOVE 4)
+
+(const FEATURE-SSE2 0)
+
+(const FEATURE-SSSE3 1)
+
+(const FEATURE-SSE41 2)
+
+;;; The feature level an `sse-*` operation constant needs: FEATURE-SSE2
+;;; (baseline), FEATURE-SSSE3 or FEATURE-SSE41.
+(defn sse-feature [(op i32)] (-> i32)
+  (& (>> op 24) 3))
+
+(defn sse-form [(op i32)] (-> i32)
+  (& (>> op 16) 15))
+
+;;; Moves for `sse-mov-*`. Register-to-register MOVSS/MOVSD merge into the
+;;; destination's upper lanes; from memory they zero them.
+(const MOVSS 0x042110)
+
+(const MOVSD 0x043110)
+
+(const MOVAPS 0x040128)
+
+(const MOVAPD 0x041128)
+
+(const MOVUPS 0x040110)
+
+(const MOVUPD 0x041110)
+
+(const MOVDQA 0x04116F)
+
+(const MOVDQU 0x04216F)
+
+;;; Scalar arithmetic for `sse-rr` / `sse-rm`: xmm, xmm/m32 or xmm/m64.
+(const ADDSS 0x2158)
+
+(const ADDSD 0x3158)
+
+(const SUBSS 0x215C)
+
+(const SUBSD 0x315C)
+
+(const MULSS 0x2159)
+
+(const MULSD 0x3159)
+
+(const DIVSS 0x215E)
+
+(const DIVSD 0x315E)
+
+(const SQRTSS 0x2151)
+
+(const SQRTSD 0x3151)
+
+(const MINSS 0x215D)
+
+(const MINSD 0x315D)
+
+(const MAXSS 0x215F)
+
+(const MAXSD 0x315F)
+
+;;; Scalar compares setting ZF/PF/CF. UCOMIS* raise invalid only for
+;;; signaling NaNs.
+(const UCOMISS 0x012E)
+
+(const UCOMISD 0x112E)
+
+(const COMISS 0x012F)
+
+(const COMISD 0x112F)
+
+;;; Floating conversions between XMM operands.
+(const CVTSS2SD 0x215A)
+
+(const CVTSD2SS 0x315A)
+
+(const CVTPS2PD 0x015A)
+
+(const CVTPD2PS 0x115A)
+
+(const CVTDQ2PS 0x015B)
+
+(const CVTPS2DQ 0x115B)
+
+(const CVTTPS2DQ 0x215B)
+
+(const CVTDQ2PD 0x21E6)
+
+(const CVTTPD2DQ 0x11E6)
+
+;;; Packed floating arithmetic (memory operands must be 16-byte aligned).
+(const ADDPS 0x0158)
+
+(const ADDPD 0x1158)
+
+(const SUBPS 0x015C)
+
+(const SUBPD 0x115C)
+
+(const MULPS 0x0159)
+
+(const MULPD 0x1159)
+
+(const DIVPS 0x015E)
+
+(const DIVPD 0x115E)
+
+(const MINPS 0x015D)
+
+(const MINPD 0x115D)
+
+(const MAXPS 0x015F)
+
+(const MAXPD 0x115F)
+
+(const SQRTPS 0x0151)
+
+(const SQRTPD 0x1151)
+
+;;; Bitwise.
+(const ANDPS 0x0154)
+
+(const ANDPD 0x1154)
+
+(const ANDNPS 0x0155)
+
+(const ANDNPD 0x1155)
+
+(const ORPS 0x0156)
+
+(const ORPD 0x1156)
+
+(const XORPS 0x0157)
+
+(const XORPD 0x1157)
+
+(const PAND 0x11DB)
+
+(const PANDN 0x11DF)
+
+(const POR 0x11EB)
+
+(const PXOR 0x11EF)
+
+;;; Packed integer arithmetic and comparison.
+(const PADDB 0x11FC)
+
+(const PADDW 0x11FD)
+
+(const PADDD 0x11FE)
+
+(const PADDQ 0x11D4)
+
+(const PSUBB 0x11F8)
+
+(const PSUBW 0x11F9)
+
+(const PSUBD 0x11FA)
+
+(const PSUBQ 0x11FB)
+
+(const PMULLW 0x11D5)
+
+(const PMULUDQ 0x11F4)
+
+(const PCMPEQB 0x1174)
+
+(const PCMPEQW 0x1175)
+
+(const PCMPEQD 0x1176)
+
+(const PCMPGTB 0x1164)
+
+(const PCMPGTW 0x1165)
+
+(const PCMPGTD 0x1166)
+
+(const PMINUB 0x11DA)
+
+(const PMAXUB 0x11DE)
+
+(const PMINSW 0x11EA)
+
+(const PMAXSW 0x11EE)
+
+;;; Packed shifts by the low quadword of an XMM/m128 count.
+(const PSLLW 0x11F1)
+
+(const PSLLD 0x11F2)
+
+(const PSLLQ 0x11F3)
+
+(const PSRLW 0x11D1)
+
+(const PSRLD 0x11D2)
+
+(const PSRLQ 0x11D3)
+
+(const PSRAW 0x11E1)
+
+(const PSRAD 0x11E2)
+
+;;; Packed shifts by an immediate, for `sse-shift-ri`. PSLLDQ/PSRLDQ shift the
+;;; whole register by bytes.
+(const PSLLW-I 0x621171)
+
+(const PSLLD-I 0x621172)
+
+(const PSLLQ-I 0x621173)
+
+(const PSRLW-I 0x221171)
+
+(const PSRLD-I 0x221172)
+
+(const PSRLQ-I 0x221173)
+
+(const PSRAW-I 0x421171)
+
+(const PSRAD-I 0x421172)
+
+(const PSLLDQ-I 0x721173)
+
+(const PSRLDQ-I 0x321173)
+
+;;; Interleaves and saturating packs.
+(const PUNPCKLBW 0x1160)
+
+(const PUNPCKLWD 0x1161)
+
+(const PUNPCKLDQ 0x1162)
+
+(const PUNPCKLQDQ 0x116C)
+
+(const PUNPCKHBW 0x1168)
+
+(const PUNPCKHWD 0x1169)
+
+(const PUNPCKHDQ 0x116A)
+
+(const PUNPCKHQDQ 0x116D)
+
+(const PACKSSWB 0x1163)
+
+(const PACKUSWB 0x1167)
+
+(const PACKSSDW 0x116B)
+
+(const UNPCKLPS 0x0114)
+
+(const UNPCKLPD 0x1114)
+
+(const UNPCKHPS 0x0115)
+
+(const UNPCKHPD 0x1115)
+
+;;; movq xmm, xmm/m64: copy the low quadword and zero the upper one.
+(const MOVQ 0x217E)
+
+;;; Operations with an immediate, for `sse-rri` / `sse-rmi`. CMP* take the
+;;; comparison predicate 0..7 (eq lt le unord neq nlt nle ord).
+(const PSHUFD 0x011170)
+
+(const PSHUFLW 0x013170)
+
+(const PSHUFHW 0x012170)
+
+(const SHUFPS 0x0101C6)
+
+(const SHUFPD 0x0111C6)
+
+(const CMPPS 0x0101C2)
+
+(const CMPPD 0x0111C2)
+
+(const CMPSS 0x0121C2)
+
+(const CMPSD 0x0131C2)
+
+;;; Sign masks into a 32-bit general register, for `sse-rx`.
+(const PMOVMSKB 0x0311D7)
+
+(const MOVMSKPS 0x030150)
+
+(const MOVMSKPD 0x031150)
+
+;;; SSSE3 (optional): byte shuffle by a control vector.
+(const PSHUFB 0x1001200)
+
+;;; SSE4.1 (optional).
+(const PMULLD 0x2001240)
+
+(const PCMPEQQ 0x2001229)
+
+(const PTEST 0x2001217)
+
+(const ROUNDPS 0x2011308)
+
+(const ROUNDPD 0x2011309)
+
+(const ROUNDSS 0x201130A)
+
+(const ROUNDSD 0x201130B)
+
+(defn hardware [(xmm i32)] (-> i32)
+  (- xmm 32))
+
+;;; op dst, src: any operation constant without an immediate.
+(defn sse-rr [(out (mut (ArrayList u8))) (op i32) (dst i32) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (cond (!= (sse-form op) FORM-RM)
+          (Err "x64 SSE operation does not have the xmm, xmm/m form")
+        (not (and (xmm? dst) (xmm? src))) (Err "invalid x64 XMM register")
+        :else
+          (do
+            (direct! (mut out) (& op 0xFFFF) 0 (hardware dst) (hardware src))
+            (Ok -1))))
+
+;;; op dst, [m]
+(defn sse-rm [(out (mut (ArrayList u8))) (op i32) (dst i32) (m Mem)]
+  (-> (Result i64 (slice u8)))
+  (cond (!= (sse-form op) FORM-RM)
+          (Err "x64 SSE operation does not have the xmm, xmm/m form")
+        (not (xmm? dst)) (Err "invalid x64 XMM register")
+        :else (raw-memory (mut out) (& op 0xFFFF) 0 (hardware dst) m)))
+
+(defn imm8? [(imm i32)] (-> bool)
+  (and (>= imm 0) (<= imm 255)))
+
+;;; op dst, src, imm8
+(defn sse-rri [(out (mut (ArrayList u8)))
+               (op i32)
+               (dst i32)
+               (src i32)
+               (imm i32)]
+  (-> (Result i64 (slice u8)))
+  (cond (!= (sse-form op) FORM-RM-IMM)
+          (Err "x64 SSE operation does not have the xmm, xmm/m, imm8 form")
+        (not (and (xmm? dst) (xmm? src))) (Err "invalid x64 XMM register")
+        (not (imm8? imm)) (Err "x64 SSE immediate must be 0..255")
+        :else
+          (do
+            (direct! (mut out) (& op 0xFFFF) 0 (hardware dst) (hardware src))
+            (byte! (mut out) imm)
+            (Ok -1))))
+
+;;; op dst, [m], imm8
+(defn sse-rmi [(out (mut (ArrayList u8))) (op i32) (dst i32) (m Mem) (imm i32)]
+  (-> (Result i64 (slice u8)))
+  (cond (!= (sse-form op) FORM-RM-IMM)
+          (Err "x64 SSE operation does not have the xmm, xmm/m, imm8 form")
+        (not (xmm? dst)) (Err "invalid x64 XMM register")
+        (not (imm8? imm)) (Err "x64 SSE immediate must be 0..255")
+        :else
+          (then-imm (mut out)
+                    (raw-memory (mut out) (& op 0xFFFF) 0 (hardware dst) m)
+                    1
+                    (cast i64 imm))))
+
+;;; op reg, count: the `*-I` packed shifts by an immediate.
+(defn sse-shift-ri [(out (mut (ArrayList u8))) (op i32) (reg i32) (count i32)]
+  (-> (Result i64 (slice u8)))
+  (cond (!= (sse-form op) FORM-SHIFT-IMM)
+          (Err "x64 SSE operation is not an immediate shift")
+        (not (xmm? reg)) (Err "invalid x64 XMM register")
+        (not (imm8? count)) (Err "x64 SSE immediate must be 0..255")
+        :else
+          (do
+            (direct! (mut out) (& op 0xFFFF) 0 (& (>> op 20) 7) (hardware reg))
+            (byte! (mut out) count)
+            (Ok -1))))
+
+;;; op gpr32, xmm: PMOVMSKB, MOVMSKPS, MOVMSKPD.
+(defn sse-rx [(out (mut (ArrayList u8))) (op i32) (dst i32) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (cond (!= (sse-form op) FORM-GPR)
+          (Err "x64 SSE operation does not have the r32, xmm form")
+        (not (gpr? dst)) (Err "invalid x64 general register")
+        (not (xmm? src)) (Err "invalid x64 XMM register")
+        :else
+          (do
+            (direct! (mut out) (& op 0xFFFF) 0 dst (hardware src))
+            (Ok -1))))
+
+;;; The store opcode of a move: 6F pairs with 7F, the others with opcode + 1.
+(defn store-op [(op i32)] (-> i32)
+  (let [load (& op 0xFFFF)]
+    (if (= (& load 255) 0x6F) (+ load 0x10) (+ load 1))))
+
+;;; move dst, src (the load-form opcode, as llvm-mc emits)
+(defn sse-mov-rr [(out (mut (ArrayList u8))) (op i32) (dst i32) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (cond (!= (sse-form op) FORM-MOVE) (Err "x64 SSE operation is not a move")
+        (not (and (xmm? dst) (xmm? src))) (Err "invalid x64 XMM register")
+        :else
+          (do
+            (direct! (mut out) (& op 0xFFFF) 0 (hardware dst) (hardware src))
+            (Ok -1))))
+
+;;; move dst, [m]
+(defn sse-mov-rm [(out (mut (ArrayList u8))) (op i32) (dst i32) (m Mem)]
+  (-> (Result i64 (slice u8)))
+  (cond (!= (sse-form op) FORM-MOVE) (Err "x64 SSE operation is not a move")
+        (not (xmm? dst)) (Err "invalid x64 XMM register")
+        :else (raw-memory (mut out) (& op 0xFFFF) 0 (hardware dst) m)))
+
+;;; move [m], src
+(defn sse-mov-mr [(out (mut (ArrayList u8))) (op i32) (m Mem) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (cond (!= (sse-form op) FORM-MOVE) (Err "x64 SSE operation is not a move")
+        (not (xmm? src)) (Err "invalid x64 XMM register")
+        :else (raw-memory (mut out) (store-op op) 0 (hardware src) m)))
+
+(defn long? [(bits i32)] (-> bool)
+  (or (= bits 32) (= bits 64)))
+
+;;; movd/movq xmm, gpr: the upper lanes are zeroed.
+(defn movd-xr [(out (mut (ArrayList u8))) (bits i32) (dst i32) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (cond (not (long? bits)) (Err "unsupported x64 operand width")
+        (not (xmm? dst)) (Err "invalid x64 XMM register")
+        :else
+          (raw-direct (mut out) 0x116E (width-flags bits) (hardware dst) src)))
+
+;;; movd/movq gpr, xmm
+(defn movd-rx [(out (mut (ArrayList u8))) (bits i32) (dst i32) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (cond (not (long? bits)) (Err "unsupported x64 operand width")
+        (not (xmm? src)) (Err "invalid x64 XMM register")
+        :else
+          (raw-direct (mut out) 0x117E (width-flags bits) (hardware src) dst)))
+
+;;; movd xmm, dword [m] / movq xmm, qword [m]: the upper lanes are zeroed.
+(defn movd-xm [(out (mut (ArrayList u8))) (bits i32) (dst i32) (m Mem)]
+  (-> (Result i64 (slice u8)))
+  (cond (not (long? bits)) (Err "unsupported x64 operand width")
+        (not (xmm? dst)) (Err "invalid x64 XMM register")
+        :else
+          (raw-memory (mut out)
+                      (if (= bits 64) 0x217E 0x116E)
+                      0
+                      (hardware dst)
+                      m)))
+
+;;; movd dword [m], xmm / movq qword [m], xmm
+(defn movd-mx [(out (mut (ArrayList u8))) (bits i32) (m Mem) (src i32)]
+  (-> (Result i64 (slice u8)))
+  (cond (not (long? bits)) (Err "unsupported x64 operand width")
+        (not (xmm? src)) (Err "invalid x64 XMM register")
+        :else
+          (raw-memory (mut out)
+                      (if (= bits 64) 0x11D6 0x117E)
+                      0
+                      (hardware src)
+                      m)))
+
+(defn scalar-prefix [(fp-bits i32)] (-> i32)
+  (if (= fp-bits 64) 0x3000 0x2000))
+
+;;; cvtsi2ss (fp-bits 32) / cvtsi2sd (fp-bits 64) xmm, gpr of `int-bits` 32/64.
+(defn cvtsi2fp-rr [(out (mut (ArrayList u8)))
+                   (fp-bits i32)
+                   (int-bits i32)
+                   (dst i32)
+                   (src i32)] (-> (Result i64 (slice u8)))
+  (cond (not (and (long? fp-bits) (long? int-bits)))
+          (Err "unsupported x64 conversion width")
+        (not (xmm? dst)) (Err "invalid x64 XMM register")
+        :else
+          (raw-direct (mut out)
+                      (| (scalar-prefix fp-bits) 0x012A)
+                      (width-flags int-bits)
+                      (hardware dst)
+                      src)))
+
+;;; cvtsi2ss / cvtsi2sd xmm, dword or qword [m]
+(defn cvtsi2fp-rm [(out (mut (ArrayList u8)))
+                   (fp-bits i32)
+                   (int-bits i32)
+                   (dst i32)
+                   (m Mem)] (-> (Result i64 (slice u8)))
+  (cond (not (and (long? fp-bits) (long? int-bits)))
+          (Err "unsupported x64 conversion width")
+        (not (xmm? dst)) (Err "invalid x64 XMM register")
+        :else
+          (raw-memory (mut out)
+                      (| (scalar-prefix fp-bits) 0x012A)
+                      (width-flags int-bits)
+                      (hardware dst)
+                      m)))
+
+;;; cvttss2si (fp-bits 32) / cvttsd2si (fp-bits 64) gpr of `int-bits`, xmm:
+;;; truncating conversion.
+(defn cvttfp2si-rr [(out (mut (ArrayList u8)))
+                    (fp-bits i32)
+                    (int-bits i32)
+                    (dst i32)
+                    (src i32)] (-> (Result i64 (slice u8)))
+  (cond (not (and (long? fp-bits) (long? int-bits)))
+          (Err "unsupported x64 conversion width")
+        (not (gpr? dst)) (Err "invalid x64 general register")
+        (not (xmm? src)) (Err "invalid x64 XMM register")
+        :else
+          (do
+            (direct! (mut out)
+                     (| (scalar-prefix fp-bits) 0x012C)
+                     (width-flags int-bits)
+                     dst
+                     (hardware src))
+            (Ok -1))))
+
+;;; cvttss2si / cvttsd2si gpr, dword or qword [m]
+(defn cvttfp2si-rm [(out (mut (ArrayList u8)))
+                    (fp-bits i32)
+                    (int-bits i32)
+                    (dst i32)
+                    (m Mem)] (-> (Result i64 (slice u8)))
+  (cond (not (and (long? fp-bits) (long? int-bits)))
+          (Err "unsupported x64 conversion width")
+        (not (gpr? dst)) (Err "invalid x64 general register")
+        :else
+          (raw-memory (mut out)
+                      (| (scalar-prefix fp-bits) 0x012C)
+                      (width-flags int-bits)
+                      dst
+                      m)))
+
+(defn lane? [(bits i32) (lane i32)] (-> bool)
+  (and (width? SIZES-ALL bits) (>= lane 0) (< lane (/ 128 bits))))
+
+;;; pextrb/pextrw/pextrd/pextrq gpr, xmm, lane: zero-extended into the
+;;; register. Only the 16-bit form is SSE2; 8, 32 and 64 need SSE4.1.
+(defn pextr-rx [(out (mut (ArrayList u8)))
+                (bits i32)
+                (dst i32)
+                (src i32)
+                (lane i32)] (-> (Result i64 (slice u8)))
+  (cond (not (lane? bits lane)) (Err "invalid x64 vector lane")
+        (not (gpr? dst)) (Err "invalid x64 general register")
+        (not (xmm? src)) (Err "invalid x64 XMM register")
+        (= bits 16)
+          (do
+            (direct! (mut out) 0x11C5 0 dst (hardware src))
+            (byte! (mut out) lane)
+            (Ok -1))
+        :else
+          (do
+            (direct! (mut out)
+                     (if (= bits 8) 0x1314 0x1316)
+                     (width-flags bits)
+                     (hardware src)
+                     dst)
+            (byte! (mut out) lane)
+            (Ok -1))))
+
+;;; pextrb/pextrw/pextrd/pextrq [m], xmm, lane. Every width needs SSE4.1.
+(defn pextr-mx [(out (mut (ArrayList u8)))
+                (bits i32)
+                (m Mem)
+                (src i32)
+                (lane i32)] (-> (Result i64 (slice u8)))
+  (cond (not (lane? bits lane)) (Err "invalid x64 vector lane")
+        (not (xmm? src)) (Err "invalid x64 XMM register")
+        :else
+          (then-imm (mut out)
+                    (raw-memory (mut out)
+                                (case bits 8 0x1314 16 0x1315 0x1316)
+                                (if (= bits 64) F-W 0)
+                                (hardware src)
+                                m)
+                    1
+                    (cast i64 lane))))
+
+(defn insert-op [(bits i32)] (-> i32)
+  (case bits 8 0x1320 16 0x11C4 0x1322))
+
+;;; pinsrb/pinsrw/pinsrd/pinsrq xmm, gpr, lane. Only the 16-bit form is SSE2;
+;;; 8, 32 and 64 need SSE4.1.
+(defn pinsr-xr [(out (mut (ArrayList u8)))
+                (bits i32)
+                (dst i32)
+                (src i32)
+                (lane i32)] (-> (Result i64 (slice u8)))
+  (cond (not (lane? bits lane)) (Err "invalid x64 vector lane")
+        (not (xmm? dst)) (Err "invalid x64 XMM register")
+        :else
+          (then-imm (mut out)
+                    (raw-direct (mut out)
+                                (insert-op bits)
+                                (if (= bits 64) F-W 0)
+                                (hardware dst)
+                                src)
+                    1
+                    (cast i64 lane))))
+
+;;; pinsrb/pinsrw/pinsrd/pinsrq xmm, [m], lane
+(defn pinsr-xm [(out (mut (ArrayList u8)))
+                (bits i32)
+                (dst i32)
+                (m Mem)
+                (lane i32)] (-> (Result i64 (slice u8)))
+  (cond (not (lane? bits lane)) (Err "invalid x64 vector lane")
+        (not (xmm? dst)) (Err "invalid x64 XMM register")
+        :else
+          (then-imm (mut out)
+                    (raw-memory (mut out)
+                                (insert-op bits)
+                                (if (= bits 64) F-W 0)
+                                (hardware dst)
+                                m)
+                    1
+                    (cast i64 lane))))

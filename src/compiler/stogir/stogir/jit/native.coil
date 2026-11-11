@@ -1,0 +1,385 @@
+;;; Executable mapping of text and of whole images on the host: macOS or Linux,
+;;; AArch64 or x86-64. No compiler or external codegen dependency.
+;;;
+;;; Per-target differences, chosen at compile time by the `stogir.target` macros:
+;;;   - anonymous private mapping flags (Darwin 0x1002, Linux 0x22);
+;;;   - instruction-cache publication: `sys_icache_invalidate` on Darwin
+;;;     AArch64, `__clear_cache` on Linux AArch64, nothing on x86-64, whose
+;;;     caches are coherent;
+;;;   - the veneer that carries a call to an undefined symbol any distance.
+;;; An image loads only on the machine it was built for.
+(module stogir.jit.native)
+(import "stogir.target" :as target)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "stogir.image" :as code)
+(import "stogir.text-data" :as text-data)
+(import "stogir.jit.layout" :as layout)
+(import "stogir.relocate" :as relocate)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(extern stogir.mmap
+        :as
+        "mmap"
+        :cc
+        (cc/C)
+        [(ptr u8) i64 i32 i32 i32 i64]
+        (-> (ptr u8)))
+
+(extern stogir.mprotect :as "mprotect" :cc (cc/C) [(ptr u8) i64 i32] (-> i32))
+
+(extern stogir.munmap :as "munmap" :cc (cc/C) [(ptr u8) i64] (-> i32))
+
+(extern stogir.pagesize :as "getpagesize" :cc (cc/C) [] (-> i32))
+
+(target/arch-pick (target/os-pick (extern stogir.invalidate
+                                          :as
+                                          "sys_icache_invalidate"
+                                          :cc
+                                          (cc/C)
+                                          [(ptr u8) i64]
+                                          (-> void))
+                                  (extern stogir.clear-cache
+                                          :as
+                                          "__clear_cache"
+                                          :cc
+                                          (cc/C)
+                                          [(ptr u8) (ptr u8)]
+                                          (-> void)))
+                  (do))
+
+;;; MAP_PRIVATE | MAP_ANONYMOUS for the host system.
+(defn anonymous-private [] (-> i32)
+  (target/os-pick 0x1002 0x22))
+
+;;; The machine this program runs on, as an image machine identity.
+(defn host-machine [] (-> i32)
+  (target/arch-pick code/AARCH64 code/X86-64))
+
+;;; Make freshly written instructions visible to instruction fetch.
+(defn publish-text! [(base (ptr u8)) (length i64)] (-> void)
+  (target/arch-pick (target/os-pick (stogir.invalidate base length)
+                                    (stogir.clear-cache base
+                                                        (primitive/index base
+                                                                         length)))
+                    (do)))
+
+(defstruct Image
+  [(base (ptr u8))
+   (size i64)
+   (text-size i64)
+   (allocation (ptr u8))
+   (allocation-size i64)])
+
+;;; Text must already have its internal fixups applied. Never mapped writable
+;;; and executable simultaneously. Hardened-runtime entitlement support is separate.
+(defn map-text [(text (slice u8))] (-> (Result Image (slice u8)))
+  (let [length (len text)
+        page (cast i64 (stogir.pagesize))]
+    (if (or (<= length 0) (<= page 0) (> length (- 0x7FFFFFFFFFFFFFFF page)))
+        (Err "invalid executable text size")
+        (let [size (* (/ (+ length (- page 1)) page) page)
+              base
+                (stogir.mmap (primitive/cast (ptr u8) 0)
+                             size
+                             3
+                             (anonymous-private)
+                             -1
+                             0)]
+          (if (= (primitive/cast i64 base) -1)
+              (Err "executable mapping allocation failed")
+              (do
+                (let [(mut i) 0]
+                  (while (< i length)
+                    (set! (index base i) (get text i))
+                    (set! i (+ i 1))))
+                (if (!= (stogir.mprotect base size 5) 0)
+                    (do
+                      (stogir.munmap base size)
+                      (Err "executable mapping protection failed"))
+                    (do
+                      (publish-text! base length)
+                      (Ok (Image
+                            :base base
+                            :allocation base
+                            :allocation-size size
+                            :size size
+                            :text-size length))))))))))
+
+(defn release! [(image (mut Image))] (-> bool)
+  (if (= (.size image) 0)
+      true
+      (if (!= (stogir.munmap (.allocation image) (.allocation-size image)) 0)
+          false
+          (do
+            (set! (.base image) (primitive/cast (ptr u8) 0))
+            (set! (.allocation image) (primitive/cast (ptr u8) 0))
+            (set! (.allocation-size image) 0)
+            (set! (.size image) 0)
+            (set! (.text-size image) 0)
+            true))))
+
+(defstruct Loaded
+  [(memory Image) (addresses (ArrayList u64)) (data-offset i64)])
+
+;;; The relocation kind whose undefined targets are reached through a veneer:
+;;; AArch64 BRANCH26, x86-64 PLT32. Every other reference to an undefined
+;;; symbol must reach the resolved address itself: ABS64 always can; an x86-64
+;;; PC32 can only within +-2GB and fails relocation otherwise, because a PC32
+;;; field may be a data operand, which a jump stub cannot stand in for. Code
+;;; generators therefore mark calls and jumps to external functions PLT32.
+(defn veneer-kind [(machine i32)] (-> i32)
+  (if (= machine code/X86-64) code/X64-PLT32 code/A64-BRANCH26))
+
+;;; Load defined-symbol code images. Undefined symbol resolution is separate.
+;;; Relocation patches use a private copy; the source image remains reusable.
+(defn veneer-count [(source code/Image)] (-> i64)
+  (let [(mut count) (: 0 i64)
+        kind (veneer-kind (.machine source))]
+    (for record (.relocations source)
+      (when (and (= (.kind record) kind)
+                 (>= (.symbol record) 0)
+                 (< (cast i64 (.symbol record)) (len (.symbols source)))
+                 (= (.section (get (.symbols source)
+                                   (cast i64 (.symbol record))))
+                    0))
+        (set! count (+ count 1))))
+    count))
+
+(defn map-image-resolved [(source code/Image)
+                          (resolved (slice u64))
+                          (present (slice bool))
+                          (allocator (dyn Allocator))]
+  (-> (Result Loaded (slice u8)))
+  (if (!= (.machine source) (host-machine))
+      (Err (if (code/known-machine? (.machine source))
+               "image machine does not match the JIT host"
+               "unknown image machine"))
+      (map-image-validated source resolved present allocator)))
+
+;;; Internal: source is built for the host machine.
+(defn map-image-validated [(source code/Image)
+                           (resolved (slice u64))
+                           (present (slice bool))
+                           (allocator (dyn Allocator))]
+  (-> (Result Loaded (slice u8)))
+  (match (text-data/validate (.text-data source) (len (.text source)))
+    (Err [message] (Err message))
+    (Ok [_]
+        (match (layout/plan-for (.machine source)
+                                (len (.text source))
+                                (len (.data source))
+                                (veneer-count source)
+                                (cast i64 (stogir.pagesize))
+                                (.text-alignment source)
+                                (.data-alignment source))
+          (Err [message] (Err message))
+          (Ok [plan] (map-image-planned source resolved present plan allocator))))))
+
+;;; Internal: plan is produced by layout/plan for this validated source.
+(defn map-image-planned [(source code/Image)
+                         (resolved (slice u64))
+                         (present (slice bool))
+                         (plan layout/Plan)
+                         (allocator (dyn Allocator))]
+  (-> (Result Loaded (slice u8)))
+  (let [original-text-size (len (.text source))
+        data-size (len (.data source))
+        text-size (.text-size plan)
+        text-pages (.text-pages plan)
+        data-offset (.data-offset plan)
+        data-pages (.data-pages plan)
+        allocation
+          (stogir.mmap (primitive/cast (ptr u8) 0)
+                       (.reservation plan)
+                       0
+                       (anonymous-private)
+                       -1
+                       0)]
+    (if (= (primitive/cast i64 allocation) -1)
+        (Err "image mapping allocation failed")
+        (let [low
+                (& (primitive/cast u64 allocation)
+                   (cast u64 (- (.alignment plan) 1)))
+              delta
+                (& (- (cast u64 (.alignment plan)) low)
+                   (cast u64 (- (.alignment plan) 1)))
+              base (primitive/index allocation (cast i64 delta))
+              (mut copy) (code/empty (.machine source) allocator)
+              x64? (= (.machine source) code/X86-64)
+              stub-kind (veneer-kind (.machine source))
+              (mut addresses) (ArrayList::new [u64] allocator)
+              (mut error) ""]
+          (set! (.text-alignment copy) (.text-alignment source))
+          (set! (.data-alignment copy) (.data-alignment source))
+          ; Only real text/data pages become accessible. Alignment prefix, gap
+          ; and suffix remain PROT_NONE; executable pages are never writable.
+          (when (and (> text-pages 0)
+                     (!= (stogir.mprotect base text-pages 3) 0))
+            (set! error "image text write protection failed"))
+          (when (and (> data-pages 0)
+                     (!= (stogir.mprotect (index base data-offset) data-pages 3)
+                         0))
+            (set! error "image data protection failed"))
+          (for byte (.text source) (push! (mut (.text copy)) byte))
+          (for range (.text-data source)
+            (push! (mut (.text-data copy)) range))
+          (for byte (.data source) (push! (mut (.data copy)) byte))
+          (for symbol (.symbols source)
+            (push! (mut (.symbols copy)) symbol))
+          (for relocation (.relocations source)
+            (push! (mut (.relocations copy)) relocation))
+          (let [(mut symbol-index) 0]
+            (for symbol (.symbols source)
+              (let [section (.section symbol)
+                    offset (.offset symbol)
+                    size (if (= section 1) original-text-size data-size)]
+                (if (= section 0)
+                    (if (and (< symbol-index (len resolved))
+                             (< symbol-index (len present))
+                             (get present symbol-index))
+                        (push! (mut addresses)
+                               (get resolved symbol-index))
+                        (do
+                          (set! error "unresolved image symbol")
+                          (push! (mut addresses) 0)))
+                    (if (or (< section 1)
+                            (> section 2)
+                            (< offset 0)
+                            (> offset size))
+                        (do
+                          (set! error "invalid defined symbol")
+                          (push! (mut addresses) 0))
+                        (push! (mut addresses)
+                               (+ (primitive/cast u64 base)
+                                  (cast u64
+                                        (+ (if (= section 1) 0 data-offset)
+                                           offset)))))))
+              (set! symbol-index (+ symbol-index 1))))
+          (when (= error "")
+            (let [(mut r) 0]
+              (while (< r (len (.relocations copy)))
+                (let [(mut relocation) (get (.relocations copy) r)
+                      symbol-index (cast i64 (.symbol relocation))]
+                  (when (and (= (.kind relocation) stub-kind)
+                             (>= symbol-index 0)
+                             (< symbol-index (len (.symbols source)))
+                             (= (.section (get (.symbols source)
+                                               symbol-index))
+                                0))
+                    ; AArch64 folds the addend into the veneer's target and
+                    ; branches to the veneer itself. On x86-64 the addend
+                    ; positions the field within its instruction (S + A - P),
+                    ; so it stays on the relocation and the veneer jumps to
+                    ; the symbol.
+                    (let [target
+                            (+ (cast i128 (get addresses symbol-index))
+                               (if x64? 0 (cast i128 (.addend relocation))))
+                          offset (len (.text copy))
+                          new-symbol (cast i32 (len (.symbols copy)))]
+                      (if (or (< target 0)
+                              (> target (: 18446744073709551615 i128)))
+                          (set! error "external branch target overflow")
+                          (do
+                            (if x64?
+                                (do
+                                  ; jmp [rip+0]; the 8-byte target follows.
+                                  (for byte [(: 0xFF u8) 0x25 0 0 0 0]
+                                    (push! (mut (.text copy)) byte))
+                                  (bytes/append32! (mut (.text copy))
+                                                   (cast u32
+                                                         (& (cast u64 target)
+                                                            0xFFFFFFFF)))
+                                  (bytes/append32! (mut (.text copy))
+                                                   (cast u32
+                                                         (>> (cast u64 target)
+                                                             32)))
+                                  (push! (mut (.text copy)) 0xCC)
+                                  (push! (mut (.text copy)) 0xCC))
+                                (do
+                                  ; LDR x16, #8; BR x16; the target follows.
+                                  (bytes/append32! (mut (.text copy))
+                                                   0x58000050)
+                                  (bytes/append32! (mut (.text copy))
+                                                   0xD61F0200)
+                                  (bytes/append32! (mut (.text copy))
+                                                   (cast u32
+                                                         (& (cast u64 target)
+                                                            0xFFFFFFFF)))
+                                  (bytes/append32! (mut (.text copy))
+                                                   (cast u32
+                                                         (>> (cast u64 target)
+                                                             32)))))
+                            (push! (mut (.symbols copy))
+                                   (code/Symbol
+                                     :name 0
+                                     :length 0
+                                     :section 1
+                                     :offset offset
+                                     :next -1
+                                     :global? false))
+                            (push! (mut addresses)
+                                   (+ (primitive/cast u64 base)
+                                      (cast u64 offset)))
+                            (set! (.symbol relocation) new-symbol)
+                            (when (not x64?) (set! (.addend relocation) 0))
+                            (set! (mut (.relocations copy)) r relocation))))))
+                (set! r (+ r 1)))))
+          (when (= error "")
+            (match (relocate/apply! (mut copy)
+                                    addresses
+                                    (primitive/cast u64 base)
+                                    (+ (primitive/cast u64 base)
+                                       (cast u64 data-offset))
+                                    allocator)
+              (Err [msg] (set! error msg))
+              (Ok [_] 0)))
+          (when (= error "")
+            (let [(mut i) 0]
+              (while (< i (len (.text copy)))
+                (set! (index base i) (get (.text copy) i))
+                (set! i (+ i 1)))
+              (set! i 0)
+              (while (< i data-size)
+                (set! (index base (+ data-offset i)) (get (.data copy) i))
+                (set! i (+ i 1))))
+            (when (and (> text-pages 0)
+                       (!= (stogir.mprotect base text-pages 5) 0))
+              (set! error "image text protection failed"))
+            (when (and (= error "") (> text-size 0))
+              (publish-text! base text-size)))
+
+          (code/release! (mut copy))
+          (if (!= error "")
+              (do
+                (stogir.munmap allocation (.reservation plan))
+                (free! (mut addresses))
+                (Err error))
+              (Ok (Loaded
+                    :memory
+                      (Image
+                        :base base
+                        :size (.size plan)
+                        :text-size text-size
+                        :allocation allocation
+                        :allocation-size (.reservation plan))
+                    :addresses addresses
+                    :data-offset data-offset)))))))
+
+(defn release-image! [(image (mut Loaded))] (-> bool)
+  (if (release! (mut (.memory image)))
+      (do (free! (mut (.addresses image))) true)
+      false))
+
+(defn map-image [(source code/Image) (allocator (dyn Allocator))]
+  (-> (Result Loaded (slice u8)))
+  (let [(mut resolved) (ArrayList::new [u64] allocator)
+        (mut present) (ArrayList::new [bool] allocator)
+        result
+          (map-image-resolved source (slice resolved) (slice present) allocator)]
+    (free! (mut resolved))
+    (free! (mut present))
+    result))
