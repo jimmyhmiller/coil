@@ -309,6 +309,14 @@ def main() -> None:
         run(graph, consumer / "missing.coil", "invalid", cwd=Path("/"), env=graph_env)
         print("PASS: SDK source graph follows module identity and keeps read diagnostics", flush=True)
 
+        # A program built with --emit-state is a session's first submission: it
+        # gives the saved state to a session of its own, which continues from it.
+        adopted, state = work / "adopted-state", work / "adopted.state"
+        run(COMPILER, "build", FIXTURES / "adopted_state.coil", "-o", adopted,
+            "--emit-state", state, *flags)
+        run(adopted, state)
+        print("PASS: a program's session adopts the state the program was built with", flush=True)
+
         # The demo in src/examples/jit_expose: a metaprogram hands an application to a
         # session, which type checks new code against it. Its output is its contract.
         demo = work / "jit-expose-demo"
