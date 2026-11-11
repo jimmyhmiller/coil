@@ -1328,8 +1328,10 @@ section_cross() {
     "$COIL" emit-obj "$T/xshadow.coil" --target x86_64-unknown-linux-gnu -o "$T/xshadow.o"
   # An import a macro was handed and gave back (a macro choosing between two
   # imports by the target) is an import of the module under any target, also
-  # through another macro, with :as and :use. No template builds an import
-  # here: one that loads a module restarts the expansion, which hid this.
+  # through another macro, with :as and :use, and a module only the target's
+  # choice loads derives a trait (the restart it causes keeps the derivers).
+  # No template builds an import here: one that loads a module restarts the
+  # expansion, which hid the first of these.
   mkdir -p "$T/ximport/src"
   printf '[package]\nname = "ximport"\nentry = "src/main.coil"\nsource-roots = ["src"]\n' > "$T/ximport/Coil.toml"
   cat > "$T/ximport/src/sel.coil" <<'EOF'
@@ -1341,8 +1343,8 @@ section_cross() {
     (_ other)))
 (defn pick-again [(native Code) (other Code)] (-> Code) `(native-pick ~native ~other))
 EOF
-  printf '(module ximport.a)\n(defstruct M [(x i64)])\n(defn make [] (-> M) (M :x 40))\n' > "$T/ximport/src/a.coil"
-  printf '(module ximport.b)\n(defstruct M [(x i64)])\n(defn make [] (-> M) (M :x 0))\n(defn one [] (-> i64) 100)\n' > "$T/ximport/src/b.coil"
+  printf '(module ximport.a)\n(defstruct M [(x i64)])\n(derive Debug M)\n(defn make [] (-> M) (M :x 40))\n' > "$T/ximport/src/a.coil"
+  printf '(module ximport.b)\n(defstruct M [(x i64)])\n(derive Debug M)\n(defn make [] (-> M) (M :x 0))\n(defn one [] (-> i64) 100)\n' > "$T/ximport/src/b.coil"
   printf '(module ximport.c)\n(defn one [] (-> i64) 1)\n' > "$T/ximport/src/c.coil"
   cat > "$T/ximport/src/main.coil" <<'EOF'
 (module ximport.main)
