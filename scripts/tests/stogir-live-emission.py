@@ -77,7 +77,7 @@ def emit(directory, name, settings):
     assert sorted(cached_names) == sorted(reused_names), 'cache/job identity mismatch'
     assert any(': certifiedtrue ' in line for line in native_lines), 'no certified leaf exercised'
     targets = {stogir_target.call_target(line)
-               for line in run('llvm-objdump', '-dr', obj).splitlines()} - {None}
+               for line in run(stogir_target.OBJDUMP, '-dr', obj).splitlines()} - {None}
     listing = run('nm', obj)
     assert listing.strip(), 'nm returned no symbol table'
     defined = {fields[-1] for fields in map(str.split, listing.splitlines())

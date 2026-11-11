@@ -19,6 +19,8 @@ import subprocess
 import sys
 import tempfile
 
+import stogir_target
+
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ['COIL']).resolve()
 ENV = dict(os.environ, COIL_LIBRARY_STATE='0', COIL_TPDE_SERIAL='1')
@@ -49,7 +51,7 @@ with tempfile.TemporaryDirectory(prefix='stogir-shims-') as temporary:
             f'{name}: outputs differ\n--- llvm\n{expected.stdout}--- stogir\n{actual.stdout}'
     obj = work / 'program.o'
     compile_to('emit-obj', ROOT / 'tests/backend/stogir-shim-calls.coil', obj, ['--backend', 'stogir'])
-    listing = subprocess.run(['llvm-objdump', '-d', '--no-show-raw-insn', str(obj)],
+    listing = subprocess.run([stogir_target.OBJDUMP, '-d', '--no-show-raw-insn', str(obj)],
                              capture_output=True, text=True, check=True).stdout
     thunks = re.findall(r'^[0-9a-f]+ <_coil\.stogir\.shim\.\d+>:$', listing, re.M)
     assert len(thunks) == 12, f'expected 12 thunks, found {len(thunks)}'

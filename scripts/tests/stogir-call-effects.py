@@ -18,6 +18,8 @@ import subprocess
 import sys
 import tempfile
 
+import stogir_target
+
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ['COIL']).resolve()
 SOURCE = ROOT / 'tests/backend/stogir-call-effects.coil'
@@ -84,7 +86,7 @@ with tempfile.TemporaryDirectory(prefix='stogir-call-effects-') as temporary:
     for name, record in RECORDS.items():
         line = f'stogir effects {MODULE}.{name}: present true {record}'
         assert line in result.stderr, f'{name}: expected record "{record}"'
-    listing = subprocess.run(['llvm-objdump', '-d', '--no-show-raw-insn', str(obj)],
+    listing = subprocess.run([stogir_target.OBJDUMP, '-d', '--no-show-raw-insn', str(obj)],
                              capture_output=True, text=True, check=True).stdout
     found = functions(listing)
     for name in ('reads-in-loop', 'written-bound'):

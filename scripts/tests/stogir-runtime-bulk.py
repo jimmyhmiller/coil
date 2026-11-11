@@ -76,7 +76,7 @@ int main(void) {
 ''')
     obj = d / 'matrix.o'
     run(COMPILER, 'emit-obj', fixture, '--backend', 'stogir', '-O3', '--no-debug', '-o', obj)
-    assembly = run('llvm-objdump', '-dr', obj)
+    assembly = run(stogir_target.OBJDUMP, '-dr', obj)
     bodies = re.split(r'^[0-9a-f]+ <([^>]+)>:\s*$', assembly, flags=re.M)
     functions = dict(zip(bodies[1::2], bodies[2::2]))
     for size in SIZES:

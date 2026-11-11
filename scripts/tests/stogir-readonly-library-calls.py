@@ -16,6 +16,8 @@ import subprocess
 import sys
 import tempfile
 
+import stogir_target
+
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ['COIL']).resolve()
 SOURCE = ROOT / 'tests/backend/stogir-readonly-library-calls.coil'
@@ -66,7 +68,7 @@ with tempfile.TemporaryDirectory(prefix='stogir-readonly-') as temporary:
         'a body that only calls memcmp is not classified non-writing'
     assert f'stogir nonwriting-body {MODULE}.spend-row: false' in result.stderr, \
         'a caller of a storing Coil function named memcmp is classified non-writing'
-    listing = subprocess.run(['llvm-objdump', '-d', '--no-show-raw-insn', str(obj)],
+    listing = subprocess.run([stogir_target.OBJDUMP, '-d', '--no-show-raw-insn', str(obj)],
                              capture_output=True, text=True, check=True).stdout
     found = functions(listing)
     # The comparison must still be a call: one expanded inline reads its

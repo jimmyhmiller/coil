@@ -6,7 +6,11 @@ objects in general (which symbols are defined, which symbols are called)
 spell it through this module; checks that read AArch64 instruction shapes
 (frame loads, load/store pairs, ADRP pairs) do not and stay AArch64-only.
 """
+import os
 import platform
+import shutil
+import subprocess
+from pathlib import Path
 
 SYSTEM = platform.system()
 MACHINE = platform.machine()
@@ -23,6 +27,28 @@ CALL_RELOCATION = 'R_X86_64_PLT32' if X64 else 'ARM64_RELOC_BRANCH26'
 CALL_MNEMONICS = ('call', 'callq') if X64 else ('bl',)
 # The name of the other CIR backend (tpde) for this machine.
 TPDE_BACKEND = 'x64' if X64 else 'arm64'
+
+
+
+def llvm_tool(name):
+    """The path of the LLVM tool NAME: from the LLVM the compiler was built
+    against (`$LLVM_CONFIG --bindir`, as scripts/tests/simd.py finds it), else
+    from PATH. Homebrew's LLVM is not on PATH, so the first is what CI has."""
+    config = os.environ.get('LLVM_CONFIG', 'llvm-config')
+    try:
+        bindir = subprocess.run([config, '--bindir'], capture_output=True, text=True,
+                                timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        bindir = ''
+    if bindir and (Path(bindir) / name).is_file():
+        return str(Path(bindir) / name)
+    found = shutil.which(name)
+    if found is None:
+        raise SystemExit(f'stogir checks: {name} not found through {config} --bindir or PATH')
+    return found
+
+
+OBJDUMP = llvm_tool('llvm-objdump')
 
 
 def symbol(name):
