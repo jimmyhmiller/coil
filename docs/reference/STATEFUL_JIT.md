@@ -644,6 +644,69 @@ The handed-over definitions belong to the program: a session never reclaims or
 redefines them. It may `retire-` one and define the name again, and code the program
 compiled ahead of time keeps calling the original.
 
+## A session that continues a built program
+
+A program can also be built so that a session inside it starts where the build
+stopped, with nothing compiled again:
+
+```sh
+coil build app.coil -o app --emit-state app.state
+```
+
+This compiles the program as the first submission of a session and writes the
+compiler state that session then serves to `app.state`. `app` is an ordinary
+executable. It differs from an ordinary build in two ways. Every definition is
+kept and can be found by name in the running process, so nothing is removed as
+unused and no function is private to its object. And the program is compiled
+through a session, so its metaprograms see one: `primitive/code-session-active?`
+is true, and what they stage with `primitive/code-session-stage!` is saved in
+the state.
+
+At run time the program reads the file and gives the bytes to a session before
+that session compiles anything:
+
+```text
+(jit-session-adopt! (mut session) bytes)
+```
+
+It returns 0, -1 when the session has already compiled or adopted something, or
+-2 when the bytes are not a state this toolchain wrote (`jit-diagnostic` says
+why). From then on the session is as if it had compiled the program itself:
+
+- A submission is checked against the program's definitions: its types, traits,
+  generics, macros and functions.
+- What a submission names is linked to the definition already running in the
+  process. Code the session compiles calls the program's functions and reads and
+  writes its static storage, and it makes the instances of the program's generics
+  that the program did not.
+- The queries answer for the program: `jit-env-dependencies`,
+  `jit-env-dependents`, `jit-env-definition-source`, and `coil.meta`'s from a
+  metaprogram.
+- The session's metaprograms continue. Each is built again from the definition
+  the state keeps, the first time a submission calls it, and it reads the state
+  it had staged during the build. `primitive/code-session-submission` counts on
+  from the build, which was submission 1.
+
+Nothing about the program changes when a session adopts its state. A submission
+that defines one of the program's names again is refused, as in any session;
+replacing what runs is a policy a metaprogram implements with the mechanisms
+above (see [Opting into redefinition](#opting-into-redefinition)).
+
+What to know:
+
+- **The state belongs to one build.** `jit-session-adopt!` checks that this
+  toolchain wrote the bytes. It cannot check that they are the state of the
+  program that is running, so keep the file with the executable it was written
+  beside.
+- **It is the size of the checked program.** A program that prints one line saves
+  about 9 MB, nearly all of it the library's definitions.
+- **The session needs the toolchain**, as every `coil.jit` session does: the
+  library it compiles against is found from the `coil` on `PATH`.
+- `--emit-state` applies to a native executable. It is refused with `--lib`,
+  `--shared`, a wasm target, and a program read by a reader provider.
+
+`tests/jit/adopted_state.coil` is a complete program that adopts its own state.
+
 ## Discovering a program's sources
 
 `(jit-read-source-graph allocator ENTRY)` finds an entry's source modules using

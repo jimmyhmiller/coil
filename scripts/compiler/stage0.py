@@ -76,7 +76,7 @@ def run(compiler: Path, arguments: list[str]) -> int:
 
 # Flags whose value is a path. The compiler runs in the temporary directory, so a
 # relative path the caller wrote is made absolute against the caller's cwd.
-PATH_FLAGS = {"-o", "--emit-header", "--reader-artifact", "--root",
+PATH_FLAGS = {"-o", "--emit-header", "--emit-state", "--reader-artifact", "--root",
               "--test-roots-file", "--fuzz-dir"}
 
 
