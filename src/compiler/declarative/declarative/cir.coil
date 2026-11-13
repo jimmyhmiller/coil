@@ -17,6 +17,8 @@
 (import "coil.var" :use [var-static])
 (import "coil.str" :as str)
 (import "coil.scratch" :as scratch)
+(import "coil.atomic" :as atomic)
+(import "coil.thread" :use [Thread ThreadConfig])
 (import "tpde.cir" :as cir)
 (import "tpde.asm" :as asm)
 (import "declarative.rt.graph" :as graph)
@@ -32,26 +34,95 @@
 ;;; The type every 64-bit integer has.
 (const W ir/T-PTR)
 
+;;; What the environment asks for, read once for a module.
+;;;   DECLARATIVE_CHECK        each graph is checked against the node set
+;;;   DECLARATIVE_SHOW=NAME    that function's graph, before and after, and its
+;;;                            code are printed; `?` names each with its number
+;;;   DECLARATIVE_ONLY=N       only the first N functions are optimized, to find
+;;;                            which function a wrong optimization is in
+;;;   DECLARATIVE_SMALL=N, DECLARATIVE_GROWTH=N    other limits on what is put
+;;;                            in place of its calls
+;;;   DECLARATIVE_THREADS=N    how many threads compile a module's functions
+(defstruct Settings
+  [(check bool) (show (ptr i8)) (only i64) (small i64) (growth i64) (threads i64)])
+
+(extern getenv :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
+
+;;; A number from the environment; `otherwise` if unset.
+(defn tuned [(name (ptr i8)) (otherwise i64)] (-> i64)
+  (let [text (getenv name)]
+    (if (= (primitive/cast u64 text) 0)
+        otherwise
+        (match (str/parse-int (str/from-cstr text))
+          (Some [n] n)
+          (None [] (panic "declarative backend: {} is not a number" (str/from-cstr name)))))))
+
+;;; The most instructions a function may have and still be put in place
+;;; call without having asked, how deep that may go, and how many instructions
+;;; may be put into one function in all.
+(const SMALL 40)
+(const DEEPEST 5)
+(const GROWTH 1200)
+
+(defn settings-read [] (-> Settings)
+  (Settings :check (!= (primitive/cast u64 (getenv c"DECLARATIVE_CHECK")) 0)
+            :show (getenv c"DECLARATIVE_SHOW")
+            :only (tuned c"DECLARATIVE_ONLY" -1)
+            :small (tuned c"DECLARATIVE_SMALL" SMALL)
+            :growth (tuned c"DECLARATIVE_GROWTH" GROWTH)
+            :threads (tuned c"DECLARATIVE_THREADS" 0)))
+
+;;; A function's code, and each word of it that depends on a symbol's address:
+;;; where, which symbol, and the assembler's kind of relocation.
+(defstruct Compiled
+  [(code (ArrayList u8))
+   (reloc-at (ArrayList i64))
+   (reloc-symbol (ArrayList i64))
+   (reloc-kind (ArrayList i64))
+   (done bool)])
+
+(defn compiled-none [] (-> Compiled)
+  (let [a (malloc-allocator)]
+    (Compiled :code (ArrayList::new [u8] a) :reloc-at (ArrayList::new [i64] a)
+              :reloc-symbol (ArrayList::new [i64] a) :reloc-kind (ArrayList::new [i64] a) :done false)))
+
+(defn compiled-free! [(c (ptr Compiled))] (-> void)
+  (free! (mut (.code c)))
+  (free! (mut (.reloc-at c)))
+  (free! (mut (.reloc-symbol c)))
+  (free! (mut (.reloc-kind c)))
+  (set! (.done c) false))
+
 ;;; Every function of a module, by its symbol, so that a call of a small one
-;;; can be the function's own instructions where the call stands.
+;;; can be the function's own instructions where the call stands, and so that
+;;; the functions can be compiled several at a time: each into its own
+;;; `Compiled`, put into the assembler afterwards in the module's order.
 (defstruct Module
   [(functions (ArrayList (ptr cir/Func)))   ; by symbol; null for a symbol that is no function here
    (never (ArrayList bool))                 ; asked never to be put in place of its calls
    (always (ArrayList bool))                ; asked always to be
-   (active (ArrayList u32))                 ; the functions being put in place, outermost first
-   (grown i64)                              ; instructions put in place into the function being compiled
-   (inlined i64)])                          ; calls replaced, over the whole module
+   (compiled (ArrayList Compiled))          ; by symbol
+   (order (ArrayList u32))                  ; the functions' symbols, in the order they were added
+   (settings Settings)
+   ; For the threads compiling: the assembler, the level, the next of `order` to take.
+   (ta (ptr asm/Asm))
+   (level i32)
+   (next i64)])
 
 (defn module-create [] (-> Module)
   (let [a (malloc-allocator)]
     (Module :functions (ArrayList::new [(ptr cir/Func)] a) :never (ArrayList::new [bool] a)
-            :always (ArrayList::new [bool] a) :active (ArrayList::new [u32] a) :grown 0 :inlined 0)))
+            :always (ArrayList::new [bool] a) :compiled (ArrayList::new [Compiled] a)
+            :order (ArrayList::new [u32] a) :settings (settings-read)
+            :ta (primitive/cast (ptr asm/Asm) 0) :level 0 :next 0)))
 
 (defn module-free! [(m (ptr Module))] (-> void)
+  (for i (range 0 (len (.compiled m))) (compiled-free! (elem (mut (.compiled m)) i)))
   (free! (mut (.functions m)))
   (free! (mut (.never m)))
   (free! (mut (.always m)))
-  (free! (mut (.active m))))
+  (free! (mut (.compiled m)))
+  (free! (mut (.order m))))
 
 ;;; `f` is the function `symbol` names. It must stay as it is until the last
 ;;; function of the module is compiled.
@@ -59,10 +130,39 @@
   (while (<= (len (.functions m)) (cast i64 symbol))
     (push! (mut (.functions m)) (primitive/cast (ptr cir/Func) 0))
     (push! (mut (.never m)) false)
-    (push! (mut (.always m)) false))
+    (push! (mut (.always m)) false)
+    (push! (mut (.compiled m)) (compiled-none)))
   (set! (mut (.functions m)) (cast i64 symbol) f)
   (set! (mut (.never m)) (cast i64 symbol) never)
-  (set! (mut (.always m)) (cast i64 symbol) always))
+  (set! (mut (.always m)) (cast i64 symbol) always)
+  (push! (mut (.order m)) symbol))
+
+;;; What one function being compiled has had put in place of its calls: how
+;;; many instructions, and the functions being put in place, outermost first.
+(defstruct Budget [(grown i64) (active (ArrayList u32))])
+
+;;; The library routines compiled code calls. While a function is compiled a
+;;; routine is the symbol RUNTIME + its place here; it becomes the assembler's
+;;; symbol when the code is put there, so that the assembler's symbols are made
+;;; in the module's order however many threads compile.
+(const RUNTIME 0x40000000)
+(const ROUTINES 7)
+
+(defn routine-name [(k i64)] (-> (slice u8))
+  (cond (= k 0) "memcpy"
+        (= k 1) "memset"
+        (= k 2) "memmove"
+        (= k 3) "__divti3"
+        (= k 4) "__udivti3"
+        (= k 5) "__modti3"
+        (= k 6) "__umodti3"
+        :else (panic "declarative backend: no library routine numbered {}" k)))
+
+(defn routine [(name (slice u8))] (-> u64)
+  (block :found
+    (for k (range 0 ROUTINES)
+      (when (= (routine-name k) name) (return-from :found (cast u64 (+ RUNTIME k)))))
+    (panic "declarative backend: {} is not a library routine it knows" name)))
 
 (defstruct Adapter
   [(f (ptr cir/Func))
@@ -102,6 +202,8 @@
    ; deep, and each place it returns from: the control there and the values,
    ; `exit-width` of them for each.
    (module (ptr Module))
+   (settings Settings)
+   (budget (ptr Budget))
    (depth i64)
    (exits (ArrayList i32))
    (exit-values (ArrayList i32))
@@ -207,9 +309,13 @@
 ;;; A symbol's address: where it is, if this module defines it, or read from
 ;;; the table of addresses if it does not.
 (defn symbol-address [(s (mut Adapter)) (symbol u32)] (-> i32)
-  (if (= (.sect (asm/sym-at (.ta s) symbol)) -1)
-      (ir/extern! (mut (.g s)) (cast u64 symbol))
-      (ir/symbol! (mut (.g s)) (cast u64 symbol))))
+  (let [m (.module s)
+        at (cast i64 symbol)]
+    (if (and (= (.sect (asm/sym-at (.ta s) symbol)) -1)
+             (or (= (primitive/cast u64 m) 0) (>= at (len (.functions m)))
+                 (= (primitive/cast u64 (get (.functions m) at)) 0)))
+        (ir/extern! (mut (.g s)) (cast u64 symbol))
+        (ir/symbol! (mut (.g s)) (cast u64 symbol)))))
 
 ;;; A parameter of the graph, the next one, passed as `how` says.
 (defn next-param! [(s (mut Adapter)) (type i32) (how u64)] (-> i32)
@@ -691,7 +797,7 @@
 ;;; two pairs of words, each pair in registers together, and a pair back.
 (defn wide-divide! [(s (mut Adapter)) (v u32) (name (slice u8)) (a u32) (b u32)] (-> void)
   (let [shape (graph/shape! (mut (.g s)) false)
-        routine (ir/symbol! (mut (.g s)) (cast u64 (asm/runtime-sym! (.ta s) name)))
+        routine (ir/symbol! (mut (.g s)) (routine name))
         call (ir/call-node! (mut (.g s)) shape (.c s) routine 4)]
     (for i (range 0 4)
       (graph/shape-arg! (mut (.g s)) shape (if (= (% i 2) 0) (| (: 1 u64) graph/PASS-ALIGN16) (: 0 u64))))
@@ -891,7 +997,7 @@
   (let [f (.f s)
         x (cir/val f v)
         call (ir/call-node! (mut (.g s)) 0 (.c s)
-                            (ir/symbol! (mut (.g s)) (cast u64 (asm/runtime-sym! (.ta s) name))) 3)]
+                            (ir/symbol! (mut (.g s)) (routine name)) 3)]
     (for i (range 0 3) (graph/set-input! (mut (.g s)) call (+ i 2) (value (mut s) (cir/operand f x (cast u32 i)))))
     (set! (.c s) call)))
 
@@ -1129,63 +1235,63 @@
           (= name "gotpcrel") asm/R-GOTPCREL32
           :else (fail f "the assembler has no relocation of this kind"))))
 
-;;; How many functions have been compiled.
-(def compiled (var-static i64 0))
+;;; Whether to print a function's graph, before and after the plan, and its code.
+(defn showing? [(s (mut Adapter))] (-> bool)
+  (let [want (.show (.settings s))]
+    (and (!= (primitive/cast u64 want) 0) (= (str/from-cstr want) (.name (.f s))))))
 
-;;; Whether each graph is checked against the node set before it is compiled:
-;;; when DECLARATIVE_CHECK is set in the environment.
-(extern getenv :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
-
-;;; Whether to print a function's graph, before and after the plan, and its
-;;; code: when DECLARATIVE_SHOW is the function's name.
-(defn showing? [(f (ptr cir/Func))] (-> bool)
-  (let [want (getenv c"DECLARATIVE_SHOW")]
-    (and (!= (primitive/cast u64 want) 0) (= (str/from-cstr want) (.name f)))))
-
-(defn checking? [] (-> bool)
-  (!= (primitive/cast u64 (getenv c"DECLARATIVE_CHECK")) 0))
-
-;;; Compiles the graph and puts its code in the assembler's text, as `symbol`.
-(defn emit! [(s (mut Adapter)) (symbol u32) (level i32)] (-> void)
+;;; Compiles the graph into `out`. `index` is which of its module's functions
+;;; this is, or -1 for a function on its own.
+(defn emit! [(s (mut Adapter)) (level i32) (index i64) (out (ptr Compiled))] (-> void)
   (let [f (.f s)
-        ta (.ta s)
-        problem (if (checking?) (ir/verify (.g s)) "")
+        settings (.settings s)
+        problem (if (.check settings) (ir/verify (.g s)) "")
         (mut cx) (st/create (.g s) (.a s))]
     (when (!= problem "") (fail f problem))
     (st/begin! (mut cx))
-    (set! (.copy-routine cx) (+ (cast i64 (asm/runtime-sym! ta "memcpy")) 1))
-    (set! (.fill-routine cx) (+ (cast i64 (asm/runtime-sym! ta "memset")) 1))
-    (when (showing? f)
+    (set! (.copy-routine cx) (+ (cast i64 (routine "memcpy")) 1))
+    (set! (.fill-routine cx) (+ (cast i64 (routine "memset")) 1))
+    (when (showing? (mut s))
       (println "; {} as built" (.name f))
       (ir/dump (.g cx)))
-    ; To find which function a wrong optimization is in: with
-    ; DECLARATIVE_ONLY=N, only the first N functions compiled are optimized,
-    ; and with DECLARATIVE_SHOW=? each is named with its number.
-    (let [index (get compiled)
-          only (tuned c"DECLARATIVE_ONLY" -1)]
-      (set compiled (+ index 1))
-      (when (and (!= (primitive/cast u64 (getenv c"DECLARATIVE_SHOW")) 0)
-                 (= (str/from-cstr (getenv c"DECLARATIVE_SHOW")) "?"))
-        (println "; {} {}" index (.name f)))
-      (if (or (< (cast i64 level) 2) (and (>= only 0) (>= index only)))
-          (plans/quick (mut cx))
-          (plans/default (mut cx))))
-    (when (showing? f)
+    (when (and (!= (primitive/cast u64 (.show settings)) 0) (= (str/from-cstr (.show settings)) "?"))
+      (println "; {} {}" index (.name f)))
+    (if (or (< (cast i64 level) 2) (and (>= (.only settings) 0) (>= index (.only settings))))
+        (plans/quick (mut cx))
+        (plans/default (mut cx)))
+    (when (showing? (mut s))
       (println "; {} as compiled" (.name f))
       (ir/dump (.g cx))
       (print "code:")
       (for b (.code cx) (print " {:02x}" b))
       (println ""))
-    (let [code (.code cx)
-          at (asm/sect-append! ta asm/SEC-TEXT (.data code) (len code) isa/ALIGN)]
-      (for i (range 0 (len (.reloc-at cx)))
-        (asm/reloc! ta asm/SEC-TEXT (+ at (get (.reloc-at cx) i)) (cast u32 (get (.reloc-symbol cx) i))
-                    (reloc-kind f (get (.reloc-op cx) i)) 0))
-      (asm/sym-def! ta symbol asm/SEC-TEXT at (len code)))))
+    (clear! (mut (.code out)))
+    (clear! (mut (.reloc-at out)))
+    (clear! (mut (.reloc-symbol out)))
+    (clear! (mut (.reloc-kind out)))
+    (extend! (mut (.code out)) (.data (.code cx)) (len (.code cx)))
+    (for i (range 0 (len (.reloc-at cx)))
+      (push! (mut (.reloc-at out)) (get (.reloc-at cx) i))
+      (push! (mut (.reloc-symbol out)) (get (.reloc-symbol cx) i))
+      (push! (mut (.reloc-kind out)) (reloc-kind f (get (.reloc-op cx) i))))
+    (set! (.done out) true)))
+
+;;; Puts compiled code in the assembler's text, as `symbol`.
+(defn place-code! [(ta (ptr asm/Asm)) (symbol u32) (c (ptr Compiled))] (-> void)
+  (unless (.done c) (panic "declarative backend: a function is put in place before it is compiled"))
+  (let [code (.code c)
+        at (asm/sect-append! ta asm/SEC-TEXT (.data code) (len code) isa/ALIGN)]
+    (for i (range 0 (len (.reloc-at c)))
+      (let [named (get (.reloc-symbol c) i)
+            to (if (>= named RUNTIME)
+                   (asm/runtime-sym! ta (routine-name (- named RUNTIME)))
+                   (cast u32 named))]
+        (asm/reloc! ta asm/SEC-TEXT (+ at (get (.reloc-at c) i)) to (get (.reloc-kind c) i) 0)))
+    (asm/sym-def! ta symbol asm/SEC-TEXT at (len code))))
 
 ;;; An adapter for `f`, building into graph `g`.
 (defn adapter [(f (ptr cir/Func)) (ta (ptr asm/Asm)) (g graph/Graph) (a (dyn Allocator)) (module (ptr Module))
-               (depth i64)] (-> Adapter)
+               (settings Settings) (budget (ptr Budget)) (depth i64)] (-> Adapter)
   (let [(mut s) (Adapter
                   :f f :ta ta :g g :a a
                   :node (ArrayList::new [i32] a) :high (ArrayList::new [i32] a) :truth (ArrayList::new [i32] a)
@@ -1197,7 +1303,7 @@
                   :before (ArrayList::new [i32] a) :before-high (ArrayList::new [i32] a)
                   :order (ArrayList::new [u32] a)
                   :c 0 :params 0 :ints 0 :floats 0
-                  :module module :depth depth
+                  :module module :settings settings :budget budget :depth depth
                   :exits (ArrayList::new [i32] a) :exit-values (ArrayList::new [i32] a) :exit-width 0)]
     (for _ (range 0 (i64-of (cir/value-count f)))
       (push! (mut (.node s)) 0)
@@ -1244,26 +1350,13 @@
         (when (or (= op cir/OP-RET) (= op cir/OP-TAILCALL)) (set! found true))))
     found))
 
-;;; The most instructions a function may have and still be put in place of a
-;;; call without having asked, how deep that may go, and how many instructions
-;;; may be put into one function in all.
-(const SMALL 40)
-(const DEEPEST 5)
-(const GROWTH 1200)
-
-;;; A number from the environment, for trying other limits; `otherwise` if unset.
-(defn tuned [(name (ptr i8)) (otherwise i64)] (-> i64)
-  (let [text (getenv name)]
-    (if (= (primitive/cast u64 text) 0)
-        otherwise
-        (match (str/parse-int (str/from-cstr text)) (Some [n] n) (None [] otherwise)))))
-
 ;;; Call `v` as the called function's own instructions, if the module has the
 ;;; function and it is small or asks for this; false if the call must be made.
 (defn in-place! [(s (mut Adapter)) (v u32)] (-> bool)
   (let [f (.f s)
         x (cir/val f v)
         m (.module s)
+        budget (.budget s)
         symbol (.imm x)]
     (block :done
       (when (or (= (primitive/cast u64 m) 0) (< symbol 0) (>= symbol (len (.functions m))))
@@ -1275,17 +1368,17 @@
           (when (or (.has-dynamic-alloca callee)
                     (!= (len (.args callee)) (i64-of (.nops x)))
                     (>= (.depth s) DEEPEST)
-                    (and (not always) (> size (tuned c"DECLARATIVE_SMALL" SMALL)))
-                    (> (+ (.grown m) size) (tuned c"DECLARATIVE_GROWTH" GROWTH)))
+                    (and (not always) (> size (.small (.settings s))))
+                    (> (+ (.grown budget) size) (.growth (.settings s))))
             (return-from :done false))
-          (for active (.active m) (when (= (i64-of active) symbol) (return-from :done false)))
+          (for active (.active budget) (when (= (i64-of active) symbol) (return-from :done false)))
           ; Each argument must be what the parameter is, and all of them named.
           (for i (range 0 (i64-of (.nops x)))
             (when (or (!= (.ty (cir/val f (cir/operand f x (cast u32 i))))
                           (.ty (cir/val callee (get (.args callee) i))))
                       (!= (& (get (.argflags f) (+ (i64-of (.opb x)) i)) (cast u32 cir/AF-VARIADIC)) (: 0 u32)))
               (return-from :done false)))
-          (let [(mut inner) (adapter callee (.ta s) (.g s) (.a s) m (+ (.depth s) 1))]
+          (let [(mut inner) (adapter callee (.ta s) (.g s) (.a s) m (.settings s) budget (+ (.depth s) 1))]
             (walk! (mut inner))
             (unless (returns? (mut inner)) (return-from :done false))
             (for i (range 0 (i64-of (.nops x)))
@@ -1293,13 +1386,12 @@
                     p (i64-of (get (.args callee) i))]
                 (set! (mut (.node inner)) p (value (mut s) a))
                 (when (wide? (mut s) a) (set! (mut (.high inner)) p (value-high (mut s) a)))))
-            (push! (mut (.active m)) (cast u32 symbol))
-            (set! (.grown m) (+ (.grown m) size))
-            (set! (.inlined m) (+ (.inlined m) 1))
+            (push! (mut (.active budget)) (cast u32 symbol))
+            (set! (.grown budget) (+ (.grown budget) size))
             (set! (.g inner) (.g s))
             (body! (mut inner) (.c s))
             (set! (.g s) (.g inner))
-            (pop! (mut (.active m)))
+            (pop! (mut (.active budget)))
             (leave! (mut s) v (mut inner))
             true))))))
 
@@ -1332,25 +1424,78 @@
               (do (define! (mut s) r (get results at))
                   (set! at (+ at 1)))))))))
 
-;;; One function of a module, compiled into the assembler as `symbol`, with
-;;; calls of the module's small functions put in place. `level` is the
-;;; optimization level asked for: below 2, selection and allocation alone.
-(defn compile-in! [(module (ptr Module)) (f (ptr cir/Func)) (ta (ptr asm/Asm)) (symbol u32) (level i32)] (-> void)
+;;; One function compiled into `out`, with calls of its module's small
+;;; functions put in place if it has a module. `level` is the optimization
+;;; level asked for: below 2, selection and allocation alone.
+(defn compile-to! [(module (ptr Module)) (settings Settings) (f (ptr cir/Func)) (ta (ptr asm/Asm)) (symbol u32)
+                   (level i32) (index i64) (out (ptr Compiled))] (-> void)
   (let [work (primitive/alloc-stack scratch/ScratchArena)]
     (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
     (let [a (allocator work)
-          (mut s) (adapter f ta (graph/create a) a module 0)]
-      (when (!= (primitive/cast u64 module) 0)
-        (set! (.grown module) 0)
-        (clear! (mut (.active module)))
-        (push! (mut (.active module)) symbol))
+          (mut budget) (Budget :grown 0 :active (ArrayList::new [u32] a))
+          (mut s) (adapter f ta (graph/create a) a module settings (primitive/cast (ptr Budget) (mut budget)) 0)]
+      (push! (mut (.active budget)) symbol)
       (walk! (mut s))
       (let [start (ir/start! (mut (.g s)))]
         (params! (mut s))
         (body! (mut s) start))
-      (emit! (mut s) symbol level))
+      (emit! (mut s) level index out))
     (close! work)))
 
-;;; One function on its own.
+;;; One function on its own, compiled into the assembler as `symbol`.
 (defn compile! [(f (ptr cir/Func)) (ta (ptr asm/Asm)) (symbol u32) (level i32)] (-> void)
-  (compile-in! (primitive/cast (ptr Module) 0) f ta symbol level))
+  (let [(mut out) (compiled-none)]
+    (compile-to! (primitive/cast (ptr Module) 0) (settings-read) f ta symbol level -1 (mut out))
+    (place-code! ta symbol (mut out))
+    (compiled-free! (mut out))))
+
+;;; What each thread compiling a module does: takes the next function nobody
+;;; has taken, until there is none.
+(defn work [(argument (ptr i8))] (-> (ptr i8))
+  (let [m (primitive/cast (ptr Module) argument)
+        count (len (.order m))]
+    (loop
+      (let [index (atomic/add (field m next) 1)]
+        (when (>= index count) (break))
+        (let [symbol (get (.order m) index)]
+          (compile-to! m (.settings m) (get (.functions m) (cast i64 symbol)) (.ta m) symbol (.level m) index
+                       (elem (mut (.compiled m)) (cast i64 symbol))))))
+    argument))
+
+;;; A thread's stack: a pass may go as deep as a function's graph is.
+(const STACK 268435456)
+
+;;; Compiles every function of the module, on `threads` threads (or as many as
+;;; DECLARATIVE_THREADS says; one while a function is being shown). Nothing is
+;;; put in the assembler: `place!` does that for each, in whatever order the
+;;; module's code is to be in, which is what makes the object the same however
+;;; many threads there are.
+(defn compile-module! [(m (ptr Module)) (ta (ptr asm/Asm)) (level i32) (threads i64)] (-> void)
+  (let [settings (.settings m)
+        asked (if (> (.threads settings) 0) (.threads settings) threads)
+        count (if (!= (primitive/cast u64 (.show settings)) 0) 1 asked)
+        (mut others) (ArrayList::new [Thread] (malloc-allocator))
+        (mut started) 0]
+    (when (or (< count 1) (> count 64)) (panic "declarative backend: {} threads is not between 1 and 64" count))
+    (set! (.ta m) ta)
+    (set! (.level m) level)
+    (set! (.next m) 0)
+    ; A thread's handle must not move once the thread is started into it.
+    (for _ (range 1 count) (push! (mut others) (zeroed Thread)))
+    (for i (range 0 (len others))
+      (when (= (Thread::spawn-configured (elem (mut others) i) (fnptr-of work) (primitive/cast (ptr i8) m)
+                                         (ThreadConfig::new STACK -1))
+               (: 0 i32))
+        (set! started (+ started 1))))
+    ; This thread compiles too, so a thread that could not be started is only fewer.
+    (work (primitive/cast (ptr i8) m))
+    (for i (range 0 started)
+      (unless (= (Thread::join (elem (mut others) i)) (: 0 i32))
+        (panic "declarative backend: a compiling thread could not be waited for")))
+    (free! (mut others))))
+
+;;; Puts the compiled function `symbol` of the module in the assembler's text.
+(defn place! [(m (ptr Module)) (ta (ptr asm/Asm)) (symbol u32)] (-> void)
+  (let [c (elem (mut (.compiled m)) (cast i64 symbol))]
+    (place-code! ta symbol c)
+    (compiled-free! c)))
