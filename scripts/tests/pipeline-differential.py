@@ -18,7 +18,10 @@ Hygiene numbers its syntax contexts and generated `$scopeN@` names in the order
 it allocates them, and a meaning-preserving change (a cache) can allocate in
 another order. Two dumps that are equal once each is renumbered in order of first
 appearance (zero, the authored context, stays zero) name the same contexts, and
-count as equal; they are reported as such, not as differences.
+count as equal; they are reported as such, not as differences. The names the
+compiler mints from a counter (`$gN`, `$borrow.temp.N`, `$overwrite.place.N`,
+`hoisted$N`) are renumbered the same way: the counter counts every node parsed,
+so a change that parses a function fewer times moves all of them.
 """
 from pathlib import Path
 import argparse
@@ -85,12 +88,14 @@ def dump(compiler, command, path):
 
 NODE_CONTEXT = re.compile(rb"(@-?\d+:-?\d+:-?\d+:)(-?\d+)")
 SCOPE_NAME = re.compile(rb"\$scope(\d+)@")
+MINTED_NAME = re.compile(rb"(\$borrow\.temp\.|\$overwrite\.(?:place|value)\.|\$g|hoisted\$)(\d+)")
 
 
 def renumber_hygiene(text):
-    """TEXT with its syntax contexts and `$scopeN@` names renumbered by first
-    appearance: a bijection, so two dumps equal after it name the same contexts."""
-    contexts, scopes = {b"0": b"0"}, {}
+    """TEXT with its syntax contexts, `$scopeN@` names and counter-minted names
+    renumbered by first appearance: a bijection, so two dumps equal after it name
+    the same contexts and definitions."""
+    contexts, scopes, minted = {b"0": b"0"}, {}, {}
 
     def context(m):
         key = m.group(2)
@@ -104,7 +109,15 @@ def renumber_hygiene(text):
             scopes[key] = str(len(scopes)).encode()
         return b"$scope" + scopes[key] + b"@"
 
-    return SCOPE_NAME.sub(scope, NODE_CONTEXT.sub(context, text))
+    def mint(m):
+        # `$overwrite.place.N` and `$overwrite.value.N` are one N.
+        family = b"$overwrite." if m.group(1).startswith(b"$overwrite.") else m.group(1)
+        numbers = minted.setdefault(family, {})
+        if m.group(2) not in numbers:
+            numbers[m.group(2)] = str(len(numbers)).encode()
+        return m.group(1) + numbers[m.group(2)]
+
+    return MINTED_NAME.sub(mint, SCOPE_NAME.sub(scope, NODE_CONTEXT.sub(context, text)))
 
 
 def compare(reference, candidate, path, output_dir=None):
