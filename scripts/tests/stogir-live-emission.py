@@ -24,9 +24,9 @@ def run(*args):
 SOURCE = ROOT / 'tests/cli/stogir-live-emission.coil'
 MODULE_PREFIX = 'tests.cli.stogir-live-emission.'
 PREFIX = stogir_target.symbol(MODULE_PREFIX)
-# The policy that charges every clone to the caller's budget, so the fanout
-# callers keep most of their calls whatever the default policy inlines.
-CHARGED = {'COIL_STOGIR_INLINE': 'budget=512'}
+# A policy that puts nothing in place of a call unasked: calls of small helpers
+# remain, whatever the default policy inlines.
+CHARGED = {'DECLARATIVE_SMALL': '0', 'DECLARATIVE_ONCE': '0'}
 DRIVER = """#include <stdint.h>
 #include <stdlib.h>
 struct NativePair { uint64_t first, second; };
@@ -49,33 +49,11 @@ def emit(directory, name, settings):
     targets and the defined symbols of its object."""
     environment = dict(ENV, **settings)
     obj = directory / f'{name}.o'
-    traced = directory / f'{name}-traced.o'
     command = [str(COMPILER), 'emit-obj', str(SOURCE),
                '--backend', 'stogir', '-O3', '--no-debug', '-o']
     plain = subprocess.run(command + [str(obj)], cwd=ROOT, env=environment,
                            capture_output=True, text=True, timeout=120)
     assert plain.returncode == 0, plain.stdout + plain.stderr
-    result = subprocess.run(command + [str(traced)], cwd=ROOT,
-                            env=dict(environment, COIL_TPDE_STATS='1'),
-                            capture_output=True, text=True, timeout=120)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert obj.read_bytes() == traced.read_bytes(), 'effect tracing changes object bytes'
-    # The effect proof comes from each body, under every inline policy.
-    assert f'stogir nonwriting-body {MODULE_PREFIX}readonly-leaf: true' in result.stderr
-    assert f'stogir nonwriting-body {MODULE_PREFIX}writing-leaf: false' in result.stderr
-    assert f'stogir nonwriting-body {MODULE_PREFIX}readonly-pair-result: true' in result.stderr
-    # The native prepass publishes once, and the ordinary job reuses each body.
-    native_lines = [line for line in result.stderr.splitlines()
-                    if line.startswith('stogir native-leaf ')]
-    assert native_lines, 'private module prepass did not run'
-    cached_names = [line.split(': certified', 1)[0].removeprefix('stogir native-leaf ')
-                    for line in native_lines]
-    assert len(cached_names) == len(set(cached_names)), 'native body compiled twice'
-    reused_names = [line.removeprefix('stogir reuse-native ')
-                    for line in result.stderr.splitlines()
-                    if line.startswith('stogir reuse-native ')]
-    assert sorted(cached_names) == sorted(reused_names), 'cache/job identity mismatch'
-    assert any(': certifiedtrue ' in line for line in native_lines), 'no certified leaf exercised'
     targets = {stogir_target.call_target(line)
                for line in run(stogir_target.OBJDUMP, '-dr', obj).splitlines()} - {None}
     listing = run('nm', obj)
@@ -84,9 +62,10 @@ def emit(directory, name, settings):
                if len(fields) == 3 and fields[1] != 'U'}
     # An :inline (Never) callee is called under every policy.
     assert PREFIX + 'pair-result' in targets, 'no residual aggregate call exercised'
-    # Helpers every policy inlines everywhere are not emitted.
-    for helper in ['leaf', 'wrapper', 'make-callback']:
-        assert PREFIX + helper not in defined, helper
+    # Helpers the default policy inlines everywhere are not emitted.
+    if not settings:
+        for helper in ['leaf', 'wrapper', 'make-callback']:
+            assert PREFIX + helper not in defined, helper
     # Roots that no direct call reaches: native data, an address that arrives
     # through an inlined helper, an export alias, and a recursive function.
     for retained in [PREFIX + 'address-only', PREFIX + 'returned-callback',
@@ -110,8 +89,8 @@ with tempfile.TemporaryDirectory(prefix='stogir-emission-') as temporary:
     directory = Path(temporary)
     # The default policy: whatever it inlines, emission follows the final graphs.
     emit(directory, 'default', {})
-    # Charged clones exhaust the fanout callers' budgets, so calls to callees
-    # proven read-only from their bodies remain and their targets are emitted.
+    # With nothing put in place unasked, calls to the helpers remain and their
+    # targets are emitted.
     targets, defined = emit(directory, 'charged', CHARGED)
     assert PREFIX + 'readonly-leaf' in targets, 'no residual read-only call exercised'
     assert PREFIX + 'readonly-pair-result' in targets, \

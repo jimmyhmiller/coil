@@ -54,7 +54,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "tests" / "corpus"
 DIAG = ROOT / "tests" / "diag"
 DIAG_SETS = ("compile", "link", "no-hang")
-LANES = ("arm64", "llvm", "x64", "tpde", "stogir", "declarative", "interp", "safety", "meta-interp", "opt3")
+LANES = ("arm64", "llvm", "x64", "tpde", "stogir", "declarative", "declarative-debug", "interp", "safety", "meta-interp", "opt3")
 BUILD_TIMEOUT = 120
 RUN_TIMEOUT = 30
 
@@ -110,6 +110,8 @@ def lane_build_flags(lane: str) -> list[str]:
         "tpde": ["--backend", "tpde"],
         "stogir": ["--backend", "stogir", "--no-debug"],
         "declarative": ["--backend", "declarative", "--no-debug"],
+        # With debug information: functions compiled one at a time, frame objects kept in memory.
+        "declarative-debug": ["--backend", "declarative", "-g"],
         "llvm": [],
         "safety": ["--use", "coil.safety"],
         "opt3": ["-O3"],

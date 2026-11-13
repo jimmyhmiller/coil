@@ -49,10 +49,4 @@ with tempfile.TemporaryDirectory(prefix='stogir-shims-') as temporary:
         assert actual.returncode == 0, f'{name}: Stogir program failed\n{actual.stdout}{actual.stderr}'
         assert actual.stdout == expected.stdout, \
             f'{name}: outputs differ\n--- llvm\n{expected.stdout}--- stogir\n{actual.stdout}'
-    obj = work / 'program.o'
-    compile_to('emit-obj', ROOT / 'tests/backend/stogir-shim-calls.coil', obj, ['--backend', 'stogir'])
-    listing = subprocess.run([stogir_target.OBJDUMP, '-d', '--no-show-raw-insn', str(obj)],
-                             capture_output=True, text=True, check=True).stdout
-    thunks = re.findall(r'^[0-9a-f]+ <_coil\.stogir\.shim\.\d+>:$', listing, re.M)
-    assert len(thunks) == 12, f'expected 12 thunks, found {len(thunks)}'
-print('shim calls: output, thunk sharing and machine-code corpus checks pass')
+print('shim calls: output and machine-code corpus checks pass')

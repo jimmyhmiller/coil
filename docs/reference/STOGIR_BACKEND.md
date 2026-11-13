@@ -1,355 +1,72 @@
-# stogir backend integration
+# The Stogir backend
 
-`--backend stogir` selects the independent [coil-stogir library](https://github.com/jimmyhmiller/coil-stogir).
+`--backend stogir` and `--backend declarative` both select the declarative
+backend: a code generator written as a set of small languages in the
+coil-stogir-declarative project and written out as Coil into `src/compiler/declarative/` by that project's
+`tools/expand.sh` (see its `NOTICE`). Edit it there, never here.
+It replaced the earlier Stogir library, which this tree vendored under
+`src/compiler/stogir/` until it was removed; that history is in git and in
+`docs/benchmarks/`.
+
+## What it compiles for
+
 It generates code for the machine the compiler itself was built for: AArch64
-macOS (Mach-O) or x86-64 Linux (System V, ELF); any other target is refused
-with a message naming both. `-O1`, `-O2` and `-O3` are supported, `-O0` and
-`-g` are refused, and an operation the library cannot compile is an error,
-never another backend's code. The compiler builds itself with it on both
-machines and the bootstrap reproduces. The current state, the vendoring
-history, the measurements and the open work are in the package's
-[README](../../src/compiler/stogir/README.md) and, for x86-64, in
-`docs/benchmarks/x86/tuning.md`; the sections below describe the integration
-as it was first built on AArch64.
+macOS (Mach-O) or x86-64 Linux (System V, ELF). Any other target is refused
+with a message naming both. It shares the AST-to-CIR lowering with TPDE
+(`backend/codegen_tpde.coil`); the TPDE selector and allocator are not used.
 
-The compiler shares its AST-to-native-CIR lowering with TPDE, then translates CIR
-into a stogir graph. Stogir performs scheduling, allocation and instruction
-selection. The TPDE selector and allocator are not used on this path. Sharing CIR
-and module transport lets the engines consume the same native lowering while
-remaining distinct code generators. LLVM retains its existing lowering path.
+- `-O0` and `-O1`: selection and register allocation, one function at a time.
+- `-O2` and `-O3` (the same): the whole module at once, with inlining, copy
+  forwarding across functions, and the optimizer.
+- `-g`: debug information. Functions are compiled one at a time, frame objects
+  stay in memory, and a value that lives only in registers has no location.
+  A call in tail position is still a tail call, at every level, so a debugger
+  does not show its caller's frame.
 
-The library is a separately declared package, vendored under
-`src/compiler/stogir` (its `NOTICE` names the vendored commit). Its [README](../../src/compiler/stogir/README.md),
-[LICENSE](../../src/compiler/stogir/LICENSE), [NOTICE](../../src/compiler/stogir/NOTICE)
-and provenance preserve credit to coil-stogir and Dmitry Stogov's IR. No per-file
-license headers are added by the integration.
+## Settings
 
-The adapter explicitly bridges CIR's extended integer containers and stogir's
-scalar/address types, preserves memory control ordering, constructs cyclic Phi
-and control edges before verification, and keeps every reachable terminator as
-observable control, including paths with no return. Register-piece and x8
-indirect results use stogir's ABI metadata; grouped arguments retain their
-all-or-stack classification. Switches use stogir dispatch. Image text, private
-relocatable constants and relocations merge into the compiler module. Embedded
-jump tables retain `LC_DATA_IN_CODE`, with bounded u16 entry lengths and VM offsets.
+Read from the environment when compiling. Those that change the code are part
+of a unit's key (`cli/units.coil`).
 
-Unit identities distinguish `stogir` from LLVM and TPDE. Debug info is not enabled
-by default for this backend, and an explicit `-g` is diagnosed until implemented.
-The public stateful JIT API has not yet acquired a stogir backend choice.
+| variable | effect |
+|---|---|
+| `DECLARATIVE_SMALL`, `DECLARATIVE_GROWTH`, `DECLARATIVE_ONCE` | inlining limits |
+| `DECLARATIVE_OFF=BITS`, `DECLARATIVE_OFF_AT=N` | turn single transformations off (numbers in the backend's `cfg.pass`) |
+| `DECLARATIVE_TRIAL`, `DECLARATIVE_ONLY` | optimize or try something in only the first N functions |
+| `DECLARATIVE_SHOW=NAME` | print a function's graph before and after, and its code |
+| `DECLARATIVE_THREADS=N` | how many threads compile a module's functions (the object is the same for every count) |
+| `COIL_TPDE_SERIAL=1` | one thread for everything |
 
-The same combined fixture now executes successfully under LLVM, TPDE and stogir:
-loops, dense switches, grouped aggregate parameters, two-register and x8 indirect
-results, four-float HFA results, FP conversions/NaNs, stack memory, ArrayList heap
-allocation, function pointers and native atomics. Exported aggregate C ABI tests
-also pass all three engines. Mach-O serialization and the existing JIT loader
-selftest pass. The CLI objects section runs these checks on macOS arm64.
+## What the optimizer assumes
 
-An initial full corpus run passes 6 of 9 programs. Remaining failures include
-pinned-register shim calls and deep tail recursion. The narrow-bit/i128 gap
-from that run is repaired in 0dcc4101; scalar FP math CIR remains unsupported.
-The adapter currently demotes tail calls to ordinary calls and returns, so deep
-recursion exhausts the stack. This must be fixed before general backend use.
-Unsupported operations diagnose rather than fall back to another selector.
+Each of these is what LLVM assumes as well, or follows from what Coil
+guarantees; a program that breaks one is undefined.
 
-The target-program reachability pass is shared with TPDE and retains exported
-entries, direct and indirect function references, and native-data references.
-Host image APIs retain all requested functions for later private-name lookup.
+- A switch whose default only traps names every value it can be given: the
+  trap is where control cannot go, as LLVM's `unreachable` is. A value no case
+  names then goes to some case.
+- A counter used only to make addresses is stepped as an address and the loop
+  ends when the address reaches the bound's: it assumes the loop's addresses
+  do not wrap around 64 bits (element sizes are at most 4096 bytes).
+- A symbol named `memcpy`, `memmove`, `memset`, `memcmp`, `bcmp`, `strlen`,
+  `strcmp`, `strncmp` or `memchr` (as C names it on the machine) is the C
+  library's routine. Coil's own functions are named by their modules and never
+  match; an `extern` with one of those names must be the C routine.
+- A function whose frame does not escape (CIR's `frame-escapes`) can end in a
+  tail call; and once a function has a tail call, no callee whose frame
+  escapes is put in its place.
+- Two frame objects never overlap, and a store to a frame object nothing else
+  can reach changes no memory reached another way.
 
-Comparative benchmarking is available in `scripts/benchmarks` using the
-same Coil source, inputs and `-O3 --no-debug`. Measurements separate compile,
-platform link and executable run, rotate backend order and compare full output.
-The [initial comparison](../benchmarks/STOGIR_INITIAL.md) records five measured
-samples and full input hashes. Public stateful JIT selection and DWARF remain
-unfinished.
+## Tests
 
-## Architecture fidelity audit
-
-The reference is pinned upstream `ir.h:ir_jit_compile` and
-`ir_main.c:ir_compile_func`. Its optimized pipeline is:
-
-1. Construction folding/CSE and def-use lists.
-2. Optional mem2ssa with CFG/dominators, followed by CFG invalidation.
-3. SCCP at optimization levels above one.
-4. CFG/dominators/loops, global code motion and scheduling.
-5. Target matching, including fusion and register-reuse rules.
-6. Virtual-register assignment, live ranges, coalescing and allocation.
-7. Block scheduling and target emission.
-
-The Coil port preserves the compact Sea-of-Nodes graph and the independent
-relocatable-image boundary used by JIT and AOT. It does not yet implement every
-stage above. The library now provides rooted SCCP analysis, owned graph
-rewriting and incremental scalar fold/CSE/DCE. The adapter passes the requested
-optimization level explicitly: O1 retains the existing native path, while O2/O3
-run that pipeline before CFG/GCM, matching and liveness. O0 explicitly diagnoses
-the missing distinct fast-allocation path. This supersedes the previous behavior
-where the CLI level did not select native optimizer stages. Optional mem2ssa,
-remaining fold/restart rules, promotion and control/load cleanup remain pending.
-Persistent AArch64 matching precedes liveness and carries selected scalar
-rules and conservative single-use, same-block 64-bit compare/branch fusion.
-Its def/use metadata retains the original graph references. Full target fusion
-and reuse coverage remains incomplete. Coalescing remains incomplete. The post-allocation block scheduling core now
-follows upstream bottom-up/top-down selection; optional empty-entry merging and
-surrounding CFG/loop metadata parity remain open.
-The split-interval allocator also needs a detailed invariant audit against
-`ir_ra.c`; its current implementation must not be represented as established
-upstream parity.
-
-The current local AArch64 changes correspond to upstream `IR_SHIFT_CONST` and
-`IR_MUL_PWR2` rules in `ir_aarch64.dasc`. Upstream also supplies copy/reuse flags
-that must be carried through matching and allocation. Efficient encodings alone
-cannot replace these missing stages. The next optimizer work belongs in the
-independent library, with the adapter limited to CIR-to-graph translation and
-construction APIs. No benchmark-specific loop rewrite or alternate backend is
-an acceptable substitute.
-
-The pinned pipeline does not establish an automatic loop-vectorization pass.
-The stencil is useful for exposing the LLVM O3 gap, but closing it must not be
-claimed as an automatic consequence of completing upstream's scalar pipeline.
-The original benchmark samples remain the fixed baseline.
-
-The [persistent matching checkpoint](../benchmarks/STOGIR_MATCHING.md) records
-the next source snapshot and unchanged workload. Its ≥5× codegen target is met
-in the measured medians; the runtime-within-10% target remains unmet.
-
-AArch64 emission now omits END/LOOP_END jumps to the next scheduled block and
-inverts conditional predicates for true fallthrough, following pinned target
-rules. Nonempty edge copies remain path-specific in deferred stubs. Direct
-conditional branches beyond their reach relax transactionally with all labels,
-relocations and table offsets rebased together. Allocation positions stay fixed.
-The subsequent post-allocation layout checkpoint now supplies the physical
-block-chain scheduling core; the earlier fallthrough checkpoint did not include it.
-
-The [fallthrough checkpoint](../benchmarks/STOGIR_FALLTHROUGH.md) preserves the
-next measured snapshot: stogir runtime 2959.625 ms, TPDE 3987.739 ms and LLVM O3
-308.410 ms, with stogir codegen 5.22× faster than LLVM. The combined runtime and
-codegen goal remains unachieved. Earlier reports and original baseline are unchanged.
-
-
-## Post-allocation block layout
-
-The standalone pass ports pinned `ir_cfg.c` bottom-up Pettis-Hansen for small
-reducible functions and top-down positioning for >256 blocks or irreducibility.
-It preserves static frequency estimation, tie-breaking, early joins, loop
-rotation and loop alignment. Shared post-allocation CFG facts produce identical
-orders/alignment decisions in 59 checked comparisons against the unmodified
-pinned C scheduler. This proves the scheduling core on those facts; surrounding
-optimizer/loop-analysis/allocator parity is still unproven. Optional empty-entry
-merging remains disabled.
-
-Allocation subpositions stay fixed. Physical emission follows original schedule
-indices and aliases proven-empty start/END blocks. Actual edge/split moves keep
-blocks nonempty, and all-empty cycles retain an anchor. Eight-byte loop alignment
-is preserved by conditional relaxation and carried through the code-buffer/image
-alignment fields into JIT, AOT and module merging. Each PAGE21, PAGEOFF12 or
-BRANCH26 relocation describes one instruction, so adjacent branches/calls remain
-valid while true overlaps are rejected.
-
-The [block-layout checkpoint](../benchmarks/STOGIR_BLOCK_LAYOUT.md) records
-compiler `60174544`: 4.85× faster codegen and 9.68× LLVM runtime on the unchanged
-workload. Both active criteria remain unmet. Its 59-case scheduler differential,
-212 standalone checks, 65 linked consumers and Coil FAST 49/49 pass.
-
-## SCCP value-domain prerequisite (historical)
-
-The vendored library now includes the combined constant/copy lattice from
-pinned `ir_sccp.c`, using 16-byte cells and circular copy partitions. Its
-deduplicating bit worklist supports backward discovery and lower-reference
-insertions. The shared bitset now finds the first bit in a nonzero word using
-trailing-zero count, following upstream.
-
-The domain differential matches 179,554 state/queue observations across 13
-traces, including forward/reverse dependent-partition splits, exact floating
-payloads, symbolic and long constants. This does not enable SCCP: its analyzer,
-graph transformation, follow-up iterative optimization, mutable compilation
-ownership and optimization-level policy remain pending. Current `-O3` behavior
-must not be represented as upstream optimized-pipeline parity.
-
-The [SCCP-domain validation checkpoint](../validation/STOGIR_SCCP_DOMAIN.md)
-records source provenance, differential scope and delivery checks. New timings
-for the shared-bitset change remain pending an uncontended machine.
-
-## Graph rewrites and initial-owner pressure
-
-The graph now supports whole-node rewrites within existing cell allocations.
-Shrunk tails become cleared NOPs with valid arity metadata; later references
-stay fixed. Construction CSE is invalidated, while the owning optimizer must
-remap incoming edges/roots and rebuild use/analysis caches. These APIs do not
-yet connect SCCP to codegen.
-
-Blocked allocation now spills a whole owner prefix when eviction occurs at its
-start and no register-required use occurs there. This follows upstream's
-`child = other` case; it does not claim optimal-split or full allocator parity.
-It fixes the allocator rejection in a pressured graph-rewrite program; that
-source program then reaches the separately recorded i128 CIR type gap. Native
-JIT and linked AOT pressure fixtures execute correctly with the fix. Immediate
-required uses remain protected. Repeated CSE invalidation skips an already-empty
-map, avoiding repeated capacity scans during rewrites.
-
-The [rewrite/pressure validation checkpoint](../validation/STOGIR_GRAPH_REWRITES.md)
-records stable storage, the initial-owner spill correction, native before/after
-evidence and installed checks. SCCP is still not enabled.
-
-
-## SCCP mode integration validation
-
-The vendored executable source `799bba6` passes 228 standalone programs and
-69 linked AOT consumers with fresh objects and frozen-input checks. Public
-library mode tests compare JIT/AOT paths and verify constant-pool ownership
-through image finishing. Compiler executable source `3baa1650` passes full FAST (49/49, 343.1 seconds,
-with time and 1.60 GB memory warnings) and is installed with its matching SDK.
-Off-checkout object generation/link/run checks pass LLVM, TPDE and stogir;
-new SDK namespaces resolve and all 127 installed modules match standalone
-source. The stogir corpus remains 6/9 with the same known failures.
-All optimization stays inside the existing `ir-codegen` timing span.
-The [delivery report](../validation/stogir-sccp-pipeline-installed.json) records
-these checks. The [latest timing attempt](../benchmarks/STOGIR_SCCP_MODES.md) is
-provisional due competing compiler processes and does not meet the performance
-goal. Older prerequisite-only statements above describe historical checkpoints.
-
-## Full compiler bootstrap checkpoint
-
-Adapter 0dcc4101 legalizes i128 into two scalar graph values, including calls,
-PHIs and memory, and preserves narrow bit-operation widths. The full compiler
-now compiles and independently self-rebuilds byte-identical target objects on
-both stogir and LLVM paths. This is functional support, not LLVM performance
-parity: normal linked builds take 39.799s with stogir versus 11.319s LLVM O3;
-the stogir-built compiler runs substantially slower on compiler workloads.
-See [full measurements](../benchmarks/STOGIR_COMPILER.md) for phases, sample
-ranges, load qualifications, binary disassembly and validation. Historical
-checkpoint statements above describe their original revisions.
-
-## Cross-block field promotion and closed Always expressions
-
-The library now constructs typed SSA values across joins and loops for supported
-nonescaping ALLOCA fields. It preserves CFG predecessor positions, resets
-loop-local allocation lifetimes, and retains the complete allocation when any
-path is uninitialized. The discovery algorithm uses explicit demand-driven work
-frames; it is documented separately from upstream's dominance-frontier walk.
-
-Shared native CIR lowering accepts closed expression sequences and conditional
-scalar or aggregate results marked Always. It validates every nested expression, rejects lexical/control
-escapes, caches immutable-body eligibility, tracks active callees to break
-recursive cycles, and bounds the callee to 64 AST nodes, cumulative expansion
-to 16,384 nodes per function and nesting to 16. Default/Hint/Never policy is
-unchanged. This extends existing language-annotation lowering; it is not general
-module-level IR inlining. Coil's reference-model struct parameters retain their
-pointer aliases. Actual aggregate TV arguments are captured as private values
-when evaluated, before later arguments; explicit mutable copies remain distinct.
-Sequences contain no lexical bindings, cleanup/control escapes or static identity
-changes. Unsupported bodies retain ordinary calls.
-
-Timing mode includes eligibility, aggregate value capture and outermost
-inlined-body lowering spans in
-the native codegen sum, aggregated once per source function. Nested spans are
-not counted twice. Those optimizer costs are no longer hidden in IR creation;
-older reports did not charge them and retain their original timing definition.
-
-### Immutable callee validation reuse
-
-The vendored standalone library includes `coil-stogir` commit `6842e2d`.
-Module preparation registers deep immutable callee snapshots once per definition
-version. Replacing a source definition clears its handle; old snapshots remain
-immutable until module emission completes. Before emission, every final version
-is registered and the provider freezes. Emission cannot insert into the registry.
-All snapshots are released after the module jobs finish. Caller validation and
-per-site eligibility, observations, capture, result and budget checks remain.
-This is an independent module orchestration extension, not an upstream pass.
-
-Standalone `06b7d4f` restores the pinned upstream `ir_fold.h` `TRUNC(AND)`
-restart for exact 8/16/32-bit destination masks. Ordinary use-list/worklist
-updates preserve other observations and shared producers. The standalone full
-incremental fold/CSE/JIT suite passes with ASAN/debug checks. A compact header
-reduction removes an extra 32-bit normalization and an AND; compiler workload
-performance still requires measurement.
-
-Standalone `3ed815e` adds persistent AArch64 shifted-field extraction. Integer
-TRUNC(SHR/SAR) becomes UBFX only when the complete field lies inside a 32/64-bit
-word. Matching redirects machine uses and constraints before liveness and
-retires only fully absorbed, unrooted producers. BOOL and crossing fields retain
-ordinary lowering. This generic fusion is an independent extension beyond the
-pinned upstream truncation matcher. Encoder and native matrix checks, incremental
-fold/CSE/JIT and memory address matching pass under ASAN/debug checks.
-
-Standalone `b72f92c` fixes private-field classification of symbolic offsets.
-Named FUNC/SYM/STR payloads are string-table IDs and no longer establish byte
-displacements or fixed extents. Known numeric address constants retain normal
-behavior. A native in-bounds reduction initialized bytes 1 and 8, then resolved
-a symbolic offset to 8 while its ID was 1: the old optimizer incorrectly returned
-97 for byte 1 instead of 41. The classifier now retains memory and returns 41.
-The complete standalone memory promotion/forwarding suite passes under ASAN/debug.
-
-### Typed constructor words and small aggregate merges
-
-For stogir O2/O3, the shared native lowering constructs known words of bounded
-fresh sum values from their declared scalar integer/pointer fields. It masks
-sign extension to field storage bytes. Words touched by opaque active fields
-(aggregate, floating, vector, or crossing-word layouts) retain their original
-typed construction, including those fields' representation bytes. Known outer
-padding and inactive variant bytes receive zero; every active field still comes
-from its checked constructor argument, evaluated in order. This constructs a
-fresh value, never widens a store into an existing object. The existing native
-inline-copy bound also bounds constructor packing.
-
-Small aggregate if/match results snapshot each live branch into one static
-private destination, rather than merging branch-object addresses. CIR's static
-allocas dominate reachable bodies; the adapter keeps them in the entry prefix.
-Scalar/reference-valued and large aggregate merges retain their existing paths.
-TPDE and nonoptimizing stogir levels retain their existing producer forms; these
-value forms are selected for the backend's memory-promotion capability.
-Frame-escape policy remains conservative. These are Coil value-lowering choices,
-independent of upstream stogir's compact graph and exact-field SSA pass.
-
-The sums corpus adds signed/unsigned mixed-width fields, argument snapshots,
-pointer preservation, and opaque/scalar fields sharing a word. Existing large, aggregate and floating payload cases cover fallback.
-Performance and full native validation are pending for this checkpoint.
-
-
-## Program observations and private IF splitting
-
-The adapter observes RETURN/UNREACHABLE terminals and every reachable CIR edge
-whose destination does not increase the total block order. Every directed cycle
-has such an edge, so backward closure retains both terminating paths and paths
-that loop forever. Intermediate acyclic branches are not external observations.
-This does not weaken explicit roots supplied to the standalone library.
-
-The iterative optimizer ports pinned upstream `ir_try_split_if` and
-`ir_try_split_if_cmp`. Private two-input merge/Phi/tests can route literal
-predecessors directly and test the other value in its original predecessor.
-Branch-local loads stay behind their original control. Protected identities
-decline the rewrite. Same-truth cases use the ordinary control reachability
-rebuild. Tests extend the FFI corpus with an exported self-cycle and an exported
-returning function with two nonreturning cycle paths.
-
-## Post-inline target emission planning
-
-The Coil module layer now determines which functions still need machine code
-after bounded inlining. This is a compiler integration pass, independent of the
-pinned upstream's per-function pipeline. It leaves library graph validation,
-callee eligibility, recursion rules and the 512-cell growth ledger intact.
-
-Public symbols, export aliases, native-data function addresses and prebuilt-unit
-exports remain roots. Non-template callers remain roots too; they are prepared
-in source order against the frozen callee registry. Their finalized graphs
-supply symbol edges, including function addresses cloned into a caller. Unused
-constants retained in an interning pool do not create edges. Host-image mode
-retains every requested function for later private-name lookup.
-
-Temporary adaptation/optimization scratch is closed after copying only the
-final graph, observations and import bindings into a retained snapshot arena.
-Code generation borrows that exact snapshot; its arena is released after text
-and relocations have merged. Snapshot copying preserves graph references,
-constant/prototype IDs and owned string bytes. The ordinary native image
-optimizer and verifier still run.
-
-Pruned jobs are removed from native definition placement rather than assigned a
-fake text offset. A late relocation to a pruned function is a hard error. New
-planning, validation and release costs are included in IR-codegen timing.
-
-The CLI object gate checks inlined-helper removal, ordinary and cloned function
-addresses, native data, exported C aliases, recursion and prebuilt-unit retention.
-A direct CIR-to-native ASAN harness executes 6432 calls after releasing all
-caller arenas. An independent resolver-probe ASAN failure prevents claiming a
-clean end-to-end sanitized compiler; it is recorded in the coil-bugs Pad.
-
-Performance evidence is kept in `docs/benchmarks/live-emission`; neither this
-pass nor the latest bootstrap diagnostic meets the full performance objective.
+In this tree: the `stogir`, `declarative` and `declarative-debug` lanes of
+`scripts/oracle.py`, the Stogir rows of `scripts/tests/fast/cli.sh objects`,
+`scripts/tests/declarative-unit-settings.py`, `scripts/tests/declarative-threads.py`
+and the sweep against LLVM, `scripts/tests/stogir-x86-sweep.py`. In
+coil-stogir-declarative: `tools/check.sh` (every rewrite rule against the
+nodes' meanings, random programs interpreted against compiled with a count of
+what each transformation did, linking), `tools/coil-cycle.sh` (the corpus,
+the compiler rebuilding itself to the same object), `tools/coil-stress.sh`
+(the same under large inlining limits), `tools/coil-debugger.sh` (what lldb
+shows, against LLVM's -g build) and `tools/coil-sweep.sh`.

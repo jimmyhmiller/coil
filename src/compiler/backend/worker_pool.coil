@@ -1,0 +1,184 @@
+;;; Worker threads for the per-function steps of a module's generation, and
+;;; how many. Moved here from the Stogir adapter when that backend was removed:
+;;; module copy forwarding (codegen_tpde) runs its phases on such a pool, and
+;;; the declarative backend compiles a module's functions on as many threads.
+;;;
+;;; Everything that touches shared state stays on the submitting thread, which
+;;; performs it in submission order at points fixed by task indices alone; so
+;;; the result is the same for any thread count and any scheduling.
+(module coil.compiler.worker_pool)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.cc" :as cc)
+(import "coil.os" :as os)
+(import "coil.sync" :use [Mutex Condition])
+(import "coil.thread" :as thread :use [Thread ThreadConfig])
+(import "coil.compiler.ffi" :use [worker-stack-size])
+(import "coil.compiler.trace" :as tr)
+
+(extern worker-pool.getenv :as "getenv" :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
+
+(defn fail [(message (slice u8))] (-> never)
+  (eprintln "worker pool: {}" message)
+  (os/_exit 1))
+
+;;; One unit of work for a worker and whether it has finished.
+(defstruct PoolTask [(argument (ptr i8)) (done bool)])
+
+;;; Worker threads running `run` on submitted arguments, each exactly once.
+;;; `tasks` (reserved to `capacity` at creation, so that its storage never
+;;; moves), `next` (the next unclaimed task), `closed` and `awaited` (the
+;;; task the submitter is blocked on, or -1) are guarded by `mutex`. Workers
+;;; wait on `work` for a task or the close; the one submitting thread waits
+;;; on `finished` for its awaited task. A task's argument is handed to the
+;;; worker and back to the submitter under that mutex, so the two never use
+;;; it at the same time. With `helping` the submitting thread, instead of
+;;; only waiting, runs unclaimed tasks itself while the one it awaits is not
+;;; done (pool-await!): for pools whose submitter has little else to do.
+(defstruct Pool
+  [(run (fnptr (cc/C) [(ptr i8)] (ptr i8)))
+   (tasks (ArrayList PoolTask)) (capacity i64)
+   (mutex Mutex) (work Condition) (finished Condition)
+   (next i64) (closed bool) (awaited i64)
+   (threads (ArrayList Thread)) (started i64) (helping bool)])
+
+(defn pool-lock! [(pool (ptr Pool))] (-> void)
+  (match (Mutex::lock! (field pool mutex))
+    (Ok [_] 0) (Err [_] (fail "mutex lock failed"))))
+
+(defn pool-unlock! [(pool (ptr Pool))] (-> void)
+  (match (Mutex::unlock! (field pool mutex))
+    (Ok [_] 0) (Err [_] (fail "mutex unlock failed"))))
+
+;;; Wait on CONDITION (of POOL); the caller holds the mutex.
+(defn pool-wait! [(pool (ptr Pool)) (condition (ptr Condition))] (-> void)
+  (match (Condition::wait! condition (field pool mutex))
+    (Ok [_] 0) (Err [_] (fail "condition wait failed"))))
+
+(defn pool-notify-one! [(condition (ptr Condition))] (-> void)
+  (match (Condition::notify-one! condition)
+    (Ok [_] 0) (Err [_] (fail "condition notify failed"))))
+
+(defn pool-notify-all! [(condition (ptr Condition))] (-> void)
+  (match (Condition::notify-all! condition)
+    (Ok [_] 0) (Err [_] (fail "condition notify failed"))))
+
+(defn pool-worker [(argument (ptr i8))] (-> (ptr i8))
+  (let [pool (primitive/cast (ptr Pool) argument)]
+    (pool-lock! pool)
+    (loop
+      (while (and (>= (.next pool) (len (.tasks pool))) (not (.closed pool)))
+        (pool-wait! pool (field pool work)))
+      (if (>= (.next pool) (len (.tasks pool)))
+          (break)
+          (let [index (.next pool)
+                task (.argument (get (.tasks pool) index))
+                run (.run pool)]
+            (set! (.next pool) (+ index 1))
+            (pool-unlock! pool)
+            (run task)
+            (pool-lock! pool)
+            (set! (.done (elem (mut (.tasks pool)) index)) true)
+            (when (= index (.awaited pool)) (pool-notify-one! (field pool finished))))))
+    (pool-unlock! pool)
+    (primitive/cast (ptr i8) 0)))
+
+;;; A pool of up to THREADS workers for at most CAPACITY tasks, or null when
+;;; not even one thread could be started (nothing has been done; the caller
+;;; takes its serial path). Workers get the stack of the compiler's own
+;;; pipeline thread, which is what this work runs on serially.
+(defn pool-start [(run (fnptr (cc/C) [(ptr i8)] (ptr i8))) (capacity i64) (threads i64)]
+  (-> (ptr Pool))
+  (when (or (< threads 1) (< capacity 0)) (fail "invalid pool size"))
+  (let [pool (box! (malloc-allocator) Pool (zeroed Pool))
+        (mut refused) false]
+    (set! (.run pool) run) (set! (.capacity pool) capacity) (set! (.awaited pool) -1)
+    (set! (.tasks pool) (ArrayList::new [PoolTask] (malloc-allocator)))
+    (reserve! (mut (.tasks pool)) capacity)
+    (set! (.threads pool) (ArrayList::new [Thread] (malloc-allocator)))
+    ; Thread handles must not move once a thread has been created into one.
+    (for [i 0 threads] (push! (mut (.threads pool)) (zeroed Thread)))
+    (match (Mutex::init (field pool mutex))
+      (Ok [_] 0) (Err [_] (fail "mutex creation failed")))
+    (match (Condition::init (field pool work))
+      (Ok [_] 0) (Err [_] (fail "condition creation failed")))
+    (match (Condition::init (field pool finished))
+      (Ok [_] 0) (Err [_] (fail "condition creation failed")))
+    (while (and (not refused) (< (.started pool) threads))
+      (if (= (Thread::spawn-configured (elem (mut (.threads pool)) (.started pool))
+                                       (fnptr-of pool-worker)
+                                       (primitive/cast (ptr i8) pool)
+                                       (ThreadConfig::new (worker-stack-size) -1))
+             (: 0 i32))
+          (set! (.started pool) (+ (.started pool) 1))
+          (set! refused true)))
+    (if (> (.started pool) 0)
+        pool
+        (do (pool-finish! pool) (primitive/cast (ptr Pool) 0)))))
+
+;;; Hand ARGUMENT to the workers; the result is its task index, counting up
+;;; from zero. The submitter must not touch what ARGUMENT designates again
+;;; before pool-await! of that index.
+(defn pool-submit! [(pool (ptr Pool)) (argument (ptr i8))] (-> i64)
+  (pool-lock! pool)
+  (let [index (len (.tasks pool))]
+    (when (or (.closed pool) (>= index (.capacity pool)))
+      (fail "task submitted beyond the pool's capacity"))
+    (push! (mut (.tasks pool)) (PoolTask :argument argument :done false))
+    (pool-notify-one! (field pool work))
+    (pool-unlock! pool)
+    index))
+
+;;; Block until task INDEX has run. In a helping pool the calling thread
+;;; meanwhile takes unclaimed tasks, oldest first, as a worker would; a task
+;;; runs once either way, so nothing a task computes depends on who ran it.
+(defn pool-await! [(pool (ptr Pool)) (index i64)] (-> void)
+  (pool-lock! pool)
+  (when (>= index (len (.tasks pool))) (fail "awaited task was never submitted"))
+  (set! (.awaited pool) index)
+  (while (not (.done (get (.tasks pool) index)))
+    (if (and (.helping pool) (< (.next pool) (len (.tasks pool))))
+        (let [taken (.next pool)
+              task (.argument (get (.tasks pool) taken))
+              run (.run pool)]
+          (set! (.next pool) (+ taken 1))
+          (pool-unlock! pool)
+          (run task)
+          (pool-lock! pool)
+          (set! (.done (elem (mut (.tasks pool)) taken)) true))
+        (pool-wait! pool (field pool finished))))
+  (set! (.awaited pool) -1)
+  (pool-unlock! pool))
+
+;;; Let the workers run out of tasks, join them and release POOL.
+(defn pool-finish! [(pool (ptr Pool))] (-> void)
+  (pool-lock! pool)
+  (set! (.closed pool) true)
+  (pool-notify-all! (field pool work))
+  (pool-unlock! pool)
+  (for [i 0 (.started pool)]
+    (unless (= (Thread::join (elem (mut (.threads pool)) i)) (: 0 i32))
+      (fail "thread join failed")))
+  (match (Condition::destroy! (field pool work))
+    (Ok [_] 0) (Err [_] (fail "condition release failed")))
+  (match (Condition::destroy! (field pool finished))
+    (Ok [_] 0) (Err [_] (fail "condition release failed")))
+  (match (Mutex::destroy! (field pool mutex))
+    (Ok [_] 0) (Err [_] (fail "mutex release failed")))
+  (free! (mut (.threads pool)))
+  (free! (mut (.tasks pool)))
+  (destroy (malloc-allocator) pool))
+
+;;; How many threads do the per-function work of module generation: one under
+;;; COIL_TPDE_SERIAL, and one while COIL_CODEGEN_TIMINGS is on, whose records
+;;; are summed as serial CPU time; else the online processors, at most eight.
+;;; (DECLARATIVE_THREADS, read by the declarative backend, overrides this for
+;;; its compiling.) What is generated is the same for every count.
+(defn generation-threads [] (-> i64)
+  (cond (!= (primitive/cast usize (worker-pool.getenv c"COIL_TPDE_SERIAL")) 0) 1
+        (tr/codegen-enabled?) 1
+        :else
+          (match (thread/available-parallelism)
+            (Ok [n] (cond (< n 1) 1 (> n 8) 8 :else n))
+            (Err [_] 1))))
