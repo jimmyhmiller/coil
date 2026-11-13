@@ -222,4 +222,12 @@ if [ -n "$own_n" ] && [ -n "$off_n" ] && [ "$own_n" -lt "$off_n" ]; then
   ok "a transform of the program's own modules runs on the library state"
 else bad "a transform of the program's own modules runs on the library state" "$own (without the state: $off)"; fi
 
+# A library function the state resolved and no compile had checked is checked by
+# the compile that first reaches it, as it would be without the state: here by a
+# macro compiled early, for another macro that needs what it defines.
+on=$("$COIL" run $M/early_macro.coil 2>&1)
+off=$(COIL_LIBRARY_STATE=0 "$COIL" run $M/early_macro.coil 2>&1)
+if [ "$on" = 9 ] && [ "$off" = 9 ]; then ok "a macro compiled early checks the library functions it reaches on the library state"
+else bad "a macro compiled early checks the library functions it reaches on the library state" "with the state: $on; without: $off"; fi
+
 if [ "$fail" = 0 ]; then echo "meta: PASS"; else echo "meta: FAILED"; exit 1; fi
