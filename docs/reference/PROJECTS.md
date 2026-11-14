@@ -63,7 +63,7 @@ inputs and metaprograms as a bare `coil build`, and writes
 | `[project]` | `path` | Point this directory at a package or workspace in another one (the only section) |
 | `[dependencies]` | `NAME = { path … }` or `{ git … }` | Other Coil packages |
 | `[build]` | `out`, `optimization`, `target`, `debug`, `jit` | Defaults for the package executable |
-| `[profile.NAME]` | `inherits`, `optimization`, `debug`, `debug-checks`, `jit`, `use` | A named build configuration (`--profile NAME`) |
+| `[profile.NAME]` | `inherits`, `optimization`, `debug`, `debug-checks`, `single-module`, `jit`, `use` | A named build configuration (`--profile NAME`) |
 | `[run]` | `args` | Arguments `coil run` passes to the program |
 | `[artifacts.NAME]` | `kind`, `entry`, `out`, `optimization`, link keys | Extra objects and executables |
 | `[link]` | `libs`, `frameworks`, `search-paths`, `objects`, `flags` | Native link inputs |
@@ -330,6 +330,19 @@ use = ["coil.safety"]         # metaprograms added to [metaprograms] use
 inherits = "debug"            # DWARF symbols
 debug-checks = true           # the library's invariant checks
 optimization = 1
+```
+
+`single-module = true` (`--single-module` on the command line) has the LLVM
+backend optimize the program as one module on one thread. By default it splits
+a program of 256 or more functions into eight partitions and optimizes them in
+parallel; a call from one partition into another is inlined only when the
+callee is small. Building the compiler, one module takes about 3x as long and
+the code it produces is about 12% faster.
+
+```toml
+[profile.dist]
+inherits = "release"
+single-module = true          # slowest to build, fastest code
 ```
 
 ```sh

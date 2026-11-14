@@ -152,6 +152,8 @@ manifest_error "Coil.toml:6: dependency 'nope' path does not exist" "a missing d
 manifest_error "dependency must specify either path, or git together with exactly one of sha, tag, or branch" \
   "a git dependency without a commit selector is an error" \
   "$PKG\n[dependencies]\nfoo = { git = \"https://example.invalid/foo.git\" }\n"
+manifest_error "Coil.toml:6: [profile] single-module must be true or false" \
+  "a profile's single-module is a boolean" "$PKG\n[profile.a]\nsingle-module = 1\n" --profile a
 manifest_error "profile 'a' inherits from itself" "a profile inheritance cycle is an error" \
   "$PKG\n[profile.a]\ninherits = \"b\"\n\n[profile.b]\ninherits = \"a\"\n" --profile a
 cp "$W/Coil.app.toml" "$APP/Coil.toml"
