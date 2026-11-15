@@ -172,7 +172,7 @@ Linux x86-64 (as ELF); on any other target a `--jit=native` build has no backend
 | `(jit-prepare! s SOURCE)`, `(jit-prepare-with-entry! s SOURCE ENTRY)` | 0 or nonzero | Compile without publishing |
 | `(jit-commit-prepared! s)`, `(jit-abort-prepared! s)` | | Publish or discard the prepared candidate |
 | `(jit-symbol-address s NAME)` | `(ptr i8)` | Address of an `export-c` symbol; null if absent |
-| `(jit-symbol-at s ADDRESS START)` | `(slice u8)` | Name of the symbol whose code ADDRESS is in, with where it begins stored at START; `""` when the session loaded no code there |
+| `(jit-symbol-at s ADDRESS START)` | `(slice u8)` | Name of the symbol whose code ADDRESS is in, with where it begins stored at START; `""` when the session loaded no code there. An `Llvm` session knows where a function is when its section holds a function the session exports, as every function of a Mach-O object's one code section does |
 | `(jit-diagnostic s)`, `(jit-pending s)`, `(jit-status s)` | | Why the last submission failed (every located diagnostic of its compile); the pending candidate |
 | `(jit-session-set-quiet! s true)` | 0 | Stop also writing diagnostics to stderr; `jit-diagnostic` still has them |
 | `(jit-session-set-source-name! s NAME)` | 0 | Name submitted source `NAME` in diagnostics instead of `<jit>` |
