@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Write src/compiler/declarative/generated from the native backend's sources.
+"""Write the native backend's generated Coil from its sources.
 
 The backend is written in small languages (src/declarative/lang): each reads a
 file of its own (a .pass, an .isa, a .lower, ...) and makes it a Coil module.
 The compiler's own build does not run them, as no stage-0 compiler and no
-installed toolchain need to, so what they make is kept as plain Coil in
-src/compiler/declarative/generated, the way src/compiler/cli/guide.coil is kept
-from the language reference.
+installed toolchain need to, so what they make is kept as plain Coil, the way
+src/compiler/cli/guide.coil is kept from the language reference: a module named
+declarative.* in src/compiler/declarative/generated, and one named native.*
+(CIR's numbers, from cir/cir.ops) in src/compiler/native/generated.
 
     gen-declarative.py [--compiler COIL]           # rewrite generated/
     gen-declarative.py --check [--compiler COIL]   # exit 1 if generated/ is not what the sources say
@@ -34,9 +35,12 @@ sys.path.insert(0, str(ROOT / "scripts" / "compiler"))
 import project_config  # noqa: E402
 
 SOURCES = ROOT / "src" / "declarative"
-GENERATED = ROOT / "src" / "compiler" / "declarative" / "generated"
+# Each package a generated module may belong to, and where its modules go.
+PACKAGES = {
+    "declarative.": ROOT / "src" / "compiler" / "declarative" / "generated",
+    "native.": ROOT / "src" / "compiler" / "native" / "generated",
+}
 DRIVER = SOURCES / "generate.coil"
-PACKAGE = "declarative."
 # The toy calculator is the languages' second client, for their tests; it is
 # not part of the backend.
 NOT_GENERATED = ("toy.",)
@@ -46,9 +50,9 @@ def generated_modules() -> list[str]:
     manifest = tomllib.loads((SOURCES / "Coil.toml").read_text())
     names = sorted(n for n in manifest["modules"] if not n.startswith(NOT_GENERATED))
     for name in names:
-        if not name.startswith(PACKAGE):
-            raise SystemExit(f"gen-declarative: module {name} in src/declarative/Coil.toml is not "
-                             f"{PACKAGE}*, so the compiler's package could not hold it")
+        if not name.startswith(tuple(PACKAGES)):
+            raise SystemExit(f"gen-declarative: module {name} in src/declarative/Coil.toml is in none of "
+                             f"{', '.join(p + '*' for p in PACKAGES)}, so no package of the compiler could hold it")
     return names
 
 
@@ -62,8 +66,17 @@ def driver_text(names: list[str]) -> str:
 
 
 def relative_file(name: str) -> Path:
-    parts = name[len(PACKAGE):].split(".")
+    """Where the languages write module NAME under DECLARATIVE_EXPAND
+    (expanded-path in lang/readers.coil): declarative.a64.unit as a64/unit.coil,
+    native.cir-ops as native/cir-ops.coil."""
+    rest = name.removeprefix("declarative.")
+    parts = rest.split(".")
     return Path(*parts[:-1], parts[-1] + ".coil")
+
+
+def split(into: Path) -> dict[Path, Path]:
+    """The written tree, each package's part: native/ for native.*, the rest declarative.*."""
+    return {PACKAGES["declarative."]: into / "declarative", PACKAGES["native."]: into / "native"}
 
 
 def expand(compiler: str, names: list[str], into: Path) -> None:
@@ -79,6 +92,14 @@ def expand(compiler: str, names: list[str], into: Path) -> None:
         raise SystemExit(f"gen-declarative: checking the sources failed:\n{result.stdout}")
     want = {relative_file(n) for n in names}
     got = {p.relative_to(into) for p in into.rglob("*.coil")}
+    if want == got:
+        native = into / "native"
+        declarative = into / "declarative"
+        declarative.mkdir()
+        for entry in list(into.iterdir()):
+            if entry not in (native, declarative):
+                entry.rename(declarative / entry.name)
+        native.mkdir(exist_ok=True)
     if want != got:
         missing = sorted(str(p) for p in want - got)
         extra = sorted(str(p) for p in got - want)
@@ -116,19 +137,26 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="gen-declarative.") as work:
         into = Path(work) / "generated"
         expand(compiler, names, into)
+        parts = split(into)
         if args.check:
-            diff = differences(into, GENERATED)
-            if diff:
-                print("gen-declarative: src/compiler/declarative/generated is not what src/declarative "
-                      "says; run scripts/compiler/gen-declarative.py", file=sys.stderr)
-                for line in diff:
-                    print(f"  {line}", file=sys.stderr)
+            stale = False
+            for generated, written in parts.items():
+                diff = differences(written, generated)
+                if diff:
+                    stale = True
+                    print(f"gen-declarative: {generated.relative_to(ROOT)} is not what src/declarative "
+                          "says; run scripts/compiler/gen-declarative.py", file=sys.stderr)
+                    for line in diff:
+                        print(f"  {line}", file=sys.stderr)
+            if stale:
                 return 1
             print(f"gen-declarative: generated/ is up to date ({len(names)} modules)")
             return 0
-        shutil.rmtree(GENERATED, ignore_errors=True)
-        shutil.copytree(into, GENERATED)
-    print(f"gen-declarative: wrote {len(names)} modules to {GENERATED.relative_to(ROOT)}")
+        for generated, written in parts.items():
+            shutil.rmtree(generated, ignore_errors=True)
+            shutil.copytree(written, generated)
+    print(f"gen-declarative: wrote {len(names)} modules to "
+          + " and ".join(str(g.relative_to(ROOT)) for g in PACKAGES.values()))
     return 0
 
 

@@ -54,7 +54,11 @@ uses LLVM instead.
   classification, string interning, DWARF types, and the Mach-O object.
 - `src/compiler/native/` — CIR (`cir.coil`; `cir_copies.coil`, copy forwarding)
   and the assembler the code goes into (`asm.coil`, `buf.coil`), from
-  [coil-tpde](https://github.com/jimmyhmiller/coil-tpde) (`NOTICE`).
+  [coil-tpde](https://github.com/jimmyhmiller/coil-tpde) (`NOTICE`). CIR's
+  types and operations are said once, in `src/declarative/cir/cir.ops`: the
+  module of their numbers, `native.cir-ops` (`generated/cir-ops.coil`), is
+  written from it, as are the direct compile's tables and CIR's reference
+  interpreter.
 - `src/declarative/` — the backend's sources, a Coil project of its own whose
   `Coil.toml` gives each file type its language (`[readers]`) and each file its
   module (`[modules]`):
@@ -66,7 +70,8 @@ uses LLVM instead.
     compiler), `.pipeline` (the order passes run in at each level), `.layout`
     (an object file format), `.ops` (CIR's operations, read from CIR itself),
     `.select` (instructions for each CIR operation, for the compile straight
-    from CIR) and `.instance` (one Coil file as a module for each machine). A
+    from CIR), `.numbers` (CIR's numbers, from its `.ops` file) and
+    `.instance` (one Coil file as a module for each machine). A
     file whose text is `same OTHER` stands for OTHER.
   - `backend/` — the node set and the passes both machines share; `a64/` and
     `x64/` — each machine's instructions, convention, lowering, rules and passes,
