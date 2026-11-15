@@ -31,11 +31,67 @@ does for section buffers and its mutex. `fill`, `append-list` and `truncate`
 keep list representation and allocation out of algorithms. The buffer storage
 generator is the layer that calls allocation and byte-memory primitives.
 
-The algorithm language supports typed fixed-width values, references at API
-boundaries, records and collections, infix expressions, and structured loops.
-It has no raw Coil forms or source-text escape. The native types and entry
-points retain their existing ABI, so the lowering, object writers and JIT use
-the generated library without a compatibility implementation.
+The correction toward declarative algorithms is in progress. `.pass` library
+mode still accepts imperative function bodies; using that syntax alone does not
+make an algorithm declarative. The remaining SSA builders, compaction,
+several copy analyses, and assembler operations need further conversion.
+
+The declarations already used by the native sources are:
+
+- `insert`: one logical row across declared columns, returning its ordinal.
+  Values observe the pre-insertion state; the language derives column appends.
+  CIR values, operands, variables and blocks use this declaration.
+- `relation`: ordered rows and output columns. The language derives a compressed
+  inverse index, including counts, prefix sums and placement. A query can bind
+  ordinary ranges, linked chains or ragged segments without client cursors.
+- `dominators`: graph adjacency and immediate-dominator equations. The language
+  derives reverse postorder, sparse predecessor intersection and convergence;
+  unreachable nodes retain the declared absent value.
+- `epoch-map`: key/value storage, a hash equation, initial capacity and load
+  policy. The language derives probing, growth, rehashing and epoch-wrap clearing.
+- `consensus`: agreement over a pure row query, with an explicit empty identity.
+  Trivial-PHI removal uses this aggregate and a typed guarded rewrite.
+- `meet`: descending bit facts constrained by the indexed dependency relation.
+  A change schedules dependent rows; recursive components converge without a
+  client worklist. Unknown callees have an explicit boundary fact.
+- `region`: stopped reachability over ordered graph segments. Bounds, partition
+  and adjacency are declared; the language derives directional scanning,
+  generation stamps and block scheduling.
+- `predicate` and `rewrite`: named bindings, requirements, derived row views and
+  path queries. All constraints precede effects. Typed rewrites specify a rejection value and result; `create`
+  bindings execute only after constraints succeed. Rejected rules apply no rewrite
+  effects; analysis scratch can change while checking a constraint.
+- `scatter`: row queries with declared array cells or record fields to update.
+  Writes execute in row order. Query domains and predicate inputs must remain
+  stable during the scatter. There is no imperative body or arbitrary callback.
+- `snapshot` and `recycle`: deep list copies and reset policy derived from record
+  fields. `snapshot fresh` omits scratch contents; `reset keep` retains scratch
+  capacity and contents; `reset fill` refills without reallocating. `drop` and
+  `drop-each` declare ownership of fields and list elements. Release and reset
+  invoke those destructors; snapshots reject opaque ownership without a fresh
+  policy.
+
+For example, operand redirection names the relation and destination cells:
+
+```text
+scatter redirect-root-uses!(st: ref[State], old: u32, new: u32) {
+  from u in range(cir::i64-of(st.use-start[cir::i64-of(old)]),
+                  cir::i64-of(st.use-start[cir::i64-of(old) + 1]));
+  let user = st.use-user[u];
+  let x = cir::val(st.f, user);
+  write st.f.operands at cir::i64-of(x.opb + st.use-index[u]) = new;
+}
+```
+
+Pure equations support `let`, `all`, `any`, `count` and `tabulate`; generated `all` and `any`
+short-circuit. Expressions in rows and constraints reject explicit mutation,
+imperative control flow and effectful `!` calls. Called functions must follow
+the language's naming convention for effects.
+
+The native public types and entry points retain their ABI. The compiler and
+standalone backend both consume these sources; generated Coil is an artifact.
+Tests and measurements must cover both uses before claiming completion or
+performance parity. Source-size accounting includes the declaration compilers.
 
 After editing:
 
@@ -43,5 +99,7 @@ After editing:
     python3 scripts/tests/declarative.py /absolute/path/to/coil
 
 The second client in `toy/storage.pass`, called by `tests/toy.coil`, exercises
-record construction and release and the buffer generator with a different
-record name and initial capacity.
+the same declarations with noncompiler data: recursive and unknown-boundary
+facts, cyclic stopped paths, rejected and accepted rewrites, cell updates,
+snapshot isolation, retained scratch, ownership, dominator diamonds and cycles,
+epoch-map collisions/growth/wrap, agreement, and unaligned buffer encodings.
