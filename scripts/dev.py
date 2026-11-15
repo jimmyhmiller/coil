@@ -342,10 +342,13 @@ def warm_jit_unit(compiler: Path, libdir: Path) -> None:
     `<lib>/coil/units/<backend>/jit-<implementation>/coil.compiler.jit_api`
     (the layout `shipped-unit-dir` in driver.coil reads). A consumer links only
     the unit built by its own backend, and the compiler builds a missing one on
-    the first build that imports coil.jit. Installing warms the unit for the
-    compiler's default backend (`llvm` for this LLVM-linked build), so the common
-    path is fast from the start. Always -O3: every consumer optimization level
-    shares the one unit. Best-effort: without it the compiler builds it on demand.
+    the first build that imports coil.jit. Installing warms the units of the
+    common paths, so they are fast from the start: a release build's (the
+    compiler's default backend, `llvm` for this LLVM-linked build) and, where the
+    native backend compiles for the host, a debug build's (`native`, which a build
+    without --release uses there). Both link `--jit=llvm`, the default
+    implementation. Always -O3: every consumer optimization level shares the one
+    unit. Best-effort: without one the compiler builds it on demand.
     """
     entry = libdir / "compiler" / "jit_api.coil"
     if not entry.is_file():
@@ -357,15 +360,19 @@ def warm_jit_unit(compiler: Path, libdir: Path) -> None:
     # The per-backend layout that preceded per-implementation units.
     for backend in units.iterdir() if units.is_dir() else ():
         shutil.rmtree(backend / "coil.compiler.jit_api", ignore_errors=True)
-    out = units / "llvm" / "jit-llvm" / "coil.compiler.jit_api"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    result = toolchain_build(compiler, "build-unit", str(entry), "-o", str(out),
-                             "--backend", "llvm", "--jit=llvm", "-O3", "--quiet")
-    if result.returncode == 0:
-        print(f"warmed coil.jit unit -> {out}")
-    else:
-        print("note: could not warm the coil.jit unit; the first coil.jit build will build it")
-        shutil.rmtree(out, ignore_errors=True)
+    backends = ["llvm"]
+    if (sys.platform, platform.machine().lower()) in {("darwin", "arm64"), ("linux", "x86_64")}:
+        backends.append("native")
+    for backend in backends:
+        out = units / backend / "jit-llvm" / "coil.compiler.jit_api"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        result = toolchain_build(compiler, "build-unit", str(entry), "-o", str(out),
+                                 "--backend", backend, "--jit=llvm", "-O3", "--quiet")
+        if result.returncode == 0:
+            print(f"warmed coil.jit unit -> {out}")
+        else:
+            print(f"note: could not warm the {backend} coil.jit unit; the first such coil.jit build will build it")
+            shutil.rmtree(out, ignore_errors=True)
 
 
 def warm_lint_profile(compiler: Path, libdir: Path) -> None:

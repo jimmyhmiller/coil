@@ -104,6 +104,13 @@ jit_sdk() {
   [ -f "$units/llvm/jit-llvm/coil.compiler.jit_api/unit.o" ] \
     && ok "install warmed the coil.jit unit for the default (LLVM) backend" \
     || bad "install warmed the coil.jit unit" "no $units/llvm/jit-llvm/coil.compiler.jit_api/unit.o"
+  # Where a debug build uses the native backend, install warms its unit too.
+  case "$(uname -sm)" in
+    "Darwin arm64"|"Linux x86_64")
+      [ -f "$units/native/jit-llvm/coil.compiler.jit_api/unit.o" ] \
+        && ok "install warmed the coil.jit unit a debug build (the native backend) links" \
+        || bad "install warmed the debug build's coil.jit unit" "no $units/native/jit-llvm/coil.compiler.jit_api/unit.o" ;;
+  esac
   local iface; iface=$(cat "$units/llvm/jit-llvm/coil.compiler.jit_api/interface.coil" 2>/dev/null)
   case "$iface" in
     *"(module coil.compiler.jit_api)"*)
@@ -172,8 +179,9 @@ EOF
         *libSystem*) ok "a --jit=native coil.jit application links no LLVM" ;;
         *) bad "a --jit=native coil.jit application links no LLVM" "otool printed no dependencies: $native_deps" ;;
       esac
-      [ -f "$units/llvm/jit-native/coil.compiler.jit_api/unit.o" ] \
-        && [ -f "$units/llvm/jit-llvm/coil.compiler.jit_api/unit.o" ] \
+      # A debug build, so the native backend's units.
+      [ -f "$units/native/jit-native/coil.compiler.jit_api/unit.o" ] \
+        && [ -f "$units/native/jit-llvm/coil.compiler.jit_api/unit.o" ] \
         && ok "--jit=native builds its own coil.jit unit beside the llvm one" \
         || bad "--jit=native builds its own coil.jit unit beside the llvm one" "$(ls -R "$units" 2>&1 | head -20)"
     else

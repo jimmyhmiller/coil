@@ -66,7 +66,7 @@ Then re-run `python3 scripts/dev.py bootstrap c`.
 
 * `build/bootstrap/c/coil-bootstrap build src/examples/fib.coil -o /tmp/fib && /tmp/fib` exits **55**.
 * **Self-build reproduction**: the C-bootstrapped compiler builds a compiler
-  from `src/compiler/main_a64.coil --backend arm64`, and that binary's
+  from `src/compiler/main_a64.coil --backend native`, and that binary's
   `__TEXT,__text` (`otool -X -s __TEXT __text`) is **byte-identical** to the
   natively-built compiler's — i.e. the C bootstrap faithfully reproduces the
   compiler. The reproduced compiler itself builds `fib` → 55.

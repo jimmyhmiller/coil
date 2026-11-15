@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 from pathlib import Path
 import subprocess
@@ -198,7 +199,8 @@ with tempfile.TemporaryDirectory(prefix="coil-generated-tests-", dir=os.environ.
     invoke("run", "--backend", "llvm", "--quiet", expected=42)
     provider([consumer, state], facade)
     # The LLVM backend ran every program above; build one with the native backend.
-    for backend in (("arm64",) if sys.platform == "darwin" else ()):
+    native_host = (sys.platform, platform.machine().lower()) in {("darwin", "arm64"), ("linux", "x86_64")}
+    for backend in (("native",) if native_host else ()):
         executable = directory / backend
         invoke("build", "--backend", backend, "-o", str(executable))
         run([str(executable)], 42, env=environment)

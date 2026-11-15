@@ -31,7 +31,7 @@ def main() -> int:
             return 1
     with tempfile.TemporaryDirectory(prefix="wasm-self-host-", dir=os.environ.get("COIL_TEST_SCRATCH")) as raw:
         wasm = str(Path(raw) / "coilc.wasm")
-        built = run(COIL, "build", "src/compiler/main_wasm.coil", "--target", "wasm64-unknown-unknown",
+        built = run(COIL, "build", "src/compiler/main_wasm.coil", "--release", "--target", "wasm64-unknown-unknown",
                     "--wasm-stack-size=64", "-o", wasm)
         if built.returncode:
             print("FAIL the compiler does not build for wasm64\n" + (built.stdout + built.stderr)[-3000:])

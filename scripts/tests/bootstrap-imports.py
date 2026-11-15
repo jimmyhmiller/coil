@@ -134,7 +134,7 @@ def main():
                 # Built exactly as the WASM seed is. An unoptimized build keeps
                 # unreachable code (the libcurl client, for one) whose imports no
                 # bootstrap ever calls, so it is not what the hosts must provide.
-                subprocess.run([args.compiler, "build", str(ROOT / "src/compiler/main_wasm.coil"), "--target", target,
+                subprocess.run([args.compiler, "build", str(ROOT / "src/compiler/main_wasm.coil"), "--release", "--target", target,
                                 "--wasm-stack-size=64", "-o", str(module)], cwd=ROOT, check=True,
                                stdout=subprocess.DEVNULL)
                 ok = check(module, ROOT / "src/bootstrap" / runtime, f"current {target.split('-')[0]} compiler") and ok
