@@ -27,6 +27,8 @@ import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+       "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]
 
 REMOTE_SCRIPT = """
 set -eu
@@ -60,7 +62,7 @@ echo "x64 host: PASS"
 
 
 def ssh(host: str, command: str, **kwargs) -> subprocess.CompletedProcess:
-    return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command], **kwargs)
+    return subprocess.run([*SSH, host, command], **kwargs)
 
 
 def copy_tree(host: str, root: Path, dest: str) -> bool:
@@ -72,7 +74,7 @@ def copy_tree(host: str, root: Path, dest: str) -> bool:
     tar = subprocess.Popen(["tar", "--no-mac-metadata", "--no-xattrs", "--null", "-T", "-", "-czf", "-"],
                            cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                            env={**os.environ, "COPYFILE_DISABLE": "1"})
-    untar = subprocess.Popen(["ssh", "-o", "BatchMode=yes", host,
+    untar = subprocess.Popen([*SSH, host,
                               f"mkdir -p {dest} && tar -xzf - -C {dest}"], stdin=tar.stdout)
     tar.stdin.write(present)
     tar.stdin.close()
@@ -96,10 +98,28 @@ def main() -> int:
         print(f"FAIL could not copy {ROOT} to the x64 host")
         return 1
     try:
-        result = ssh(args.host, "bash -c " + shlex.quote(REMOTE_SCRIPT.format(dir=remote)), timeout=1800)
+        # Preserve output on the host as well as streaming it. If a connection
+        # drops, retrieving this file keeps the useful failure instead of forcing
+        # another full bootstrap just to recover its diagnostics.
+        command = ("set -o pipefail; PYTHONUNBUFFERED=1 bash -c "
+                   + shlex.quote(REMOTE_SCRIPT.format(dir=remote))
+                   + " 2>&1 | tee " + shlex.quote(f"{remote}/run.log")
+                   + "; result=${PIPESTATUS[0]}; printf '%s\\n' \"$result\" > "
+                   + shlex.quote(f"{remote}/exit-status") + "; exit \"$result\"")
+        result = ssh(args.host, "bash -c " + shlex.quote(command), timeout=1800)
         return 0 if result.returncode == 0 else 1
     finally:
-        if not args.keep:
+        logs = ROOT / "build" / "test-logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        local_log = logs / f"{remote}.log"
+        with local_log.open("wb") as output:
+            saved = ssh(args.host, "cat " + shlex.quote(f"{remote}/run.log"),
+                        stdout=output, stderr=subprocess.PIPE, timeout=30)
+        if saved.returncode == 0:
+            print(f"Linux host log: {local_log}", flush=True)
+        else:
+            print(f"Linux host log could not be retrieved; remote copy: {remote}", flush=True)
+        if not args.keep and saved.returncode == 0:
             ssh(args.host, f"rm -rf {remote}", timeout=120)
 
 
