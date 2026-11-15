@@ -188,3 +188,8 @@ on the native backend. The rest of COMPREHENSIVE runs locally.
   behaviour change to explain.
 - `scripts/tests/fuzz_targets.py` runs fuzz campaigns (`tests/fuzz`); they are
   local only.
+- `scripts/declarative/` holds the native backend's development tools: the
+  compiler it builds rebuilding itself (`selfcheck.sh`), the same under far
+  larger inlining limits (`stress.sh`), its run time against LLVM's
+  (`runtime.sh`), bisecting a trial to the function it breaks (`bisect.sh`),
+  and lldb on its `-g` builds against LLVM's (`debugger.sh`). See its README.
