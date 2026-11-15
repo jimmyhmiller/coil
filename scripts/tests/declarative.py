@@ -10,7 +10,8 @@ COIL and run:
     tests/, so that everything else is written in the languages;
   - rules: every rewrite rule and every fact, checked against the meanings of
     the nodes;
-  - toy: the languages' second client, a calculator;
+  - toy: the languages' independent calculator and storage/analysis clients,
+    under LLVM O1 and native O0;
   - link: an object written by the backend and linked in memory, then linked
     by the system linker into a C program, twice (the second with LINK_BASE=1);
   - variadic, results, passing: calls, several results, arguments;
@@ -26,6 +27,7 @@ COIL and run:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import shutil
@@ -60,7 +62,55 @@ def check_split() -> None:
     if stray or in_adapter:
         fail("the sources hold Coil that should be written in a language: "
              + " ".join(str(p) for p in stray + in_adapter))
+    for source in (SOURCES / "native").glob("*.pass"):
+        declarations = [line.strip() for line in source.read_text().splitlines()
+                        if line.strip() and not line.lstrip().startswith("#")]
+        if not declarations or declarations[0] != "library declarative":
+            fail(f"native infrastructure must use the strict declarative language: {source.name}")
     print("ok   the split: no Coil outside lang/, adapter/machine.coil and tests/")
+
+
+def check_library_boundary(coil: str, work: Path) -> None:
+    boundary = work / "boundary"
+    boundary.mkdir()
+    (boundary / "Coil.toml").write_text(
+        '[package]\nname = "declarative-boundary"\n'
+        f'source-roots = [".", {json.dumps(str(SOURCES / "lang"))}]\n'
+        '[readers]\n".pass" = "lang.readers"\n'
+        '[modules]\n"boundary.value" = "value.pass"\n')
+    driver = boundary / "check.coil"
+    driver.write_text('(module boundary.check)\n(import "boundary.value" :as value)\n')
+    cases = [
+        ('library declarative\nfn value() -> u32 = typed[u32](7);\n', None),
+        ('library declarative\nfn value() -> u32 { typed[u32](7); }\n', "function equations, not statement bodies"),
+        ('library declarative\nrewrite value!() -> u32 { create value = do { typed[u32](7); }; result = value; }\n',
+         "procedural control and assignment are not allowed"),
+    ]
+    index_source = ('library declarative\nrecord Cell { value: u64; }\n'
+                    'record Table { chunks: list[list[Cell]] capacity CAPACITY; count: i64; }\n'
+                    'stable-index append!(table: ref[Table], cell: Cell) {\n'
+                    ' chunks = chunks; count = count; shift = typed[i64](SHIFT); lookup = at; length = size; }\n')
+    for capacity, shift in [("0", "1"), ("1", "32"), ("1", "0 - 1"), ("2", "31")]:
+        cases.append((index_source.replace("CAPACITY", capacity).replace("SHIFT", shift),
+                      "invalid stable-index capacity or chunk shift"))
+    cases.extend([
+        ('library declarative\nfollow value(n: u32) -> u32 { start = n; start = n; view = node; stop = true; next = node; result = node; }\n',
+         "duplicate property: start"),
+        ('library declarative\nfollow value(n: u32) -> u32 { start = n; view = node; stop = true; next = node; }\n',
+         "missing required property: result"),
+        ('library declarative\nfollow value(n: u32) -> u32 { start = n; view = node; stop = true; next = node; result = node; typo = n; }\n',
+         "unknown property: typo"),
+    ])
+    for source, diagnostic in cases:
+        (boundary / "value.pass").write_text(source)
+        result = subprocess.run([coil, "check", str(driver)], cwd=boundary,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if diagnostic is None:
+            if result.returncode != 0:
+                fail(f"a declarative equation was rejected:\n{result.stdout[-3000:]}")
+        elif result.returncode == 0 or diagnostic not in result.stdout:
+            fail(f"the declarative boundary did not produce the expected rejection:\n{result.stdout[-3000:]}")
+    print("ok   declarative boundary: equations accepted; procedural forms, invalid storage and malformed schemas rejected")
 
 
 def main() -> int:
@@ -77,10 +127,12 @@ def main() -> int:
     check_split()
     work = Path(tempfile.mkdtemp(prefix="declarative-tests."))
     (work / "out").mkdir()
+    check_library_boundary(coil, work)
 
-    def build(name: str) -> Path:
-        exe = work / name
-        result = subprocess.run([coil, "build", str(SOURCES / "tests" / f"{name}.coil"), "--release", "-O1",
+    def build(name: str, *, backend: str | None = None, level: int = 1) -> Path:
+        exe = work / (name if backend is None else f"{name}-{backend}-O{level}")
+        flags = ["--release", f"-O{level}"] + (["--backend", backend] if backend else [])
+        result = subprocess.run([coil, "build", str(SOURCES / "tests" / f"{name}.coil"), *flags,
                                  "-o", str(exe)], cwd=SOURCES, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True)
         if result.returncode != 0:
@@ -101,6 +153,9 @@ def main() -> int:
     for name in SINGLES:
         out = run([build(name)], name)
         print(f"ok   {name}: {out.strip().splitlines()[-1] if out.strip() else ''}")
+        if name == "toy":
+            out = run([build(name, backend="native", level=0)], "toy, native O0")
+            print(f"ok   toy/native-O0: {out.strip().splitlines()[-1] if out.strip() else ''}")
 
     link = build("link")
     cc = os.environ.get("CC", "cc")

@@ -25,25 +25,50 @@ lists; other fields default to zero unless given an initial value. `capacity` on
 uses that to keep its symbol-chunk table stable. `construct`
 generates a constructor from those declarations, and `release` frees the
 record's list fields. A release can name its parameter, for example
-`release Func as func-free!(f);`, preserving named-argument callers. It does not own references, borrowed spans, or resources
-inside record elements: an algorithm closes those explicitly, as the assembler
-does for section buffers and its mutex. `fill`, `append-list` and `truncate`
+`release Func as func-free!(f);`, preserving named-argument callers. It does not own references or borrowed spans. `drop` and `drop-each` declare
+ownership of nested resources; mutex lifecycle is declared separately. `fill`, `append-list` and `truncate`
 keep list representation and allocation out of algorithms. The buffer storage
 generator is the layer that calls allocation and byte-memory primitives.
 
-The correction toward declarative algorithms is in progress. `.pass` library
-mode still accepts imperative function bodies; using that syntax alone does not
-make an algorithm declarative. The remaining SSA builders, compaction,
-several copy analyses, and assembler operations need further conversion.
+All four native sources use `library declarative`. This mode rejects procedural
+function bodies and hidden control or assignment forms. Function definitions are
+pure equations or single effect aliases; storage, graph solvers, row queries,
+guarded rewrites and schedules express the algorithms. The standalone gate
+requires this strict mode for every native infrastructure source.
 
 The declarations already used by the native sources are:
 
+- `follow`: terminal and next-node equations, optionally with an accumulated
+  fold. These compile to a single loop even at O0, without recursive stack use.
+- `tally`: dense cardinalities derived from pure key rows.
+- `reduce`: an ordered fold over pure rows with an explicit empty identity.
+- `worklist`: append-discovered rows in FIFO order, or a consuming LIFO stack.
+  The effect declares discovery; the language derives the traversal cursor.
+  FIFO effects may append but cannot remove or reorder queue entries.
+- `intern`: dense bounded-domain or ordered keyed interning. The constructor
+  runs once on a miss; hits preserve object identity.
+- `mutex` and `stable-index`: a resource lifecycle and a bounded chunked index.
+  The outer reservation derives from the record, chunk addresses remain stable,
+  and insertion can declare paired acquisition/release hooks.
+- `sweep`, `count-rewrites` and `saturate`: ordered rule application, application
+  counts, or convergence. `materialize` derives grouped output and order;
+  `pipeline` declares the stage sequence.
+- `prune`: use, root and operand relations plus eligibility. The language derives
+  reference counts, the reverse sweep and cascading deletion.
+- `compact` and `retain`: stable filtering with group metadata and optional
+  forward anchors, or in-place ID retention with updated ordinals.
 - `insert`: one logical row across declared columns, returning its ordinal.
   Values observe the pre-insertion state; the language derives column appends.
   CIR values, operands, variables and blocks use this declaration.
 - `relation`: ordered rows and output columns. The language derives a compressed
   inverse index, including counts, prefix sums and placement. A query can bind
   ordinary ranges, linked chains or ragged segments without client cursors.
+- `sealed-ssa`: definitions, predecessor constraints, deferred merge storage and
+  merge-building hooks. The solver publishes a cyclic merge before reading its
+  predecessors and discharges deferred merges when a block seals.
+- `gather`: column-major ragged rows with a declared resolver. The language
+  reserves and publishes the row before resolving its inputs, so recursive
+  construction can append more rows without invalidating the reserved offsets.
 - `dominators`: graph adjacency and immediate-dominator equations. The language
   derives reverse postorder, sparse predecessor intersection and convergence;
   unreachable nodes retain the declared absent value.
@@ -59,7 +84,9 @@ The declarations already used by the native sources are:
   generation stamps and block scheduling.
 - `predicate` and `rewrite`: named bindings, requirements, derived row views and
   path queries. All constraints precede effects. Typed rewrites specify a rejection value and result; `create`
-  bindings execute only after constraints succeed. Rejected rules apply no rewrite
+  bindings execute only after constraints succeed. `resource` binds mutable
+  temporary storage and its release action; generated defers release nested
+  resources in reverse acquisition order when their scopes exit. Rejected rules apply no rewrite
   effects; analysis scratch can change while checking a constraint.
 - `scatter`: row queries with declared array cells or record fields to update.
   Writes execute in row order. Query domains and predicate inputs must remain
@@ -92,6 +119,7 @@ The native public types and entry points retain their ABI. The compiler and
 standalone backend both consume these sources; generated Coil is an artifact.
 Tests and measurements must cover both uses before claiming completion or
 performance parity. Source-size accounting includes the declaration compilers.
+The standalone suite runs the independent clients under LLVM O1 and native O0.
 
 After editing:
 
@@ -102,4 +130,7 @@ The second client in `toy/storage.pass`, called by `tests/toy.coil`, exercises
 the same declarations with noncompiler data: recursive and unknown-boundary
 facts, cyclic stopped paths, rejected and accepted rewrites, cell updates,
 snapshot isolation, retained scratch, ownership, dominator diamonds and cycles,
-epoch-map collisions/growth/wrap, agreement, and unaligned buffer encodings.
+epoch-map collisions/growth/wrap, agreement, cyclic/deferred SSA merges, reserved
+rows across nested appends, pruning cascades, segment-local anchors, stable
+retention, scheduling, lazy scoped fallbacks, long path folds, and unaligned
+buffer encodings.
