@@ -1,0 +1,457 @@
+# From chosen registers to bytes. Each operand is the register its value's
+# piece has there. Where a value changes home, inside a block or along an edge,
+# it is moved or brought back from the frame; a value that ever waits in the
+# frame is stored there as it is written. Copies to the same register and jumps
+# to the next block go away, the frame is opened and closed, and each
+# instruction is encoded.
+pass in unit
+use mach as mach
+use alloc as alloc
+use lower as lower
+use frames as frames
+import target as isa
+import abi as abi
+
+column final-first: Block -> Int      # a block's first final instruction
+column onward: Block -> Block         # for a block that is only a jump: where it jumps
+state final-start: Int                # final instructions follow the selected ones
+tally unplanned: Int                  # a plan to open the frame late that did not hold, here or in alloc
+state move-to: [Int]                  # moves to make together: the registers written
+state move-from: [Int]                # and read; -(slot + 1) for a value in the frame
+state move-wide: [Bool]               # and whether what moves is sixteen bytes
+column offset: Inst -> Int             # a final instruction's place in the code, in bytes
+state code: [Byte]
+state code-bytes: Int
+state reloc-at: [Int]                  # the words that depend on a symbol's address,
+state reloc-symbol: [Int]              # the symbol,
+state reloc-op: [Int]                  # and the instruction there
+state dropped: Int                     # a jump that the branch before it made needless
+state row-at: [Int]                    # where in the code what is computed starts to come from
+state row-from: [Int]                  # somewhere else in the source, and from where
+
+fn marker(r: Int) -> Int = 0 - r - 1
+
+# The piece that holds `v` at `pos`. Emission moves forward, so this never looks back.
+fn here(v: Vreg, pos: Int) -> Piece {
+  var p = v.at-piece
+  if p == none { p = v.first-piece }
+  while p.next-piece != none and pos >= p.pend { p = p.next-piece }
+  v.at-piece = p
+  p
+}
+
+# Operand `k` of `i`: for a virtual register, the machine register it is in there.
+fn resolve(i: Inst, k: Int) -> Int {
+  let op = i.inst-op
+  if k >= isa.operand-count(op) { return 0 }
+  let kind = isa.operand-kind(op, k)
+  let a = mach.arg(i, k)
+  if not alloc.reg-kind?(kind) or a < 0 { return a }
+  let p = here(id(a), if kind == isa.K-DEF then 2 * int(i) + 1 else 2 * int(i))
+  if p.reg == 0 { panic("emission: a value has no register where it is used") }
+  marker(p.reg - 1)
+}
+
+# A register operand `a` as the machine register it is at `pos`.
+fn placed(a: Int, pos: Int) -> Int = if a < 0 then a else marker(here(id(a), pos).reg - 1)
+
+# The block an instruction jumps to: its label operand.
+fn label-of(i: Inst) -> Int {
+  let op = i.inst-op
+  for k in 0..isa.operand-count(op) {
+    if isa.operand-kind(op, k) == isa.K-LABEL { return mach.arg(i, k) }
+  }
+  0
+}
+
+# A value that waits in the frame anywhere is stored there wherever it is written.
+fn finish(i: Inst, k: Int) {
+  let op = i.inst-op
+  # Before the frame is open there is nowhere to store it: it is stored as the frame opens.
+  if frame-at != none and not i.home.framed { return }
+  if k < isa.operand-count(op) and alloc.writes?(isa.operand-kind(op, k)) {
+    let a = mach.arg(i, k)
+    if a > 0 and id(a).slot != 0 {
+      frames.keep(here(id(a), 2 * int(i) + 1).reg - 1, out-slots + id(a).slot - 1, id(a).wide)
+    }
+  }
+}
+
+# ---------------------------------------------------------------- moves made together
+
+fn move(to: Int, from: Int, wide: Bool) {
+  if to != from {
+    move-to.push(to)
+    move-from.push(from)
+    move-wide.push(wide)
+  }
+}
+
+fn emit-move(to: Int, from: Int, wide: Bool) {
+  if from < 0 { frames.fetch(to, out-slots + (0 - from) - 1, wide) } else { frames.copy(to, from) }
+}
+
+# Every pending move, each source read before anything overwrites it. A ring
+# of registers is opened by setting one of them aside in the scratch register.
+fn flush-moves() {
+  var left = move-to.len
+  while left > 0 {
+    var progress = false
+    for j in 0..move-to.len {
+      let d = move-to[j]
+      if d >= 0 {
+        let wanted = any k in 0..move-to.len: k != j and move-to[k] >= 0 and move-from[k] == d
+        if not wanted {
+          emit-move(d, move-from[j], move-wide[j])
+          move-to[j] = -1
+          left = left - 1
+          progress = true
+        }
+      }
+    }
+    if not progress {
+      var d = -1
+      for j in 0..move-to.len { if d < 0 and move-to[j] >= 0 { d = move-to[j] } }
+      let aside = if frames.floating?(d) then isa.FSCRATCH else isa.SCRATCH0
+      frames.copy(aside, d)
+      for j in 0..move-to.len { if move-to[j] >= 0 and move-from[j] == d { move-from[j] = aside } }
+    }
+  }
+  move-to.clear()
+  move-from.clear()
+  move-wide.clear()
+}
+
+# A piece that starts inside a block takes its value from the piece before it.
+fn transition(p: Piece) {
+  let q = p.prev-piece
+  if q == none or p.in-frame or p.reg == 0 { return }
+  if q.in-frame or q.reg == 0 { move(p.reg - 1, 0 - p.owner.slot, p.owner.wide) }
+  else { move(p.reg - 1, q.reg - 1, p.owner.wide) }
+}
+
+# The values live into `s`, from where they are at the end of `p` to where `s`
+# expects them.
+fn bring(p: Block, s: Block) {
+  for v in s.live-in {
+    # A value with one piece is in one place everywhere.
+    if v.first-piece.next-piece != none {
+      let to = alloc.piece-at(v, 2 * s.first-inst)
+      let from = alloc.piece-at(v, 2 * p.last-inst + 1)
+      if not to.in-frame and to.reg != 0 {
+        if from.in-frame or from.reg == 0 { move(to.reg - 1, 0 - v.slot, v.wide) }
+        else { move(to.reg - 1, from.reg - 1, v.wide) }
+      }
+    }
+  }
+  flush-moves()
+}
+
+# Whether `i` is a branch with an opposite.
+fn turns?(i: Inst) -> Bool = isa.opposite-op(i.inst-op) != 0 or isa.opposite-turn(i.inst-op) >= 0
+
+# Branch `i` the other way round, to block `to`: its opposite instruction, or
+# itself with the operand that says which way turned.
+fn turned(i: Inst, to: Int) {
+  let op = i.inst-op
+  let turn = isa.opposite-turn(op)
+  var x0 = resolve(i, 0)
+  var x1 = resolve(i, 1)
+  var x2 = resolve(i, 2)
+  if isa.operand-kind(op, 0) == isa.K-LABEL { x0 = to }
+  if isa.operand-kind(op, 1) == isa.K-LABEL { x1 = to }
+  if isa.operand-kind(op, 2) == isa.K-LABEL { x2 = to }
+  if turn == 0 { x0 = if x0 % 2 == 0 then x0 + 1 else x0 - 1 }
+  if turn == 1 { x1 = if x1 % 2 == 0 then x1 + 1 else x1 - 1 }
+  if turn == 2 { x2 = if x2 % 2 == 0 then x2 + 1 else x2 - 1 }
+  mach.emit(if isa.opposite-op(op) != 0 then isa.opposite-op(op) else op, x0, x1, x2, resolve(i, 3), resolve(i, 4))
+}
+
+# Whether the values live into `s` are, at the end of `p`, already where `s`
+# expects them: the edge needs no moves.
+fn settled?(p: Block, s: Block) -> Bool {
+  for v in s.live-in {
+    if v.first-piece.next-piece != none {
+      let to = alloc.piece-at(v, 2 * s.first-inst)
+      let from = alloc.piece-at(v, 2 * p.last-inst + 1)
+      if not to.in-frame and to.reg != 0 {
+        if from.in-frame or from.reg == 0 or from.reg != to.reg { return false }
+      }
+    }
+  }
+  true
+}
+
+# The machine register operand `a` is in at `pos`, found without moving the
+# marks emission keeps.
+fn register-at(a: Int, pos: Int) -> Int = if a < 0 then a else marker(alloc.piece-at(id(a), pos).reg - 1)
+
+# Whether instruction `i` comes to nothing: a copy between two values in the
+# same register, the one written not also kept in the frame.
+fn nothing?(i: Inst) -> Bool {
+  if i.kind != 1 { return false }
+  if i.copy-to > 0 and id(i.copy-to).slot != 0 { return false }
+  register-at(i.copy-to, 2 * int(i) + 1) == register-at(i.copy-from, 2 * int(i))
+}
+
+# A block that is a jump and nothing else that comes to anything, reached and
+# left with nothing to move, is no code at all: what goes to it goes to where
+# it jumps.
+fn find-onward() {
+  for b in order {
+    if id(b.last-inst).kind == 2 and b.preds.len >= 1 and b.succs.len == 1 and b.succs[0] != b and b != frame-at and not (frame-at != none and b.framed and not b.succs[0].framed) {
+      var empty = true
+      for at in b.first-inst..b.last-inst { if not nothing?(id(at)) { empty = false } }
+      # Nor may a value come back from the frame part way through it.
+      for at in b.first-inst + 1..b.last-inst + 1 {
+        let i: Inst = id(at)
+        if i.starts-even.len > 0 { empty = false }
+      }
+      if empty and (all p in b.preds: settled?(p, b)) and settled?(b, b.succs[0]) { b.onward = b.succs[0] }
+    }
+  }
+  # Blocks that only jump round to one another are a loop that must be code:
+  # one that comes back to itself, or never arrives, stays a jump.
+  for b in order {
+    if b.onward != none {
+      var x = b.onward
+      var steps = 0
+      while x != none and x != b and steps <= order.len {
+        x = x.onward
+        steps = steps + 1
+      }
+      if x != none { b.onward = none }
+    }
+  }
+  # Then each goes straight to where its jumps end.
+  for b in order {
+    if b.onward != none { b.onward = lands(b) }
+  }
+}
+
+# Where a jump to block `b` ends up, through blocks that are only jumps.
+fn lands(b: Block) -> Block {
+  var x = b
+  while x.onward != none { x = x.onward }
+  x
+}
+
+# The block `i` jumps or branches to, as it lands; 0 if `i` names no block.
+fn goes(i: Inst) -> Int {
+  let l = label-of(i)
+  if l == 0 then 0 else int(lands(id(l)))
+}
+
+fn rewrite(i: Inst, next: Int) {
+  if int(i) == dropped { return }
+  emitting-from = i.came-from
+  let op = i.inst-op
+  let x0 = resolve(i, 0)
+  let x1 = resolve(i, 1)
+  let x2 = resolve(i, 2)
+  let x3 = resolve(i, 3)
+  let x4 = resolve(i, 4)
+  let same-register = i.kind == 1 and placed(i.copy-to, 2 * int(i) + 1) == placed(i.copy-from, 2 * int(i))
+  let falls-through = i.kind == 2 and goes(i) == next
+  if i.kind == 4 {
+    # A parameter from the caller's frame, now that this frame's size is known.
+    let d = placed(i.copy-to, 2 * int(i) + 1)
+    let at = i.copy-from + frame + abi.RETURN-SLOTS * 8
+    if frames.floating?(0 - d - 1) { lower.from-stack-float(d, frames.base(), at, i.caller-bytes) }
+    else { lower.from-stack(d, frames.base(), at, i.caller-bytes) }
+  } else if i.kind == 12 {
+    let r = placed(i.copy-to, 2 * int(i))
+    let at = i.copy-from + frame + abi.RETURN-SLOTS * 8
+    if frames.floating?(0 - r - 1) { lower.to-object-float(r, frames.base(), at, i.caller-bytes) }
+    else { lower.to-object(r, frames.base(), at, i.caller-bytes) }
+  } else if i.kind == 11 {
+    lower.frame-address(placed(i.copy-to, 2 * int(i) + 1), frames.base(), i.copy-from + frame + abi.RETURN-SLOTS * 8)
+  } else if i.kind == 8 {
+    # A frame object, now that it is known how far above the base it is.
+    let d = placed(i.copy-to, 2 * int(i) + 1)
+    let at = frames.record-slot() * 8 - i.copy-from
+    if frames.floating?(0 - d - 1) { lower.from-object-float(d, frames.base(), at, i.caller-bytes) }
+    else { lower.from-object(d, frames.base(), at, i.caller-bytes) }
+  } else if i.kind == 9 {
+    let r = placed(i.copy-to, 2 * int(i))
+    let at = frames.record-slot() * 8 - i.copy-from
+    if frames.floating?(0 - r - 1) { lower.to-object-float(r, frames.base(), at, i.caller-bytes) }
+    else { lower.to-object(r, frames.base(), at, i.caller-bytes) }
+  } else if i.kind == 10 {
+    lower.frame-address(placed(i.copy-to, 2 * int(i) + 1), frames.base(), frames.record-slot() * 8 - i.copy-from)
+  } else if i.kind == 6 {
+    # The frame register is where the record is, which is known from the base;
+    # in a function that moves the stack pointer, the base must have survived.
+    if dynamic and has-bit(i.also-writes, abi.BASE) { panic("a call writes both registers the frame is found by, in a function that moves the stack pointer") }
+    lower.frame-record(frames.base(), frames.record-slot() * 8)
+  } else if i.kind == 7 {
+    # Only a function that moves the stack pointer keeps a base, below the record.
+    if dynamic { lower.base-from-frame(marker(abi.BASE), frames.record-slot() * 8) }
+  } else if i.kind == 5 {
+    lower.above-arguments(placed(i.copy-to, 2 * int(i) + 1), out-slots * 8)
+  } else if not same-register and not falls-through {
+    if i.kind == 3 and frame > 0 and (frame-at == none or i.home.framed) { frames.leave() }
+    mach.emit(op, x0, x1, x2, x3, x4)
+  }
+  for k in 0..5 { finish(i, k) }
+}
+
+# Where a block's code starts, in bytes.
+fn block-offset(b: Block) -> Int =
+  if b.final-first > Inst.count then code-bytes else id(b.final-first).offset
+
+# Operand `k` of a final instruction as its encoding wants it. A register is
+# its number; a label the distance from the instruction, known once every
+# instruction has its place; a symbol nothing yet.
+fn encoded(i: Inst, k: Int, placed: Bool) -> Int {
+  let op = i.inst-op
+  if k >= isa.operand-count(op) { return 0 }
+  let kind = isa.operand-kind(op, k)
+  let a = mach.arg(i, k)
+  if alloc.reg-kind?(kind) { return 0 - a - 1 }
+  if kind == isa.K-LABEL { return if placed then block-offset(lands(id(a))) - i.offset else 0 }
+  if kind == isa.K-SYMBOL { return 0 }
+  a
+}
+
+# The symbol a final instruction names, if any operand is one.
+fn symbol-of(i: Inst) -> Int {
+  let op = i.inst-op
+  for k in 0..isa.operand-count(op) {
+    if isa.operand-kind(op, k) == isa.K-SYMBOL { return mach.arg(i, k) }
+  }
+  0
+}
+
+# Every final instruction gets its place, then its bytes.
+fn encode() {
+  var last-from = 0
+  for at in final-start + 1..Inst.count + 1 {
+    let i = id(at)
+    if i.came-from != 0 and i.came-from != last-from {
+      row-at.push(code-bytes)
+      row-from.push(i.came-from)
+      last-from = i.came-from
+    }
+    i.offset = code-bytes
+    code-bytes = code-bytes + isa.size(mut code, i.inst-op, encoded(i, 0, false), encoded(i, 1, false), encoded(i, 2, false), encoded(i, 3, false), encoded(i, 4, false))
+  }
+  for at in final-start + 1..Inst.count + 1 {
+    let i = id(at)
+    let field = isa.encode!(mut code, i.inst-op, encoded(i, 0, true), encoded(i, 1, true), encoded(i, 2, true), encoded(i, 3, true), encoded(i, 4, true))
+    # A symbol's bits are filled in when the code is given addresses.
+    if field >= 0 {
+      reloc-at.push(i.offset + field)
+      reloc-symbol.push(symbol-of(i))
+      reloc-op.push(i.inst-op)
+    }
+  }
+}
+
+# The final code of block `b`, which block `next` follows.
+# Whether the plan to open the frame at `frame-at` holds now that every value
+# has its homes: before there, nothing waits in the frame or comes back from
+# it, and no register the caller expects back is used.
+fn plan-holds?() -> Bool {
+  for b in order {
+    if not b.framed {
+      for v in b.live-in {
+        let p = alloc.piece-at(v, 2 * b.first-inst)
+        if p.in-frame or p.reg == 0 or isa.in-set?(isa.CALLEE-SAVED, p.reg - 1) { return false }
+      }
+      for at in b.first-inst..b.last-inst + 1 {
+        let i = id(at)
+        if i.kind >= 4 { return false }
+        let op = i.inst-op
+        for k in 0..isa.operand-count(op) {
+          let kind = isa.operand-kind(op, k)
+          let a = mach.arg(i, k)
+          if alloc.reg-kind?(kind) and a > 0 {
+            let p = alloc.piece-at(id(a), if kind == isa.K-DEF then 2 * at + 1 else 2 * at)
+            if p.in-frame or p.reg == 0 or isa.in-set?(isa.CALLEE-SAVED, p.reg - 1) { return false }
+          }
+        }
+        for p in i.starts-even { if p.in-frame or p.reg == 0 or (p.prev-piece != none and (p.prev-piece.in-frame or p.prev-piece.reg == 0)) { return false } }
+        for p in i.starts-odd { if p.in-frame or p.reg == 0 { return false } }
+      }
+      # Nor may a value leave the block waiting in the frame.
+      for s in b.succs {
+        for v in s.live-in {
+          let p = alloc.piece-at(v, 2 * b.last-inst + 1)
+          if p.in-frame or p.reg == 0 { return false }
+        }
+      }
+    }
+  }
+  true
+}
+
+# The frame opens at the top of `b`: and every value alive here that ever
+# waits in the frame is stored there now, from where the block before left it,
+# none having been stored as it was written.
+fn open-frame(b: Block) {
+  frames.enter()
+  let before = b.preds[0]
+  for v in b.live-in {
+    if v.slot != 0 {
+      let from = alloc.piece-at(v, 2 * before.last-inst + 1)
+      frames.keep(from.reg - 1, out-slots + v.slot - 1, v.wide)
+    }
+  }
+}
+
+fn block-code(b: Block, next: Int) {
+  if b == frame-at { open-frame(b) }
+  # A block with one way in, from a block with two ways out, takes its values here.
+  if b.preds.len == 1 and b.preds[0].succs.len > 1 { bring(b.preds[0], b) }
+  for at in b.first-inst..b.last-inst + 1 {
+    let i = id(at)
+    if at != b.first-inst {
+      for p in i.starts-even { transition(p) }
+      flush-moves()
+    }
+    # Before a block's closing jump, the values the next block expects.
+    if at == b.last-inst and b.succs.len == 1 { bring(b, b.succs[0]) }
+    # Going on to where the frame was never opened, it is closed first.
+    if at == b.last-inst and frame-at != none and b.framed and b.succs.len == 1 and not b.succs[0].framed { frames.leave() }
+    # A branch to the next block, then a jump elsewhere, is the opposite
+    # branch to elsewhere, if the branch is the block's only one.
+    let last = id(b.last-inst)
+    if at + 1 == b.last-inst and turns?(i) and goes(i) == next and next != 0 and last.kind == 2 and goes(last) != next and (at == b.first-inst or label-of(id(at - 1)) == 0) {
+      turned(i, goes(last))
+      dropped = b.last-inst
+    } else if at + 1 == b.last-inst and turns?(i) and last.kind == 2 and goes(i) != next and goes(last) != next and goes(last) != 0 and goes(i) != 0 and id(goes(last)).rpo <= b.rpo and (id(goes(i)).rpo > b.rpo or id(goes(last)).loop-depth > id(goes(i)).loop-depth) and (at == b.first-inst or label-of(id(at - 1)) == 0) {
+      # Neither way is the next block, and the jump goes back while the branch
+      # goes on, or back to a loop further out: the branch is turned to go
+      # where the jump went, so that going round the inner loop is one branch
+      # taken, and the jump is what leaves.
+      let onward-to = goes(i)
+      turned(i, goes(last))
+      lower.jump(onward-to)
+      dropped = b.last-inst
+    } else { rewrite(i, next) }
+  }
+}
+
+fn run() {
+  frames.settle(used, slots, false)
+  final-start = Inst.count
+  if frame-at != none and (frame == 0 or not plan-holds?()) {
+    if frame > 0 { unplanned = unplanned + 1 }
+    frame-at = none
+    for b in order { b.framed = true }
+  }
+  if frame > 0 and frame-at == none { frames.enter() }
+  find-onward()
+  for index in 0..order.len {
+    let b = order[index]
+    # The next block that is code.
+    var after = index + 1
+    while after < order.len and order[after].onward != none { after = after + 1 }
+    b.final-first = Inst.count + 1
+    if b.onward == none { block-code(b, if after < order.len then int(order[after]) else 0) }
+  }
+  # The entry block's code starts at the frame's opening.
+  order[0].final-first = final-start + 1
+  encode()
+}

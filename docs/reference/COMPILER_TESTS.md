@@ -72,8 +72,8 @@ toolchain), and `$COIL_TEST_SCRATCH`, a directory the harness removes afterwards
 
 | Steps | What they run | Where |
 |---|---|---|
-| `examples/*` | the ten example packages: build, run six on their data, `coil test` each, arm64 tests for two, huffman under `coil.safety`, `fmt --check` | `scripts/tests/fast/examples.py`, `examples/` |
-| `corpus/*` | nine self-checking programs on arm64, LLVM and the interpreter (which refuses the machine-code one), two under `coil.safety`, three with the interpreted metaprogram engine | `scripts/oracle.py corpus`, `tests/corpus/` |
+| `examples/*` | the ten example packages: build, run six on their data, `coil test` each, native-backend tests for two, huffman under `coil.safety`, `fmt --check` | `scripts/tests/fast/examples.py`, `examples/` |
+| `corpus/*` | nine self-checking programs on the native backend, LLVM and the interpreter (which refuses the machine-code one), two under `coil.safety`, three with the interpreted metaprogram engine | `scripts/oracle.py corpus`, `tests/corpus/` |
 | `diag/*` | compile errors (many per file), link errors, compiles that must stop and say so, byte-exact | `scripts/oracle.py diag`, `tests/diag/` |
 | `cli/*` | the command-line contract, one step per area | `scripts/tests/fast/cli.sh`, `tests/cli/` |
 | `projects` | one package using every `Coil.toml` feature, a workspace, a hermetic profile, prebuilt units | `scripts/tests/fast/projects.sh`, `tests/projects/` |
@@ -81,11 +81,12 @@ toolchain), and `$COIL_TEST_SCRATCH`, a directory the harness removes afterwards
 | `wasm` | wasm32 and wasm64 programs under node, validated | `scripts/tests/fast/wasm.py`, `tests/wasm/` |
 | `memory/*` | generated units and the namespace index stay within their memory bounds; the REPL's resident set and time per submission are reported | `scripts/tests/generated-unit-memory.py`, `project-scan-memory.py`, `repl-growth.py` |
 | `readers` | reader-provider projects and provider artifacts | `scripts/tests/fast/readers.sh`, `tests/readers/` |
+| `declarative/generated` | the native backend's generated Coil is what its sources say: the languages run again and their output compared with `src/compiler/declarative/generated` | `scripts/compiler/gen-declarative.py --check`, `src/declarative/` |
 | `meta` | code->code programs, hygiene both ways, lint suggestions, staged entries, transforms | `scripts/tests/fast/meta.sh`, `tests/meta/` |
 | `simd` | the SIMD differential on both backends and the vectorized codegen check | `scripts/tests/simd.py fast`, `tests/simd/` |
 | `stdlib/*` | seven deftest suites over the standard library | `tests/stdlib/` |
 
-The quick tier is the corpus on arm64 and LLVM, the compile diagnostics and the
+The quick tier is the corpus on the native backend and LLVM, the compile diagnostics and the
 compiles that must stop, `coil run` and `coil fmt`, the tests of two example
 packages, the C ABI and one wasm program.
 
@@ -116,8 +117,9 @@ FAST are the Stogir rows of
 `scripts/tests/fast/cli.sh objects`, and `scripts/tests/stogir-x86-sweep.py`
 compares it with LLVM over the corpus, the demos, the stdlib suites and the
 examples at -O1, -O2 and -O3. Its own tests (rewrite rules, random programs
-interpreted against compiled, linking, debugging against LLVM's -g build) are
-in coil-stogir-declarative.
+interpreted against compiled, linking) are COMPREHENSIVE's `declarative` step,
+and FAST's `declarative/generated` keeps its generated Coil what its sources
+(`src/declarative`) say.
 
 ### Diagnostics
 
@@ -157,8 +159,9 @@ nothing else heavy is running: the build steps peak near 10 GB.
 | `corpus/*-all`, `corpus/opt3` | every corpus program under `coil.safety`, `-O3` and the interpreted engine |
 | `guide-demos` | every `src/examples` demo builds and exits as `tests/demos.txt` says |
 | `regex-reference`, `prop`, `fuzz`, `simd` | breadth: regex conformance, property tests, the fuzz engine, SIMD in full |
+| `declarative` | the native backend's own tests, from `src/declarative/tests`: every rewrite rule and fact against the nodes' meanings, the languages' toy client, objects linked in memory and by the system linker, calls, CIR's interpreter, and 2000 random programs each through the compile from CIR and the whole pipeline (`scripts/tests/declarative.py`) |
 | `freestanding` | every `src/examples/freestanding` program links bare-metal (aarch64, riscv32, ESP32-C3) with `ld.lld --gc-sections` and no undefined symbols, then boots under QEMU; needs `brew install lld qemu` |
-| `x64/host` | on the x86-64 Linux host over ssh: the Linux bootstrap, the corpus on LLVM, the C ABI checks, the native backend's x86-64 fixpoint and gates, the LLVM-free Linux bootstrap |
+| `x64/host` | on the x86-64 Linux host over ssh: the Linux bootstrap, the corpus on LLVM, the C ABI checks, the native backend's x86-64 fixpoint and gates and its own tests, the LLVM-free Linux bootstrap, and an ELF object with more sections than its header counts |
 
 The x64 step uses `COIL_X64_HOST` (default `computer.jimmyhmiller.com`). That
 host may be unreachable; the step then fails and says so, rather than passing
@@ -174,7 +177,7 @@ The `full` job builds the compiler with `build full`, then runs FAST against it
 and two COMPREHENSIVE slices with `--only`: the
 JIT and generated units (after a private install), and SIMD. The
 `linux` job runs the SIMD slice; the `llvm-free` job's bootstrap runs the corpus
-on arm64. The rest of COMPREHENSIVE runs locally.
+on the native backend. The rest of COMPREHENSIVE runs locally.
 
 ## Manual tools
 

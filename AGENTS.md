@@ -205,8 +205,9 @@ Use this format:
   command; the rest is grouped by stage: `frontend/` (parser, loader, resolve, expander, check,
   mono), `meta/` (the metaprogram engine, the code operations and the bytecode
   interpreter), `backend/` (LLVM, wasm and native codegen; the native backend's IR and assembler
-  are the package `native/`, ported from coil-tpde, and its compile straight from CIR is
-  written out from coil-stogir-declarative into `declarative/`; each has its NOTICE),
+  are the package `native/`, and the backend itself the package `declarative/`, whose
+  `generated/` is what the languages of `src/declarative/` make of its sources: edit those
+  and run `scripts/compiler/gen-declarative.py`; each has its NOTICE),
   `object/` (instruction encoders, Mach-O/ELF/DWARF/wasm writers), `jit/` (with `session.coil`,
   a live session, and `terminal.coil`, the terminal REPL over one), `artifact/` (units and
   artifact identity), `cli/` (one module per command
@@ -214,6 +215,13 @@ Use this format:
   it, and nothing imports a command but `driver.coil`), `support/` and `selftest/`.
   Module names do not follow the folders: a module is found by its declared
   `(module coil.compiler.NAME)`, so moving a file changes no import.
+- `src/declarative/` — the native backend's sources, a project of its own: the
+  languages it is written in (`lang/`), the files written in them (`backend/`,
+  `a64/`, `x64/`, `*-direct/`, `cir/`), and its tests (`scripts/tests/declarative.py`
+  runs them). Coil compiles what the languages make of them, kept in
+  `src/compiler/declarative/generated/`: after an edit here run
+  `scripts/compiler/gen-declarative.py` and commit both (FAST checks they agree).
+  See `docs/reference/NATIVE_BACKEND.md`.
 - `tests/` — what the two test tiers run: `corpus` (the runtime programs), `diag`
   (diagnostic goldens), `cli`, `projects`, `stdlib`, `meta`, `readers`, `cabi`,
   `wasm`, `simd`, `jit`, `http`, `comprehensive`, plus `prop` and `fuzz` (property

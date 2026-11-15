@@ -51,6 +51,8 @@ echo "== the LLVM-free Linux bootstrap"
 python3 scripts/dev.py build nollvm-linux
 echo "== ELF output"
 scripts/compiler/oracle/x64/gate-elf.sh build/bin/coil-x64
+echo "== the native backend's own tests: rules, linking, calls, CIR, the fuzzers"
+python3 scripts/tests/declarative.py build/bin/coil
 echo "== an LLVM -O0 object with more sections than e_shnum counts still links"
 python3 scripts/tests/elf-many-sections.py build/bin/coil
 echo "x64 host: PASS"

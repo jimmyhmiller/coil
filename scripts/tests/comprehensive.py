@@ -91,6 +91,7 @@ def steps(x64: bool) -> list[Step]:
         Step("regex-reference", ["coil", "test", "tests/comprehensive/regex_reference_test.coil"]),
         Step("prop", ["sh", "scripts/tests/prop.sh", "-q", "{compiler}"]),
         Step("fuzz", [PY, "scripts/tests/fuzz_gate.py", "--compiler", "{compiler}"]),
+        Step("declarative", [PY, "scripts/tests/declarative.py", "{compiler}"]),
         Step("simd", [PY, "scripts/tests/simd.py", "full"]),
         # Bare-metal images link with no undefined symbols and run under QEMU.
         Step("freestanding", [PY, "scripts/tests/freestanding.py", "--compiler", "{compiler}"]),

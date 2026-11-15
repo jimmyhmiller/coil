@@ -1,0 +1,1872 @@
+# The compile, block by block, as the code is written: TPDE's shape. One look
+# at the function finds where each value is computed and who reads it; then
+# each block is walked twice, backward to choose each instruction's rule and
+# what it computes in place, forward to write it.
+#
+# A value read in another block than its own lives in its slot, and so does
+# every value a phi takes and every phi: the moves into a block's phis are
+# copies from slot to slot, the same whichever way into the block they are on,
+# so a branch whose targets have phis goes to a little run of moves of its own.
+pass in unit
+use mach as mach
+use regs as regs
+use frames as frames
+use lower as lower
+use select as sel
+import target as isa
+import abi as abi
+
+column label: Block -> Label           # where its code starts
+column edge-from: Label -> Block       # for the code of a way into a block with phis: from where,
+column edge-target: Label -> Block     # and to where
+state edges: [Label]                   # the ways into blocks with phis written after the block
+state stubs: [Label]                   # the ways out of a function with a frame, written after the body:
+state stub-kind: [Int]                 # 0 a return, 1 a tail call of symbol `stub-arg`, 2 one through x16
+state stub-arg: [Int]
+setting near-calls: Bool               # a function called by its symbol is called where it is
+setting near-routines: Bool            # and so are the C library's routines; else through the
+                                       # table of addresses (code loaded where nothing links it)
+setting copy-routine: Int              # one more than the symbols of the C library's memcpy,
+setting move-routine: Int              # memmove and memset; 0 if there is none
+setting fill-routine: Int
+setting divide-routine: Int            # one more than the symbols of the runtime's 128-bit division:
+setting udivide-routine: Int           # __divti3, __udivti3, __modti3, __umodti3
+setting remainder-routine: Int
+setting uremainder-routine: Int
+state routine-values: [Int]            # the arguments of a routine being called: a value, or 0
+state routine-constants: [Int]         # for a constant
+
+state ending: Label                    # the way out the body's last instruction falls into
+state position: Int                    # how far the block being written has got
+state known-frame: Bool
+tally rewritten: Int                   # bodies written again, the frame having been guessed wrong
+
+fn marker(r: Int) -> Int = 0 - r - 1
+
+# ---------------------------------------------------------------- the first look
+
+column order: Block -> Int32           # its place in the order blocks are written, + 1; 0 if no way reaches it
+column depth: Block -> Int32           # how many loops it is in
+column head: Block -> Bool             # a block written after it leads back to it: it heads a loop
+state loops: Bool                      # the function has a loop
+column pred-at: Block -> Int32         # where the blocks that lead into it start in `preds`
+column pred-fill: Block -> Int32
+column seen: Block -> Int32            # the walk that last came by it
+column taken: Block -> Word            # the fixed registers of the values alive in it
+column deep: Value -> Int8             # the most loops a block that reads it is in, + 1, up to 127; 0 if none reads it
+column use-head: Value -> Int32        # its last read outside its own block, + 1: where in `use-block`
+column reach: Value -> Int32           # the last of the blocks that read it outside its own, by order
+column low: Value -> Int32             # for a phi: the first of the blocks that set it, by order
+column tail: Value -> Bool             # a call whose results are returned as they are: one in tail position
+column written: Value -> Bool          # its code is written: from here on it is somewhere
+state calling: Bool                    # the function calls another, or a routine of the C library
+state layout: [Int]                    # the blocks in the reverse of the order they are written
+state preds: [Int]
+state use-block: [Int]                 # the block of each read outside a value's own block,
+state use-next: [Int]                  # and the one before it of the same value, + 1
+state sharing: [Int]                   # the values kept in their slots, or fixed registers
+state stack: [Int]
+state step: [Int]
+state stamp: Int
+state candidates: [Int]
+state live: [Int]
+
+fn exits(b: Block) -> Int = if b.end > b.first then b.term.targets else 0
+
+# The order the blocks are written in: reverse post-order from the entry, each
+# block's first target visited last, so that it comes right after it. A block
+# no way reaches is not written at all.
+fn order-blocks() {
+  let entry: Block = id(1)
+  entry.seen = 1
+  stack.push(1)
+  step.push(0)
+  while stack.len > 0 {
+    let b: Block = id(stack.last)
+    let n = exits(b)
+    let k = step.last
+    if k < n {
+      step[step.len - 1] = k + 1
+      let s = b.term.target(n - 1 - k)
+      s.ways-in = s.ways-in + 1
+      s.way-from = b
+      if s.seen == 0 {
+        s.seen = 1
+        stack.push(int(s))
+        step.push(0)
+      } else if s.seen == 1 {
+        # A way back to a block still being walked from: it heads a loop.
+        s.head = true
+        loops = true
+      }
+    } else {
+      b.seen = 2
+      layout.push(int(b))
+      stack.pop()
+      step.pop()
+    }
+  }
+  for i in 0..layout.len {
+    let b = block-at(i)
+    b.order = i + 1
+  }
+}
+
+# The blocks that lead into each block, of those that are written (how many
+# the walk that ordered them counted).
+fn find-preds() {
+  var at = 0
+  for i in 0..layout.len {
+    let b = block-at(i)
+    b.pred-at = at
+    b.pred-fill = at
+    at = at + b.ways-in
+  }
+  for k in 0..at { preds.push(0) }
+  for i in 0..layout.len {
+    let b = block-at(i)
+    for k in 0..exits(b) {
+      let s = b.term.target(k)
+      preds[s.pred-fill] = int(b)
+      s.pred-fill = s.pred-fill + 1
+    }
+  }
+}
+
+# How many loops each block is in. A block that a block written after it
+# leads back to heads a loop, whose blocks are those that reach one of those
+# later blocks without passing the head.
+fn find-loops() {
+  for i in 0..layout.len {
+    let h = block-at(i)
+    if h.head { find-loop(h) }
+  }
+}
+
+fn find-loop(h: Block) {
+  stamp = stamp + 1
+  h.seen = stamp
+  var back = false
+  for j in h.pred-at..h.pred-at + h.ways-in {
+    let p: Block = id(preds[j])
+    if p.order >= h.order {
+      back = true
+      if p.seen != stamp {
+        p.seen = stamp
+        stack.push(int(p))
+      }
+    }
+  }
+  if back {
+    h.depth = h.depth + 1
+    while stack.len > 0 {
+      let b: Block = id(stack.pop())
+      b.depth = b.depth + 1
+      for j in b.pred-at..b.pred-at + b.ways-in {
+        let p: Block = id(preds[j])
+        if p.seen != stamp and p.order >= h.order {
+          p.seen = stamp
+          stack.push(int(p))
+        }
+      }
+    }
+  }
+}
+
+# Whether the values a call returns, or a return gives back, each have a
+# register the convention returns them in.
+fn results-fit?(v: Value) -> Bool {
+  var ints = 0
+  var floats = 0
+  let n = if v is RET then v.arity else v.aux
+  for i in 0..n {
+    let x: Value = if v is RET then v.in(i) else id(int(v) + i)
+    if x.float {
+      if abi.float-result(floats) < 0 { return false }
+      floats = floats + 1
+    } else {
+      let parts = if regs.wide?(x) then 2 else 1
+      if abi.int-result(ints + parts - 1) < 0 { return false }
+      ints = ints + parts
+    }
+  }
+  true
+}
+
+# Whether a call may pass an argument on the stack: it has more than a kind
+# has registers, or one past the named parameters, copied there, or with parts
+# that must all find registers.
+fn may-stack?(v: Value) -> Bool =
+  v.arity > min(abi.INT-ARGS, abi.FLOAT-ARGS) or
+  (any j in 0..v.arity: operand-passing(v, j) & word(4863) != word(0) or regs.wide?(v.in(j)))
+
+# `x` is read in block `b`, at `at` with `calls` calls before it in the region;
+# with `kept`, from its slot even in `b`'s region. Where its last read is, and
+# the calls before it, are what writing a value read in one region wants.
+# (A value computed by an instruction is checked for its type where it is
+# computed; one made where it is read, here.)
+inline fn reads(x: Value, b: Block, kept: Bool, at: Int, calls: Int) {
+  x.uses = x.uses + 1
+  x.last-use = at
+  x.read-calls = calls
+  # Loops deeper than 126 rank as that deep.
+  if loops and b.depth + 1 > x.deep { x.deep = min(b.depth + 1, 127) }
+  if x.home == b and not kept { return }
+  if regs.remade?(x) {
+    if x is ALLOCA { with-frame = true }
+    return
+  }
+  if x.home == none { panic("a value is read in a block written before the block that computes it") }
+  if b.order > x.reach { x.reach = b.order }
+  if kept or x.home.region != b.region { share(x) }
+  # Where it is read outside its own block, for the registers fixed for it,
+  # which only values read in loops are given.
+  if loops and x.home != b {
+    use-block.push(int(b))
+    use-next.push(x.use-head)
+    x.use-head = use-block.len
+  }
+}
+
+# Whether `v` calls another function, or a routine of the C library.
+fn calls?(v: Value) -> Bool =
+  v is CALL or v is SHIMCALL or wide-division?(v) or v is MEMCPYV or v is MEMMOVEV or v is MEMSETV or (v is MEMCPY and v.imm > 128) or (v is MEMZERO and v.imm > 128)
+
+# `x` is kept in its slot, or a fixed register, wherever it is read.
+inline fn share(x: Value) {
+  if not x.shared {
+    x.shared = true
+    sharing.push(int(x))
+  }
+}
+
+# The order blocks are written in, and the loops they are in.
+fn order() {
+  stamp = 2
+  # One block: the order is it, and there is no loop.
+  if Block.count == 1 {
+    layout.push(1)
+    let entry: Block = id(1)
+    entry.order = 1
+    return
+  }
+  order-blocks()
+  if loops {
+    find-preds()
+    find-loops()
+  }
+}
+
+# What the function computes where, and who reads it.
+fn survey() {
+  # A value a debugger follows is read by it as well: it is computed where it
+  # is, never in place by what reads it, and kept to the end of its region.
+  for t in track {
+    let v: Value = id(t)
+    v.uses = v.uses + 1
+  }
+  through-memory = false
+  for k in 0..arg-count() {
+    let a = arg-value(k)
+    a.home = id(1)
+    if has-bit(arg-passing(k), 8) { through-memory = true }
+  }
+  with-frame = false
+  # Calls so far in the region, for what lives across one.
+  var called = 0
+  # The blocks in the order they are written, which puts the block that
+  # computes a value before every block that reads it.
+  for i in 0..layout.len {
+    let b = block-at(i)
+    # Regions: a block whose one way in is from the block written just before
+    # it goes on where that block left off, registers and all.
+    b.region = if i > 0 and b.ways-in == 1 and b.way-from == block-at(i - 1) then block-at(i - 1).region else b
+    if b.region == b { called = 0 }
+    for p in phis(b) {
+      p.home = b
+      share(p)
+    }
+    for k in b.first..b.end {
+      let v = inst-at(k)
+      if v is CALL or v is ALLOCA or v is TAILCALL or v is MEMCPY or v is MEMZERO or v is MEMCPYV or v is MEMMOVEV or v is MEMSETV { with-frame = true }
+      if v is CALL or v is TAILCALL or v is MEMCPYV or v is MEMMOVEV or v is MEMSETV or (v is MEMCPY and v.imm > 128) or (v is MEMZERO and v.imm > 128) or wide-division?(v) { calling = true }
+      # The stack pointer moved as the function runs: the frame is found from
+      # a register of its own.
+      if v is DYNALLOCA {
+        dynamic = true
+        with-frame = true
+      }
+      # A call that follows no convention writes what it says it does.
+      if v is SHIMCALL {
+        pinned-writes = pinned-writes | shim-writes(v)
+        with-frame = true
+        if v.imm >= 0 { calling = true }
+      }
+      # The room for arguments on the stack, below everything else in the frame:
+      # only more arguments than a kind has registers, or ones past the named
+      # parameters or copied there, go on the stack.
+      if (v is CALL or v is TAILCALL) and may-stack?(v) {
+        begin-placing()
+        for j in (if v.imm < 0 then 1 else 0)..v.arity { place-operand(v, j) }
+        out-slots = max(out-slots, (stack-bytes + 7) / 8)
+      }
+      for j in 0..v.arity { reads(v.in(j), b, false, k, called) }
+      # What a call reads is not alive across it; what it computes is after it.
+      if calls?(v) { called = called + 1 }
+      v.home = b
+      v.def-calls = called
+      # Its rule, and what that computes in place: chosen as it is first seen,
+      # with what reads each operand so far (made right once all are known).
+      if not unruled?(v) {
+        v.rule = sel.choose(v)
+        if v.rule != 0 { sel.fold(v, v.rule) }
+        else if refusal == 0 {
+          refused-op = v.op
+          refuse(10)
+        }
+      }
+      if v is CALL or v is TAILCALL or v is RET { exits-at.push(k) }
+      # A call's later results are computed where it is.
+      if v is CALL {
+        if not results-fit?(v) { refuse(3) }
+        for j in 1..v.aux {
+          let r: Value = id(int(v) + j)
+          r.home = b
+          r.def-calls = called
+        }
+      }
+      if v is RET and not results-fit?(v) { refuse(8) }
+    }
+    # A call whose results go, through nothing but phis and jumps, to a
+    # return of them is in tail position: its block's way out is never taken.
+    let ends = tail-of(b)
+    if ends != none { ends.tail = true }
+    # A value a phi takes is read at the end of the block it comes from. On a
+    # branch's way it is read where the branch has gone, so it is kept in its
+    # slot; at a jump, it is read as the jump is made.
+    let t = if b.end > b.first then b.term else none
+    for k in 0..(if ends != none then 0 else exits(b)) {
+      for p in phis(t.target(k)) {
+        reads(incoming(p, b), b, not (t is BR), b.end, called)
+        if p.low == 0 or b.order < p.low { p.low = b.order }
+      }
+    }
+  }
+  # Parameters on the stack are found from the frame record; how far the
+  # caller's room for them goes, and whether any is bytes copied there.
+  begin-placing()
+  incoming-bytes = 0
+  incoming-copied = false
+  for k in 0..arg-count() {
+    let a = arg-value(k)
+    let how = arg-passing(k)
+    if regs.wide?(a) {
+      let r = place-low(how)
+      let r2 = place-high(how)
+      if r < 0 { incoming-bytes = max(incoming-bytes, 0 - r - 1 + 8) }
+      if r2 < 0 { incoming-bytes = max(incoming-bytes, 0 - r2 - 1 + 8) }
+      if (r < 0 or r2 < 0) and a.uses > 0 { with-frame = true }
+    } else {
+      let r = place(a.float, bytes-of(a), how)
+      if r < 0 {
+        incoming-bytes = max(incoming-bytes, 0 - r - 1 + placed-bytes)
+        if placed-copy { incoming-copied = true }
+        if a.uses > 0 { with-frame = true }
+      }
+    }
+  }
+  settle-rules()
+}
+
+# ---------------------------------------------------------------- fixed registers
+
+# A value read in more than one region keeps a register of its own wherever it
+# is alive, so that neither a call nor a block's start puts it back in its
+# slot: in a function that calls, one the callee saves, two of each kind of
+# those being left for values that live across a call within their block; in
+# one that calls nothing, one no argument or result is passed in, which nothing
+# else writes. The values read in the most loops are given one first, and no
+# more than 64 are tried.
+fn fixable?(v: Value) -> Bool =
+  v.shared and v.uses > 0 and not regs.remade?(v) and v.type != I128 and v.type != V128
+
+fn pool(c: Int) -> Word {
+  var set = isa.ALLOCATABLE & isa.class-registers(c)
+  if dynamic { set = clear-bit(set, abi.BASE) }
+  set = regs.without(set, pinned-writes)
+  if calling {
+    set = set & isa.CALLEE-SAVED
+    for k in 0..2 { if set != word(0) { set = clear-bit(set, highest-bit(set)) } }
+  } else {
+    set = regs.without(set & isa.CALLER-SAVED, passed())
+  }
+  set
+}
+
+# The registers arguments and results are passed in.
+fn passed() -> Word {
+  var set = abi.ARGUMENTS
+  if abi.INDIRECT-RESULT >= 0 { set = set-bit(set, abi.INDIRECT-RESULT) }
+  for k in 0..abi.FLOAT-ARGS { set = set-bit(set, abi.float-arg(k)) }
+  var k = 0
+  while abi.int-result(k) >= 0 {
+    set = set-bit(set, abi.int-result(k))
+    k = k + 1
+  }
+  k = 0
+  while abi.float-result(k) >= 0 {
+    set = set-bit(set, abi.float-result(k))
+    k = k + 1
+  }
+  set
+}
+
+fn fix-registers() {
+  if refusal != 0 { return }
+  var top = 0
+  for c in sharing {
+    let v: Value = id(c)
+    if fixable?(v) {
+      candidates.push(c)
+      top = max(top, v.deep)
+    }
+  }
+  if candidates.len > 0 and loops {
+    let ints = pool(0)
+    let floats = pool(1)
+    var tries = 0
+    for level in reverse 0..top + 1 {
+      for c in candidates {
+        let v: Value = id(c)
+        if v.deep == level and tries < 64 {
+          tries = tries + 1
+          fix(v, if v.float then floats else ints)
+        }
+      }
+    }
+  }
+  if candidates.len > 0 and not loops { fix-spans() }
+  for c in sharing {
+    let v: Value = id(c)
+    if v.fixed == 0 { with-frame = true }
+  }
+  # Registers the caller expects back are saved where the frame opens.
+  if reserved & isa.CALLEE-SAVED != word(0) { with-frame = true }
+}
+
+# Without loops, every way from where a value is computed to where it is read
+# goes through blocks written between the two: each value has a span of
+# blocks, in written order, from where it is computed (for a phi, the first
+# block that sets it) to where it is last read. Taken in the order their spans
+# start, each is given the first register of its pool that the last value
+# given it is no longer alive by then.
+column starts: Block -> Int32          # the last value whose span starts there, + 1, in `candidates`
+state starts-next: [Int]               # and for each one, the one before it there, + 1
+state free-from: [Int]                 # for each register, the last block in a span given it, by order
+
+fn span-low(v: Value) -> Int =
+  if v is PHI and v.low > 0 then min(v.low, v.home.order) else v.home.order
+
+fn fix-spans() {
+  let ints = pool(0)
+  let floats = pool(1)
+  free-from.zeros(isa.REGISTERS)
+  for i in 0..candidates.len {
+    let v: Value = id(candidates[i])
+    let b = block-at(span-low(v) - 1)
+    starts-next.push(b.starts)
+    b.starts = i + 1
+  }
+  for i in 0..layout.len {
+    var e = block-at(i).starts
+    while e > 0 {
+      let v: Value = id(candidates[e - 1])
+      fix-span(v, if v.float then floats else ints)
+      e = starts-next[e - 1]
+    }
+  }
+}
+
+fn fix-span(v: Value, pool: Word) {
+  let lo = span-low(v)
+  var open = pool
+  while open != word(0) {
+    let r = lowest-bit(open)
+    if free-from[r] < lo {
+      v.fixed = r + 1
+      v.reg = r + 1
+      reserved = set-bit(reserved, r)
+      free-from[r] = max(v.reach, v.home.order)
+      return
+    }
+    open = clear-bit(open, r)
+  }
+}
+
+# `v` given a register of `pool` that no value already given one is alive in
+# where `v` is: from its block to each block that reads it, and for a phi, the
+# blocks that set it as well.
+fn fix(v: Value, pool: Word) {
+  stamp = stamp + 1
+  live.clear()
+  let home = v.home
+  home.seen = stamp
+  live.push(int(home))
+  var at = v.use-head
+  while at > 0 {
+    let u: Block = id(use-block[at - 1])
+    if u.seen != stamp {
+      u.seen = stamp
+      live.push(int(u))
+      stack.push(int(u))
+    }
+    at = use-next[at - 1]
+  }
+  while stack.len > 0 {
+    let b: Block = id(stack.pop())
+    for j in b.pred-at..b.pred-at + b.ways-in {
+      let p: Block = id(preds[j])
+      if p.seen != stamp {
+        p.seen = stamp
+        live.push(int(p))
+        stack.push(int(p))
+      }
+    }
+  }
+  if v is PHI {
+    for j in home.pred-at..home.pred-at + home.ways-in {
+      let p: Block = id(preds[j])
+      if p.seen != stamp {
+        p.seen = stamp
+        live.push(int(p))
+      }
+    }
+  }
+  var taken = word(0)
+  for k in live {
+    let b: Block = id(k)
+    taken = taken | b.taken
+  }
+  let open = regs.without(pool, taken)
+  if open == word(0) { return }
+  let r = lowest-bit(open)
+  v.fixed = r + 1
+  v.reg = r + 1
+  reserved = set-bit(reserved, r)
+  for k in live {
+    let b: Block = id(k)
+    b.taken = set-bit(b.taken, r)
+  }
+}
+
+column ways-in: Block -> Int32         # how many ways lead into it
+column way-from: Block -> Block        # where one of them comes from
+column region: Block -> Block          # the first block of the run it belongs to
+
+# Rules chosen as the survey first saw each instruction took what read each
+# operand then; one that computes in place a value read again later is chosen
+# again, now that every read is known. Then where values last read by a call or
+# a return would rather be made.
+state exits-at: [Int]                  # where the calls and returns are
+
+fn settle-rules() {
+  for f in folds {
+    let x: Value = id(f)
+    if x.folded and x.uses > 1 { choose-again(x.folder) }
+  }
+  for k in exits-at {
+    let v = inst-at(k)
+    if v is RET { hint-results(v, k) } else { hint-arguments(v, k) }
+  }
+}
+
+# Root `r`'s rule chosen again, what its rule computed in place let go of first.
+fn choose-again(r: Value) {
+  for i in 0..r.arity {
+    let x = r.in(i)
+    if x.folder == r {
+      x.folded = false
+      x.folder = none
+    }
+  }
+  r.rule = sel.choose(r)
+  if r.rule != 0 { sel.fold(r, r.rule) }
+  else if refusal == 0 {
+    refused-op = r.op
+    refuse(10)
+  }
+}
+
+# Value `v`, about to be computed: read in no other region, its reads are all
+# it has, and it lives across a call if one comes before its last read.
+inline fn defined(v: Value) {
+  v.written = true
+  if not v.shared {
+    v.left = v.uses
+    v.across = v.read-calls > v.def-calls
+  }
+}
+
+# Whether `x`'s read at `at` is its last in the region, as far as is known: a
+# value read in more than one region is taken to be read again.
+fn last-read?(x: Value, at: Int) -> Bool = not x.shared and x.last-use == at
+
+# The `i`-th block written.
+fn block-at(i: Int) -> Block = id(layout[layout.len - 1 - i])
+
+# A value last read as an argument of call `v` would rather be made where the
+# argument goes.
+fn hint-arguments(v: Value, at: Int) {
+  let first = if v.imm < 0 then 1 else 0
+  begin-placing()
+  for i in first..v.arity {
+    let x = v.in(i)
+    let r = place-operand(v, i)
+    if r >= 0 and not regs.wide?(x) and last-read?(x, at) { x.hint = r + 1 }
+  }
+}
+
+# And one last read as what is returned, where it is returned.
+fn hint-results(v: Value, at: Int) {
+  var ints-out = 0
+  var floats-out = 0
+  for i in 0..v.arity {
+    let x = v.in(i)
+    let r = if x.float then abi.float-result(floats-out) else abi.int-result(ints-out)
+    if x.float { floats-out = floats-out + 1 } else { ints-out = ints-out + (if regs.wide?(x) then 2 else 1) }
+    if r >= 0 and not regs.wide?(x) and last-read?(x, at) { x.hint = r + 1 }
+  }
+}
+
+# An instruction this compile writes by a procedure of its own, not a rule.
+fn unruled?(v: Value) -> Bool =
+  v is CALL or v is RET or v is BR or v is SWITCH or v is TAILCALL or v is MEMCPY or v is MEMZERO or
+  v is MEMCPYV or v is MEMMOVEV or v is MEMSETV or v is DYNALLOCA or v is SHIMCALL or wide-division?(v)
+
+# A 128-bit division or remainder: a routine of the runtime's.
+fn wide-division?(v: Value) -> Bool =
+  (v is SDIV or v is UDIV or v is SREM or v is UREM) and regs.wide?(v)
+
+column read-calls: Value -> Int32      # how many calls come before its last read in its region (one read in one)
+column def-calls: Value -> Int32       # and before it is computed
+
+# ---------------------------------------------------------------- writing
+
+# `x` into machine register `r`, for a call or a return: made there, moved
+# there, or loaded there.
+fn read-into(x: Value, r: Int) {
+  if regs.remade?(x) {
+    sel.emit(x, sel.choose(x), marker(r))
+  } else if x.reg != 0 {
+    if x.reg - 1 != r { frames.copy(r, x.reg - 1) }
+  } else {
+    regs.load-into(x, r)
+  }
+  regs.done(x)
+  forbidden = set-bit(forbidden, r)
+}
+
+# 128-bit `x` into registers `r` and `r2`, its low half and its high.
+fn read-into-pair(x: Value, r: Int, r2: Int) {
+  if regs.remade?(x) {
+    regs.set-given-high(marker(r2))
+    sel.emit(x, sel.choose(x), marker(r))
+  } else if x.reg != 0 {
+    let lo = x.reg - 1
+    let hi = x.high - 1
+    if hi == r and lo == r2 {
+      frames.copy(isa.SCRATCH0, hi)
+      frames.copy(r, lo)
+      frames.copy(r2, isa.SCRATCH0)
+    } else if hi == r {
+      frames.copy(r2, hi)
+      frames.copy(r, lo)
+    } else {
+      frames.copy(r, lo)
+      frames.copy(r2, hi)
+    }
+  } else {
+    frames.fetch(r, regs.slot-of(x), false)
+    frames.fetch(r2, regs.slot-of(x) + 1, false)
+  }
+  regs.done(x)
+  forbidden = set-bit(set-bit(forbidden, r), r2)
+}
+
+fn write-block(b: Block, next: Block, last: Bool) {
+  mach.place(b.label)
+  next-label = if next == none then none else next.label
+  if refusal != 0 { return }
+  if int(b) == 1 { params() }
+  # After a call in tail position, the jump that ends the block is not taken.
+  var gone = false
+  for p in phis(b) { p.written = true }
+  for k in b.first..b.end {
+    let v = inst-at(k)
+    position = k
+    emitting-from = int(v)
+    if track.len > 0 { sample() }
+    defined(v)
+    if not v.folded and not gone {
+      # A branch's rule is written with the labels its ways go to.
+      if v is CONDBR { branch-out(b, v, next) }
+      else if v.rule != 0 { sel.emit(v, v.rule, 0) }
+      else if v is BR { jump-out(b, v) }
+      else if v is SWITCH { switch-out(b, v) }
+      else if v is RET { return-out(v, last and k + 1 == b.end) }
+      else if v is CALL and v.tail {
+        tail-out(v, false)
+        gone = true
+      }
+      else if v is CALL { call(v) }
+      else if v is TAILCALL { tail-out(v, last and k + 1 == b.end) }
+      else if v is MEMCPY { copy-bytes(v) }
+      else if v is MEMZERO { zero-bytes(v) }
+      else if v is MEMCPYV { routine-of(copy-routine, v) }
+      else if v is MEMMOVEV { routine-of(move-routine, v) }
+      else if v is MEMSETV { routine-of(fill-routine, v) }
+      else if v is DYNALLOCA { room(v) }
+      else if v is SHIMCALL { shim-call(v) }
+      else if wide-division?(v) { wide-divide(v) }
+      else {
+        print("{} in {}", v.name, int(v))
+        panic("no rule computes an instruction")
+      }
+    }
+  }
+  # A region ends where the next block does not go on from this one.
+  if next == none or next.region != b.region {
+    while occupied != word(0) { regs.free(lowest-bit(occupied)) }
+    busy = word(0)
+    forbidden = word(0)
+  }
+}
+
+# The moves of each way into a block with phis that a branch goes by: written
+# after the body, from slots alone.
+fn write-edges() {
+  next-label = none
+  for e in edges {
+    mach.place(e)
+    moves(e.edge-from, e.edge-target, false)
+    lower.jump(int(e.edge-target.label))
+  }
+}
+
+# The label a branch out of `b` uses to go to `s`: its own, or for a block
+# with phis a way that sets them first.
+fn way(b: Block, s: Block) -> Label {
+  if s.phi-count == 0 { return s.label }
+  let e = mach.new-label()
+  e.edge-from = b
+  e.edge-target = s
+  edges.push(e)
+  e
+}
+
+fn jump-out(b: Block, v: Value) {
+  let s = v.target(0)
+  moves(b, s, true)
+  lower.jump(int(s.label))
+}
+
+fn branch-out(b: Block, v: Value, next: Block) {
+  let yes = v.target(0)
+  let no = v.target(1)
+  labels.clear()
+  if yes == no {
+    labels.push(int(way(b, yes)))
+    regs.done(v.in(0))
+    lower.jump(labels[0])
+    return
+  }
+  labels.push(int(way(b, yes)))
+  labels.push(int(way(b, no)))
+  sel.emit(v, v.rule, 0)
+  # A branch to what comes next, the other way being elsewhere, is the
+  # opposite branch to elsewhere.
+  let then: Label = id(labels[0])
+  let otherwise: Label = id(labels[1])
+  if mach.turns?() and mach.held-label() == int(then) and then == next-label and otherwise != next-label {
+    mach.turn(otherwise)
+  } else {
+    lower.jump(int(otherwise))
+  }
+}
+
+fn switch-out(b: Block, v: Value) {
+  let x = v.in(0)
+  let r = sel.read-value(x)
+  for c in 0..v.targets - 1 {
+    lower.branch-if-equal(1, r, int(case-value(v, c)), int(way(b, v.target(c + 1))))
+  }
+  regs.done(x)
+  lower.jump(int(way(b, v.target(0))))
+  busy = word(0)
+  mach.done-temps()
+}
+
+# The values a phi of `s` takes coming from `b`, each into the phi's slot. The
+# moves are made together: a phi's value that is another phi of `s` is read
+# before that phi is written, a ring of them broken through a slot of its own.
+fn moves(b: Block, s: Block, registers: Bool) {
+  # One phi: one move, which nothing else reads.
+  if s.phi-count == 1 {
+    for p in phis(s) {
+      let x = incoming(p, b)
+      if x != p { move(int(x), int(p), registers) }
+    }
+    return
+  }
+  var from: [Int] = []                 # a value, or -(slot + 1) for a slot a ring was broken into
+  var to: [Int] = []                   # the phi each goes into
+  for p in phis(s) {
+    let x = incoming(p, b)
+    if x != p {
+      from.push(int(x))
+      to.push(int(p))
+    }
+  }
+  var left = to.len
+  while left > 0 {
+    var progress = false
+    for j in 0..to.len {
+      if to[j] != 0 {
+        let wanted = any k in 0..to.len: k != j and to[k] != 0 and from[k] == to[j]
+        if not wanted {
+          move(from[j], to[j], registers)
+          to[j] = 0
+          left = left - 1
+          progress = true
+        }
+      }
+    }
+    if not progress {
+      # A ring: the first phi still to be written is set aside in a slot of its own.
+      var j = 0
+      while to[j] == 0 { j = j + 1 }
+      let p: Value = id(to[j])
+      slots = slots + (if regs.wide?(p) then 2 else 1)
+      let aside = slots - (if regs.wide?(p) then 1 else 0)
+      copy-slot(p, out-slots + aside - 1)
+      for k in 0..to.len { if to[k] != 0 and from[k] == to[j] { from[k] = 0 - aside } }
+    }
+  }
+}
+
+# One move into phi `p`, to its fixed register or its slot: from value `x`, or
+# from a slot a ring was set aside in (`x` = -slot). With `registers`, the
+# moves are made as the block jumps, and a value in a register is read from
+# there; a value with a fixed register is read from it always.
+fn move(x: Int, p: Int, registers: Bool) {
+  let phi: Value = id(p)
+  if regs.wide?(phi) {
+    move-wide(x, phi, registers)
+    return
+  }
+  let into = if phi.fixed != 0 then phi.fixed - 1 else if phi.float then isa.FSCRATCH else isa.SCRATCH0
+  if x < 0 {
+    frames.fetch(into, out-slots + (0 - x) - 1, false)
+  } else {
+    let v: Value = id(x)
+    if regs.remade?(v) { sel.emit(v, sel.choose(v), marker(into)) }
+    else if v.reg != 0 and (registers or v.fixed != 0) {
+      if phi.fixed == 0 {
+        frames.keep(v.reg - 1, regs.slot-of(phi), false)
+        if registers { regs.done(v) }
+        mach.done-temps()
+        return
+      }
+      if v.reg - 1 != into { frames.copy(into, v.reg - 1) }
+    }
+    else { frames.fetch(into, regs.slot-of(v), false) }
+    if registers { regs.done(v) }
+  }
+  if phi.fixed == 0 { frames.keep(into, regs.slot-of(phi), false) }
+  mach.done-temps()
+}
+
+# The same for a 128-bit phi, which is in two words of its slot: from the
+# two words a ring set it aside in, its value's two registers (or the
+# temporaries one made where it is read is made in), or its value's slot.
+fn move-wide(x: Int, phi: Value, registers: Bool) {
+  let at = regs.slot-of(phi)
+  if x < 0 {
+    let from = out-slots + (0 - x) - 1
+    word-across(from, at)
+    word-across(from + 1, at + 1)
+  } else {
+    let v: Value = id(x)
+    if regs.remade?(v) {
+      regs.set-given-high(marker(isa.SCRATCH1))
+      sel.emit(v, sel.choose(v), marker(isa.SCRATCH0))
+      frames.keep(isa.SCRATCH0, at, false)
+      frames.keep(isa.SCRATCH1, at + 1, false)
+    } else if v.reg != 0 and registers {
+      frames.keep(v.reg - 1, at, false)
+      frames.keep(v.high - 1, at + 1, false)
+    } else {
+      word-across(regs.slot-of(v), at)
+      word-across(regs.slot-of(v) + 1, at + 1)
+    }
+    if registers { regs.done(v) }
+  }
+  mach.done-temps()
+}
+
+# Frame slot `from`'s word into slot `to`, through the scratch register.
+fn word-across(from: Int, to: Int) {
+  frames.fetch(isa.SCRATCH0, from, false)
+  frames.keep(isa.SCRATCH0, to, false)
+}
+
+# Phi `p`'s value into slot `at`, from its fixed register or through the
+# scratch register.
+fn copy-slot(p: Value, at: Int) {
+  if regs.wide?(p) {
+    word-across(regs.slot-of(p), at)
+    word-across(regs.slot-of(p) + 1, at + 1)
+    return
+  }
+  if p.fixed != 0 {
+    frames.keep(p.fixed - 1, at, false)
+    return
+  }
+  let scratch = if p.float then isa.FSCRATCH else isa.SCRATCH0
+  frames.fetch(scratch, regs.slot-of(p), false)
+  frames.keep(scratch, at, false)
+}
+
+# ---------------------------------------------------------------- calls, parameters, returns
+
+# Where the convention puts arguments, one after another: how many of each
+# kind's registers are taken, how many bytes of stack, and how many arguments
+# to come must follow the last one there.
+state ints: Int
+state floats: Int
+state stack-bytes: Int
+state following: Int
+state placed-bytes: Int                # how many bytes the last one takes on the stack
+state placed-copy: Bool                # and whether it is bytes copied there, it being their address
+state placed-signed: Bool              # and whether, read back, it is extended as signed
+
+fn begin-placing() {
+  ints = 0
+  floats = 0
+  stack-bytes = 0
+  following = 0
+}
+
+# How many bytes a value of `v`'s type is.
+fn bytes-of(v: Value) -> Int =
+  if v.type == F32 then 4 else if v.type == V128 or v.type == I128 then 16 else 8
+
+# The next one's place, as the convention and `how` (rt.graph's PASS-… bits)
+# say: a register, or -(n + 1) for n bytes above the stack pointer as the
+# call is made.
+fn place(float: Bool, bytes: Int, how: Word) -> Int {
+  let with = int(how & word(255))
+  placed-copy = false
+  placed-signed = has-bit(how, 19)
+  # Bytes copied onto the stack, in whole words: at a multiple of 16 if asked.
+  if has-bit(how, 12) {
+    let n = int(how >> word(32))
+    let align = if has-bit(how, 10) then 16 else 8
+    let at = (stack-bytes + align - 1) / align * align
+    stack-bytes = at + (n + 7) / 8 * 8
+    placed-bytes = n
+    placed-copy = true
+    return 0 - at - 1
+  }
+  if has-bit(how, 8) and abi.INDIRECT-RESULT >= 0 { return abi.INDIRECT-RESULT }
+  let unnamed = has-bit(how, 9)
+  if following > 0 { following = following - 1 }
+  else if not (unnamed and abi.VARIADIC-ON-STACK) {
+    if float and floats + with < abi.FLOAT-ARGS {
+      floats = floats + 1
+      return abi.float-arg(floats - 1)
+    }
+    if not float and ints + with < abi.INT-ARGS {
+      ints = ints + 1
+      return abi.int-arg(ints - 1)
+    }
+    following = with
+    if abi.REGISTERS-CLOSE { if float { floats = abi.FLOAT-ARGS } else { ints = abi.INT-ARGS } }
+  }
+  # An integer is as wide on the stack as its type in C, where arguments are
+  # packed; a floating value as wide as it is.
+  let size = int((how >> word(16)) & word(7))
+  let width = if float or size == 0 then bytes else if size == 1 then 1 else if size == 2 then 2 else if size == 3 then 4 else 8
+  let slot = if abi.STACK-PACKED and not unnamed then width else max(width, 8)
+  placed-bytes = if float then width else slot
+  let align = if has-bit(how, 10) then 16 else slot
+  let at = (stack-bytes + align - 1) / align * align
+  stack-bytes = at + slot
+  0 - at - 1
+}
+
+# A 128-bit argument or parameter: its low half, which goes in a register
+# only with the high half in the next, or else on the stack at a multiple of
+# 16; then its high half.
+fn place-low(how: Word) -> Int = place(false, 8, (how & word(512)) | word(1) | word(1024))
+fn place-high(how: Word) -> Int = place(false, 8, how & word(512))
+
+# Operand `j` of call `v` placed, both halves of a 128-bit one; where its low
+# half goes.
+fn place-operand(v: Value, j: Int) -> Int {
+  let x = v.in(j)
+  if regs.wide?(x) {
+    let r = place-low(operand-passing(v, j))
+    place-high(operand-passing(v, j))
+    return r
+  }
+  place(x.float, bytes-of(x), operand-passing(v, j))
+}
+
+# How far above the frame register the caller's arguments on the stack start:
+# past the frame record and the return address.
+fn caller-arguments() -> Int = ((if abi.LINK >= 0 then 2 else 1) + abi.RETURN-SLOTS) * 8
+
+state stacked: [Int]                   # the parameters on the stack that are read: which,
+state stacked-at: [Int]                # where above the caller's stack pointer,
+state stacked-bytes: [Int]             # how many bytes,
+state stacked-how: [Int]               # and 1 if bytes copied there, + 2 if signed, + 4 if 128 bits
+
+# A 128-bit parameter: in two registers, or two words on the stack.
+fn wide-param(a: Value, k: Int) {
+  let r = place-low(arg-passing(k))
+  let r2 = place-high(arg-passing(k))
+  if a.uses == 0 { return }
+  if r >= 0 and r2 >= 0 {
+    regs.give(a, r)
+    regs.give-high(a, r2)
+    a.clean = false
+    if a.shared { regs.store(a) }
+  } else if r < 0 and r2 < 0 {
+    stacked.push(k)
+    stacked-at.push(0 - r - 1)
+    stacked-bytes.push(8)
+    stacked-how.push(4)
+  } else { panic("a 128-bit parameter is split between a register and the stack") }
+}
+
+fn params() {
+  # A parameter read in one region: its reads are all there.
+  for k in 0..arg-count() {
+    let a = arg-value(k)
+    a.written = true
+    if not a.shared { a.left = a.uses }
+  }
+  begin-placing()
+  stacked.clear()
+  for k in 0..arg-count() {
+    let a = arg-value(k)
+    if regs.wide?(a) { wide-param(a, k) }
+    else {
+    let r = place(a.float, bytes-of(a), arg-passing(k))
+    if r < 0 {
+      if a.uses > 0 {
+        stacked.push(k)
+        stacked-at.push(0 - r - 1)
+        stacked-bytes.push(placed-bytes)
+        stacked-how.push((if placed-copy then 1 else 0) + (if placed-signed then 2 else 0))
+      }
+    } else if a.uses > 0 {
+      if a.fixed != 0 { frames.copy(a.fixed - 1, r) }
+      else {
+        regs.give(a, r)
+        a.clean = false
+        if a.shared { regs.store(a) }
+      }
+    }
+    }
+  }
+  # Those on the stack, once those in registers are where they are: read from
+  # the caller's frame, or for bytes copied there, their address.
+  for j in 0..stacked.len {
+    let a = arg-value(stacked[j])
+    let at = caller-arguments() + stacked-at[j]
+    let r = if a.fixed != 0 then a.fixed - 1 else regs.take(regs.class-of(a), word(0), regs.preferred(a.across))
+    let how = stacked-how[j]
+    if how % 2 == 1 { lower.frame-address(marker(r), marker(abi.FRAME), at) }
+    else if a.float { lower.load-float(marker(r), marker(abi.FRAME), at, stacked-bytes[j]) }
+    else { lower.load-word(marker(r), marker(abi.FRAME), at, stacked-bytes[j], (how / 2) % 2) }
+    if a.fixed == 0 {
+      regs.give(a, r)
+      # A 128-bit one: its high half is the word after.
+      if how / 4 == 1 {
+        let r2 = regs.take(0, word(0), regs.preferred(a.across))
+        lower.load-word(marker(r2), marker(abi.FRAME), at + 8, 8, 0)
+        regs.give-high(a, r2)
+      }
+      a.clean = false
+      if a.shared { regs.store(a) }
+    }
+  }
+  # What no instruction of the entry block reads is let go.
+  for k in 0..arg-count() {
+    let a = arg-value(k)
+    if a.reg != 0 and a.fixed == 0 and not a.shared and a.left <= 0 { regs.free(a.reg - 1) }
+  }
+}
+
+fn call(v: Value) {
+  let first = if v.imm < 0 then 1 else 0
+  pass-arguments(v, first)
+  if first == 1 {
+    read-into(v.in(0), isa.SCRATCH0)
+    lower.call-register(marker(isa.SCRATCH0))
+  } else if near-calls {
+    lower.call-symbol(v.imm)
+  } else {
+    lower.call-through-table(v.imm)
+  }
+  calls = true
+  forbidden = word(0)
+  busy = word(0)
+  mach.done-temps()
+  # The results, where the convention leaves them.
+  for i in 1..v.aux {
+    let x: Value = id(int(v) + i)
+    defined(x)
+  }
+  var ints-out = 0
+  var floats-out = 0
+  for i in 0..max(v.aux, 1) {
+    let r: Value = id(int(v) + i)
+    if i < v.aux {
+      let at = if r.float then abi.float-result(floats-out) else abi.int-result(ints-out)
+      if r.float { floats-out = floats-out + 1 } else { ints-out = ints-out + 1 }
+      if at < 0 { panic("a call's result is numbered past the convention's result registers") }
+      # A 128-bit one, in two: the high half in the next.
+      if regs.wide?(r) {
+        let at2 = abi.int-result(ints-out)
+        ints-out = ints-out + 1
+        if at2 < 0 { panic("a call's result is numbered past the convention's result registers") }
+        if r.uses > 0 {
+          regs.give(r, at)
+          regs.give-high(r, at2)
+          r.clean = false
+          if r.shared { regs.store(r) }
+          else if r.left <= 0 { regs.free(at) }
+        }
+      }
+      else if r.uses > 0 and r.fixed != 0 { frames.copy(r.fixed - 1, at) }
+      else if r.uses > 0 {
+        regs.give(r, at)
+        r.clean = false
+        if r.shared { regs.store(r) }
+        else if r.left <= 0 { regs.free(at) }
+      }
+    }
+  }
+}
+
+fn return-out(v: Value, last: Bool) {
+  var ints-out = 0
+  var floats-out = 0
+  # The registers results go in are emptied of anything else first.
+  var into = word(0)
+  for i in 0..v.arity {
+    let x = v.in(i)
+    let r = if x.float then abi.float-result(floats-out) else abi.int-result(ints-out)
+    if x.float { floats-out = floats-out + 1 } else { ints-out = ints-out + 1 }
+    if r >= 0 { into = set-bit(into, r) }
+    if regs.wide?(x) {
+      let r2 = abi.int-result(ints-out)
+      ints-out = ints-out + 1
+      if r2 >= 0 { into = set-bit(into, r2) }
+    }
+  }
+  regs.clobbers(into)
+  forbidden = word(0)
+  ints-out = 0
+  floats-out = 0
+  for i in 0..v.arity {
+    let x = v.in(i)
+    let r = if x.float then abi.float-result(floats-out) else abi.int-result(ints-out)
+    if x.float { floats-out = floats-out + 1 } else { ints-out = ints-out + 1 }
+    if r < 0 { panic("more values are returned than the convention has registers for") }
+    if regs.wide?(x) {
+      let r2 = abi.int-result(ints-out)
+      ints-out = ints-out + 1
+      if r2 < 0 { panic("more values are returned than the convention has registers for") }
+      read-into-pair(x, r, r2)
+    } else { read-into(x, r) }
+  }
+  forbidden = word(0)
+  busy = word(0)
+  mach.done-temps()
+  leaving(last)
+}
+
+# A way out of the function: straight out if it has no frame; else to code
+# written after the body that closes the frame first, which the body's last
+# instruction falls into. `kind` 0 returns; 1 goes to symbol `arg`, 2 to the
+# address in the first scratch register, each with this frame given back.
+fn leaving(last: Bool) {
+  leave-by(0, 0, last)
+}
+
+fn leave-by(kind: Int, arg: Int, last: Bool) {
+  if not with-frame {
+    out-by(kind, arg)
+    return
+  }
+  var s: Label = none
+  for j in 0..stubs.len { if stub-kind[j] == kind and stub-arg[j] == arg { s = stubs[j] } }
+  if s == none {
+    s = mach.new-label()
+    stubs.push(s)
+    stub-kind.push(kind)
+    stub-arg.push(arg)
+  }
+  if last { ending = s } else { lower.jump(int(s)) }
+}
+
+fn out-by(kind: Int, arg: Int) {
+  if kind == 0 { lower.leave() }
+  else if kind == 1 and near-calls { lower.tail-symbol(arg) }
+  else if kind == 1 { lower.tail-through-table(arg) }
+  else { lower.tail-register(marker(isa.SCRATCH0)) }
+}
+
+# A call in tail position: its arguments where the call's would be, this
+# frame given back, and a jump to the function called. Where an argument would
+# need this frame (on the stack, or the address of something in it), it is a
+# call after all, and what it returns is returned.
+# The call that block `b` ends with, if what it returns is what the function
+# returns: the block's way out is a jump, and each block it goes through, up to
+# a return, holds nothing but phis and a jump. A function that returns through
+# memory, and a call of more than one result, are left as they are.
+state through-memory: Bool             # the function's result is written to memory its caller gives
+
+fn tail-of(b: Block) -> Value {
+  if through-memory or b.end - b.first < 2 { return none }
+  let t = b.term
+  let c = inst-at(b.end - 2)
+  if not (t is BR) or not (c is CALL) or c.aux > 1 { return none }
+  # The value carried along: the call's, then the phi each block takes it as.
+  var carried = if c.aux == 1 then int(c) else 0
+  var from = b
+  var to = t.target(0)
+  for hop in 0..8 {
+    if carried != 0 {
+      for p in phis(to) { if int(incoming(p, from)) == carried { carried = int(p) } }
+    }
+    if to.end - to.first != 1 { return none }
+    let u = to.term
+    if u is RET {
+      if c.aux == 0 and u.arity == 0 { return c }
+      if c.aux == 1 and u.arity == 1 and int(u.in(0)) == carried { return c }
+      return none
+    }
+    if not (u is BR) { return none }
+    from = to
+    to = u.target(0)
+  }
+  none
+}
+
+# A call in tail position: its arguments where the convention puts them, the
+# frame closed, and a jump. Those on the stack go where this function's own
+# were (read from there as it began), when they fit in that room and none of
+# this function's is bytes copied there, whose address may be what is passed.
+# A call that needs this frame still, or returns through memory, or takes
+# unnamed or copied arguments, is an ordinary call and a return.
+state incoming-bytes: Int              # how far the caller's room for this function's arguments goes
+state incoming-copied: Bool            # an argument is bytes copied into that room
+state tail-arguments: Bool             # arguments on the stack go to that room, not below the frame
+
+fn tail-out(v: Value, last: Bool) {
+  let first = if v.imm < 0 then 1 else 0
+  var direct = true
+  var stacked = 0
+  begin-placing()
+  for i in first..v.arity {
+    let x = v.in(i)
+    let how = operand-passing(v, i)
+    if has-bit(how, 8) or has-bit(how, 9) or has-bit(how, 12) { direct = false }
+    else if regs.wide?(x) {
+      let r = place-low(how)
+      let r2 = place-high(how)
+      if r < 0 { stacked = max(stacked, 0 - r - 1 + 8) }
+      if r2 < 0 { stacked = max(stacked, 0 - r2 - 1 + 8) }
+    } else {
+      let r = place(x.float, bytes-of(x), how)
+      if r < 0 { stacked = max(stacked, 0 - r - 1 + placed-bytes) }
+    }
+    if frame-escapes() and not x.float { direct = false }
+  }
+  if stacked > 0 and (stacked > incoming-bytes or incoming-copied) { direct = false }
+  if not direct {
+    call(v)
+    leaving(last)
+    return
+  }
+  tail-arguments = true
+  pass-arguments(v, first)
+  tail-arguments = false
+  if first == 1 { read-into(v.in(0), isa.SCRATCH0) }
+  forbidden = word(0)
+  busy = word(0)
+  mach.done-temps()
+  if first == 1 { leave-by(2, 0, last) } else { leave-by(1, v.imm, last) }
+}
+
+# The arguments of call `v`, from its operand `first` on, where the convention
+# puts them. Those on the stack are written first, before anything moves.
+# Then what is wanted after the call leaves the registers the call may write;
+# but an argument read here for the last time stays where it is, and is moved
+# straight to where it goes. The moves are made together: one is made once no
+# argument still to be moved is in the register it writes, a ring of them
+# broken through a free register.
+state arg-regs: [Int]
+
+state arg-highs: [Int]                 # for a 128-bit argument, where its high half goes
+
+fn pass-arguments(v: Value, first: Int) {
+  arg-regs.clear()
+  arg-highs.clear()
+  begin-placing()
+  var left = 0
+  var targets = word(0)
+  # An argument in a register, read here for the one last time, stays where it is.
+  var keep = word(0)
+  for i in first..v.arity {
+    let x = v.in(i)
+    if regs.wide?(x) {
+      let r = place-low(operand-passing(v, i))
+      let r2 = place-high(operand-passing(v, i))
+      if r < 0 and r2 < 0 { onto-stack-wide(x, 0 - r - 1) }
+      else if r >= 0 and r2 >= 0 {
+        left = left + 1
+        targets = set-bit(set-bit(targets, r), r2)
+      } else { panic("a 128-bit argument is split between a register and the stack") }
+      arg-regs.push(r)
+      arg-highs.push(r2)
+    } else {
+      let r = place(x.float, bytes-of(x), operand-passing(v, i))
+      if r < 0 { onto-stack(x, 0 - r - 1) }
+      else {
+        left = left + 1
+        targets = set-bit(targets, r)
+        if x.reg != 0 and x.fixed == 0 and x.left == 1 { keep = set-bit(keep, x.reg - 1) }
+      }
+      arg-regs.push(r)
+      arg-highs.push(-1)
+    }
+  }
+  regs.clobbers-but(isa.CALLER-SAVED, keep)
+  forbidden = word(0)
+  while left > 0 {
+    var progress = false
+    for i in 0..arg-regs.len {
+      let r = arg-regs[i]
+      if r >= 0 {
+        let x = v.in(first + i)
+        let r2 = arg-highs[i]
+        let from = if x.reg != 0 and has-bit(keep, x.reg - 1) then x.reg - 1 else -1
+        if r2 >= 0 {
+          # A 128-bit one, kept nowhere, once neither register is wanted.
+          if not has-bit(keep, r) and not has-bit(keep, r2) {
+            read-into-pair(x, r, r2)
+            arg-regs[i] = -1
+            left = left - 1
+            progress = true
+          }
+        } else if not has-bit(keep, r) or from == r {
+          read-into(x, r)
+          arg-regs[i] = -1
+          left = left - 1
+          progress = true
+          if from >= 0 { keep = clear-bit(keep, from) }
+        }
+      }
+    }
+    if not progress {
+      # A ring: the first argument still to be moved goes to a free register first.
+      var i = 0
+      while arg-regs[i] < 0 or arg-highs[i] >= 0 { i = i + 1 }
+      let x = v.in(first + i)
+      let from = x.reg - 1
+      let free = regs.without(regs.without(class-regs[regs.class-of(x)], occupied | busy | forbidden | temps), targets)
+      if free == word(0) { panic("no register is free to break a ring of arguments") }
+      let to = lowest-bit(free)
+      frames.copy(to, from)
+      regs.free(from)
+      regs.give(x, to)
+      keep = set-bit(clear-bit(keep, from), to)
+    }
+  }
+  # A call past named parameters, where the convention wants it, says how many
+  # vector registers its arguments took, once they are all in place (the
+  # register is caller-saved, and emptied with the rest).
+  var unnamed = false
+  for i in first..v.arity { if has-bit(operand-passing(v, i), 9) { unnamed = true } }
+  if unnamed and abi.VARIADIC-COUNT >= 0 {
+    lower.count-into(marker(abi.VARIADIC-COUNT), min(floats, abi.FLOAT-ARGS))
+    forbidden = set-bit(forbidden, abi.VARIADIC-COUNT)
+  }
+}
+
+# 128-bit argument `x` to `at` bytes above the stack pointer, a word for each half.
+fn onto-stack-wide(x: Value, at: Int) {
+  if regs.remade?(x) {
+    regs.set-given-high(marker(isa.SCRATCH1))
+    sel.emit(x, sel.choose(x), marker(isa.SCRATCH0))
+    to-arguments(isa.SCRATCH0, at, 8, false)
+    to-arguments(isa.SCRATCH1, at + 8, 8, false)
+  } else if x.reg != 0 {
+    to-arguments(x.reg - 1, at, 8, false)
+    to-arguments(x.high - 1, at + 8, 8, false)
+  } else {
+    frames.fetch(isa.SCRATCH0, regs.slot-of(x), false)
+    to-arguments(isa.SCRATCH0, at, 8, false)
+    frames.fetch(isa.SCRATCH0, regs.slot-of(x) + 1, false)
+    to-arguments(isa.SCRATCH0, at + 8, 8, false)
+  }
+  regs.done(x)
+  mach.done-temps()
+}
+
+# Register `r`'s `bytes` to an argument's place on the stack, `at` bytes into
+# the room for them: above the stack pointer, or in a call in tail position,
+# where this function's own were.
+fn to-arguments(r: Int, at: Int, bytes: Int, float: Bool) {
+  if tail-arguments {
+    let into = caller-arguments() + at
+    if float { lower.store-float(marker(r), marker(abi.FRAME), into, bytes) }
+    else { lower.store-word(marker(r), marker(abi.FRAME), into, bytes) }
+  } else if float { lower.to-stack-float(marker(r), at, bytes) }
+  else { lower.to-stack(marker(r), at, bytes) }
+}
+
+# Argument `x` to `at` bytes above the stack pointer, as `place` said: its
+# value, `placed-bytes` wide, or for bytes copied there, those bytes.
+fn onto-stack(x: Value, at: Int) {
+  let from = if x.reg != 0 then x.reg - 1 else if x.float and not placed-copy then isa.FSCRATCH else isa.SCRATCH0
+  if x.reg == 0 {
+    if regs.remade?(x) { sel.emit(x, sel.choose(x), marker(from)) }
+    else { frames.fetch(from, regs.slot-of(x), false) }
+  }
+  if placed-copy {
+    var done = 0
+    var width = 8
+    while width > 0 {
+      while done + width <= placed-bytes {
+        lower.load-word(marker(isa.SCRATCH1), marker(from), done, width, 0)
+        to-arguments(isa.SCRATCH1, at + done, width, false)
+        done = done + width
+      }
+      width = width / 2
+    }
+  }
+  else { to-arguments(from, at, placed-bytes, x.float) }
+  regs.done(x)
+  mach.done-temps()
+}
+
+# ---------------------------------------------------------------- room and calls that follow no convention
+
+# DYNALLOCA: room on the stack as the function runs. The stack pointer goes
+# down by the bytes asked for, to a multiple of 16 (and as much again as
+# the room's alignment, if more than that), and the room is what is above the
+# arguments calls pass on the stack.
+fn room(v: Value) {
+  let x = v.in(0)
+  let n = sel.read-value(x)
+  let align = v.imm
+  if align > 16 {
+    let t = regs.temp(0)
+    lower.address(t, n, align)
+    regs.done(x)
+    lower.reserve(t)
+  } else {
+    regs.done(x)
+    lower.reserve(n)
+  }
+  let out = regs.write(v)
+  lower.above-arguments(out, out-slots * 8)
+  if align > 16 { lower.align-up(out, out, align) }
+  regs.finish(v, 0)
+}
+
+# The registers a call that follows no convention writes: those it says it
+# clobbers, those its arguments are put in, and the one its result is in.
+fn shim-writes(v: Value) -> Word {
+  var set = word(v.imm2)
+  for i in 0..v.arity { set = set-bit(set, pinned-register(v, i)) }
+  if v.aux != 255 { set = set-bit(set, v.aux) }
+  set
+}
+
+# SHIMCALL: each argument in the register it is pinned to, and what the call
+# is: machine code of its own, word by word, or a call of a symbol. Its
+# result is taken from the register it names.
+fn shim-call(v: Value) {
+  regs.clobbers(shim-writes(v))
+  forbidden = word(0)
+  for i in 0..v.arity { read-into(v.in(i), pinned-register(v, i)) }
+  if v.imm < 0 {
+    # The bytes, a unit of the machine's code at a time (least significant first).
+    let n = inline-count(v)
+    let unit = isa.CODE-UNIT
+    if n % unit != 0 { panic("machine code of a call that follows no convention is not whole instructions") }
+    var k = 0
+    while k < n {
+      var bits = 0
+      var scale = 1
+      for j in 0..unit {
+        bits = bits + inline-byte(v, k + j) * scale
+        scale = scale * 256
+      }
+      lower.machine-code(bits)
+      k = k + unit
+    }
+  } else {
+    calls = true
+    if near-calls { lower.call-symbol(v.imm) } else { lower.call-through-table(v.imm) }
+  }
+  forbidden = word(0)
+  busy = word(0)
+  mach.done-temps()
+  # The registers the frame is found by, put back if the call wrote them: the
+  # frame register from the stack pointer, the base from the frame register,
+  # each by the frame's size, which is known once the body is written once.
+  let writes = shim-writes(v)
+  if has-bit(writes, abi.FRAME) or (dynamic and has-bit(writes, abi.BASE)) {
+    if not known-frame { rewrite = true }
+    else {
+      if has-bit(writes, abi.FRAME) {
+        if dynamic and has-bit(writes, abi.BASE) { panic("a call writes both registers the frame is found by, in a function that moves the stack pointer") }
+        lower.frame-record(frames.base(), frames.record-slot() * 8)
+      }
+      if dynamic and has-bit(writes, abi.BASE) { lower.base-from-frame(marker(abi.BASE), frames.record-slot() * 8) }
+    }
+  }
+  if v.aux != 255 and v.uses > 0 {
+    let out = regs.write(v)
+    frames.copy(0 - out - 1, v.aux)
+    regs.finish(v, 0)
+  }
+}
+
+# A 128-bit division or remainder, by the runtime's routine: the operands in
+# the first four argument registers, the result in the first two result ones.
+fn wide-divide(v: Value) {
+  let routine = if v is SDIV then divide-routine else if v is UDIV then udivide-routine
+                else if v is SREM then remainder-routine else uremainder-routine
+  if routine == 0 { panic("a 128-bit division needs a routine of the runtime, and none was given") }
+  regs.clobbers(isa.CALLER-SAVED)
+  forbidden = word(0)
+  read-into-pair(v.in(0), abi.int-arg(0), abi.int-arg(1))
+  read-into-pair(v.in(1), abi.int-arg(2), abi.int-arg(3))
+  if near-routines { lower.call-symbol(routine - 1) } else { lower.call-through-table(routine - 1) }
+  calls = true
+  forbidden = word(0)
+  busy = word(0)
+  mach.done-temps()
+  if v.uses > 0 {
+    regs.give(v, abi.int-result(0))
+    regs.give-high(v, abi.int-result(1))
+    v.clean = false
+    if v.shared { regs.store(v) }
+    else if v.left <= 0 { regs.free(abi.int-result(0)) }
+  }
+}
+
+# ---------------------------------------------------------------- copies and fills
+
+# `bytes` bytes from `src` to `dst`, which do not overlap: in pieces of
+# sixteen, then of the widest that fit; more than 128 bytes by the C library.
+fn copy-bytes(v: Value) {
+  let bytes = v.imm
+  let dst = v.in(0)
+  let src = v.in(1)
+  if bytes > 128 {
+    routine-values.clear()
+    routine-constants.clear()
+    routine-values.push(int(dst))
+    routine-constants.push(0)
+    routine-values.push(int(src))
+    routine-constants.push(0)
+    routine-values.push(0)
+    routine-constants.push(bytes)
+    call-routine(copy-routine)
+    return
+  }
+  # A frame object is reached from the frame record: no register is given
+  # its address.
+  let d = if frame-object?(dst) then marker(abi.FRAME) else sel.read-value(dst)
+  let s = if frame-object?(src) then marker(abi.FRAME) else sel.read-value(src)
+  let dat = if frame-object?(dst) then 0 - regs.object-offset(dst) else 0
+  let sat = if frame-object?(src) then 0 - regs.object-offset(src) else 0
+  var done = 0
+  while done + 16 <= bytes {
+    lower.copy-sixteen(s, sat + done, d, dat + done)
+    done = done + 16
+  }
+  var width = 8
+  while width > 0 {
+    while done + width <= bytes {
+      lower.copy-word(s, sat + done, d, dat + done, width)
+      done = done + width
+    }
+    width = width / 2
+  }
+  regs.done(dst)
+  regs.done(src)
+  busy = word(0)
+  temps = word(0)
+}
+
+# A stack variable the frame record is aligned enough for.
+fn frame-object?(v: Value) -> Bool = v is ALLOCA and v.imm2 <= 16
+
+# `bytes` bytes at `dst` set to zero: in words, then the widest that fit;
+# more than 128 bytes by the C library.
+fn zero-bytes(v: Value) {
+  let bytes = v.imm
+  let dst = v.in(0)
+  if bytes > 128 {
+    routine-values.clear()
+    routine-constants.clear()
+    routine-values.push(int(dst))
+    routine-constants.push(0)
+    routine-values.push(0)
+    routine-constants.push(0)
+    routine-values.push(0)
+    routine-constants.push(bytes)
+    call-routine(fill-routine)
+    return
+  }
+  let d = if frame-object?(dst) then marker(abi.FRAME) else sel.read-value(dst)
+  let dat = if frame-object?(dst) then 0 - regs.object-offset(dst) else 0
+  var done = 0
+  var width = 8
+  while width > 0 {
+    while done + width <= bytes {
+      lower.store-zero(d, dat + done, width)
+      done = done + width
+    }
+    width = width / 2
+  }
+  regs.done(dst)
+  busy = word(0)
+  temps = word(0)
+}
+
+# A C library routine called with `v`'s three operands.
+fn routine-of(routine: Int, v: Value) {
+  routine-values.clear()
+  routine-constants.clear()
+  for i in 0..3 {
+    routine-values.push(int(v.in(i)))
+    routine-constants.push(0)
+  }
+  call-routine(routine)
+}
+
+# The routine called with `routine-values` (or `routine-constants`) as its
+# arguments, in the integer registers of the convention.
+fn call-routine(routine: Int) {
+  if routine == 0 { panic("a copy or fill needs a routine of the C library, and none was given") }
+  regs.clobbers(isa.CALLER-SAVED)
+  forbidden = word(0)
+  for i in 0..routine-values.len {
+    let r = abi.int-arg(i)
+    if routine-values[i] != 0 {
+      let x: Value = id(routine-values[i])
+      read-into(x, r)
+    } else {
+      lower.constant(marker(r), routine-constants[i])
+      forbidden = set-bit(forbidden, r)
+    }
+  }
+  if near-routines { lower.call-symbol(routine - 1) } else { lower.call-through-table(routine - 1) }
+  calls = true
+  forbidden = word(0)
+  busy = word(0)
+  mach.done-temps()
+}
+
+# ---------------------------------------------------------------- the function
+
+# The `j`-th way out: the frame closed, then out as its kind says.
+fn write-stub(j: Int) {
+  mach.place(stubs[j])
+  emitting-from = 0
+  frames.leave()
+  out-by(stub-kind[j], stub-arg[j])
+}
+
+# Everything writing the body changes, as it was before: the first time, as
+# the function was surveyed.
+fn reset(again: Bool) {
+  if again {
+    for v in Value {
+      v.reg = v.fixed
+      v.slot = 0
+      v.clean = false
+      v.object-at = 0
+      v.folded = false
+      v.across = false
+      v.written = false
+    }
+    for r in 0..holder.len { holder[r] = 0 }
+    # Where frame objects are, with how much room they take, start over
+    # together (a rule's guard may have placed one as it was chosen).
+    object-bytes = 0
+  }
+  stubs.clear()
+  stub-kind.clear()
+  stub-arg.clear()
+  edges.clear()
+  loc-row.clear()
+  loc-track.clear()
+  loc-what.clear()
+  track-last.zeros(track.len)
+  ending = none
+  slots = 0
+  used = reserved
+  occupied = word(0)
+  busy = word(0)
+  forbidden = word(0)
+  temps = word(0)
+  held = false
+  last-from = 0
+  body.clear()
+  fix-at.clear()
+  fix-op.clear()
+  fix-a0.clear()
+  fix-a1.clear()
+  fix-a2.clear()
+  fix-a3.clear()
+  fix-a4.clear()
+  reloc-at.clear()
+  reloc-symbol.clear()
+  reloc-op.clear()
+  row-at.clear()
+  row-from.clear()
+}
+
+fn write-body() {
+  for b in Block { b.label = mach.new-label() }
+  let count = layout.len
+  for i in 0..count {
+    let next: Block = if i + 1 < count then block-at(i + 1) else none
+    if refusal == 0 { write-block(block-at(i), next, i + 1 == count) }
+  }
+  if refusal != 0 { return }
+  # The moves of the branches' ways into blocks with phis follow the body: the
+  # last block then goes to its way out, which no longer comes next.
+  if edges.len > 0 {
+    next-label = none
+    if ending != none {
+      lower.jump(int(ending))
+      ending = none
+    }
+    write-edges()
+  }
+}
+
+fn write() {
+  if refusal != 0 { return }
+  regs.setup()
+  var tries = 0
+  var again = true
+  while again {
+    tries = tries + 1
+    if tries > 3 { panic("the frame did not settle after three writings of the body") }
+    reset(tries > 1)
+    rewrite = false
+    write-body()
+    if refusal != 0 { return }
+    if rewrite and not with-frame { with-frame = true }
+    # A register the caller expects back that the body came to use is saved
+    # where a frame opens: one the function did not plan for is written again
+    # with it.
+    if not with-frame and used & isa.CALLEE-SAVED != word(0) {
+      with-frame = true
+      rewrite = true
+    }
+    let had = frame
+    frames.settle(used, slots, with-frame)
+    again = rewrite or (known-frame and had != frame)
+    if again { rewritten = rewritten + 1 }
+    if rewrite { known-frame = true }
+  }
+  # The way out the body falls into, then the others.
+  next-label = none
+  for j in 0..stubs.len { if stubs[j] == ending { write-stub(j) } }
+  for j in 0..stubs.len { if stubs[j] != ending { write-stub(j) } }
+  mach.fix()
+  mach.opening()
+  if with-frame and frame > 0 { frames.enter() }
+  mach.assemble()
+  # A slot, now that the frame is laid out: how far from the frame register.
+  for i in 0..loc-what.len {
+    if loc-what[i] >> word(56) == word(3) {
+      let at = int(loc-what[i] & word(16777215))
+      loc-what[i] = (word(2) << word(56)) | (word((at - frames.record-slot()) * 8) & word(4294967295))
+    }
+  }
+}
+
+# ---------------------------------------------------------------- for a debugger
+
+# Where each value a debugger follows is, noted where it changes, as the code
+# is written: for each change, the row of code it holds from (the next row
+# begun), which value, and where: 1 << 56 | its register, 2 << 56 | how far
+# from the frame register its slot is, or 0 where it is nowhere (not computed
+# yet, or computed again each time it is read, or 128 bits).
+state track: [Int]                     # the values followed, by CIR number + 1
+state track-last: [Word]
+state loc-row: [Int]
+state loc-track: [Int]
+state loc-what: [Word]
+
+fn where-is(v: Value) -> Word {
+  if not v.written or regs.wide?(v) or regs.remade?(v) { return word(0) }
+  if v.reg != 0 { return (word(1) << word(56)) | word(v.reg - 1) }
+  # A slot is noted by its number until the frame is laid out.
+  if v.slot != 0 { return (word(3) << word(56)) | word(out-slots + v.slot - 1) }
+  word(0)
+}
+
+fn sample() {
+  # The row the next code starts: the instruction held back, if it begins one,
+  # comes first.
+  let at = row-at.len + (if held and held-from != 0 and held-from != last-from then 1 else 0)
+  for k in 0..track.len {
+    let w = where-is(id(track[k]))
+    if w != track-last[k] {
+      track-last[k] = w
+      loc-row.push(at)
+      loc-track.push(k)
+      loc-what.push(w)
+    }
+  }
+}
+
+fn run() {
+  order()
+  survey()
+  fix-registers()
+  write()
+}
+
+# ---------------------------------------------------------------- what this compile takes
+
+# What this compile cannot compile is found as the function is surveyed and
+# its rules are chosen; whoever compiles reports it as an error. `refusal`
+# says why, by these numbers: 3 a call returning more values than the
+# convention has result registers for, 8 a return of more values than that,
+# 10 an instruction no rule computes (`refused-op`).
+state refusal: Int
+state refused-op: Int
+
+fn refuse(why: Int) {
+  if refusal == 0 { refusal = why }
+}

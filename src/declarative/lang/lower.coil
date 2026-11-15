@@ -1,0 +1,606 @@
+;;; The `.lower` language: which instructions compute a node.
+;;;
+;;;   rule ADD(x, CONST k) when u12(k)  => add-imm(sf, out, x, k)
+;;;   rule ADD(x, y)                    => add(sf, out, x, y)
+;;;   rule IF(_, LT(a, b))              => cmp(sf(a), a, b) ; b-cond(lt, then) ; b(else)
+;;;   template move(d, s)               = mov(1, d, s)
+;;;
+;;; A rule is a pattern over nodes and a sequence of the target's instructions.
+;;; `once NODE(…)` inside a pattern matches only a node the emitting pass calls
+;;; fusable into this root (used here alone, say, and in the same block).
+;;; Rules for one node are tried in the order written. A node named by a variable
+;;; must be in a register, so its own rule runs; a node matched inside a pattern
+;;; is computed by this rule and needs none of its own.
+;;;
+;;; A template may have several cases, each `when` something of its parameters,
+;;; and may say what its instruction is to the passes: `is copy`, `is jump`,
+;;; `is return`. A rule's sequence may use templates as it uses instructions.
+;;;
+;;; `rule TRUNC(x) => x` says a node is another node: it has no instructions and
+;;; no register of its own.
+;;;
+;;; `local CONST` in the header says a node is cheap enough to compute again in
+;;; every block that needs it, so it never holds a register across blocks.
+;;;
+;;; From the rules: `select` (which rule computes a node), `mark` (which nodes that
+;;; rule needs in registers) and `emit` (its instructions). Instructions go to the
+;;; pass module named by `emit`, which decides how machine code is stored.
+(module lang.lower)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "lang.text" :as t)
+(import "lang.ir" :as ir)
+(import "lang.isa" :as isa)
+(import "lang.project" :as project)
+
+;;; A pattern: a node with operand patterns, a variable, or `_`.
+;;; payload: the name bound to the node's payload (`CONST k`), or "".
+(defstruct Pat
+  [(node (slice u8)) (var (slice u8)) (payload (slice u8)) (kids (ArrayList Pat)) (once bool)
+   (tok t/Tok)])
+
+;;; A name a pattern binds, and the Coil expression for it: a node, or a
+;;; payload as a signed 64-bit value.
+(defstruct Binding [(name (slice u8)) (code (slice u8)) (is-node bool)])
+
+(defstruct L
+  [(c t/Cur)
+   (nodes ir/Spec)
+   (target isa/Spec)
+   (bindings (ArrayList Binding))
+   (temps (ArrayList (slice u8)))
+   (params (ArrayList (slice u8)))
+   (locals (ArrayList (slice u8)))
+   (template-names (ArrayList (slice u8)))
+   ; Registers are chosen as the instructions are written (a unit over an
+   ; IR said in `.ops`), so an instruction of a fixed-width machine whose
+   ; operands name no label and no symbol goes out already encoded.
+   (encoded bool)])
+
+(defn parse-pattern [(l (mut L))] (-> Pat)
+  (let [tok (t/peek (mut (.c l)))
+        once (t/accept! (mut (.c l)) "once")
+        name (if (t/accept! (mut (.c l)) "_") "_" (t/name! (mut (.c l)) "a pattern"))
+        (mut kids) (ArrayList::new [Pat] (malloc-allocator))]
+    (if (!= (ir/node-number (.nodes l) name) 0)
+        (let [(mut payload) ""]
+          (cond
+            (and (t/at? (mut (.c l)) "(") (.glued (t/peek (mut (.c l)))))
+              (do (t/advance! (mut (.c l)))
+                  (unless (t/at? (mut (.c l)) ")")
+                    (push! (mut kids) (parse-pattern (mut l)))
+                    (while (t/accept! (mut (.c l)) ",") (push! (mut kids) (parse-pattern (mut l)))))
+                  (t/expect! (mut (.c l)) ")"))
+            (and (t/at-ident? (mut (.c l))) (not (t/at-line-start? (mut (.c l))))
+                 (not (t/at? (mut (.c l)) "when")))
+              (set! payload (t/name! (mut (.c l)) "a payload name"))
+            :else 0)
+          ; `… as v` names the node the pattern matched, for a guard to ask of.
+          (Pat :node name :var (if (t/accept! (mut (.c l)) "as") (t/name! (mut (.c l)) "a name for the node") "")
+               :payload payload :kids kids :once once :tok tok))
+        (Pat :node "" :var name :payload "" :kids kids :once false :tok tok))))
+
+;;; The tests a pattern makes of the node `at`, and the names it binds.
+(defn match-text! [(l (mut L)) (p Pat) (at (slice u8)) (tests (mut t/Out)) (swap bool)] (-> void)
+  (if (= (.node p) "")
+      (unless (= (.var p) "_")
+        (push! (mut (.bindings l)) (Binding :name (.var p) :code at :is-node true)))
+      (do (t/emit! (mut tests) (t/cat4 " (= (graph/op (.g cx) " at ") ir/" (t/cat2 (.node p) ")")))
+          (when (!= (.var p) "")
+            (push! (mut (.bindings l)) (Binding :name (.var p) :code at :is-node true)))
+          ; `once`: only where the pass that stores machine code says this node
+          ; may be computed as part of the rule's root.
+          (when (.once p) (t/emit! (mut tests) (t/cat3 " (mach/fusable (mut cx) " at " n)")))
+          (when (!= (.payload p) "")
+            (push! (mut (.bindings l))
+                   (Binding
+                     :name (.payload p)
+                     :code (t/cat3 "(payload-value (mut cx) " at ")")
+                     :is-node false)))
+          (for i (range 0 (len (.kids p)))
+            (let [slot (if (and swap (= (len (.kids p)) 2)) (- 1 i) i)]
+              (match-text! (mut l) (get (.kids p) i)
+                           (t/cat4 "(graph/input (.g cx) " at " " (t/cat2 (t/int-text slot) ")"))
+                           (mut tests) false))))))
+
+(defn binding-of [(l (mut L)) (name (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for i (range 0 (len (.bindings l)))
+      (when (= (.name (get (.bindings l) i)) name) (set! found i)))
+    found))
+
+;; ---------------------------------------------------------------- expressions
+
+;;; Guards and operand values: 64-bit signed arithmetic over payloads.
+(defn value-level [(op (slice u8))] (-> i64)
+  (cond (= op "or") 1
+        (= op "and") 2
+        (or (= op "==") (= op "!=") (= op "<") (= op "<=") (= op ">") (= op ">=")) 3
+        (= op "|") 4
+        (= op "^") 5
+        (= op "&") 6
+        (or (= op "<<") (= op ">>")) 7
+        (or (= op "+") (= op "-")) 8
+        (or (= op "*") (= op "/") (= op "%")) 9
+        :else 0))
+
+(defn fits-text [(signed bool) (width i64) (v (slice u8))] (-> (slice u8))
+  (if signed
+      (t/cat4 "(let [v* " v
+              (t/cat3 "] (and (>= v* (- 0 (<< 1 " (t/int-text (- width 1)) ")))")
+              (t/cat3 " (< v* (<< 1 " (t/int-text (- width 1)) "))))"))
+      (t/cat4 "(let [v* " v "] (and (>= v* 0) (< v* (<< 1 " (t/cat2 (t/int-text width) "))))"))))
+
+(defn value-primary [(l (mut L)) (operand bool)] (-> (slice u8))
+  (let [tok (t/advance! (mut (.c l)))
+        name (.text tok)
+        call (and (t/at? (mut (.c l)) "(") (.glued (t/peek (mut (.c l)))))]
+    (cond
+      (= (.kind tok) t/T-NUM) (t/int-text (cast i64 (.value tok)))
+      (t/tok-is? tok "(")
+        (let [e (value-expr (mut l) 0 operand)]
+          (t/expect! (mut (.c l)) ")")
+          e)
+      (t/tok-is? tok "-") (t/cat3 "(- 0 " (value-primary (mut l) operand) ")")
+      (t/tok-is? tok "~") (t/cat3 "(^ " (value-primary (mut l) operand) " -1)")
+      (t/tok-is? tok "not") (t/cat3 "(not " (value-primary (mut l) operand) ")")
+      ; `$t`: a new virtual register, the same one wherever this rule names it.
+      (t/tok-is? tok "$")
+        (let [temp (t/name! (mut (.c l)) "a temporary's name")]
+          (when (< (t/index-of (.temps l) temp) 0) (push! (mut (.temps l)) temp))
+          (t/cat2 "t*" temp))
+      (!= (.kind tok) t/T-IDENT) (t/die (mut (.c l)) tok (t/cat2 "expected a value, found " name))
+      (and call (= name "sf"))
+        (do (t/advance! (mut (.c l)))
+            (let [x (value-expr (mut l) 0 false)]
+              (t/expect! (mut (.c l)) ")")
+              (t/cat3 "(if (= (ir/type-bits (graph/ty (.g cx) (primitive/cast i32 " x "))) 64) 1 0)")))
+      (and call (= name "bits"))
+        (do (t/advance! (mut (.c l)))
+            (let [x (value-expr (mut l) 0 false)]
+              (t/expect! (mut (.c l)) ")")
+              (t/cat3 "(ir/type-bits (graph/ty (.g cx) (primitive/cast i32 " x ")))")))
+      ; `u12(k)`, `s9(k)`: the value fits an immediate of that many bits.
+      (and call (> (len name) 1) (or (= (get name 0) #\u) (= (get name 0) #\s))
+           (t/digit? (get name 1)))
+        (let [(mut width) 0]
+          (for i (range 1 (len name)) (set! width (+ (* width 10) (cast i64 (- (get name i) #\0)))))
+          (t/advance! (mut (.c l)))
+          (let [x (value-expr (mut l) 0 false)]
+            (t/expect! (mut (.c l)) ")")
+            (fits-text (= (get name 0) #\s) width x)))
+      ; `sx(x)`, `zx(x)`, `ex(x)`: x in a register with its value carried up to 32
+      ; bits, by sign, by zeros, or by whichever its type is.
+      (and call operand (or (= name "sx") (= name "zx") (= name "ex")))
+        (do (t/advance! (mut (.c l)))
+            (let [at (t/peek (mut (.c l)))
+                  var (t/name! (mut (.c l)) "a node the pattern names")
+                  index (binding-of (mut l) var)]
+              (when (or (< index 0) (not (.is-node (get (.bindings l) index))))
+                (t/die (mut (.c l)) at "sx, zx and ex take a node the pattern names"))
+              (t/expect! (mut (.c l)) ")")
+              (t/cat4 "(extended (mut cx) " (.code (get (.bindings l) index)) " "
+                      (cond (= name "sx") "1)" (= name "zx") "0)" :else "2)"))))
+      ; A class of immediates the target lists: in a condition, whether the
+      ; value is one; as an operand, the bits that encode it.
+      (and call (>= (t/index-of (.immediates (.target l)) name) 0))
+        (do (t/advance! (mut (.c l)))
+            (let [x (value-expr (mut l) 0 false)]
+              (t/expect! (mut (.c l)) ")")
+              (if operand
+                  (t/cat4 "(isa/" name "-code " (t/cat2 x ")"))
+                  (t/cat4 "(>= (isa/" name "-code " (t/cat2 x ") 0)")))))
+      ; `log2(k)`: which power of two k is.
+      (and call (= name "log2"))
+        (do (t/advance! (mut (.c l)))
+            (let [x (value-expr (mut l) 0 false)]
+              (t/expect! (mut (.c l)) ")")
+              (t/cat3 "(bv/lowest (cast u64 " x "))")))
+      ; `repeat32(k)`: the low 32 bits of k, twice.
+      (and call (= name "repeat32"))
+        (do (t/advance! (mut (.c l)))
+            (let [x (value-expr (mut l) 0 false)]
+              (t/expect! (mut (.c l)) ")")
+              (t/cat3 "(let [v* (& " x " 4294967295)] (| v* (<< v* 32)))")))
+      ; `slot(p)`: whether node p is a frame object's address; `object(p)`: how
+      ; far below the frame record that object lies.
+      (and call (= name "slot"))
+        (do (t/advance! (mut (.c l)))
+            (let [x (value-expr (mut l) 0 false)]
+              (t/expect! (mut (.c l)) ")")
+              (t/cat3 "(= (graph/op (.g cx) (primitive/cast i32 " x ")) ir/SLOT)")))
+      ; `loaded(x)`: whether node x is what a load read, which has zeros above it.
+      (and call (= name "loaded"))
+        (do (t/advance! (mut (.c l)))
+            (let [x (value-expr (mut l) 0 false)]
+              (t/expect! (mut (.c l)) ")")
+              (t/cat3 "(= (graph/op (.g cx) (primitive/cast i32 " x ")) ir/LOAD)")))
+      (and call (= name "object"))
+        (do (t/advance! (mut (.c l)))
+            (let [x (value-expr (mut l) 0 false)]
+              (t/expect! (mut (.c l)) ")")
+              (t/cat3 "(mach/object-offset (mut cx) (primitive/cast i32 " x "))")))
+      (and call (= name "float"))
+        (do (t/advance! (mut (.c l)))
+            (let [x (value-expr (mut l) 0 false)]
+              (t/expect! (mut (.c l)) ")")
+              (t/cat3 "(ir/type-float? (graph/ty (.g cx) (primitive/cast i32 " x ")))")))
+      (= name "float") "(ir/type-float? (graph/ty (.g cx) n))"
+      (= name "out") "out"
+      (= name "width") "(ir/type-bits (graph/ty (.g cx) n))"
+      (= name "sf") "(if (= (ir/type-bits (graph/ty (.g cx) n)) 64) 1 0)"
+      ; `object`: how far below the frame record the frame object `n` lies.
+      (= name "object") "(mach/object-offset (mut cx) n)"
+      (= name "then") (t/cat3 "(" "mach/target" " (mut cx) n 1)")
+      (= name "else") (t/cat3 "(" "mach/target" " (mut cx) n 0)")
+      (>= (t/index-of (.params l) name) 0) name
+      (>= (binding-of (mut l) name) 0)
+        (let [b (get (.bindings l) (binding-of (mut l) name))]
+          (cond (not (.is-node b)) (.code b)
+                operand (t/cat3 "(operand (mut cx) " (.code b) ")")
+                :else (t/cat3 "(cast i64 " (.code b) ")")))
+      (and call (= name "reg"))
+        (do (t/advance! (mut (.c l)))
+            (let [x (value-expr (mut l) 0 false)]
+              (t/expect! (mut (.c l)) ")")
+              (t/cat3 "(- 0 (+ " x " 1))")))
+      (>= (isa/const-number (.target l) name) 0) (t/int-text (isa/const-number (.target l) name))
+      ; A machine register, written as the negative number that marks one.
+      (>= (isa/reg-number (.target l) name) 0)
+        (t/int-text (- 0 (+ (isa/reg-number (.target l) name) 1)))
+      (!= (ir/type-number (.nodes l) name) 0) (t/cat2 "ir/T-" (t/upper name))
+      :else (t/die (mut (.c l)) tok (t/cat2 "no such name in this rule: " name)))))
+
+(defn value-expr [(l (mut L)) (min i64) (operand bool)] (-> (slice u8))
+  (let [(mut left) (value-primary (mut l) operand)
+        (mut going) true]
+    (while going
+      (let [tok (t/peek (mut (.c l)))
+            level (if (.first tok) 0 (value-level (.text tok)))]
+        (if (and (> level 0) (> level min))
+            (do (t/advance! (mut (.c l)))
+                (let [right (value-expr (mut l) level operand)
+                      op (if (= (.text tok) "==") "=" (.text tok))]
+                  (set! left (t/cat4 (t/cat3 "(" op " ") left " " (t/cat2 right ")")))))
+            (set! going false))))
+    left))
+
+;;; `name(args) ; name(args)` as calls that append instructions. An argument for
+;;; an immediate operand is checked against the operand's width where it is
+;;; emitted; one that does not fit is a rule that should not have matched.
+(defn sequence-text [(l (mut L))] (-> (slice u8))
+  (let [(mut o) (t/out-new)
+        (mut more) (not (t/accept! (mut (.c l)) "nothing"))]
+    (while more
+      (let [tok (t/peek (mut (.c l)))
+            name (t/name! (mut (.c l)) "an instruction")
+            number (isa/inst-number (.target l) name)]
+        (if (>= (t/index-of (.template-names l) name) 0)
+            ; A template, with whatever it marks its instruction as.
+            (do (t/emit! (mut o) (t/cat3 " (" name " (mut cx)"))
+                (t/expect! (mut (.c l)) "(")
+                (unless (t/at? (mut (.c l)) ")")
+                  (let [(mut going) true]
+                    (while going
+                      (t/emit! (mut o) (t/cat2 " " (value-expr (mut l) 0 true)))
+                      (set! going (t/accept! (mut (.c l)) ",")))))
+                (t/expect! (mut (.c l)) ")")
+                (t/emit! (mut o) ")"))
+            (instruction-text! (mut l) (mut o) tok name number)))
+      (set! more (t/accept! (mut (.c l)) ";")))
+    (t/text-of (mut o))))
+
+(defn instruction-text! [(l (mut L)) (o (mut t/Out)) (tok t/Tok) (name (slice u8)) (number i64)] (-> void)
+  (do
+        (when (= number 0) (t/die (mut (.c l)) tok (t/cat2 "the target has no instruction " name)))
+        (let [inst (get (.insts (.target l)) (- number 1))
+              encoded (and (.encoded l) (isa/encodable? (.target l) inst))
+              (mut i) 0]
+          (t/emit! (mut o) (if encoded
+                               (t/cat4 " (mach/emit-word (mut cx) " (t/int-text number) " (cast u64 (isa/word-" (t/int-text number))
+                               (t/cat3 " (mach/emit (mut cx) " (t/int-text number) "")))
+          (t/expect! (mut (.c l)) "(")
+          (unless (t/at? (mut (.c l)) ")")
+            (let [(mut going) true]
+              (while going
+                (let [code (value-expr (mut l) 0 true)]
+                  (t/emit! (mut o) (t/cat2 " " (if encoded (isa/operand-code-text inst i code) code))))
+                (set! i (+ i 1))
+                (set! going (t/accept! (mut (.c l)) ",")))))
+          (t/expect! (mut (.c l)) ")")
+          (when (!= i (len (.operands inst)))
+            (t/die (mut (.c l)) tok
+                   (t/cat4 name " takes " (t/int-text (len (.operands inst))) " operands")))
+          (for _ (range i 5) (t/emit! (mut o) " 0"))
+          (t/emit! (mut o) (if encoded ")))" ")")))))
+
+;; ---------------------------------------------------------------- the module
+
+(defn module-name! [(c (mut t/Cur))] (-> (slice u8))
+  (let [(mut name) (t/name! (mut c) "a module name")]
+    (while (and (t/at? (mut c) ".") (.glued (t/peek (mut c))))
+      (t/advance! (mut c))
+      (set! name (t/cat3 name "." (t/name! (mut c) "a module name"))))
+    name))
+
+(defn module-text [(context Code)] (-> (slice u8))
+  (let [p (project/open context)
+        path (t/path-of context)
+        (mut c) (t/cursor (t/source-of context) path)
+        (mut unit) ""
+        (mut nodes-module) ""
+        (mut target-module) ""
+        (mut mach-module) ""
+        (mut nodes-file) ""
+        (mut target-file) ""
+        (mut locals) (ArrayList::new [(slice u8)] (malloc-allocator))
+        (mut template-names) (ArrayList::new [(slice u8)] (malloc-allocator))]
+    (for one (templates (t/source-of context) path)
+      (when (< (t/index-of template-names (get one 0)) 0) (push! (mut template-names) (get one 0))))
+    (t/expect! (mut c) "lower")
+    (t/expect! (mut c) "in")
+    (set! unit (project/resolve p (module-name! (mut c)) 1 1))
+    ; A unit that lists this file as `templates` has no node set: its rules
+    ; are not read, and its templates are all it gives.
+    (let [only (and (templates-only? (project/read-file (project/file-of p unit 1 1) path) (project/module-of p path))
+                    (ops-unit? (project/read-file (project/file-of p unit 1 1) path)))]
+    (let [(mut header) true]
+      (while header
+        (let [at (t/peek-at (mut c) 1)]
+          (cond
+            (t/accept! (mut c) "nodes")
+              (do (set! nodes-module (module-name! (mut c)))
+                  (set! nodes-file (project/file-of p nodes-module (.line at) (.col at))))
+            (t/accept! (mut c) "target")
+              (do (set! target-module (module-name! (mut c)))
+                  (set! target-file (project/file-of p target-module (.line at) (.col at))))
+            (t/accept! (mut c) "emit") (set! mach-module (project/resolve p (module-name! (mut c)) (.line at) (.col at)))
+            (t/accept! (mut c) "local") (push! (mut locals) (t/name! (mut c) "a node name"))
+            :else (set! header false)))))
+    (when (or (= nodes-file "") (= target-file "") (= mach-module ""))
+      (t/fail-at path 1 1 "a .lower file names its `nodes`, its `target` and where it `emit`s"))
+    (let [(mut l) (L
+                    :c c
+                    :nodes (ir/parse (project/read-file nodes-file path) nodes-file)
+                    :target (isa/parse (project/read-file target-file path) target-file)
+                    :bindings (ArrayList::new [Binding] (malloc-allocator))
+                    :temps (ArrayList::new [(slice u8)] (malloc-allocator))
+                    :params (ArrayList::new [(slice u8)] (malloc-allocator))
+                    :locals locals
+                    :template-names template-names
+                    :encoded only)
+          (mut o) (t/out-new)
+          (mut selects) (t/out-new)
+          (mut marks) (t/out-new)
+          (mut emits) (t/out-new)
+          (mut aliases) (t/out-new)
+          (mut template-order) (ArrayList::new [(slice u8)] (malloc-allocator))
+          (mut template-heads) (ArrayList::new [(slice u8)] (malloc-allocator))
+          (mut template-cases) (ArrayList::new [(slice u8)] (malloc-allocator))
+          (mut rule) 0
+          names (templates (t/source-of context) path)
+          (mut extends) false]
+      (block :done
+      (for one names (when (= (get one 0) "sign-extend") (set! extends true)))
+      (t/line! (mut o) (t/cat4 "(depends-on \"" nodes-file "\" \"" (t/cat2 target-file "\")")))
+      (t/line! (mut o) "(import \"coil.primitive\" :as primitive)")
+      (t/line! (mut o) "(import \"declarative.rt.graph\" :as graph)")
+      (t/line! (mut o) "(import \"declarative.rt.bits\" :as bv)")
+      (t/line! (mut o) (t/cat3 "(import \"" unit "\" :as st)"))
+      (t/line! (mut o) (t/cat3 "(import \"" nodes-module "\" :as ir)"))
+      (t/line! (mut o) (t/cat3 "(import \"" mach-module "\" :as mach)"))
+      (t/line! (mut o) (t/cat3 "(import \"" target-module "\" :as isa)"))
+      (while (not (t/eof? (mut (.c l))))
+        (let [tok (t/advance! (mut (.c l)))]
+          (cond
+            (t/tok-is? tok "template")
+              (let [name (t/name! (mut (.c l)) "a template name")
+                    (mut header) (t/out-new)
+                    (mut index) (t/index-of template-order name)]
+                (clear! (mut (.params l)))
+                (clear! (mut (.bindings l)))
+                (clear! (mut (.temps l)))
+                (t/emit! (mut header) (t/cat3 "(defn " name " [(cx (mut st/State))"))
+                (t/expect! (mut (.c l)) "(")
+                (while (not (t/accept! (mut (.c l)) ")"))
+                  (let [param (t/name! (mut (.c l)) "a parameter")]
+                    (push! (mut (.params l)) param)
+                    (t/emit! (mut header) (t/cat3 " (" param " i64)"))
+                    (t/accept! (mut (.c l)) ",")))
+                (t/line! (mut header) "] (-> void)")
+                (when (< index 0)
+                  (push! (mut template-order) name)
+                  (push! (mut template-heads) (t/text-of (mut header)))
+                  (push! (mut template-cases) "")
+                  (set! index (- (len template-order) 1)))
+                ; `is copy`: its instruction copies its second parameter to its
+                ; first. `is jump`: it only goes to its label. `is return`: it
+                ; leaves the function.
+                (let [kind (if (t/accept! (mut (.c l)) "is") (t/name! (mut (.c l)) "what the template is") "")
+                      guard (if (t/accept! (mut (.c l)) "when") (value-expr (mut l) 0 false) "true")]
+                  (t/expect! (mut (.c l)) "=")
+                  (let [body (sequence-text (mut l))
+                        mark (cond (= kind "copy")
+                                     (t/cat4 " (mach/mark-copy (mut cx) " (get (.params l) 0) " "
+                                             (t/cat2 (get (.params l) 1) ")"))
+                                   (= kind "jump") " (mach/mark-jump (mut cx))"
+                                   (= kind "return") " (mach/mark-return (mut cx))"
+                                   ; A frame object read into, written from or its
+                                   ; address given to the first parameter; the second
+                                   ; says how far below the frame record, the third how
+                                   ; many bytes. What the instruction is is settled when
+                                   ; the frame is laid out.
+                                   (or (= kind "object-read") (= kind "object-write") (= kind "object-address"))
+                                     (t/cat4 (t/cat3 " (mach/mark-object (mut cx) "
+                                                     (cond (= kind "object-read") "8" (= kind "object-write") "9" :else "10")
+                                                     " ")
+                                             (get (.params l) 0) " "
+                                             (t/cat4 (get (.params l) 1) " " (get (.params l) 2) ")"))
+                                   (= kind "") ""
+                                   :else (t/die (mut (.c l)) tok "a template is copy, jump, return, object-read, object-write or object-address"))]
+                    ; A template's `$t` is a new virtual register each time it is used.
+                    (let [(mut fresh) (t/out-new)]
+                      (for temp (.temps l)
+                        (t/emit! (mut fresh) (t/cat3 "t*" temp " (mach/fresh (mut cx)) ")))
+                      (set! (mut template-cases) index
+                            (t/cat4 (get template-cases index) "    " guard
+                                    (t/cat4 " (let [" (t/text-of (mut fresh)) "] (do"
+                                            (t/cat3 body mark " (do)))\n"))))))))
+            ; Read for its templates alone: a rule is passed over.
+            (and only (t/tok-is? tok "rule"))
+              (while (and (not (t/eof? (mut (.c l))))
+                          (not (and (= (.col (t/peek (mut (.c l)))) 1)
+                                    (or (t/tok-is? (t/peek (mut (.c l))) "rule")
+                                        (t/tok-is? (t/peek (mut (.c l))) "template")))))
+                (t/advance! (mut (.c l))))
+            (t/tok-is? tok "rule")
+              (let [pattern (parse-pattern (mut l))
+                    commutative (and (!= (.node pattern) "")
+                                     (= (len (.kids pattern)) 2)
+                                     (.commutative (get (.nodes (.nodes l))
+                                                        (- (ir/node-number (.nodes l) (.node pattern)) 1)))
+                                     (!= (.node (get (.kids pattern) 0)) "")
+                                     (= (.node (get (.kids pattern) 1)) ""))]
+                (when (= (.node pattern) "")
+                  (t/die (mut (.c l)) tok "a rule's pattern starts at a node"))
+                ; A commutative node whose pattern names a node on the left and a
+                ; variable on the right is tried both ways round.
+                (let [start (.pos (.c l))]
+                  (for way (range 0 (if commutative 2 1))
+                    (set! (.pos (.c l)) start)
+                    (set! rule (+ rule 1))
+                    (clear! (mut (.params l)))
+                    (clear! (mut (.bindings l)))
+                    (clear! (mut (.temps l)))
+                    (let [(mut tests) (t/out-new)]
+                      (match-text! (mut l) pattern "n" (mut tests) (= way 1))
+                      (when (t/accept! (mut (.c l)) "when")
+                        (t/emit! (mut tests) (t/cat2 " " (value-expr (mut l) 0 false))))
+                      (t/expect! (mut (.c l)) "=>")
+                      (t/line! (mut selects)
+                               (t/cat4 "    (and" (t/text-of (mut tests)) ") " (t/int-text rule)))
+                      (t/emit! (mut marks) (t/cat3 "    (" (t/int-text rule) " (do"))
+                      (for b (.bindings l)
+                        (when (.is-node b)
+                          (t/emit! (mut marks) (t/cat3 " (mach/need (mut cx) " (.code b) ")"))))
+                      (t/line! (mut marks) " (do)))")
+                      ; `=> x`: the node is `x` itself, in whatever register `x` is in.
+                      (let [first (t/peek (mut (.c l)))
+                            index (binding-of (mut l) (.text first))
+                            next (t/peek-at (mut (.c l)) 1)]
+                        (if (and (>= index 0) (.is-node (get (.bindings l) index))
+                                 (not (and (t/tok-is? next "(") (.glued next))))
+                            (do (t/advance! (mut (.c l)))
+                                (t/line! (mut aliases)
+                                         (t/cat4 "    (" (t/int-text rule) " "
+                                                 (t/cat2 (.code (get (.bindings l) index)) ")"))))
+                            (let [body (sequence-text (mut l))]
+                              (t/emit! (mut emits) (t/cat3 "    (" (t/int-text rule) " (let ["))
+                              (for temp (.temps l)
+                                (t/emit! (mut emits) (t/cat3 "t*" temp " (mach/fresh (mut cx)) ")))
+                              (t/line! (mut emits) (t/cat3 "] (do" body " (do))))")))))))))
+            :else (t/die (mut (.c l)) tok (t/cat2 "expected rule or template, found " (.text tok))))))
+      ; A template is its cases, the first whose condition holds.
+      (for i (range 0 (len template-order))
+        (t/emit! (mut o) (get template-heads i))
+        (t/line! (mut o) "  (cond")
+        (t/emit! (mut o) (get template-cases i))
+        (t/line! (mut o) (t/cat3 "    :else (panic \"no case of template " (get template-order i) " applies\")))")))
+      (when only (return-from :done (t/text-of (mut o))))
+      (t/line! (mut o) ";;; The rule that computes `n`, or 0 if none matches.")
+      (t/line! (mut o) "(defn select [(cx (mut st/State)) (n i32)] (-> i64)")
+            (t/line! (mut o) "  (cond")
+      (t/emit! (mut o) (t/text-of (mut selects)))
+      (t/line! (mut o) "    :else 0))")
+      (t/line! (mut o) ";;; The nodes rule `rule` needs in registers to compute `n`.")
+      (t/line! (mut o) "(defn mark [(cx (mut st/State)) (n i32) (rule i64)] (-> void)")
+            (t/line! (mut o) "  (match rule")
+      (t/emit! (mut o) (t/text-of (mut marks)))
+      (t/line! (mut o) "    (_ (do))))")
+      (t/line! (mut o) ";;; Whether `n` is computed again in each block that needs it.")
+      (t/emit! (mut o) "(defn local? [(cx (mut st/State)) (n i32)] (-> bool) (and (not (mach/kept? (mut cx) n)) (or false")
+      (for name (.locals l)
+        (t/emit! (mut o) (t/cat3 " (= (graph/op (.g cx) n) ir/" name ")")))
+      (t/line! (mut o) ")))")
+      (t/line! (mut o) ";;; The node `n` simply is, by the rule chosen for it, or 0.")
+      (t/line! (mut o) "(defn alias-of [(cx (mut st/State)) (n i32)] (-> i32)")
+      (t/line! (mut o) "  (match (mach/rule-of (mut cx) n)")
+      (t/emit! (mut o) (t/text-of (mut aliases)))
+      (t/line! (mut o) "    (_ (: 0 i32))))")
+      (t/line! (mut o) ";;; The register that holds `n` where instructions are being emitted.")
+      (t/line! (mut o) "(defn operand [(cx (mut st/State)) (n i32)] (-> i64)")
+      (t/line! (mut o) "  (if (not (local? (mut cx) n))")
+      (t/line! (mut o) "      (let [same (alias-of (mut cx) n)]")
+      (t/line! (mut o) "        (if (!= same 0) (operand (mut cx) same) (cast i64 n)))")
+      (t/line! (mut o) "      (let [r (mach/local (mut cx) n)]")
+      (t/line! (mut o) "        (if (!= r 0)")
+      (t/line! (mut o) "            r")
+      (t/line! (mut o) "            (let [fresh (mach/fresh (mut cx))]")
+      (t/line! (mut o) "              (mach/set-local (mut cx) n fresh)")
+      (t/line! (mut o) "              (emit (mut cx) n (mach/rule-of (mut cx) n) fresh)")
+      (t/line! (mut o) "              fresh)))))")
+      (t/line! (mut o) ";;; A constant's value as a rule sees it: signed if its type is.")
+      (t/line! (mut o) "(defn payload-value [(cx (mut st/State)) (n i32)] (-> i64)")
+      (t/line! (mut o) "  (if (ir/type-signed? (graph/ty (.g cx) n))")
+      (t/line! (mut o) "      (bv/signed (graph/payload (.g cx) n) (ir/type-bits (graph/ty (.g cx) n)))")
+      (t/line! (mut o) "      (primitive/cast i64 (graph/payload (.g cx) n))))")
+      (when extends
+        (t/line! (mut o) ";;; `n` in a register with its value carried up to 32 bits: by sign (1), by")
+        (t/line! (mut o) ";;; zeros (0) or as its type says (2). A value 32 bits wide or more is as it is.")
+        (t/line! (mut o) "(defn extended [(cx (mut st/State)) (n i32) (how i64)] (-> i64)")
+        (t/line! (mut o) "  (let [bits (ir/type-bits (graph/ty (.g cx) n))")
+        (t/line! (mut o) "        r (operand (mut cx) n)]")
+        (t/line! (mut o) "    (if (>= bits 32)")
+        (t/line! (mut o) "        r")
+        (t/line! (mut o) "        (let [t (mach/fresh (mut cx))]")
+        (t/line! (mut o) "          (if (or (= how 1) (and (= how 2) (ir/type-signed? (graph/ty (.g cx) n))))")
+        (t/line! (mut o) "              (sign-extend (mut cx) t r bits)")
+        (t/line! (mut o) "              (zero-extend (mut cx) t r bits))")
+        (t/line! (mut o) "          t))))"))
+      (t/line! (mut o) ";;; The instructions of rule `rule` for `n`, leaving its value in `out`.")
+      (t/line! (mut o) "(defn emit [(cx (mut st/State)) (n i32) (rule i64) (out i64)] (-> void)")
+            (t/line! (mut o) "  (match rule")
+      (t/emit! (mut o) (t/text-of (mut emits)))
+      (t/line! (mut o) "    (_ (do))))")
+      (t/text-of (mut o)))))))
+
+;;; Whether the unit whose text is `unit-src` lists the module `name` as
+;;; `templates`, to be read for its templates alone.
+;;; Whether the unit is over an IR said in `.ops`, whose registers are chosen
+;;; as instructions are written.
+(defn ops-unit? [(unit-src (slice u8))] (-> bool)
+  (let [(mut c) (t/cursor unit-src "")
+        (mut found) false]
+    (while (not (t/eof? (mut c)))
+      (let [tok (t/advance! (mut c))]
+        (when (and (t/tok-is? tok "ops") (= (.col tok) 1)) (set! found true))))
+    found))
+
+(defn templates-only? [(unit-src (slice u8)) (name (slice u8))] (-> bool)
+  (let [(mut c) (t/cursor unit-src "")
+        (mut found) false]
+    (while (not (t/eof? (mut c)))
+      (let [tok (t/advance! (mut c))]
+        (when (and (t/tok-is? tok "templates") (not (t/eof? (mut c))))
+          (when (= (module-name! (mut c)) name) (set! found true)))))
+    found))
+
+;;; The functions a `.lower` file gives the passes: its templates' names and
+;;; parameters, for the unit's table of functions.
+(defn templates [(src (slice u8)) (path (slice u8))] (-> (ArrayList (ArrayList (slice u8))))
+  (let [(mut c) (t/cursor src path)
+        (mut out) (ArrayList::new [(ArrayList (slice u8))] (malloc-allocator))]
+    (while (not (t/eof? (mut c)))
+      (let [tok (t/advance! (mut c))]
+        (when (and (t/tok-is? tok "template") (= (.col tok) 1))
+          (let [(mut one) (ArrayList::new [(slice u8)] (malloc-allocator))
+                (mut seen) false]
+            (push! (mut one) (t/name! (mut c) "a template name"))
+            (t/expect! (mut c) "(")
+            (while (not (t/accept! (mut c) ")"))
+              (push! (mut one) (t/name! (mut c) "a parameter"))
+              (t/accept! (mut c) ","))
+            ; A template with several cases is one function.
+            (for other out (when (= (get other 0) (get one 0)) (set! seen true)))
+            (unless seen (push! (mut out) one))))))
+    out))

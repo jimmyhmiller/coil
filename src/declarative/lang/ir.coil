@@ -1,0 +1,978 @@
+;;; The `.ir` language: a sea-of-nodes node set, said once.
+;;;
+;;;   type i32 : 32 signed
+;;;   set int = i8 i16 i32 i64
+;;;   node ADD(a: T, b: T) : T in int  commutative  = a + b
+;;;   node IF(c: ctrl, cond: bool) : ctrl  role if
+;;;
+;;; From it: operation and type numbers, name and role tables, a builder per node
+;;; (value-numbered where the node is a value of its inputs), a verifier from the
+;;; operand types, and from `= …` an evaluator. Other languages read the same
+;;; file through `parse` and are checked against it.
+(module lang.ir)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "lang.text" :as t)
+
+(const KIND-CONTROL 0)
+(const KIND-UNSIGNED 1)
+(const KIND-SIGNED 2)
+(const KIND-FLOAT 3)
+
+(defstruct TypeDecl [(name (slice u8)) (bits i64) (kind i64)])
+
+(defstruct SetDecl [(name (slice u8)) (members (ArrayList (slice u8)))])
+
+;;; type: "" for any value, a declared type, or a type variable.
+(defstruct Operand [(name (slice u8)) (type (slice u8)) (variadic bool)])
+
+(defstruct Constraint [(var (slice u8)) (set (slice u8))])
+
+;;; `bits(narrow) < bits(wide)`, or `<=` when `strict` is false.
+(defstruct Width [(narrow (slice u8)) (wide (slice u8)) (strict bool)])
+
+;;; meaning: the Coil expression for the node's value over a, b, c, or "".
+(defstruct Node
+  [(name (slice u8))
+   (operands (ArrayList Operand))
+   (result (slice u8))
+   (constraints (ArrayList Constraint))
+   (widths (ArrayList Width))
+   (role (slice u8))
+   (commutative bool)
+   (payload (slice u8))
+   (meaning (slice u8))
+   (line i64)])
+
+(defstruct Spec
+  [(types (ArrayList TypeDecl)) (sets (ArrayList SetDecl)) (nodes (ArrayList Node))])
+
+(defn role-number [(role (slice u8))] (-> i64)
+  (cond (= role "pure") 0
+        (= role "start") 1
+        (= role "return") 2
+        (= role "region") 3
+        (= role "loop") 4
+        (= role "if") 5
+        (= role "true") 6
+        (= role "false") 7
+        (= role "phi") 8
+        (= role "param") 9
+        (= role "const") 10
+        (= role "call") 11
+        (= role "result") 12
+        (= role "load") 13
+        (= role "store") 14
+        (= role "object") 15
+        (= role "symbol") 16
+        (= role "extern") 17
+        (= role "trap") 18
+        (= role "switch") 19
+        (= role "case") 20
+        (= role "default") 21
+        (= role "tailcall") 22
+        ; In the control chain, on memory: the node is what was at its address,
+        ; and its meaning, which may read that as `old`, is what it leaves there.
+        (= role "update") 23
+        ; In the control chain, and nothing to the values a program computes.
+        (= role "barrier") 24
+        ; In the control chain: memory of its own, as many bytes as its operand
+        ; says, and the node is its address.
+        (= role "reserve") 25
+        ; In the control chain: as many bytes as the payload says, copied from
+        ; the second address to the first, or each set to the operand.
+        (= role "copy") 26
+        (= role "fill") 27
+        :else -1))
+
+;;; A type's number; 0 is "no type". Numbers follow declaration order from 1.
+(defn type-number [(spec Spec) (name (slice u8))] (-> i64)
+  (let [(mut found) 0]
+    (for i (range 0 (len (.types spec)))
+      (when (= (.name (get (.types spec) i)) name) (set! found (+ i 1))))
+    found))
+
+;;; A node's operation number, from 1 in declaration order, or 0.
+(defn node-number [(spec Spec) (name (slice u8))] (-> i64)
+  (let [(mut found) 0]
+    (for i (range 0 (len (.nodes spec)))
+      (when (= (.name (get (.nodes spec) i)) name) (set! found (+ i 1))))
+    found))
+
+(defn set-declared? [(spec Spec) (name (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (for s (.sets spec) (when (= (.name s) name) (set! found true)))
+    found))
+
+;;; A type that is control, not a value.
+(defn control-type? [(spec Spec) (name (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (for ty (.types spec) (when (and (= (.name ty) name) (= (.kind ty) KIND-CONTROL)) (set! found true)))
+    found))
+
+;;; A node in the flow of control: one whose type is control, a load, which
+;;; sits in the control chain and is also its value, and a return, which ends it.
+(defn control-node? [(spec Spec) (node Node)] (-> bool)
+  (or (control-type? spec (.result node)) (= (.role node) "load") (= (.role node) "return")
+      (= (.role node) "update") (= (.role node) "reserve")
+      (= (.role node) "trap") (= (.role node) "tailcall")))
+
+(defn fixed-count [(node Node)] (-> i64)
+  (let [(mut k) 0]
+    (for o (.operands node) (unless (.variadic o) (set! k (+ k 1))))
+    k))
+
+(defn variadic? [(node Node)] (-> bool)
+  (let [(mut v) false]
+    (for o (.operands node) (when (.variadic o) (set! v true)))
+    v))
+
+;;; A value of its inputs alone: interned when built, removed when unused.
+(defn pure? [(node Node)] (-> bool)
+  (or (= (.role node) "pure") (= (.role node) "const") (= (.role node) "param")
+      (= (.role node) "object") (= (.role node) "symbol") (= (.role node) "extern")))
+
+;; ---------------------------------------------------------------- meanings
+
+;;; The position (0, 1, 2) of a value operand among a node's operands, or -1.
+(defn operand-index [(node Node) (name (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for i (range 0 (len (.operands node)))
+      (when (= (.name (get (.operands node) i)) name) (set! found i)))
+    found))
+
+(defn truth [(test (slice u8))] (-> (slice u8))
+  (t/cat3 "(if " test " (: 1 u64) (: 0 u64))"))
+
+(defn meaning-call [(c (mut t/Cur)) (node Node) (name (slice u8)) (at t/Tok)] (-> (slice u8))
+  (let [(mut args) (ArrayList::new [(slice u8)] (malloc-allocator))]
+    (unless (t/at? (mut c) ")")
+      (push! (mut args) (meaning-expr (mut c) node 0))
+      (while (t/accept! (mut c) ",") (push! (mut args) (meaning-expr (mut c) node 0))))
+    (t/expect! (mut c) ")")
+    (let [k (len args)
+          a (if (> k 0) (get args 0) "")
+          b (if (> k 1) (get args 1) "")]
+      (cond
+        (and (= name "sext") (= k 1)) (t/cat3 "(bv/sext " a " bits)")
+        (and (= name "clz") (= k 1)) (t/cat3 "(bv/clz " a " bits)")
+        (and (= name "ctz") (= k 1)) (t/cat3 "(bv/ctz " a " bits)")
+        (and (= name "popcount") (= k 1)) (t/cat3 "(bv/popcount " a " bits)")
+        (and (= name "bswap") (= k 1)) (t/cat3 "(bv/bswap " a " bits)")
+        (and (= name "rol") (= k 2)) (t/cat4 "(bv/rol " a " " (t/cat2 b " bits)"))
+        (and (= name "ror") (= k 2)) (t/cat4 "(bv/ror " a " " (t/cat2 b " bits)"))
+        (and (= name "umulh") (= k 2)) (t/cat4 "(bv/umulh " a " " (t/cat2 b " bits)"))
+        (and (= name "smulh") (= k 2)) (t/cat4 "(bv/smulh " a " " (t/cat2 b " bits)"))
+        (and (= name "sadd-overflows") (= k 2)) (truth (t/cat4 "(bv/sadd-overflows " a " " (t/cat2 b " bits)")))
+        (and (= name "ssub-overflows") (= k 2)) (truth (t/cat4 "(bv/ssub-overflows " a " " (t/cat2 b " bits)")))
+        (and (= name "uadd-overflows") (= k 2)) (truth (t/cat4 "(bv/uadd-overflows " a " " (t/cat2 b " bits)")))
+        (and (= name "usub-overflows") (= k 2)) (truth (t/cat4 "(bv/usub-overflows " a " " (t/cat2 b " bits)")))
+        (and (= name "smul-overflows") (= k 2)) (truth (t/cat4 "(bv/smul-overflows " a " " (t/cat2 b " bits)")))
+        (and (= name "umul-overflows") (= k 2)) (truth (t/cat4 "(bv/umul-overflows " a " " (t/cat2 b " bits)")))
+        (and (= name "smin") (= k 2)) (t/cat4 "(if (< (bv/signed " a " bits) (bv/signed " (t/cat4 b " bits)) " a (t/cat3 " " b ")")))
+        (and (= name "smax") (= k 2)) (t/cat4 "(if (> (bv/signed " a " bits) (bv/signed " (t/cat4 b " bits)) " a (t/cat3 " " b ")")))
+        (and (= name "umin") (= k 2)) (t/cat4 "(if (< " a " " (t/cat4 b ") " a (t/cat3 " " b ")")))
+        (and (= name "umax") (= k 2)) (t/cat4 "(if (> " a " " (t/cat4 b ") " a (t/cat3 " " b ")")))
+        ; Floating point, on the values' bits.
+        (and (= name "fadd") (= k 2)) (t/cat4 "(bv/fadd " a " " (t/cat2 b " bits)"))
+        (and (= name "fsub") (= k 2)) (t/cat4 "(bv/fsub " a " " (t/cat2 b " bits)"))
+        (and (= name "fmul") (= k 2)) (t/cat4 "(bv/fmul " a " " (t/cat2 b " bits)"))
+        (and (= name "fdiv") (= k 2)) (t/cat4 "(bv/fdiv " a " " (t/cat2 b " bits)"))
+        (and (= name "fneg") (= k 1)) (t/cat3 "(bv/fneg " a " bits)")
+        (and (= name "fabs") (= k 1)) (t/cat3 "(bv/fabs " a " bits)")
+        (and (= name "fsqrt") (= k 1)) (t/cat3 "(bv/fsqrt " a " bits)")
+        (and (= name "fmin") (= k 2)) (t/cat4 "(bv/fmin " a " " (t/cat2 b " bits)"))
+        (and (= name "fmax") (= k 2)) (t/cat4 "(bv/fmax " a " " (t/cat2 b " bits)"))
+        (and (= name "fmin-number") (= k 2)) (t/cat4 "(bv/fmin-number " a " " (t/cat2 b " bits)"))
+        (and (= name "fmax-number") (= k 2)) (t/cat4 "(bv/fmax-number " a " " (t/cat2 b " bits)"))
+        (and (= name "fround") (= k 2)) (t/cat4 "(bv/fround " a " " (t/cat2 b " bits)"))
+        (and (= name "fma") (= k 3)) (t/cat4 "(bv/fma " a " " (t/cat4 b " " (get args 2) " bits)"))
+        (and (= name "bitrev") (= k 1)) (t/cat3 "(bv/bitrev " a " bits)")
+        (and (= name "feq") (= k 2)) (truth (t/cat4 "(bv/feq " a " " (t/cat2 b " bits)")))
+        (and (= name "fne") (= k 2)) (truth (t/cat4 "(not (bv/feq " a " " (t/cat2 b " bits))")))
+        (and (= name "flt") (= k 2)) (truth (t/cat4 "(bv/flt " a " " (t/cat2 b " bits)")))
+        (and (= name "fle") (= k 2)) (truth (t/cat4 "(bv/fle " a " " (t/cat2 b " bits)")))
+        (and (= name "sitof") (= k 1)) (t/cat3 "(bv/sitof (bv/sext " a " bits) rbits)")
+        (and (= name "uitof") (= k 1)) (t/cat3 "(bv/uitof " a " rbits)")
+        (and (= name "ftosi") (= k 1)) (t/cat3 "(bv/ftosi " a " bits rbits)")
+        (and (= name "ftoui") (= k 1)) (t/cat3 "(bv/ftoui " a " bits rbits)")
+        (and (= name "fext") (= k 1)) (t/cat3 "(bv/fext " a ")")
+        (and (= name "ftrunc") (= k 1)) (t/cat3 "(bv/ftrunc " a ")")
+        (and (= name "udiv") (= k 2)) (t/cat4 "(bv/udiv " a " " (t/cat2 b ")"))
+        (and (= name "urem") (= k 2)) (t/cat4 "(bv/urem " a " " (t/cat2 b ")"))
+        (and (= name "sdiv") (= k 2)) (t/cat4 "(bv/sdiv (bv/sext " a " bits) (bv/sext " (t/cat2 b " bits))"))
+        (and (= name "srem") (= k 2)) (t/cat4 "(bv/srem (bv/sext " a " bits) (bv/sext " (t/cat2 b " bits))"))
+        (and (= name "select") (= k 3))
+          (t/cat4 "(if (!= " a " 0) " (t/cat4 b " " (get args 2) ")"))
+        (and (= name "sar") (= k 2)) (t/cat4 "(bv/sar (bv/sext " a " bits) " (t/cat2 b ")"))
+        (and (= name "slt") (= k 2))
+          (truth (t/cat4 "(< (bv/signed " a " bits) (bv/signed " (t/cat2 b " bits))")))
+        (and (= name "sle") (= k 2))
+          (truth (t/cat4 "(<= (bv/signed " a " bits) (bv/signed " (t/cat2 b " bits))")))
+        (and (= name "sgt") (= k 2))
+          (truth (t/cat4 "(> (bv/signed " a " bits) (bv/signed " (t/cat2 b " bits))")))
+        (and (= name "sge") (= k 2))
+          (truth (t/cat4 "(>= (bv/signed " a " bits) (bv/signed " (t/cat2 b " bits))")))
+        (and (= name "ult") (= k 2)) (truth (t/cat4 "(< " a " " (t/cat2 b ")")))
+        (and (= name "ule") (= k 2)) (truth (t/cat4 "(<= " a " " (t/cat2 b ")")))
+        (and (= name "ugt") (= k 2)) (truth (t/cat4 "(> " a " " (t/cat2 b ")")))
+        (and (= name "uge") (= k 2)) (truth (t/cat4 "(>= " a " " (t/cat2 b ")")))
+        :else (t/die (mut c) at (t/cat2 "no meaning function named " name))))))
+
+(defn meaning-primary [(c (mut t/Cur)) (node Node)] (-> (slice u8))
+  (let [tok (t/advance! (mut c))]
+    (cond
+      (= (.kind tok) t/T-NUM) (t/u64-text (.value tok))
+      (t/tok-is? tok "(")
+        (let [e (meaning-expr (mut c) node 0)]
+          (t/expect! (mut c) ")")
+          e)
+      (t/tok-is? tok "-") (t/cat3 "(primitive/isub (: 0 u64) " (meaning-primary (mut c) node) ")")
+      (t/tok-is? tok "~") (t/cat3 "(^ " (meaning-primary (mut c) node) " (: 0xFFFFFFFFFFFFFFFF u64))")
+      (= (.kind tok) t/T-IDENT)
+        (cond
+          (t/accept! (mut c) "(") (meaning-call (mut c) node (.text tok) tok)
+          (= (.text tok) "bits") "(cast u64 bits)"
+          :else
+            ; An update's meaning reads what was in memory and the operands
+            ; after the address.
+            (let [update (= (.role node) "update")
+                  i (- (operand-index node (.text tok)) (if update 1 0))]
+              (cond (and update (= (.text tok) "old")) "a"
+                    (and (not update) (= i 0)) "a"
+                    (= i 1) "b"
+                    (= i 2) "c"
+                    :else (t/die (mut c) tok
+                                 (t/cat2 "a meaning reads the node's first three value operands; this is not one: "
+                                         (.text tok))))))
+      :else (t/die (mut c) tok (t/cat2 "expected a value, found " (.text tok))))))
+
+;;; Binary operators by binding strength; all are over 64-bit words, and the
+;;; evaluator cuts the result to the node's width.
+(defn meaning-level [(op (slice u8))] (-> i64)
+  (cond (= op "|") 1
+        (= op "^") 2
+        (= op "&") 3
+        (or (= op "==") (= op "!=")) 4
+        (or (= op "<<") (= op ">>")) 5
+        (or (= op "+") (= op "-")) 6
+        (or (= op "*") (= op "%")) 7
+        :else 0))
+
+(defn meaning-binary [(op (slice u8)) (x (slice u8)) (y (slice u8))] (-> (slice u8))
+  (cond
+    (= op "+") (t/cat4 "(primitive/iadd " x " " (t/cat2 y ")"))
+    (= op "-") (t/cat4 "(primitive/isub " x " " (t/cat2 y ")"))
+    (= op "*") (t/cat4 "(primitive/imul " x " " (t/cat2 y ")"))
+    (= op "%") (t/cat4 "(bv/urem " x " " (t/cat2 y ")"))
+    (= op "<<") (t/cat4 "(bv/shl " x " " (t/cat2 y ")"))
+    (= op ">>") (t/cat4 "(bv/shr " x " " (t/cat2 y ")"))
+    (= op "==") (truth (t/cat4 "(= " x " " (t/cat2 y ")")))
+    (= op "!=") (truth (t/cat4 "(!= " x " " (t/cat2 y ")")))
+    :else (t/cat4 (t/cat3 "(" op " ") x " " (t/cat2 y ")"))))
+
+(defn meaning-expr [(c (mut t/Cur)) (node Node) (min i64)] (-> (slice u8))
+  (let [(mut left) (meaning-primary (mut c) node)
+        (mut going) true]
+    (while going
+      (let [tok (t/peek (mut c))
+            level (if (and (= (.kind tok) t/T-PUNCT) (not (.first tok)))
+                      (meaning-level (.text tok))
+                      0)]
+        (if (and (> level 0) (> level min))
+            (do (t/advance! (mut c))
+                (set! left (meaning-binary (.text tok) left (meaning-expr (mut c) node level))))
+            (set! going false))))
+    left))
+
+;; ---------------------------------------------------------------- parsing
+
+(defn parse-type [(c (mut t/Cur)) (spec (mut Spec))] (-> void)
+  (let [name (t/name! (mut c) "a type name")]
+    (t/expect! (mut c) ":")
+    (let [bits (cast i64 (t/num! (mut c) "the type's width in bits"))
+          at (t/peek (mut c))
+          kind (t/name! (mut c) "control, signed or unsigned")]
+      (push! (mut (.types spec))
+             (TypeDecl
+               :name name
+               :bits bits
+               :kind (cond (= kind "control") KIND-CONTROL
+                           (= kind "unsigned") KIND-UNSIGNED
+                           (= kind "signed") KIND-SIGNED
+                           (= kind "float") KIND-FLOAT
+                           :else (t/die (mut c) at "expected control, signed, unsigned or float")))))))
+
+(defn parse-set [(c (mut t/Cur)) (spec (mut Spec))] (-> void)
+  (let [name (t/name! (mut c) "a set name")
+        (mut members) (ArrayList::new [(slice u8)] (malloc-allocator))]
+    (t/expect! (mut c) "=")
+    (while (and (t/at-ident? (mut c)) (not (t/at-line-start? (mut c))))
+      (let [at (t/peek (mut c))
+            member (t/name! (mut c) "a type")]
+        (when (= (type-number spec member) 0)
+          (t/die (mut c) at (t/cat2 "no type named " member)))
+        (push! (mut members) member)))
+    (push! (mut (.sets spec)) (SetDecl :name name :members members))))
+
+(defn parse-node [(c (mut t/Cur)) (spec (mut Spec))] (-> void)
+  (let [at (t/peek (mut c))
+        name (t/name! (mut c) "a node name")
+        (mut node) (Node
+                     :name name
+                     :operands (ArrayList::new [Operand] (malloc-allocator))
+                     :result ""
+                     :constraints (ArrayList::new [Constraint] (malloc-allocator))
+                     :widths (ArrayList::new [Width] (malloc-allocator))
+                     :role "pure"
+                     :commutative false
+                     :payload ""
+                     :meaning ""
+                     :line (.line at))]
+    (when (!= (node-number spec name) 0) (t/die (mut c) at (t/cat2 "node declared twice: " name)))
+    (when (and (t/at? (mut c) "(") (not (t/at-line-start? (mut c))))
+      (t/advance! (mut c))
+      (unless (t/at? (mut c) ")")
+        (let [(mut more) true]
+          (while more
+            (let [operand (t/name! (mut c) "an operand name")
+                  variadic (t/accept! (mut c) "...")
+                  type (if (t/accept! (mut c) ":") (t/name! (mut c) "a type") "")]
+              (push! (mut (.operands node)) (Operand :name operand :type type :variadic variadic)))
+            (set! more (t/accept! (mut c) ",")))))
+      (t/expect! (mut c) ")"))
+    (when (and (t/at? (mut c) ":") (not (t/at-line-start? (mut c))))
+      (t/advance! (mut c))
+      (set! (.result node) (t/name! (mut c) "the node's type"))
+      (when (t/accept! (mut c) "in")
+        (push! (mut (.constraints node))
+               (Constraint :var (.result node) :set (t/name! (mut c) "a set"))))
+      (while (t/accept! (mut c) ",")
+        (if (and (t/at? (mut c) "bits") (t/tok-is? (t/peek-at (mut c) 1) "("))
+            ; `bits(S) < bits(T)`: how two of the node's types compare in width.
+            (do (t/advance! (mut c)) (t/advance! (mut c))
+                (let [narrow (t/name! (mut c) "a type variable")]
+                  (t/expect! (mut c) ")")
+                  (let [strict (if (t/accept! (mut c) "<") true (do (t/expect! (mut c) "<=") false))]
+                    (t/expect! (mut c) "bits")
+                    (t/expect! (mut c) "(")
+                    (push! (mut (.widths node))
+                           (Width :narrow narrow :wide (t/name! (mut c) "a type variable") :strict strict))
+                    (t/expect! (mut c) ")"))))
+            (let [var (t/name! (mut c) "a type variable")]
+              (t/expect! (mut c) "in")
+              (push! (mut (.constraints node)) (Constraint :var var :set (t/name! (mut c) "a set")))))))
+    (for k (.constraints node)
+      (unless (set-declared? spec (.set k)) (t/die (mut c) at (t/cat2 "no set named " (.set k)))))
+    (let [(mut going) true]
+      (while (and going (not (t/at-line-start? (mut c))))
+        (let [tok (t/peek (mut c))]
+          (cond
+            (t/accept! (mut c) "commutative") (set! (.commutative node) true)
+            (t/accept! (mut c) "role")
+              (let [role (t/name! (mut c) "a role")]
+                (when (< (role-number role) 0) (t/die (mut c) tok (t/cat2 "no role named " role)))
+                (set! (.role node) role))
+            (t/accept! (mut c) "payload") (set! (.payload node) (t/name! (mut c) "the payload's name"))
+            (t/accept! (mut c) "=") (set! (.meaning node) (meaning-expr (mut c) node 0))
+            :else (set! going false)))))
+    (unless (t/at-line-start? (mut c))
+      (t/die (mut c) (t/peek (mut c)) (t/cat2 "unexpected in a node declaration: "
+                                              (.text (t/peek (mut c))))))
+    (push! (mut (.nodes spec)) node)))
+
+(defn parse [(src (slice u8)) (path (slice u8))] (-> Spec)
+  (let [(mut c) (t/cursor src path)
+        (mut spec) (Spec
+                     :types (ArrayList::new [TypeDecl] (malloc-allocator))
+                     :sets (ArrayList::new [SetDecl] (malloc-allocator))
+                     :nodes (ArrayList::new [Node] (malloc-allocator)))]
+    (while (not (t/eof? (mut c)))
+      (let [tok (t/peek (mut c))]
+        (cond (t/accept! (mut c) "type") (parse-type (mut c) (mut spec))
+              (t/accept! (mut c) "set") (parse-set (mut c) (mut spec))
+              (t/accept! (mut c) "node") (parse-node (mut c) (mut spec))
+              :else (t/die (mut c) tok (t/cat2 "expected type, set or node, found " (.text tok))))))
+    spec))
+
+;; ---------------------------------------------------------------- output
+
+(defn bool-text [(b bool)] (-> (slice u8))
+  (if b "true" "false"))
+
+(defn foldable? [(node Node)] (-> bool)
+  (and (!= (.meaning node) "") (= (.role node) "pure") (not (variadic? node))))
+
+(defn const-name [(spec Spec)] (-> (slice u8))
+  (let [(mut name) ""]
+    (for node (.nodes spec) (when (= (.role node) "const") (set! name (.name node))))
+    name))
+
+;;; How an operand's or result's type is checked against `type`, the node's own:
+;;; a declared type's constant, the node's type for its result variable, or the
+;;; type of the first operand that has the same variable.
+(defn type-text [(spec Spec) (node Node) (name (slice u8))] (-> (slice u8))
+  (cond
+    (!= (type-number spec name) 0) (t/cat2 "T-" (t/upper name))
+    (= name (.result node)) "type"
+    :else
+      (let [(mut first) -1]
+        (for i (range 0 (len (.operands node)))
+          (when (and (< first 0) (= (.type (get (.operands node) i)) name)) (set! first i)))
+        (t/cat3 "(graph/ty g (graph/input g n " (t/int-text first) "))"))))
+
+(defn emit-numbers! [(o (mut t/Out)) (spec Spec)] (-> void)
+  (t/line! (mut o) (t/cat3 "(const TYPES " (t/int-text (len (.types spec))) ")"))
+  (for i (range 0 (len (.types spec)))
+    (t/line! (mut o)
+             (t/cat4 "(const T-" (t/upper (.name (get (.types spec) i))) " "
+                     (t/cat2 (t/int-text (+ i 1)) ")"))))
+  (for i (range 0 (len (.nodes spec)))
+    (t/line! (mut o)
+             (t/cat4 "(const " (.name (get (.nodes spec) i)) " " (t/cat2 (t/int-text (+ i 1)) ")")))))
+
+(defn emit-tables! [(o (mut t/Out)) (spec Spec)] (-> void)
+  (t/emit! (mut o) "(def NAMES [\"\"")
+  (for node (.nodes spec) (t/emit! (mut o) (t/cat3 " \"" (.name node) "\"")))
+  (t/line! (mut o) "])")
+  (t/emit! (mut o) "(def ROLES [0")
+  (for node (.nodes spec) (t/emit! (mut o) (t/cat2 " " (t/int-text (role-number (.role node))))))
+  (t/line! (mut o) "])")
+  (t/emit! (mut o) "(def PURE [false")
+  (for node (.nodes spec) (t/emit! (mut o) (t/cat2 " " (bool-text (pure? node)))))
+  (t/line! (mut o) "])")
+  (t/emit! (mut o) "(def CONTROL [false")
+  (for node (.nodes spec) (t/emit! (mut o) (t/cat2 " " (bool-text (control-node? spec node)))))
+  (t/line! (mut o) "])")
+  (t/line! (mut o) "(defn control-node? [(operation i32)] (-> bool) (get CONTROL (cast i64 operation)))")
+  (t/emit! (mut o) "(def COMMUTATIVE [false")
+  (for node (.nodes spec) (t/emit! (mut o) (t/cat2 " " (bool-text (.commutative node)))))
+  (t/line! (mut o) "])")
+  (t/emit! (mut o) "(def FOLDABLE [false")
+  (for node (.nodes spec) (t/emit! (mut o) (t/cat2 " " (bool-text (foldable? node)))))
+  (t/line! (mut o) "])")
+  (t/emit! (mut o) "(def TYPE-NAMES [\"none\"")
+  (for ty (.types spec) (t/emit! (mut o) (t/cat3 " \"" (.name ty) "\"")))
+  (t/line! (mut o) "])")
+  (t/emit! (mut o) "(def TYPE-BITS [0")
+  (for ty (.types spec) (t/emit! (mut o) (t/cat2 " " (t/int-text (.bits ty)))))
+  (t/line! (mut o) "])")
+  (t/emit! (mut o) "(def TYPE-KINDS [0")
+  (for ty (.types spec) (t/emit! (mut o) (t/cat2 " " (t/int-text (.kind ty)))))
+  (t/line! (mut o) "])")
+  (t/line! (mut o) "(defn name [(operation i32)] (-> (slice u8)) (get NAMES (cast i64 operation)))")
+  (t/line! (mut o) "(defn role [(operation i32)] (-> i64) (get ROLES (cast i64 operation)))")
+  (t/line! (mut o) "(defn pure? [(operation i32)] (-> bool) (get PURE (cast i64 operation)))")
+  (t/line! (mut o) "(defn commutative? [(operation i32)] (-> bool) (get COMMUTATIVE (cast i64 operation)))")
+  (t/line! (mut o) "(defn foldable? [(operation i32)] (-> bool) (get FOLDABLE (cast i64 operation)))")
+  (t/line! (mut o) "(defn type-name [(type i32)] (-> (slice u8)) (get TYPE-NAMES (cast i64 type)))")
+  (t/line! (mut o) "(defn type-bits [(type i32)] (-> i64) (get TYPE-BITS (cast i64 type)))")
+  (t/line! (mut o) "(defn type-signed? [(type i32)] (-> bool) (= (get TYPE-KINDS (cast i64 type)) 2))")
+  (t/line! (mut o) "(defn type-float? [(type i32)] (-> bool) (= (get TYPE-KINDS (cast i64 type)) 3))")
+  (t/line! (mut o) "(defn value-type? [(type i32)] (-> bool) (and (> type 0) (!= (get TYPE-KINDS (cast i64 type)) 0)))")
+  (for s (.sets spec)
+    (t/emit! (mut o) (t/cat3 "(defn in-" (.name s) "? [(type i32)] (-> bool) (or false"))
+    (for member (.members s)
+      (t/emit! (mut o) (t/cat3 " (= type " (t/int-text (type-number spec member)) ")")))
+    (t/line! (mut o) "))"))
+  (t/line! (mut o) "(defn swap? [(g graph/Graph) (a i32) (b i32)] (-> bool)")
+  (if (= (const-name spec) "")
+      (t/line! (mut o) "  (> a b))")
+      (do (t/line! (mut o) (t/cat3 "  (let [ca (= (graph/op g a) " (const-name spec) ")"))
+          (t/line! (mut o) (t/cat3 "        cb (= (graph/op g b) " (const-name spec) ")]"))
+          (t/line! (mut o) "    (if (= ca cb) (> a b) ca)))")))
+  (t/line! (mut o) "(defn variadic-ok? [(g graph/Graph) (n i32) (from i64) (want i32)] (-> bool)")
+  (t/line! (mut o) "  (let [(mut ok) true]")
+  (t/line! (mut o) "    (for i (range from (graph/arity g n))")
+  (t/line! (mut o) "      (let [d (graph/input g n i)]")
+  (t/line! (mut o) "        (when (or (= d 0)")
+  (t/line! (mut o) "                  (cond (= want -2) (not (control-node? (graph/op g d)))")
+  (t/line! (mut o) "                        (< want 0) (not (value-type? (graph/ty g d)))")
+  (t/line! (mut o) "                        :else (!= (graph/ty g d) want)))")
+  (t/line! (mut o) "          (set! ok false))))")
+  (t/line! (mut o) "    ok))"))
+
+(defn intern-call [(head (slice u8)) (k i64) (x (slice u8)) (y (slice u8)) (z (slice u8))]
+  (-> (slice u8))
+  (t/cat4 head (t/int-text k) " " (t/cat4 x " " y (t/cat3 " " z ")"))))
+
+;;; One arm of a verifier's `cond`: when `test` holds, the node is wrong this way.
+(defn bad! [(o (mut t/Out)) (test (slice u8)) (node (slice u8)) (what (slice u8))] (-> void)
+  (t/line! (mut o) (t/cat4 "        " test " \"" (t/cat4 node ": " what "\""))))
+
+;;; A node's builder: `add!` for ADD. Where Coil keeps that name for itself, as
+;;; it does `load!` and `store!`, the builder is `load-node!`.
+(defn builder-name [(node (slice u8))] (-> (slice u8))
+  (let [plain (t/lower node)]
+    (if (or (= plain "load") (= plain "store") (= plain "call"))
+        (t/cat2 plain "-node!")
+        (t/cat2 plain "!"))))
+
+(defn emit-builder! [(o (mut t/Out)) (spec Spec) (node Node)] (-> void)
+  (let [fixed (fixed-count node)
+        type (cond (= (.result node) "") "0"
+                   (!= (type-number spec (.result node)) 0) (t/cat2 "T-" (t/upper (.result node)))
+                   :else "type")
+        data (if (= (.payload node) "") "0" (.payload node))
+        ; Two frame objects of one size are still two objects.
+        interned (and (pure? node) (not (variadic? node)) (<= fixed 3) (!= (.role node) "object"))]
+    (t/emit! (mut o) (t/cat3 "(defn " (builder-name (.name node)) " [(g (mut graph/Graph))"))
+    (when (= type "type") (t/emit! (mut o) " (type i32)"))
+    (when (!= (.payload node) "") (t/emit! (mut o) (t/cat3 " (" (.payload node) " u64)")))
+    (for operand (.operands node)
+      (if (.variadic operand)
+          (t/emit! (mut o) " (count i64)")
+          (t/emit! (mut o) (t/cat3 " (" (.name operand) " i32)"))))
+    (t/line! (mut o) "] (-> i32)")
+    ; A parameter's type is part of the function's signature.
+    (when (= (.role node) "param")
+      (t/line! (mut o) (t/cat3 "  (graph/declare-param! (mut g) (cast i64 " (.payload node) ") type)")))
+    (if interned
+        (let [x (if (> fixed 0) (.name (get (.operands node) 0)) "0")
+              y (if (> fixed 1) (.name (get (.operands node) 1)) "0")
+              z (if (> fixed 2) (.name (get (.operands node) 2)) "0")
+              head (t/cat4 "(graph/intern! (mut g) " (.name node) " " (t/cat4 type " " data " "))]
+          (if (and (.commutative node) (= fixed 2))
+              (t/line! (mut o)
+                       (t/cat4 "  (if (swap? g " (t/cat3 x " " y) ") "
+                               (t/cat4 (intern-call head fixed y x z) " " (intern-call head fixed x y z) "))")))
+              (t/line! (mut o) (t/cat3 "  " (intern-call head fixed x y z) ")"))))
+        (do (t/line! (mut o)
+                     (t/cat4 "  (let [n (graph/node! (mut g) " (.name node) " "
+                             (t/cat4 type " " data
+                                     (if (variadic? node)
+                                         (t/cat3 " (+ " (t/int-text fixed) " count))]")
+                                         (t/cat3 " " (t/int-text fixed) ")]")))))
+            (let [(mut i) 0]
+              (for operand (.operands node)
+                (unless (.variadic operand)
+                  (t/line! (mut o)
+                           (t/cat4 "    (graph/set-input! (mut g) n " (t/int-text i) " "
+                                   (t/cat2 (.name operand) ")")))
+                  (set! i (+ i 1)))))
+            (when (= (.role node) "start") (t/line! (mut o) "    (set! (.start g) n)"))
+            (t/line! (mut o) "    n))")))))
+
+(defn emit-verify! [(o (mut t/Out)) (spec Spec)] (-> void)
+  (t/line! (mut o) "(defn verify-node [(g graph/Graph) (n i32)] (-> (slice u8))")
+  (t/line! (mut o) "  (let [type (graph/ty g n) k (graph/arity g n)]")
+  (t/line! (mut o) "    (match (graph/op g n)")
+  (for index (range 0 (len (.nodes spec)))
+    (let [node (get (.nodes spec) index)
+          fixed (fixed-count node)]
+      (t/line! (mut o) (t/cat3 "      (" (t/int-text (+ index 1)) " (cond"))
+      (bad! (mut o)
+           (t/cat4 "(" (if (variadic? node) "<" "!=") " k " (t/cat2 (t/int-text fixed) ")"))
+           (.name node) "wrong number of inputs")
+      (cond
+        (= (.result node) "") (bad! (mut o) "(!= type 0)" (.name node) "has a type")
+        (!= (type-number spec (.result node)) 0)
+          (bad! (mut o) (t/cat3 "(!= type T-" (t/upper (.result node)) ")") (.name node)
+               (t/cat2 "type is not " (.result node)))
+        :else 0)
+      (let [(mut i) 0]
+        (for operand (.operands node)
+          (let [want (.type operand)]
+            (if (.variadic operand)
+                (bad! (mut o)
+                     (t/cat4 "(not (variadic-ok? g n " (t/int-text i) " "
+                             (t/cat2 (cond (= want "") "-1"
+                                           (control-type? spec want) "-2"
+                                           :else (type-text spec node want))
+                                     "))"))
+                     (.name node) (t/cat2 "bad operand among " (.name operand)))
+                (let [input (t/cat3 "(graph/input g n " (t/int-text i) ")")
+                      its (t/cat3 "(graph/ty g " input ")")]
+                  (bad! (mut o) (t/cat3 "(= " input " 0)") (.name node)
+                       (t/cat2 "missing operand " (.name operand)))
+                  (cond
+                    (control-type? spec want)
+                      (bad! (mut o) (t/cat3 "(not (control-node? (graph/op g " input ")))") (.name node)
+                           (t/cat3 "operand " (.name operand) " is not control"))
+                    (= want "")
+                      (bad! (mut o) (t/cat3 "(not (value-type? " its "))") (.name node)
+                           (t/cat3 "operand " (.name operand) " is not a value"))
+                    (!= (type-text spec node want) its)
+                      (bad! (mut o) (t/cat4 "(!= " its " " (t/cat2 (type-text spec node want) ")"))
+                           (.name node) (t/cat3 "operand " (.name operand) " has the wrong type"))
+                    :else 0)
+                  (set! i (+ i 1)))))))
+      (for k (.constraints node)
+        (bad! (mut o)
+             (t/cat4 "(not (in-" (.set k) "? " (t/cat2 (type-text spec node (.var k)) "))"))
+             (.name node) (t/cat4 "type " (.var k) " is not in " (.set k))))
+      (for w (.widths node)
+        (bad! (mut o)
+              (t/cat4 (if (.strict w) "(>= (type-bits " "(> (type-bits ")
+                      (type-text spec node (.narrow w)) ") (type-bits "
+                      (t/cat2 (type-text spec node (.wide w)) "))"))
+              (.name node)
+              (t/cat4 (.narrow w) (if (.strict w) " is not narrower than " " is wider than ") (.wide w) "")))
+      (t/line! (mut o) "        :else \"\"))")))
+  (t/line! (mut o) "      (_ \"\"))))")
+  (t/line! (mut o) ";;; Control is one chain: what follows a node in it, through its first operand")
+  (t/line! (mut o) ";;; or as a way into a region or loop, is one node, unless it is a branch,")
+  (t/line! (mut o) ";;; whose sides each follow it. A second would never be reached.")
+  (t/line! (mut o) "(defn verify-chain [(g graph/Graph) (n i32)] (-> (slice u8))")
+  (t/line! (mut o) "  (let [r (get ROLES (cast i64 (graph/op g n)))")
+  (t/line! (mut o) "        (mut count) 0")
+  (t/line! (mut o) "        (mut e) (graph/first-use g n)]")
+  (t/line! (mut o) "    (if (or (not (control-node? (graph/op g n))) (= r 5) (= r 19))")
+  (t/line! (mut o) "        \"\"")
+  (t/line! (mut o) "        (do (while (>= e 0)")
+  (t/line! (mut o) "              (let [u (graph/user g e)")
+  (t/line! (mut o) "                    ur (get ROLES (cast i64 (graph/op g u)))]")
+  (t/line! (mut o) "                (when (and (control-node? (graph/op g u)) (or (= ur 3) (= ur 4) (= (graph/slot g e) 0)))")
+  (t/line! (mut o) "                  (set! count (+ count 1))))")
+  (t/line! (mut o) "              (set! e (graph/next-use g e)))")
+  (t/line! (mut o) "            (if (> count 1) \"control that is not a branch is followed by more than one node\" \"\")))))")
+  (t/line! (mut o) ";;; The first thing wrong with any node, or \"\".")
+  (t/line! (mut o) "(defn verify [(g graph/Graph)] (-> (slice u8))")
+  (t/line! (mut o) "  (let [(mut problem) \"\"]")
+  (t/line! (mut o) "    (for n (range 1 (graph/size g))")
+  (t/line! (mut o) "      (when (and (= problem \"\") (not (graph/dead? g (cast i32 n))))")
+  (t/line! (mut o) "        (set! problem (verify-node g (cast i32 n)))")
+  (t/line! (mut o) "        (when (= problem \"\") (set! problem (verify-chain g (cast i32 n))))))")
+  (t/line! (mut o) "    problem))"))
+
+(defn emit-eval! [(o (mut t/Out)) (spec Spec)] (-> void)
+  (t/line! (mut o) ";;; A node's value from its operands' values: `bits` is the operands' width,")
+  (t/line! (mut o) ";;; `rbits` the result's, which the value is cut to.")
+  (t/line! (mut o) "(defn eval [(operation i32) (rbits i64) (bits i64) (a u64) (b u64) (c u64)] (-> u64)")
+  (t/line! (mut o) "  (bv/cut (match operation")
+  (for index (range 0 (len (.nodes spec)))
+    (let [node (get (.nodes spec) index)]
+      (when (or (foldable? node) (and (= (.role node) "update") (!= (.meaning node) "")))
+        (t/line! (mut o) (t/cat4 "    (" (t/int-text (+ index 1)) " " (t/cat2 (.meaning node) ")"))))))
+  (t/line! (mut o) "    (_ (: 0 u64))) rbits))"))
+
+
+;;; The reference interpreter, the same text for every node set: it reads only
+;;; roles, the type table and `eval`.
+(defn emit-interpreter! [(o (mut t/Out))] (-> void)
+  (t/line! (mut o) ";;; Every node, one to a line: its number, name, type, payload and inputs.")
+  (t/line! (mut o) "(defn dump [(g graph/Graph)] (-> void)")
+  (t/line! (mut o) "  (for i (range 1 (graph/size g))")
+  (t/line! (mut o) "    (let [n (cast i32 i)]")
+  (t/line! (mut o) "      (unless (graph/dead? g n)")
+  (t/line! (mut o) "        (print \"{:>5} {} {}\" i (name (graph/op g n)) (type-name (graph/ty g n)))")
+  (t/line! (mut o) "        (when (!= (graph/payload g n) 0) (print \" #{:x}\" (graph/payload g n)))")
+  (t/line! (mut o) "        (for k (range 0 (graph/arity g n)) (print \" {}\" (graph/input g n k)))")
+  (t/line! (mut o) "        (println \"\")))))")
+  (t/line! (mut o) ";;; The value of a node that depends only on parameters and constants.")
+  (t/line! (mut o) "(defn eval-node [(g graph/Graph) (args (slice u64)) (n i32)] (-> u64)")
+  (t/line! (mut o) "  (let [operation (graph/op g n)")
+  (t/line! (mut o) "        r (get ROLES (cast i64 operation))]")
+  (t/line! (mut o) "    (cond")
+  (t/line! (mut o) "      (= r 10) (graph/payload g n)")
+  (t/line! (mut o) "      (= r 9) (bv/cut (get args (cast i64 (graph/payload g n))) (type-bits (graph/ty g n)))")
+  (t/line! (mut o) "      :else")
+  (t/line! (mut o) "        (let [k (graph/arity g n)")
+  (t/line! (mut o) "              a (if (> k 0) (eval-node g args (graph/input g n 0)) (: 0 u64))")
+  (t/line! (mut o) "              b (if (> k 1) (eval-node g args (graph/input g n 1)) (: 0 u64))")
+  (t/line! (mut o) "              c (if (> k 2) (eval-node g args (graph/input g n 2)) (: 0 u64))")
+  (t/line! (mut o) "              bits (if (> k 0) (type-bits (graph/ty g (graph/input g n 0))) 0)]")
+  (t/line! (mut o) "          (eval operation (type-bits (graph/ty g n)) bits a b c)))))")
+  (t/line! (mut o) ";;; A reference interpreter: what a graph computes, straight from the nodes'")
+  (t/line! (mut o) ";;; meanings. Control is followed from START; a region's phis take their values")
+  (t/line! (mut o) ";;; together as it is entered.")
+  (t/line! (mut o) "(defstruct Interp")
+  (t/line! (mut o) "  [(val (ArrayList u64)) (stamp (ArrayList i64)) (phi (ArrayList u64)) (second (ArrayList u64)) (epoch i64)])")
+  (t/line! (mut o) ";;; Two integers returned together, as the C convention returns a pair.")
+  (t/line! (mut o) "(defstruct Pair [(first u64) (second u64)])")
+  (t/line! (mut o) "(defn value [(g graph/Graph) (it (mut Interp)) (args (slice u64)) (n i32)] (-> u64)")
+  (t/line! (mut o) "  (let [operation (graph/op g n)")
+  (t/line! (mut o) "        r (get ROLES (cast i64 operation))")
+  (t/line! (mut o) "        at (cast i64 n)]")
+  (t/line! (mut o) "    (cond")
+  (t/line! (mut o) "      (= r 10) (graph/payload g n)")
+  (t/line! (mut o) "      (= r 9) (bv/cut (get args (cast i64 (graph/payload g n))) (type-bits (graph/ty g n)))")
+  (t/line! (mut o) "      (or (= r 8) (= r 13) (= r 23) (= r 25)) (get (.phi it) at)")
+  (t/line! (mut o) "      ; A frame object is memory of its own, made the first time it is asked for.")
+  (t/line! (mut o) "      (= r 15)")
+  (t/line! (mut o) "        (do (when (= (get (.phi it) at) 0)")
+  (t/line! (mut o) "              (set! (mut (.phi it)) at (memory/allocate (graph/payload g n))))")
+  (t/line! (mut o) "            (get (.phi it) at))")
+  (t/line! (mut o) "      (or (= r 16) (= r 17)) (get (.addresses g) (cast i64 (graph/payload g n)))")
+  (t/line! (mut o) "      ; A call's result: the first of its kind, or the second integer.")
+  (t/line! (mut o) "      (= r 12) (bv/cut (get (if (= (graph/payload g n) 0) (.phi it) (.second it)) (cast i64 (graph/input g n 0)))")
+  (t/line! (mut o) "                       (type-bits (graph/ty g n)))")
+  (t/line! (mut o) "      (= (get (.stamp it) at) (.epoch it)) (get (.val it) at)")
+  (t/line! (mut o) "      :else")
+  (t/line! (mut o) "        (let [k (graph/arity g n)")
+  (t/line! (mut o) "              a (if (> k 0) (value g (mut it) args (graph/input g n 0)) (: 0 u64))")
+  (t/line! (mut o) "              b (if (> k 1) (value g (mut it) args (graph/input g n 1)) (: 0 u64))")
+  (t/line! (mut o) "              c (if (> k 2) (value g (mut it) args (graph/input g n 2)) (: 0 u64))")
+  (t/line! (mut o) "              bits (if (> k 0) (type-bits (graph/ty g (graph/input g n 0))) 0)")
+  (t/line! (mut o) "              v (eval operation (type-bits (graph/ty g n)) bits a b c)]")
+  (t/line! (mut o) "          (set! (mut (.val it)) at v)")
+  (t/line! (mut o) "          (set! (mut (.stamp it)) at (.epoch it))")
+  (t/line! (mut o) "          v))))")
+  (t/line! (mut o) ";;; The user of control node `c` that has role `want` and follows it.")
+  (t/line! (mut o) "(defn follower [(g graph/Graph) (c i32) (want i64)] (-> i32)")
+  (t/line! (mut o) "  (let [(mut found) (: 0 i32)")
+  (t/line! (mut o) "        (mut e) (graph/first-use g c)]")
+  (t/line! (mut o) "    (while (>= e 0)")
+  (t/line! (mut o) "      (let [u (graph/user g e)]")
+  (t/line! (mut o) "        (when (and (= (get ROLES (cast i64 (graph/op g u))) want) (= (graph/input g u 0) c))")
+  (t/line! (mut o) "          (set! found u)))")
+  (t/line! (mut o) "      (set! e (graph/next-use g e)))")
+  (t/line! (mut o) "    found))")
+  (t/line! (mut o) "(defn call-argument [(g graph/Graph) (it (mut Interp)) (args (slice u64)) (n i32) (i i64)] (-> u64)")
+  (t/line! (mut o) "  (if (> (graph/arity g n) (+ i 2)) (value g (mut it) args (graph/input g n (+ i 2))) (: 0 u64)))")
+  (t/line! (mut o) ";;; Control reaches a call: the function at its target runs with the C convention.")
+  (t/line! (mut o) ";;; Integers alone go as up to twelve integers. With floating point, up to eight")
+  (t/line! (mut o) ";;; integers and eight floating values go in their own registers.")
+  (t/line! (mut o) "(defn call-out! [(g graph/Graph) (it (mut Interp)) (args (slice u64)) (n i32)] (-> void)")
+  (t/line! (mut o) "  (when (graph/shape-pinned? g (cast i64 (graph/payload g n)))")
+  (t/line! (mut o) "    (panic \"the interpreter cannot make a call that follows no convention\"))")
+  (t/line! (mut o) "  (let [target (primitive/cast (ptr u8) (value g (mut it) args (graph/input g n 1)))")
+  (t/line! (mut o) "        (mut floating) (and (!= (graph/ty g n) 0) (value-type? (graph/ty g n)) (type-float? (graph/ty g n)))")
+  (t/line! (mut o) "        (mut float-result) (and (!= (graph/ty g n) 0) (value-type? (graph/ty g n)) (type-float? (graph/ty g n)))")
+  (t/line! (mut o) "        (mut ints) (ArrayList::new [u64] (.alc g))")
+  (t/line! (mut o) "        (mut floats) (ArrayList::new [f64] (.alc g))")
+  (t/line! (mut o) "        (mut second) false")
+  (t/line! (mut o) "        (mut e) (graph/first-use g n)]")
+  (t/line! (mut o) "    (while (>= e 0)")
+  (t/line! (mut o) "      (let [u (graph/user g e)]")
+  (t/line! (mut o) "        (when (and (= (get ROLES (cast i64 (graph/op g u))) 12) (!= (graph/payload g u) 0))")
+  (t/line! (mut o) "          (when (or (type-float? (graph/ty g u)) (> (graph/payload g u) 1))")
+  (t/line! (mut o) "            (panic \"the interpreter takes one floating result or up to two integers from a call\"))")
+  (t/line! (mut o) "          (set! second true))")
+  (t/line! (mut o) "        (when (and (= (get ROLES (cast i64 (graph/op g u))) 12) (type-float? (graph/ty g u)))")
+  (t/line! (mut o) "          (set! floating true)")
+  (t/line! (mut o) "          (set! float-result true)))")
+  (t/line! (mut o) "      (set! e (graph/next-use g e)))")
+  (t/line! (mut o) "    (for i (range 2 (graph/arity g n))")
+  (t/line! (mut o) "      (when (type-float? (graph/ty g (graph/input g n i))) (set! floating true)))")
+  (t/line! (mut o) "    (when (and second floating)")
+  (t/line! (mut o) "      (panic \"the interpreter takes a second result only from a call with no floating values\"))")
+  (t/line! (mut o) "    (cond")
+  (t/line! (mut o) "      second")
+  (t/line! (mut o) "        (let [f (primitive/cast (fnptr (cc/C) [u64 u64 u64 u64 u64 u64 u64 u64 u64 u64 u64 u64] Pair) target)")
+  (t/line! (mut o) "              both (f (call-argument g (mut it) args n 0) (call-argument g (mut it) args n 1)")
+  (t/line! (mut o) "                      (call-argument g (mut it) args n 2) (call-argument g (mut it) args n 3)")
+  (t/line! (mut o) "                      (call-argument g (mut it) args n 4) (call-argument g (mut it) args n 5)")
+  (t/line! (mut o) "                      (call-argument g (mut it) args n 6) (call-argument g (mut it) args n 7)")
+  (t/line! (mut o) "                      (call-argument g (mut it) args n 8) (call-argument g (mut it) args n 9)")
+  (t/line! (mut o) "                      (call-argument g (mut it) args n 10) (call-argument g (mut it) args n 11))]")
+  (t/line! (mut o) "          (set! (mut (.phi it)) (cast i64 n) (.first both))")
+  (t/line! (mut o) "          (set! (mut (.second it)) (cast i64 n) (.second both)))")
+  (t/line! (mut o) "      (not floating)")
+  (t/line! (mut o) "        (let [f (primitive/cast (fnptr (cc/C) [u64 u64 u64 u64 u64 u64 u64 u64 u64 u64 u64 u64] u64) target)]")
+  (t/line! (mut o) "          (set! (mut (.phi it)) (cast i64 n)")
+  (t/line! (mut o) "                (f (call-argument g (mut it) args n 0) (call-argument g (mut it) args n 1)")
+  (t/line! (mut o) "                   (call-argument g (mut it) args n 2) (call-argument g (mut it) args n 3)")
+  (t/line! (mut o) "                   (call-argument g (mut it) args n 4) (call-argument g (mut it) args n 5)")
+  (t/line! (mut o) "                   (call-argument g (mut it) args n 6) (call-argument g (mut it) args n 7)")
+  (t/line! (mut o) "                   (call-argument g (mut it) args n 8) (call-argument g (mut it) args n 9)")
+  (t/line! (mut o) "                   (call-argument g (mut it) args n 10) (call-argument g (mut it) args n 11))))")
+  (t/line! (mut o) "      :else")
+  (t/line! (mut o) "        (do")
+  (t/line! (mut o) "          (for i (range 2 (graph/arity g n))")
+  (t/line! (mut o) "            (let [a (graph/input g n i)")
+  (t/line! (mut o) "                  v (value g (mut it) args a)]")
+  (t/line! (mut o) "              ; A single-precision value rides in the low half of its register.")
+  (t/line! (mut o) "              (if (type-float? (graph/ty g a)) (push! (mut floats) (bv/f64-of v)) (push! (mut ints) v))))")
+  (t/line! (mut o) "          (when (or (> (len ints) 8) (> (len floats) 8))")
+  (t/line! (mut o) "            (panic \"the interpreter passes at most eight integers and eight floating values to a call that has any floating value\"))")
+  (t/line! (mut o) "          (while (< (len ints) 8) (push! (mut ints) 0))")
+  (t/line! (mut o) "          (while (< (len floats) 8) (push! (mut floats) 0.0))")
+  (t/line! (mut o) "          (if float-result")
+  (t/line! (mut o) "              (let [f (primitive/cast (fnptr (cc/C) [u64 u64 u64 u64 u64 u64 u64 u64 f64 f64 f64 f64 f64 f64 f64 f64] f64) target)]")
+  (t/line! (mut o) "                (set! (mut (.phi it)) (cast i64 n)")
+  (t/line! (mut o) "                      (bv/of-f64 (f (get ints 0) (get ints 1) (get ints 2) (get ints 3) (get ints 4) (get ints 5)")
+  (t/line! (mut o) "                                    (get ints 6) (get ints 7) (get floats 0) (get floats 1) (get floats 2)")
+  (t/line! (mut o) "                                    (get floats 3) (get floats 4) (get floats 5) (get floats 6) (get floats 7)))))")
+  (t/line! (mut o) "              (let [f (primitive/cast (fnptr (cc/C) [u64 u64 u64 u64 u64 u64 u64 u64 f64 f64 f64 f64 f64 f64 f64 f64] u64) target)]")
+  (t/line! (mut o) "                (set! (mut (.phi it)) (cast i64 n)")
+  (t/line! (mut o) "                      (f (get ints 0) (get ints 1) (get ints 2) (get ints 3) (get ints 4) (get ints 5)")
+  (t/line! (mut o) "                         (get ints 6) (get ints 7) (get floats 0) (get floats 1) (get floats 2)")
+  (t/line! (mut o) "                         (get floats 3) (get floats 4) (get floats 5) (get floats 6) (get floats 7)))))))")
+  (t/line! (mut o) "    (free! (mut ints))")
+  (t/line! (mut o) "    (free! (mut floats))")
+  (t/line! (mut o) "    (set! (.epoch it) (+ (.epoch it) 1))))")
+  (t/line! (mut o) ";;; What a node in the control chain does as control passes it: a call runs,")
+  (t/line! (mut o) ";;; a load reads memory, a store writes it.")
+  (t/line! (mut o) "(defn effect! [(g graph/Graph) (it (mut Interp)) (args (slice u64)) (n i32)] (-> void)")
+  (t/line! (mut o) "  (let [r (get ROLES (cast i64 (graph/op g n)))]")
+  (t/line! (mut o) "    (cond")
+  (t/line! (mut o) "      (= r 11) (call-out! g (mut it) args n)")
+  (t/line! (mut o) "      (= r 13)")
+  (t/line! (mut o) "        (do (set! (mut (.phi it)) (cast i64 n)")
+  (t/line! (mut o) "                  (memory/read (value g (mut it) args (graph/input g n 1)) (type-bits (graph/ty g n))))")
+  (t/line! (mut o) "            (set! (.epoch it) (+ (.epoch it) 1)))")
+  (t/line! (mut o) "      (= r 14)")
+  (t/line! (mut o) "        (memory/write (value g (mut it) args (graph/input g n 1))")
+  (t/line! (mut o) "                      (type-bits (graph/ty g (graph/input g n 2)))")
+  (t/line! (mut o) "                      (value g (mut it) args (graph/input g n 2)))")
+  (t/line! (mut o) "      (= r 25)")
+  (t/line! (mut o) "        (do (set! (mut (.phi it)) (cast i64 n) (memory/allocate (value g (mut it) args (graph/input g n 1))))")
+  (t/line! (mut o) "            (set! (.epoch it) (+ (.epoch it) 1)))")
+  (t/line! (mut o) "      (or (= r 26) (= r 27))")
+  (t/line! (mut o) "        (let [to (value g (mut it) args (graph/input g n 1))")
+  (t/line! (mut o) "              from (value g (mut it) args (graph/input g n 2))]")
+  (t/line! (mut o) "          (for i (range 0 (cast i64 (graph/payload g n)))")
+  (t/line! (mut o) "            (memory/write (+ to (cast u64 i)) 8 (if (= r 26) (memory/read (+ from (cast u64 i)) 8) from))))")
+  (t/line! (mut o) "      ; An update: what was there is its value, and its meaning goes back.")
+  (t/line! (mut o) "      (= r 23)")
+  (t/line! (mut o) "        (let [address (value g (mut it) args (graph/input g n 1))")
+  (t/line! (mut o) "              bits (type-bits (graph/ty g n))")
+  (t/line! (mut o) "              old (memory/read address bits)")
+  (t/line! (mut o) "              b (if (> (graph/arity g n) 2) (value g (mut it) args (graph/input g n 2)) (: 0 u64))")
+  (t/line! (mut o) "              c (if (> (graph/arity g n) 3) (value g (mut it) args (graph/input g n 3)) (: 0 u64))]")
+  (t/line! (mut o) "          (memory/write address bits (eval (graph/op g n) bits bits old b c))")
+  (t/line! (mut o) "          (set! (mut (.phi it)) (cast i64 n) old)")
+  (t/line! (mut o) "          (set! (.epoch it) (+ (.epoch it) 1)))")
+  (t/line! (mut o) "      :else (do))))")
+  (t/line! (mut o) ";;; The control node that follows `c` inside its block: a branch, a switch, a")
+  (t/line! (mut o) ";;; return, a trap, a call, a load or a store.")
+  (t/line! (mut o) "(defn next-in-chain [(g graph/Graph) (c i32)] (-> i32)")
+  (t/line! (mut o) "  (let [(mut found) (: 0 i32)")
+  (t/line! (mut o) "        (mut e) (graph/first-use g c)]")
+  (t/line! (mut o) "    (while (>= e 0)")
+  (t/line! (mut o) "      (let [u (graph/user g e)")
+  (t/line! (mut o) "            r (get ROLES (cast i64 (graph/op g u)))]")
+  (t/line! (mut o) "        (when (and (= (graph/input g u 0) c)")
+  (t/line! (mut o) "                   (or (= r 5) (= r 2) (= r 11) (= r 13) (= r 14) (= r 18) (= r 19) (= r 22) (= r 23) (= r 24) (= r 25) (= r 26) (= r 27)))")
+  (t/line! (mut o) "          (set! found u)))")
+  (t/line! (mut o) "      (set! e (graph/next-use g e)))")
+  (t/line! (mut o) "    found))")
+  (t/line! (mut o) ";;; Runs the graph on these arguments and adds the values it returns to")
+  (t/line! (mut o) ";;; `results`; false if it has not returned within `limit` control steps.")
+  (t/line! (mut o) "(defn interpret-all [(g graph/Graph) (args (slice u64)) (limit i64) (results (mut (ArrayList u64)))] (-> bool)")
+  (t/line! (mut o) "  (let [(mut it) (Interp")
+  (t/line! (mut o) "                   :val (ArrayList::new [u64] (.alc g))")
+  (t/line! (mut o) "                   :stamp (ArrayList::new [i64] (.alc g))")
+  (t/line! (mut o) "                   :phi (ArrayList::new [u64] (.alc g))")
+  (t/line! (mut o) "                   :second (ArrayList::new [u64] (.alc g))")
+  (t/line! (mut o) "                   :epoch 1)")
+  (t/line! (mut o) "        (mut pending) (ArrayList::new [u64] (.alc g))")
+  (t/line! (mut o) "        (mut c) (.start g)")
+  (t/line! (mut o) "        (mut steps) 0")
+  (t/line! (mut o) "        (mut returned) false")
+  (t/line! (mut o) "        (mut running) true]")
+  (t/line! (mut o) "    (for _ (range 0 (graph/size g))")
+  (t/line! (mut o) "      (push! (mut (.val it)) 0)")
+  (t/line! (mut o) "      (push! (mut (.stamp it)) 0)")
+  (t/line! (mut o) "      (push! (mut (.phi it)) 0)")
+  (t/line! (mut o) "      (push! (mut (.second it)) 0))")
+  (t/line! (mut o) "    (while running")
+  (t/line! (mut o) "      (set! steps (+ steps 1))")
+  (t/line! (mut o) "      (let [r (get ROLES (cast i64 (graph/op g c)))]")
+  (t/line! (mut o) "        (cond")
+  (t/line! (mut o) "          (> steps limit) (set! running false)")
+  (t/line! (mut o) "          (= r 2)")
+  (t/line! (mut o) "            (do (for i (range 1 (graph/arity g c))")
+  (t/line! (mut o) "                  (push! (mut results) (value g (mut it) args (graph/input g c i))))")
+  (t/line! (mut o) "                (set! returned true)")
+  (t/line! (mut o) "                (set! running false))")
+  (t/line! (mut o) "          ; A tail call's result is the function's.")
+  (t/line! (mut o) "          (= r 22)")
+  (t/line! (mut o) "            (do (call-out! g (mut it) args c)")
+  (t/line! (mut o) "                (push! (mut results) (bv/cut (get (.phi it) (cast i64 c))")
+  (t/line! (mut o) "                                             (if (= (graph/ty g c) 0) 64 (type-bits (graph/ty g c)))))")
+  (t/line! (mut o) "                (set! returned true)")
+  (t/line! (mut o) "                (set! running false))")
+  (t/line! (mut o) "          ; A trap ends the run with no result.")
+  (t/line! (mut o) "          (= r 18) (set! running false)")
+  (t/line! (mut o) "          ; A switch goes to the case with its value, or to its default.")
+  (t/line! (mut o) "          (= r 19)")
+  (t/line! (mut o) "            (let [v (value g (mut it) args (graph/input g c 1))")
+  (t/line! (mut o) "                  (mut to) (: 0 i32)")
+  (t/line! (mut o) "                  (mut otherwise) (: 0 i32)")
+  (t/line! (mut o) "                  (mut e) (graph/first-use g c)]")
+  (t/line! (mut o) "              (while (>= e 0)")
+  (t/line! (mut o) "                (let [u (graph/user g e)")
+  (t/line! (mut o) "                      ur (get ROLES (cast i64 (graph/op g u)))]")
+  (t/line! (mut o) "                  (when (and (= ur 20) (= (graph/payload g u) v)) (set! to u))")
+  (t/line! (mut o) "                  (when (= ur 21) (set! otherwise u)))")
+  (t/line! (mut o) "                (set! e (graph/next-use g e)))")
+  (t/line! (mut o) "              (set! c (if (!= to 0) to otherwise)))")
+  (t/line! (mut o) "          (= r 5)")
+  (t/line! (mut o) "            (set! c (follower g c (if (!= (value g (mut it) args (graph/input g c 1)) 0) 6 7)))")
+  (t/line! (mut o) "          :else")
+  (t/line! (mut o) "            (let [next (next-in-chain g c)]")
+  (t/line! (mut o) "              (if (!= next 0)")
+  (t/line! (mut o) "                  (do (set! c next)")
+  (t/line! (mut o) "                      (effect! g (mut it) args next))")
+  (t/line! (mut o) "                  ; No follower inside the block: control enters a region.")
+  (t/line! (mut o) "                  (let [(mut region) (: 0 i32)")
+  (t/line! (mut o) "                        (mut slot) 0")
+  (t/line! (mut o) "                        (mut e) (graph/first-use g c)]")
+  (t/line! (mut o) "                    (while (>= e 0)")
+  (t/line! (mut o) "                      (let [u (graph/user g e)")
+  (t/line! (mut o) "                            ur (get ROLES (cast i64 (graph/op g u)))]")
+  (t/line! (mut o) "                        (when (or (= ur 3) (= ur 4))")
+  (t/line! (mut o) "                          (set! region u)")
+  (t/line! (mut o) "                          (set! slot (graph/slot g e))))")
+  (t/line! (mut o) "                      (set! e (graph/next-use g e)))")
+  (t/line! (mut o) "                    (if (= region 0)")
+  (t/line! (mut o) "                        (set! running false)")
+  (t/line! (mut o) "                        (do")
+  (t/line! (mut o) "                          (clear! (mut pending))")
+  (t/line! (mut o) "                          (let [(mut p) (graph/first-use g region)]")
+  (t/line! (mut o) "                            (while (>= p 0)")
+  (t/line! (mut o) "                              (let [u (graph/user g p)]")
+  (t/line! (mut o) "                                (when (and (= (get ROLES (cast i64 (graph/op g u))) 8)")
+  (t/line! (mut o) "                                           (= (graph/input g u 0) region))")
+  (t/line! (mut o) "                                  (push! (mut pending)")
+  (t/line! (mut o) "                                         (value g (mut it) args (graph/input g u (+ slot 1))))))")
+  (t/line! (mut o) "                              (set! p (graph/next-use g p))))")
+  (t/line! (mut o) "                          (let [(mut p) (graph/first-use g region)")
+  (t/line! (mut o) "                                (mut i) 0]")
+  (t/line! (mut o) "                            (while (>= p 0)")
+  (t/line! (mut o) "                              (let [u (graph/user g p)]")
+  (t/line! (mut o) "                                (when (and (= (get ROLES (cast i64 (graph/op g u))) 8)")
+  (t/line! (mut o) "                                           (= (graph/input g u 0) region))")
+  (t/line! (mut o) "                                  (set! (mut (.phi it)) (cast i64 u) (get pending i))")
+  (t/line! (mut o) "                                  (set! i (+ i 1))))")
+  (t/line! (mut o) "                              (set! p (graph/next-use g p))))")
+  (t/line! (mut o) "                          (set! (.epoch it) (+ (.epoch it) 1))")
+  (t/line! (mut o) "                          (set! c region)))))))))")
+  (t/line! (mut o) "    (free! (mut (.val it)))")
+  (t/line! (mut o) "    (free! (mut (.stamp it)))")
+  (t/line! (mut o) "    (free! (mut (.phi it)))")
+  (t/line! (mut o) "    (free! (mut (.second it)))")
+  (t/line! (mut o) "    (free! (mut pending))")
+  (t/line! (mut o) "    returned))")
+  (t/line! (mut o) ";;; The first value the graph returns for these arguments (0 if it returns")
+  (t/line! (mut o) ";;; none), or None if it has not returned within `limit` control steps.")
+  (t/line! (mut o) "(defn interpret [(g graph/Graph) (args (slice u64)) (limit i64)] (-> (Option u64))")
+  (t/line! (mut o) "  (let [(mut results) (ArrayList::new [u64] (.alc g))")
+  (t/line! (mut o) "        returned (interpret-all g args limit (mut results))")
+  (t/line! (mut o) "        first (if (> (len results) 0) (get results 0) (: 0 u64))]")
+  (t/line! (mut o) "    (free! (mut results))")
+  (t/line! (mut o) "    (if returned (Some first) (None [u64]))))"))
+
+;;; The Coil module a `.ir` file means.
+(defn module-text [(src (slice u8)) (path (slice u8))] (-> (slice u8))
+  (let [spec (parse src path)
+        (mut o) (t/out-new)]
+    (t/line! (mut o) "(import \"coil.primitive\" :as primitive)")
+    (t/line! (mut o) "(import \"coil.arraylist\" :use [ArrayList])")
+    (t/line! (mut o) "(import \"coil.cc\" :as cc)")
+    (t/line! (mut o) "(import \"declarative.rt.graph\" :as graph)")
+    (t/line! (mut o) "(import \"declarative.rt.bits\" :as bv)")
+    (t/line! (mut o) "(import \"declarative.rt.memory\" :as memory)")
+    (emit-numbers! (mut o) spec)
+    (emit-tables! (mut o) spec)
+    (for node (.nodes spec) (emit-builder! (mut o) spec node))
+    ; The constant and the parameter by role, for code that works on any node set.
+    (for node (.nodes spec)
+      (when (= (.role node) "const")
+        (t/line! (mut o) (t/cat3 "(defn make-const! [(g (mut graph/Graph)) (type i32) (value u64)] (-> i32) ("
+                                 (builder-name (.name node)) " (mut g) type value))")))
+      (when (= (.role node) "phi")
+        (t/line! (mut o) (t/cat3 "(defn make-phi! [(g (mut graph/Graph)) (type i32) (region i32) (count i64)] (-> i32) ("
+                                 (builder-name (.name node)) " (mut g) type region count))")))
+      (when (= (.role node) "region")
+        (t/line! (mut o) (t/cat3 "(defn make-region! [(g (mut graph/Graph)) (count i64)] (-> i32) ("
+                                 (builder-name (.name node)) " (mut g) count))")))
+      (when (= (.role node) "param")
+        (t/line! (mut o) (t/cat3 "(defn make-param! [(g (mut graph/Graph)) (type i32) (index u64)] (-> i32) ("
+                                 (builder-name (.name node)) " (mut g) type index))"))))
+    (emit-verify! (mut o) spec)
+    (emit-eval! (mut o) spec)
+    (emit-interpreter! (mut o))
+    (t/text-of (mut o))))

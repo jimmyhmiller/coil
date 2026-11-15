@@ -1,12 +1,15 @@
 # The native backend
 
-`--backend native` is Coil's own code generator: the declarative backend, a set
-of small languages in the coil-stogir-declarative project, written out as Coil
-into `src/compiler/declarative/` by that project's `tools/expand.sh` (see its
-`NOTICE`). Edit it there, never here. It replaced both the tpde backend (a port
-of TPDE, which `--backend tpde`, `arm64` and `x64` named) and the earlier Stogir
-library; that history is in git and in `docs/benchmarks/`. Those names are now
-errors that say to use `native`.
+`--backend native` is Coil's own code generator. It is written in small
+languages: its sources are `src/declarative/` (the languages in `lang/`, and the
+files written in them), and what the languages make of them is kept as plain
+Coil in `src/compiler/declarative/generated/`, which
+`scripts/compiler/gen-declarative.py` writes (see [Files](#files)). It replaced
+both the tpde backend (a port of TPDE, which `--backend tpde`, `arm64` and `x64`
+named) and the earlier Stogir library, a port of IR; it was developed in the
+coil-stogir-declarative project before it moved here. That history, and the
+credits, are in `src/compiler/declarative/NOTICE`, git and `docs/benchmarks/`.
+The old names are errors that say to use `native`.
 
 It is the default of a debug build (`coil build` without `--release`: `-O0`
 with DWARF, into `build/debug/`) wherever it compiles for the target, the
@@ -52,7 +55,35 @@ uses LLVM instead.
 - `src/compiler/native/` — CIR (`cir.coil`; `cir_copies.coil`, copy forwarding)
   and the assembler the code goes into (`asm.coil`, `buf.coil`), from
   [coil-tpde](https://github.com/jimmyhmiller/coil-tpde) (`NOTICE`).
-- `src/compiler/declarative/` — the backend itself (written out; see above).
+- `src/declarative/` — the backend's sources, a Coil project of its own whose
+  `Coil.toml` gives each file type its language (`[readers]`) and each file its
+  module (`[modules]`):
+  - `lang/` — the languages, each a reader from a file of its own to a Coil
+    module: `.ir` (a node set), `.isa` (a machine's instructions and encodings),
+    `.abi` (a calling convention), `.lower` (from nodes to instructions),
+    `.rewrite` (rules, each checked against the nodes' meanings), `.flow`
+    (facts), `.pass` (an algorithm over the graph), `.unit` (which of them make a
+    compiler), `.pipeline` (the order passes run in at each level), `.layout`
+    (an object file format), `.ops` (CIR's operations, read from CIR itself),
+    `.select` (instructions for each CIR operation, for the compile straight
+    from CIR) and `.instance` (one Coil file as a module for each machine). A
+    file whose text is `same OTHER` stands for OTHER.
+  - `backend/` — the node set and the passes both machines share; `a64/` and
+    `x64/` — each machine's instructions, convention, lowering, rules and passes,
+    for the graph route (`-O2`/`-O3`); `direct/`, `a64-direct/`, `x64-direct/` —
+    the compile straight from CIR (`-O0`/`-O1`); `cir/` — CIR's operations.
+  - `adapter/machine.coil` — from CIR to the graph, written once:
+    `machine-a64.instance` and `machine-x64.instance` make it a module for each
+    machine.
+  - `tests/` and `toy/` — the backend's own tests, and the languages' second
+    client, a calculator (see [Gates](#gates)).
+- `src/compiler/declarative/` — the package Coil compiles: `rt/` (the runtime
+  the languages' output stands on) and `adapter/` (CIR's view, the targets),
+  written by hand; `generated/`, written by `scripts/compiler/gen-declarative.py`
+  and never by hand. After editing a file in `src/declarative/`, run that script
+  and commit both; FAST's `declarative/generated` step fails when they disagree.
+  The compiler's own build does not run the languages, so that every stage-0
+  compiler and every installed toolchain can build it.
 - `src/compiler/object/` — the Mach-O and ELF writers, DWARF, and the encoders the
   JIT's stubs, `:shim` trampolines and the self-tests use.
 - `src/compiler/jit/jit_elf.coil` — maps an in-memory ELF object into this process
@@ -174,11 +205,13 @@ Behavioral: runtime equality with the LLVM backend, not equality of code.
   frame tests at `-O1` and `-O3`; `scripts/tests/declarative-unit-settings.py`,
   `declarative-threads.py` and `stogir-x86-sweep.py` cover settings, threads and a
   sweep against LLVM.
-- In coil-stogir-declarative: `tools/check.sh` (every rewrite rule against the
-  nodes' meanings, random graphs and random CIR functions interpreted against
-  compiled), `tools/x64/remote.sh` (the same on x86-64), `tools/coil-cycle.sh`
-  (the corpus, the compiler rebuilding itself to the same object),
-  `tools/coil-debugger.sh` (what lldb shows, against LLVM's -g build).
+- `scripts/tests/declarative.py COIL` (COMPREHENSIVE, and on the x86-64 host in
+  `x64/host`): from `src/declarative/tests`, every rewrite rule and fact against
+  the nodes' meanings, the toy calculator, an object linked in memory and by the
+  system linker, calls with several results and every way of passing an
+  argument, CIR's interpreter (made from `cir.ops`), and 2000 random programs
+  each through the compile from CIR (against that interpreter) and through the
+  whole graph pipeline (every transformation must fire).
 
 ## An LLVM-backend bug the x86-64 work surfaced
 `codegen.coil` classified a by-value aggregate purely from its type, so a

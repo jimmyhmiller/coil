@@ -28,7 +28,7 @@ import stogir_target
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ['COIL']).resolve()
-ADAPTER = ROOT / 'src/compiler/declarative/declarative/machine-a64.coil'
+ADAPTER = ROOT / 'src/declarative/adapter/machine.coil'
 BASE = {k: v for k, v in os.environ.items() if not k.startswith(('COIL_', 'DECLARATIVE_'))}
 BASE['COIL_LIBRARY_STATE'] = '0'
 

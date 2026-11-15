@@ -1,0 +1,1500 @@
+;;; The `.pass` language, and the `.unit` that gathers its storage.
+;;;
+;;; `.pass` is where algorithms are written: functions over entities (ids) and
+;;; columns (what is known about an id, stored densely). The logic never says how
+;;; a column is laid out, sized or freed, never casts and never names an allocator.
+;;;
+;;;   entity Block
+;;;   column idom: Block -> Block
+;;;   column preds: Block -> [Block]
+;;;   fn depth(b: Block) -> Int = if b.idom == none then 0 else depth(b.idom) + 1
+;;;
+;;; A `.unit` file lists the node set and the passes of one compiler. Its module
+;;; holds every record and one `State` with all the passes' columns; each pass's
+;;; module holds only functions, each taking that state.
+;;;
+;;; Translation is by syntax: ids are i32, `Int` is i64, and Coil checks the types.
+(module lang.pass)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "lang.text" :as t)
+(import "lang.ir" :as ir)
+(import "lang.project" :as project)
+(import "lang.lower" :as lower)
+(import "lang.flow" :as flow)
+(import "lang.ops" :as ops)
+
+;; ---------------------------------------------------------------- declarations
+
+(defstruct Field [(name (slice u8)) (type (slice u8))])
+
+(defstruct Column [(name (slice u8)) (key (slice u8)) (type (slice u8))])
+
+(defstruct Record [(name (slice u8)) (fields (ArrayList Field))])
+
+(defstruct Func
+  [(module (slice u8)) (name (slice u8)) (params (ArrayList Field)) (result (slice u8))])
+
+(defstruct Decls
+  [(entities (ArrayList (slice u8)))
+   (columns (ArrayList Column))
+   (records (ArrayList Record))
+   (cells (ArrayList Field))
+   (given (ArrayList (slice u8)))   ; the cells `begin!` keeps: settings, given from outside, and tallies
+   (funcs (ArrayList Func))
+   (files (ArrayList (slice u8)))
+   (passes (ArrayList (slice u8)))
+   (nodes-module (slice u8))
+   (target-module (slice u8))
+   (abi-module (slice u8))
+   (unit-module (slice u8))
+   (spec ir/Spec)
+   ; A unit over a linear IR said in `.ops` instead of a node set: its
+   ; entities `Value` and `Block` are the IR's, numbered from 1.
+   (ops-module (slice u8))
+   (ops ops/Ops)])
+
+(defn ops-mode? [(d Decls)] (-> bool) (!= (.ops-module d) ""))
+
+;;; An entity whose ids are given by what is compiled (the graph's nodes, the
+;;; IR's values and blocks), not made by `new()`; columns over it are sized to it.
+(defn sized? [(d Decls) (key (slice u8))] (-> bool)
+  (or (= key "Node") (and (ops-mode? d) (or (= key "Value") (= key "Block")))))
+
+;;; A column kept in its entity's row: over the IR's values or blocks, of one
+;;; plain value each. An entity's row holds all such columns of it together,
+;;; so that what is known of one value is in one place and starting over
+;;; empties one list per entity.
+(defn row-column? [(d Decls) (key (slice u8)) (type (slice u8))] (-> bool)
+  (and (ops-mode? d) (or (= key "Value") (= key "Block")) (not (list-type? type))))
+
+;;; The rows of an entity, as the state's field and as their record's name.
+(defn rows-field [(key (slice u8))] (-> (slice u8)) (t/cat2 (t/lower key) "-rows"))
+(defn row-type [(key (slice u8))] (-> (slice u8)) (t/cat2 key "Row"))
+
+;;; One of `key`'s columns is kept in its row.
+(defn has-rows? [(d Decls) (key (slice u8))] (-> bool)
+  (let [(mut any) false]
+    (for column (.columns d)
+      (when (and (= (.key column) key) (row-column? d (.key column) (.type column))) (set! any true)))
+    any))
+
+;;; How many bytes a row's field takes, for laying the widest out first.
+(defn field-bytes [(d Decls) (type (slice u8))] (-> i64)
+  (cond (or (= type "Int") (= type "Word")) 8
+        (or (entity? d type) (= type "Int32")) 4
+        :else 1))
+
+;;; A column whose numbers are kept narrower than an Int: read, each is an Int;
+;;; written, one that does not fit is an error where it is written.
+(defn narrow-int? [(type (slice u8))] (-> bool)
+  (or (= type "Int32") (= type "Int8")))
+
+(defn entity? [(d Decls) (name (slice u8))] (-> bool)
+  (or (sized? d name) (>= (t/index-of (.entities d) name) 0)))
+
+;;; A module written in `.pass`, whose function names are made safe for Coil.
+(defn pass-module? [(d Decls) (name (slice u8))] (-> bool)
+  (>= (t/index-of (.passes d) name) 0))
+
+(defn record? [(d Decls) (name (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (for r (.records d) (when (= (.name r) name) (set! found true)))
+    found))
+
+(defn column-index [(d Decls) (name (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for i (range 0 (len (.columns d)))
+      (when (= (.name (get (.columns d) i)) name) (set! found i)))
+    found))
+
+(defn cell-index [(d Decls) (name (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for i (range 0 (len (.cells d)))
+      (when (= (.name (get (.cells d) i)) name) (set! found i)))
+    found))
+
+(defn func-index [(d Decls) (module (slice u8)) (name (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for i (range 0 (len (.funcs d)))
+      (let [f (get (.funcs d) i)]
+        (when (and (= (.name f) name) (= (.module f) module)) (set! found i))))
+    found))
+
+;;; A list column of `Int`s holds them as the 32-bit cells every list column has.
+(defn int-list? [(d Decls) (column (slice u8))] (-> bool)
+  (let [i (column-index d column)]
+    (and (>= i 0) (= (.type (get (.columns d) i)) "[Int]"))))
+
+(defn list-type? [(type (slice u8))] (-> bool)
+  (and (> (len type) 0) (= (get type 0) #\[)))
+
+(defn element-type [(type (slice u8))] (-> (slice u8))
+  (t/slice-of type 1 (- (len type) 1)))
+
+;;; The Coil type a source type is stored as. `prefix` is how the unit's module
+;;; is named from where the text goes: "" inside it, "st/" in a pass.
+(defn coil-type [(d Decls) (type (slice u8)) (prefix (slice u8))] (-> (slice u8))
+  (cond (= type "Int") "i64"
+        (= type "Int32") "i32"
+        (= type "Int8") "i8"
+        (= type "Bool") "bool"
+        (= type "Word") "u64"
+        (= type "Byte") "u8"
+        (= type "Void") "void"
+        (entity? d type) "i32"
+        (list-type? type) (t/cat3 "(ArrayList " (coil-type d (element-type type) prefix) ")")
+        :else (t/cat2 prefix type)))
+
+(defn parse-type [(c (mut t/Cur)) (d Decls)] (-> (slice u8))
+  (let [at (t/peek (mut c))
+        text (if (t/accept! (mut c) "[")
+                 (let [inner (parse-type (mut c) d)]
+                   (t/expect! (mut c) "]")
+                   (t/cat3 "[" inner "]"))
+                 (t/name! (mut c) "a type"))]
+    (t/accept! (mut c) "?")
+    text))
+
+;;; A type names something declared: checked once every declaration is read.
+(defn check-type! [(d Decls) (type (slice u8)) (path (slice u8)) (what (slice u8))] (-> void)
+  (let [base (if (list-type? type) (element-type type) type)]
+    (unless (or (= base "Int") (= base "Bool") (= base "Word") (= base "Byte") (= base "Void")
+                (entity? d base) (record? d base))
+      (t/fail-at path 1 1 (t/cat4 what ": no type named " base "")))))
+
+(defn skip-body! [(c (mut t/Cur))] (-> void)
+  (while (and (not (t/eof? (mut c)))
+              (or (!= (.col (t/peek (mut c))) 1) (!= (.kind (t/peek (mut c))) t/T-IDENT)))
+    (t/advance! (mut c))))
+
+(defn parse-signature [(c (mut t/Cur)) (d Decls) (module (slice u8))] (-> Func)
+  (let [name (t/name! (mut c) "a function name")
+        (mut params) (ArrayList::new [Field] (malloc-allocator))]
+    (t/expect! (mut c) "(")
+    (unless (t/at? (mut c) ")")
+      (let [(mut more) true]
+        (while more
+          (let [param (t/name! (mut c) "a parameter name")]
+            (t/expect! (mut c) ":")
+            (push! (mut params) (Field :name param :type (parse-type (mut c) d))))
+          (set! more (t/accept! (mut c) ",")))))
+    (t/expect! (mut c) ")")
+    (Func
+      :module module
+      :name name
+      :params params
+      :result (if (t/accept! (mut c) "->") (parse-type (mut c) d) "Void"))))
+
+;;; What a pass file declares, added to `d`. Function bodies are passed over: a
+;;; declaration starts in column 1 and a body is whatever is indented under it.
+(defn scan! [(d (mut Decls)) (src (slice u8)) (path (slice u8)) (module (slice u8))] (-> void)
+  (let [(mut c) (t/cursor src path)]
+    (while (not (t/eof? (mut c)))
+      (let [tok (t/advance! (mut c))]
+        (cond
+          (t/tok-is? tok "pass") (skip-body! (mut c))
+          (t/tok-is? tok "use") (skip-body! (mut c))
+          (t/tok-is? tok "import") (skip-body! (mut c))
+          (t/tok-is? tok "entity") (push! (mut (.entities d)) (t/name! (mut c) "an entity name"))
+          (t/tok-is? tok "column")
+            (let [name (t/name! (mut c) "a column name")]
+              (t/expect! (mut c) ":")
+              (let [key (t/name! (mut c) "the entity the column is over")]
+                (t/expect! (mut c) "->")
+                (when (>= (column-index d name) 0)
+                  (t/die (mut c) tok (t/cat2 "column declared twice: " name)))
+                (push! (mut (.columns d))
+                       (Column :name name :key key :type (parse-type (mut c) d)))))
+          ; A `tally` counts what a pass did over the whole life of the state,
+          ; so that whoever compiles can ask afterwards: starting over keeps it.
+          (or (t/tok-is? tok "state") (t/tok-is? tok "setting") (t/tok-is? tok "tally"))
+            (let [name (t/name! (mut c) "a name")]
+              (t/expect! (mut c) ":")
+              (unless (t/tok-is? tok "state") (push! (mut (.given d)) name))
+              (push! (mut (.cells d)) (Field :name name :type (parse-type (mut c) d))))
+          (t/tok-is? tok "record")
+            (let [name (t/name! (mut c) "a record name")
+                  (mut fields) (ArrayList::new [Field] (malloc-allocator))]
+              (t/expect! (mut c) "{")
+              (while (not (t/accept! (mut c) "}"))
+                (let [field (t/name! (mut c) "a field name")]
+                  (t/expect! (mut c) ":")
+                  (push! (mut fields) (Field :name field :type (parse-type (mut c) d)))
+                  (t/accept! (mut c) ",")))
+              (push! (mut (.records d)) (Record :name name :fields fields)))
+          (t/tok-is? tok "fn")
+            (do (push! (mut (.funcs d)) (parse-signature (mut c) d module))
+                (skip-body! (mut c)))
+          (t/tok-is? tok "inline")
+            (do (t/expect! (mut c) "fn")
+                (push! (mut (.funcs d)) (parse-signature (mut c) d module))
+                (skip-body! (mut c)))
+          :else (t/die (mut c) tok (t/cat2 "expected a declaration, found " (.text tok))))))))
+
+;;; Everything the unit at `file` declares: its node set and all its passes.
+(defn load-unit [(p project/Project) (file (slice u8)) (from (slice u8))] (-> Decls)
+  (let [src (project/read-file file from)
+        (mut c) (t/cursor src file)
+        (mut d) (Decls
+                  :entities (ArrayList::new [(slice u8)] (malloc-allocator))
+                  :columns (ArrayList::new [Column] (malloc-allocator))
+                  :records (ArrayList::new [Record] (malloc-allocator))
+                  :cells (ArrayList::new [Field] (malloc-allocator))
+                  :given (ArrayList::new [(slice u8)] (malloc-allocator))
+                  :funcs (ArrayList::new [Func] (malloc-allocator))
+                  :files (ArrayList::new [(slice u8)] (malloc-allocator))
+                  :passes (ArrayList::new [(slice u8)] (malloc-allocator))
+                  :nodes-module ""
+                  :target-module ""
+                  :abi-module ""
+                  :unit-module (project/module-of p file)
+                  :spec (ir/parse "" file)
+                  :ops-module ""
+                  :ops (ops/parse "ops read through none, functions are none of none" file))]
+    (push! (mut (.files d)) file)
+    (t/expect! (mut c) "unit")
+    (while (not (t/eof? (mut c)))
+      (let [tok (t/advance! (mut c))
+            at (t/peek (mut c))]
+        (cond
+          (t/tok-is? tok "nodes")
+            (let [name (module-name! (mut c))
+                  nodes-file (project/file-of p name (.line at) (.col at))]
+              (set! (.nodes-module d) name)
+              (set! (.spec d) (ir/parse (project/read-file nodes-file file) nodes-file))
+              (push! (mut (.files d)) nodes-file))
+          (t/tok-is? tok "ops")
+            (let [name (module-name! (mut c))
+                  ops-file (project/file-of p name (.line at) (.col at))]
+              (set! (.ops-module d) name)
+              (set! (.ops d) (ops/parse (project/read-file ops-file file) ops-file))
+              (push! (mut (.files d)) ops-file))
+          ; The machine and its convention, which passes ask for as `target` and `abi`.
+          (t/tok-is? tok "target") (set! (.target-module d) (module-name! (mut c)))
+          (t/tok-is? tok "abi") (set! (.abi-module d) (module-name! (mut c)))
+          (t/tok-is? tok "pass")
+            (let [name (module-name! (mut c))
+                  pass-file (project/file-of p name (.line at) (.col at))]
+              (scan! (mut d) (project/read-file pass-file file) pass-file name)
+              (push! (mut (.passes d)) name)
+              (push! (mut (.files d)) pass-file))
+          ; A .lower file read for its templates alone: by a unit with no node set.
+          (t/tok-is? tok "templates")
+            (let [name (module-name! (mut c))
+                  lower-file (project/file-of p name (.line at) (.col at))]
+              (for template (lower/templates (project/read-file lower-file file) lower-file)
+                (let [(mut params) (ArrayList::new [Field] (malloc-allocator))]
+                  (for i (range 1 (len template))
+                    (push! (mut params) (Field :name (get template i) :type "Int")))
+                  (push! (mut (.funcs d))
+                         (Func :module name :name (get template 0) :params params :result "Void"))))
+              (push! (mut (.files d)) lower-file))
+          ; A .lower file gives the passes its three functions and its templates.
+          (t/tok-is? tok "lower")
+            (let [name (module-name! (mut c))
+                  lower-file (project/file-of p name (.line at) (.col at))
+                  node (ArrayList::new [Field] (malloc-allocator))
+                  (mut node-rule) (ArrayList::new [Field] (malloc-allocator))]
+              (push! (mut node-rule) (Field :name "n" :type "Node"))
+              (push! (mut (.funcs d)) (Func :module name :name "select" :params node-rule :result "Int"))
+              (let [(mut two) (ArrayList::new [Field] (malloc-allocator))]
+                (push! (mut two) (Field :name "n" :type "Node"))
+                (push! (mut two) (Field :name "rule" :type "Int"))
+                (push! (mut (.funcs d)) (Func :module name :name "mark" :params two :result "Void")))
+              (let [(mut three) (ArrayList::new [Field] (malloc-allocator))]
+                (push! (mut three) (Field :name "n" :type "Node"))
+                (push! (mut three) (Field :name "rule" :type "Int"))
+                (push! (mut three) (Field :name "out" :type "Int"))
+                (push! (mut (.funcs d)) (Func :module name :name "emit" :params three :result "Void")))
+              (push! (mut (.funcs d)) (Func :module name :name "operand" :params node-rule :result "Int"))
+              (push! (mut (.funcs d)) (Func :module name :name "local?" :params node-rule :result "Bool"))
+              (let [(mut ext) (ArrayList::new [Field] (malloc-allocator))]
+                (push! (mut ext) (Field :name "n" :type "Node"))
+                (push! (mut ext) (Field :name "how" :type "Int"))
+                (push! (mut (.funcs d)) (Func :module name :name "extended" :params ext :result "Int")))
+              (for template (lower/templates (project/read-file lower-file file) lower-file)
+                (let [(mut params) (ArrayList::new [Field] (malloc-allocator))]
+                  (for i (range 1 (len template))
+                    (push! (mut params) (Field :name (get template i) :type "Int")))
+                  (push! (mut (.funcs d))
+                         (Func :module name :name (get template 0) :params params :result "Void"))))
+              (push! (mut (.files d)) lower-file))
+          ; A .select file gives the passes `choose`, `fold`, `emit` and `read-value`.
+          (t/tok-is? tok "select")
+            (let [name (module-name! (mut c))
+                  (mut one) (ArrayList::new [Field] (malloc-allocator))
+                  (mut two) (ArrayList::new [Field] (malloc-allocator))
+                  (mut three) (ArrayList::new [Field] (malloc-allocator))]
+              (push! (mut one) (Field :name "v" :type "Value"))
+              (push! (mut two) (Field :name "v" :type "Value"))
+              (push! (mut two) (Field :name "rule" :type "Int"))
+              (push! (mut three) (Field :name "v" :type "Value"))
+              (push! (mut three) (Field :name "rule" :type "Int"))
+              (push! (mut three) (Field :name "given" :type "Int"))
+              (push! (mut (.funcs d)) (Func :module name :name "choose" :params one :result "Int"))
+              (push! (mut (.funcs d)) (Func :module name :name "fold" :params two :result "Void"))
+              (push! (mut (.funcs d)) (Func :module name :name "emit" :params three :result "Void"))
+              (push! (mut (.funcs d)) (Func :module name :name "read-value" :params one :result "Int"))
+              (push! (mut (.files d)) (project/file-of p name (.line at) (.col at))))
+          ; A .rewrite file gives the passes `run`, which answers how much it changed.
+          (t/tok-is? tok "rewrite")
+            (let [name (module-name! (mut c))]
+              (push! (mut (.funcs d))
+                     (Func :module name :name "run" :params (ArrayList::new [Field] (malloc-allocator))
+                           :result "Int"))
+              (push! (mut (.files d)) (project/file-of p name (.line at) (.col at))))
+          ; A .flow file gives a column and a function for each fact, and `solve`.
+          (t/tok-is? tok "flow")
+            (let [name (module-name! (mut c))
+                  flow-file (project/file-of p name (.line at) (.col at))]
+              (push! (mut (.funcs d))
+                     (Func :module name :name "solve" :params (ArrayList::new [Field] (malloc-allocator))
+                           :result "Void"))
+              (for fact (flow/fact-names (project/read-file flow-file file) flow-file)
+                (let [(mut one) (ArrayList::new [Field] (malloc-allocator))]
+                  (push! (mut one) (Field :name "n" :type "Node"))
+                  (push! (mut (.funcs d)) (Func :module name :name fact :params one :result "Int"))
+                  (push! (mut (.columns d)) (Column :name (t/cat2 "fact-" fact) :key "Node" :type "Int"))))
+              (push! (mut (.files d)) flow-file))
+          :else (t/die (mut c) tok (t/cat2 "expected nodes, ops, pass, lower, templates, select, rewrite or flow, found " (.text tok))))))
+    (for column (.columns d)
+      (unless (entity? d (.key column))
+        (t/fail-at file 1 1 (t/cat4 "column " (.name column) " is over no entity: " (.key column))))
+      ; A column may keep its numbers in 32 or 8 bits, as `Int32` or `Int8`:
+      ; read, each is an Int; written, one that does not fit is an error where
+      ; it is written.
+      (unless (narrow-int? (.type column))
+        (check-type! d (.type column) file (t/cat2 "column " (.name column)))))
+    d))
+
+;;; A dotted module name: `backend.cfg`.
+(defn module-name! [(c (mut t/Cur))] (-> (slice u8))
+  (let [(mut name) (t/name! (mut c) "a module name")]
+    (while (and (t/at? (mut c) ".") (.glued (t/peek (mut c))))
+      (t/advance! (mut c))
+      (set! name (t/cat3 name "." (t/name! (mut c) "a module name"))))
+    name))
+
+(defn depends-text [(d Decls)] (-> (slice u8))
+  (let [(mut o) (t/out-new)]
+    (t/emit! (mut o) "(depends-on")
+    (for file (.files d) (t/emit! (mut o) (t/cat3 " \"" file "\"")))
+    (t/line! (mut o) ")")
+    (t/text-of (mut o))))
+
+;; ---------------------------------------------------------------- the unit's module
+
+(defn default-text [(d Decls) (type (slice u8))] (-> (slice u8))
+  (cond (= type "Int") "0"
+        (= type "Int32") "(: 0 i32)"
+        (= type "Int8") "(: 0 i8)"
+        (= type "Bool") "false"
+        (= type "Word") "(: 0 u64)"
+        (= type "Byte") "(: 0 u8)"
+        (entity? d type) "(: 0 i32)"
+        (list-type? type)
+          (t/cat3 "(ArrayList::new [" (coil-type d (element-type type) "") "] a)")
+        :else (t/cat3 "(zeroed " type ")")))
+
+(defn unit-text [(context Code)] (-> (slice u8))
+  (let [p (project/open context)
+        path (t/path-of context)
+        d (load-unit p path path)
+        (mut o) (t/out-new)]
+    (t/emit! (mut o) (depends-text d))
+    (t/line! (mut o) "(import \"coil.alloc\" :use [Allocator])")
+    (t/line! (mut o) "(import \"coil.arraylist\" :use [ArrayList])")
+    (t/line! (mut o) "(import \"declarative.rt.graph\" :as graph)")
+    (t/line! (mut o) "(import \"declarative.rt.lists\" :as lists)")
+    (t/line! (mut o) "(import \"coil.primitive\" :as primitive)")
+    (for r (.records d)
+      (t/emit! (mut o) (t/cat3 "(defstruct " (.name r) " ["))
+      (for f (.fields r)
+        (t/emit! (mut o) (t/cat4 "(" (.name f) " " (t/cat2 (coil-type d (.type f) "") ") "))))
+      (t/line! (mut o) "])"))
+    ; The state: the graph, a count per entity, a column per column, a cell per state.
+    ; `alc` holds the columns, which outlast a start over; `tmp` the lists a
+    ; function makes for itself, which whoever compiles may free between
+    ; functions. Both are the allocator `create` is given unless told otherwise.
+    (when (ops-mode? d)
+      (t/line! (mut o) (t/cat3 "(import \"" (.view (.ops d)) "\" :as view)"))
+      (t/line! (mut o) (t/cat3 "(import \"" (.func-module (.ops d)) "\" :as irf)")))
+    ; Each entity's row, its widest fields first.
+    (for key ["Value" "Block"]
+      (when (has-rows? d key)
+        (t/emit! (mut o) (t/cat3 "(defstruct " (row-type key) " ["))
+        (for width [8 4 1]
+          (for column (.columns d)
+            (when (and (= (.key column) key) (row-column? d key (.type column))
+                       (= (field-bytes d (.type column)) width))
+              (t/emit! (mut o) (t/cat4 "(" (.name column) " " (t/cat2 (coil-type d (.type column) "") ") "))))))
+        (t/line! (mut o) "])")))
+    (t/line! (mut o) (if (ops-mode? d)
+                         (t/cat3 "(defstruct State [(f (ptr irf/" (.func-type (.ops d)) ")) (alc (dyn Allocator)) (tmp (dyn Allocator)) (fired i64) (swept bool)")
+                         "(defstruct State [(g graph/Graph) (alc (dyn Allocator)) (tmp (dyn Allocator)) (fired i64) (swept bool)"))
+    (for e (.entities d)
+      (t/line! (mut o) (t/cat3 "  (" (t/lower e) "-count i32)"))
+      (t/line! (mut o) (t/cat3 "  (" (t/lower e) "-room i64)")))
+    (for key ["Value" "Block"]
+      (when (has-rows? d key)
+        (t/line! (mut o) (t/cat4 "  (" (rows-field key) " (ArrayList " (t/cat2 (row-type key) "))")))))
+    (for column (.columns d)
+      (unless (row-column? d (.key column) (.type column))
+        (t/line! (mut o)
+                 (if (list-type? (.type column))
+                     (t/cat3 "  (" (.name column) " lists/Lists)")
+                     (t/cat4 "  (" (.name column) " (ArrayList "
+                             (t/cat2 (coil-type d (.type column) "") "))"))))))
+    (for cell (.cells d)
+      (t/line! (mut o) (t/cat4 "  (" (.name cell) " " (t/cat2 (coil-type d (.type cell) "") ")"))))
+    (t/line! (mut o) "])")
+    (if (ops-mode? d)
+        (do (t/line! (mut o) "(defn create [(a (dyn Allocator))] (-> State)")
+            (t/line! (mut o) (t/cat3 "  (State :f (primitive/cast (ptr irf/" (.func-type (.ops d)) ") 0) :alc a :tmp a :fired 0 :swept true")))
+        (do (t/line! (mut o) "(defn create [(g graph/Graph) (a (dyn Allocator))] (-> State)")
+            (t/line! (mut o) "  (State :g g :alc a :tmp a :fired 0 :swept true")))
+    (for e (.entities d)
+      (t/line! (mut o) (t/cat3 "    :" (t/lower e) "-count 0"))
+      (t/line! (mut o) (t/cat3 "    :" (t/lower e) "-room 0")))
+    (for key ["Value" "Block"]
+      (when (has-rows? d key)
+        (t/line! (mut o) (t/cat4 "    :" (rows-field key) " (ArrayList::new [" (t/cat2 (row-type key) "] a)")))))
+    (for column (.columns d)
+      (unless (row-column? d (.key column) (.type column))
+        (t/line! (mut o)
+                 (if (list-type? (.type column))
+                     (t/cat3 "    :" (.name column) " (lists/create a)")
+                     (t/cat4 "    :" (.name column) " (ArrayList::new ["
+                             (t/cat2 (coil-type d (.type column) "") "] a)"))))))
+    (for cell (.cells d)
+      (t/line! (mut o) (t/cat4 "    :" (.name cell) " " (default-text d (.type cell)))))
+    (t/line! (mut o) "  ))")
+    ; One more of an entity. Its columns grow in runs, every default being
+    ; zero bits (a list column's: an empty list), so that most new ones cost a
+    ; count and a comparison.
+    (for e (.entities d)
+      (t/line! (mut o) (t/cat3 "(defn " (t/lower e) "-new! :inline (Always) [(cx (mut State))] (-> i32)"))
+      (t/line! (mut o) (t/cat4 "  (set! (." (t/lower e) "-count cx) (+ (." (t/cat2 (t/lower e) "-count cx) 1))")))
+      (t/line! (mut o) (t/cat4 "  (when (>= (cast i64 (." (t/lower e) "-count cx)) (." (t/cat3 (t/lower e) "-room cx)) (" (t/cat2 (t/lower e) "-grow! (mut cx)))"))))
+      (t/line! (mut o) (t/cat3 "  (." (t/lower e) "-count cx))"))
+      (t/line! (mut o) (t/cat3 "(defn " (t/lower e) "-grow! [(cx (mut State))] (-> void)"))
+      (t/line! (mut o) (t/cat3 "  (let [n (let [twice (* 2 (." (t/lower e) "-room cx))] (if (< twice 64) 64 twice))]"))
+      (for column (.columns d)
+        (when (= (.key column) e)
+          (t/line! (mut o)
+                   (if (list-type? (.type column))
+                       (t/cat3 "  (lists/keys! (mut (." (.name column) " cx)) n)")
+                       (t/cat4 "  (extend-zeroed! (mut (." (.name column) " cx)) (- n (len (."
+                               (t/cat2 (.name column) " cx))))"))))))
+      (t/line! (mut o) (t/cat3 "  (set! (." (t/lower e) "-room cx) n)))")))
+    ; Columns over nodes follow the graph's size; over an IR's values and
+    ; blocks, their numbers (from 1). Every default is all zero bits, so a
+    ; column grows by a run of zeros.
+    (t/line! (mut o) "(defn grow-nodes! [(cx (mut State))] (-> void)")
+    (t/line! (mut o) (if (ops-mode? d)
+                         "  (let [a (.alc cx) values (+ (view/value-count (.f cx)) 1) blocks (+ (view/block-count (.f cx)) 1)]"
+                         "  (let [a (.alc cx) nodes (graph/size (.g cx))]"))
+    (for key ["Value" "Block"]
+      (when (has-rows? d key)
+        (let [n (if (= key "Value") "values" "blocks")
+              f (rows-field key)]
+          (t/line! (mut o) (t/cat4 (t/cat4 "  (when (< (len (." f " cx)) " n)
+                                   ") (extend-zeroed! (mut (." f
+                                   (t/cat4 " cx)) (- " n " (len (." (t/cat2 f " cx)))))")))))))
+    (for column (.columns d)
+      (when (and (sized? d (.key column)) (not (row-column? d (.key column) (.type column))))
+        (let [n (cond (= (.key column) "Value") "values" (= (.key column) "Block") "blocks" :else "nodes")]
+          (t/line! (mut o)
+                   (if (list-type? (.type column))
+                       (t/cat4 "  (lists/keys! (mut (." (.name column) " cx)) " (t/cat2 n ")"))
+                       (t/cat4 (t/cat4 "  (when (< (len (." (.name column) " cx)) " n)
+                               ") (extend-zeroed! (mut (." (.name column)
+                               (t/cat4 " cx)) (- " n " (len (." (t/cat2 (.name column) " cx)))))"))))))))
+    (t/line! (mut o) "  0))")
+    ; Start over: no entities, every column empty, node columns sized to the graph.
+    (t/line! (mut o) "(defn begin! [(cx (mut State))] (-> void)")
+    (t/line! (mut o) "  (let [a (.alc cx)]")
+    (t/line! (mut o) "  (set! (.swept cx) true)")
+    (for e (.entities d)
+      (t/line! (mut o) (t/cat3 "  (set! (." (t/lower e) "-count cx) 0)"))
+      (t/line! (mut o) (t/cat3 "  (set! (." (t/lower e) "-room cx) 1)")))
+    (for key ["Value" "Block"]
+      (when (has-rows? d key)
+        (t/line! (mut o) (t/cat3 "  (lists/empty! (mut (." (rows-field key) " cx)))"))))
+    (for column (.columns d)
+      (cond
+        (row-column? d (.key column) (.type column)) 0
+        (list-type? (.type column))
+          (do (t/line! (mut o) (t/cat3 "  (lists/clear! (mut (." (.name column) " cx)))"))
+              (unless (sized? d (.key column))
+                (t/line! (mut o) (t/cat3 "  (lists/add-key! (mut (." (.name column) " cx)))"))))
+        :else
+          (do (t/line! (mut o) (t/cat3 "  (lists/empty! (mut (." (.name column) " cx)))"))
+              (unless (sized? d (.key column))
+                (t/line! (mut o)
+                         (t/cat4 "  (push! (mut (." (.name column) " cx)) "
+                                 (t/cat2 (default-text d (.type column)) ")")))))))
+    ; A setting is whoever compiles's to give, once, and a tally counts across
+    ; starts: starting over leaves both.
+    (for cell (.cells d)
+      (cond (>= (t/index-of (.given d) (.name cell)) 0) 0
+            (list-type? (.type cell))
+              (t/line! (mut o) (t/cat3 "  (lists/empty! (mut (." (.name cell) " cx)))"))
+            :else
+              (do (t/line! (mut o)
+                           (t/cat4 "  (set! (." (.name cell) " cx) " (t/cat2 (default-text d (.type cell)) ")")))
+                  0)))
+    (t/line! (mut o) "  (grow-nodes! (mut cx))))")
+    (t/text-of (mut o))))
+
+;; ---------------------------------------------------------------- compiling a pass
+
+;;; An expression as Coil text, and what it is as a place to assign or to call a
+;;; list's operations on.
+(const E-VALUE 0)
+(const E-LOCAL 1)
+(const E-COLUMN 2)
+(const E-INDEX 3)
+(const E-FIELD 4)
+(const E-LISTS 5)
+(const E-CELL 6)
+(const E-ENTITY 7)
+(const E-MODULE 8)
+(const E-RAW 9)
+
+(defstruct E [(code (slice u8)) (kind i64) (x (slice u8)) (y (slice u8))])
+
+(defn value [(code (slice u8))] (-> E)
+  (E :code code :kind E-VALUE :x "" :y ""))
+
+(defstruct K
+  [(c t/Cur)
+   (d Decls)
+   (module (slice u8))
+   (locals (ArrayList (slice u8)))
+   (aliases (ArrayList Field))
+   (raws (ArrayList (slice u8)))
+   (returns bool)
+   (breaks bool)
+   (inline bool)                        ; the function being written was declared `inline fn`
+   (tmp i64)])
+
+(defn fresh [(k (mut K)) (base (slice u8))] (-> (slice u8))
+  (set! (.tmp k) (+ (.tmp k) 1))
+  (t/cat3 base "*" (t/int-text (.tmp k))))
+
+;;; A local's name in Coil: itself, unless Coil gives the word a meaning.
+(defn local-name [(name (slice u8))] (-> (slice u8))
+  (if (or (= name "block") (= name "call") (= name "type") (= name "do") (= name "let")
+          (= name "if") (= name "fn") (= name "match") (= name "loop") (= name "for")
+          (= name "while") (= name "when") (= name "mut") (= name "get") (= name "len")
+          (= name "range") (= name "and") (= name "or") (= name "not") (= name "cast")
+          (= name "first") (= name "count") (= name "cx") (= name "at") (= name "set")
+          (= name "def") (= name "const") (= name "cond") (= name "case") (= name "unless"))
+      (t/cat2 name "*")
+      name))
+
+(defn local? [(k (mut K)) (name (slice u8))] (-> bool)
+  (>= (t/index-of (.locals k) name) 0))
+
+(defn alias-module [(k (mut K)) (alias (slice u8))] (-> (slice u8))
+  (let [(mut module) ""]
+    (for a (.aliases k) (when (= (.name a) alias) (set! module (.type a))))
+    module))
+
+(defn g-text [] (-> (slice u8)) "(.g cx)")
+
+(defn cat5 [(a (slice u8)) (b (slice u8)) (c (slice u8)) (d (slice u8)) (e (slice u8))]
+  (-> (slice u8))
+  (t/cat2 (t/cat4 a b c d) e))
+
+(defn cat6 [(a (slice u8)) (b (slice u8)) (c (slice u8)) (d (slice u8)) (e (slice u8))
+            (f (slice u8))] (-> (slice u8))
+  (t/cat3 (t/cat4 a b c d) e f))
+
+;;; A call's arguments as text. A parameter that is a list takes the caller's
+;;; list itself, so its argument is passed as a place.
+(defn call-args [(k (mut K)) (f Func) (at t/Tok)] (-> (slice u8))
+  (let [(mut o) (t/out-new)
+        (mut i) 0]
+    (unless (t/at? (mut (.c k)) ")")
+      (let [(mut more) true]
+        (while more
+          (let [arg (expr (mut k) 0)]
+            (when (>= i (len (.params f)))
+              (t/die (mut (.c k)) at (t/cat2 "too many arguments to " (.name f))))
+            (t/emit! (mut o)
+                     (if (list-type? (.type (get (.params f) i)))
+                         (t/cat3 " (mut " (.code arg) ")")
+                         (t/cat2 " " (.code arg))))
+            (set! i (+ i 1)))
+          (set! more (t/accept! (mut (.c k)) ",")))))
+    (t/expect! (mut (.c k)) ")")
+    (when (!= i (len (.params f)))
+      (t/die (mut (.c k)) at (t/cat2 "too few arguments to " (.name f))))
+    (t/text-of (mut o))))
+
+;;; One argument to a function outside the passes: `mut xs` lends the list itself.
+(defn plain-arg [(k (mut K))] (-> (slice u8))
+  (if (t/accept! (mut (.c k)) "mut")
+      (t/cat3 "(mut " (.code (expr (mut k) 0)) ")")
+      (.code (expr (mut k) 0))))
+
+(defn plain-args [(k (mut K))] (-> (ArrayList (slice u8)))
+  (let [(mut args) (ArrayList::new [(slice u8)] (malloc-allocator))]
+    (unless (t/at? (mut (.c k)) ")")
+      (push! (mut args) (plain-arg (mut k)))
+      (while (t/accept! (mut (.c k)) ",") (push! (mut args) (plain-arg (mut k)))))
+    (t/expect! (mut (.c k)) ")")
+    args))
+
+;;; What can be iterated: a range, an entity, a node's inputs or users, a list
+;;; column or a list.
+(const I-RANGE 0)
+(const I-ENTITY 1)
+(const I-INPUTS 2)
+(const I-USERS 3)
+(const I-LISTS 4)
+(const I-LIST 5)
+(const I-REVERSE 6)
+(const I-EDGES 7)
+(const I-INSTS 8)
+(const I-PHIS 9)
+
+(defstruct Iter [(kind i64) (a (slice u8)) (b (slice u8))])
+
+(defn parse-iter [(k (mut K))] (-> Iter)
+  (let [tok (t/peek (mut (.c k)))
+        next (t/peek-at (mut (.c k)) 1)]
+    (cond
+      (and (t/tok-is? tok "inputs") (t/tok-is? next "("))
+        (do (t/advance! (mut (.c k))) (t/advance! (mut (.c k)))
+            (let [n (.code (expr (mut k) 0))]
+              (t/expect! (mut (.c k)) ")")
+              (Iter :kind I-INPUTS :a n :b "")))
+      (and (t/tok-is? tok "edges") (t/tok-is? next "("))
+        (do (t/advance! (mut (.c k))) (t/advance! (mut (.c k)))
+            (let [n (.code (expr (mut k) 0))]
+              (t/expect! (mut (.c k)) ")")
+              (Iter :kind I-EDGES :a n :b "")))
+      ; A block's instructions and its phis, in an IR said in `.ops`.
+      (and (t/tok-is? tok "insts") (t/tok-is? next "(") (ops-mode? (.d k)))
+        (do (t/advance! (mut (.c k))) (t/advance! (mut (.c k)))
+            (let [b (.code (expr (mut k) 0))]
+              (t/expect! (mut (.c k)) ")")
+              (Iter :kind I-INSTS :a b :b "")))
+      (and (t/tok-is? tok "phis") (t/tok-is? next "(") (ops-mode? (.d k)))
+        (do (t/advance! (mut (.c k))) (t/advance! (mut (.c k)))
+            (let [b (.code (expr (mut k) 0))]
+              (t/expect! (mut (.c k)) ")")
+              (Iter :kind I-PHIS :a b :b "")))
+      (and (t/tok-is? tok "users") (t/tok-is? next "("))
+        (do (t/advance! (mut (.c k))) (t/advance! (mut (.c k)))
+            (let [n (.code (expr (mut k) 0))]
+              (t/expect! (mut (.c k)) ")")
+              (Iter :kind I-USERS :a n :b "")))
+      (t/tok-is? tok "reverse")
+        (do (t/advance! (mut (.c k)))
+            (let [a (.code (expr (mut k) 0))]
+              (t/expect! (mut (.c k)) "..")
+              (Iter :kind I-REVERSE :a a :b (.code (expr (mut k) 0)))))
+      (and (= (.kind tok) t/T-IDENT) (not (local? (mut k) (.text tok)))
+           (entity? (.d k) (.text tok)) (not (t/tok-is? next ".")))
+        (do (t/advance! (mut (.c k)))
+            (Iter :kind I-ENTITY :a (.text tok) :b ""))
+      :else
+        (let [e (expr (mut k) 0)]
+          (cond (t/accept! (mut (.c k)) "..")
+                  (Iter :kind I-RANGE :a (.code e) :b (.code (expr (mut k) 0)))
+                (= (.kind e) E-LISTS) (Iter :kind I-LISTS :a (.x e) :b (.y e))
+                :else (Iter :kind I-LIST :a (.code e) :b ""))))))
+
+;;; A loop binding `var` to each thing `it` gives, around `body`.
+(defn gen-for [(k (mut K)) (var (slice u8)) (it Iter) (body (slice u8))] (-> (slice u8))
+  (let [v (local-name var)
+        x (fresh (mut k) "i")]
+    (cond
+      (= (.kind it) I-RANGE)
+        (cat6 "(for " v " (range " (.a it) (t/cat3 " " (.b it) ") ") (t/cat2 body ")"))
+      (= (.kind it) I-REVERSE)
+        (cat6 "(let [(mut " x (t/cat3 ") (- " (.b it) " 1)] (while (>= ") x
+              (t/cat4 " " (.a it) ") (let [" (t/cat4 v " " x "] "))
+              (t/cat4 body ") (set! " x (t/cat3 " (- " x " 1))))")))
+      (and (= (.kind it) I-ENTITY) (ops-mode? (.d k)) (or (= (.a it) "Value") (= (.a it) "Block")))
+        (cat6 "(for " x (if (= (.a it) "Value") " (range 1 (+ (view/value-count (.f cx)) 1)) (let [" " (range 1 (+ (view/block-count (.f cx)) 1)) (let [")
+              v (t/cat3 " (cast i32 " x ")] ") (t/cat2 body "))"))
+      (= (.kind it) I-INSTS)
+        (let [b (fresh (mut k) "b")]
+          (cat6 (t/cat4 "(let [" b " (- (cast i64 " (t/cat2 (.a it) ") 1)] (for "))
+                (t/cat4 x " (range (view/block-first (.f cx) " b ") ")
+                (t/cat3 "(view/block-end (.f cx) " b ")) (let [")
+                (t/cat4 v " (cast i32 (+ (view/inst (.f cx) " x ") 1))] ")
+                body ")))"))
+      (= (.kind it) I-PHIS)
+        (let [b (fresh (mut k) "b")]
+          (cat6 (t/cat4 "(let [" b " (- (cast i64 " (t/cat2 (.a it) ") 1)] (for "))
+                (t/cat4 x " (range 0 (view/phi-count (.f cx) " b ")) (let [")
+                (t/cat3 v " (cast i32 (+ (view/phi (.f cx) " (t/cat4 b " " x ") 1))] "))
+                body ")))" ""))
+      (and (= (.kind it) I-ENTITY) (= (.a it) "Node"))
+        (cat6 "(for " x " (range 1 (graph/size (.g cx))) (let [" v
+              (t/cat3 " (cast i32 " x ")] ") (t/cat2 body "))"))
+      (= (.kind it) I-ENTITY)
+        (cat6 "(for " x " (range 1 (+ (cast i64 (." (t/lower (.a it))
+              (t/cat4 "-count cx)) 1)) (let [" v " (cast i32 " (t/cat2 x ")] "))
+              (t/cat2 body "))"))
+      (= (.kind it) I-INPUTS)
+        (let [n (fresh (mut k) "n")]
+          (cat6 (t/cat4 "(let [" n " " (.a it)) "] (for " x
+                (t/cat3 " (range 0 (graph/arity (.g cx) " n ")) (let [")
+                (t/cat4 v " (graph/input (.g cx) " n (t/cat3 " " x ")] "))
+                (t/cat2 body ")))")))
+      ; Each use of a node, as an edge; the body may move the edge elsewhere.
+      (= (.kind it) I-EDGES)
+        (let [next (fresh (mut k) "e")]
+          (cat6 (t/cat4 "(let [(mut " x ") (graph/first-use (.g cx) " (.a it))
+                (t/cat3 ")] (while (>= " x " 0) (let [")
+                (t/cat4 v " " x " ")
+                (t/cat4 next " (graph/next-use (.g cx) " x ")] ")
+                body
+                (t/cat4 " (set! " x " " (t/cat2 next "))))"))))
+      (= (.kind it) I-USERS)
+        (let [next (fresh (mut k) "e")]
+          (cat6 (t/cat4 "(let [(mut " x ") (graph/first-use (.g cx) " (.a it))
+                (t/cat3 ")] (while (>= " x " 0) (let [")
+                (t/cat4 v " (graph/user (.g cx) " x ") ")
+                (t/cat4 next " (graph/next-use (.g cx) " x ")] ")
+                body
+                (t/cat4 " (set! " x " " (t/cat2 next "))))"))))
+      (= (.kind it) I-LISTS)
+        (let [col (t/cat3 "(." (.a it) " cx)")]
+          (cat6 (t/cat4 "(let [(mut " x ") (lists/first " (t/cat4 col " " (.b it) ")] (while (>= "))
+                x
+                (if (int-list? (.d k) (.a it))
+                    (t/cat4 " 0) (let [" v " (cast i64 (lists/at " (t/cat4 col " " x "))] "))
+                    (t/cat4 " 0) (let [" v " (lists/at " (t/cat4 col " " x ")] ")))
+                body
+                (t/cat4 ") (set! " x " (lists/after " (t/cat4 col " " x "))))"))
+                ""))
+      ; A list, by index: what it holds when the loop starts.
+      :else
+        (let [l (fresh (mut k) "l")]
+          (cat6 (t/cat4 "(let [" l " " (.a it)) (t/cat4 "] (for " x " (range 0 (len " l)
+                (t/cat4 ")) (let [" v " (get " l) (t/cat4 " " x ")] " body)
+                ")))" "")))))
+
+;;; `any x in xs: test` and its kin: a loop with one running value.
+(defn quantifier [(k (mut K)) (word (slice u8))] (-> E)
+  (let [var (t/name! (mut (.c k)) "a name")
+        mark (len (.locals k))]
+    (t/expect! (mut (.c k)) "in")
+    (let [it (parse-iter (mut k))]
+      (t/expect! (mut (.c k)) ":")
+      (push! (mut (.locals k)) var)
+      (let [body (.code (expr (mut k) 0))
+            acc (fresh (mut k) "acc")
+            best (fresh (mut k) "best")
+            v (local-name var)]
+        (while (> (len (.locals k)) mark) (pop! (mut (.locals k))))
+        (value
+          (cond
+            (= word "any")
+              (cat6 "(let [(mut " acc ") false] "
+                    (gen-for (mut k) var it (t/cat4 "(when " body " (set! " (t/cat2 acc " true))")))
+                    " " (t/cat2 acc ")"))
+            (= word "all")
+              (cat6 "(let [(mut " acc ") true] "
+                    (gen-for (mut k) var it (t/cat4 "(unless " body " (set! " (t/cat2 acc " false))")))
+                    " " (t/cat2 acc ")"))
+            (= word "count")
+              (cat6 "(let [(mut " acc ") 0] "
+                    (gen-for (mut k) var it
+                             (t/cat4 "(when " body " (set! " (t/cat4 acc " (+ " acc " 1)))")))
+                    " " (t/cat2 acc ")"))
+            (= word "sum")
+              (cat6 "(let [(mut " acc ") 0] "
+                    (gen-for (mut k) var it (t/cat4 "(set! " acc " (+ " (t/cat4 acc " " body "))")))
+                    " " (t/cat2 acc ")"))
+            (= word "first")
+              (cat6 "(let [(mut " acc ") (: 0 i32)] "
+                    (gen-for (mut k) var it
+                             (cat6 "(when (and (= " acc " 0) " body ") (set! "
+                                   (t/cat4 acc " " v "))")))
+                    " " (t/cat2 acc ")"))
+            ; greatest: the largest value, or 0.
+            (= word "greatest")
+              (cat6 "(let [(mut " acc ") 0] "
+                    (gen-for (mut k) var it
+                             (cat6 "(let [w* " body "] (when (> w* " acc ") (set! "
+                                   (t/cat2 acc " w*)))")))
+                    " " (t/cat2 acc ")"))
+            ; least: the one whose value is smallest, or none.
+            :else
+              (cat6 "(let [(mut " acc (t/cat3 ") (: 0 i32) (mut " best ") 0] ")
+                    (gen-for (mut k) var it
+                             (cat6 (t/cat4 "(let [w* " body "] (when (or (= " acc)
+                                   (t/cat3 " 0) (< w* " best ")) (set! ")
+                                   (t/cat4 acc " " v ") (set! ")
+                                   best " w*)" "))"))
+                    " " (t/cat2 acc ")"))))))))
+
+(defn primary [(k (mut K))] (-> E)
+  (let [tok (t/advance! (mut (.c k)))
+        name (.text tok)]
+    (cond
+      (= (.kind tok) t/T-NUM)
+        (value (if (> (.value tok) (: 0x7FFFFFFFFFFFFFFF u64))
+                   (t/u64-text (.value tok))
+                   (t/int-text (cast i64 (.value tok)))))
+      (= (.kind tok) t/T-STR) (value (t/cat3 "\"" name "\""))
+      (t/tok-is? tok "(")
+        (let [e (expr (mut k) 0)]
+          (t/expect! (mut (.c k)) ")")
+          (value (.code e)))
+      (t/tok-is? tok "-") (value (t/cat3 "(- 0 " (.code (unary (mut k))) ")"))
+      (!= (.kind tok) t/T-IDENT)
+        (t/die (mut (.c k)) tok (t/cat2 "expected a value, found " name))
+      (local? (mut k) name) (E :code (local-name name) :kind E-LOCAL :x (local-name name) :y "")
+      ; The graph itself, for the node set's builders: `ir.phi!(mut graph, …)`.
+      (= name "graph") (value "(.g cx)")
+      (= name "true") (value "true")
+      (= name "false") (value "false")
+      (= name "none") (value "0")
+      (= name "if")
+        (let [test (.code (expr (mut k) 0))]
+          (t/expect! (mut (.c k)) "then")
+          (let [yes (.code (expr (mut k) 0))]
+            (t/expect! (mut (.c k)) "else")
+            (value (cat6 "(if " test " " yes " " (t/cat2 (.code (expr (mut k) 0)) ")")))))
+      (or (= name "any") (= name "all") (= name "count") (= name "sum") (= name "first")
+          (= name "least") (= name "greatest"))
+        (quantifier (mut k) name)
+      (t/at? (mut (.c k)) "(")
+        (do (t/advance! (mut (.c k)))
+            (cond
+              (>= (func-index (.d k) (.module k) name) 0)
+                (let [f (get (.funcs (.d k)) (func-index (.d k) (.module k) name))]
+                  (value (cat5 "(" (local-name name) " (mut cx)" (call-args (mut k) f tok) ")")))
+              (record? (.d k) name) (record-literal (mut k) name)
+              :else (builtin-call (mut k) name tok)))
+      (>= (cell-index (.d k) name) 0)
+        (E :code (t/cat3 "(." name " cx)") :kind E-CELL :x name :y "")
+      (entity? (.d k) name) (E :code "" :kind E-ENTITY :x name :y "")
+      (!= (alias-module (mut k) name) "") (E :code "" :kind E-MODULE :x name :y "")
+      (>= (t/index-of (.raws k) name) 0) (E :code "" :kind E-RAW :x name :y "")
+      (and (ops-mode? (.d k)) (>= (ops/op-number (.ops (.d k)) name) 0)) (value (t/cat2 "ops/" name))
+      (and (ops-mode? (.d k)) (>= (ops/type-number (.ops (.d k)) name) 0)) (value (t/cat2 "ops/T-" name))
+      (!= (ir/node-number (.spec (.d k)) name) 0) (value (t/cat2 "ir/" name))
+      (!= (ir/type-number (.spec (.d k)) name) 0) (value (t/cat2 "ir/T-" (t/upper name)))
+      :else (t/die (mut (.c k)) tok (t/cat2 "no such name: " name)))))
+
+;;; `Range(from: a, to: b)`.
+(defn record-literal [(k (mut K)) (name (slice u8))] (-> E)
+  (let [(mut o) (t/out-new)]
+    (t/emit! (mut o) (t/cat2 "(st/" name))
+    (unless (t/at? (mut (.c k)) ")")
+      (let [(mut more) true]
+        (while more
+          (let [field (t/name! (mut (.c k)) "a field name")]
+            (t/expect! (mut (.c k)) ":")
+            (t/emit! (mut o) (t/cat4 " :" field " " (.code (expr (mut k) 0)))))
+          (set! more (t/accept! (mut (.c k)) ",")))))
+    (t/expect! (mut (.c k)) ")")
+    (t/emit! (mut o) ")")
+    (value (t/text-of (mut o)))))
+
+;;; Functions the language itself gives.
+(defn builtin-call [(k (mut K)) (name (slice u8)) (at t/Tok)] (-> E)
+  (let [args (plain-args (mut k))
+        n (len args)
+        a (if (> n 0) (get args 0) "")
+        b (if (> n 1) (get args 1) "")]
+    (value
+      (cond
+        (and (= name "int") (= n 1)) (t/cat3 "(cast i64 " a ")")
+        (and (= name "id") (= n 1)) (t/cat3 "(cast i32 " a ")")
+        (and (= name "word") (= n 1)) (t/cat3 "(cast u64 " a ")")
+        (and (= name "min") (= n 2)) (cat5 "(let [x* " a " y* " b "] (if (< x* y*) x* y*))")
+        (and (= name "max") (= n 2)) (cat5 "(let [x* " a " y* " b "] (if (> x* y*) x* y*))")
+        ; The function's parameters: how many, and each one's type.
+        (and (= name "param-count") (= n 0)) "(graph/param-count (.g cx))"
+        (and (= name "param-type") (= n 1)) (t/cat3 "(graph/param-type (.g cx) " a ")")
+        (and (= name "float-type?") (= n 1)) (t/cat3 "(ir/type-float? " a ")")
+        (and (= name "type-bytes") (= n 1)) (t/cat3 "(/ (+ (ir/type-bits " a ") 7) 8)")
+        ; How a parameter, and an argument of a call of some shape, is passed.
+        (and (= name "param-passing") (= n 1)) (t/cat3 "(graph/param-passing (.g cx) " a ")")
+        (and (= name "shape-passing") (= n 2)) (cat5 "(graph/shape-passing (.g cx) " a " " b ")")
+        (and (= name "shape-variadic") (= n 1)) (t/cat3 "(graph/shape-variadic? (.g cx) " a ")")
+        ; A call that follows no convention: what it may write, where its
+        ; result is, and the machine code it is, if it is code and not a call.
+        (and (= name "shape-pinned") (= n 1)) (t/cat3 "(graph/shape-pinned? (.g cx) " a ")")
+        (and (= name "shape-clobbers") (= n 1)) (t/cat3 "(graph/shape-clobbers (.g cx) " a ")")
+        (and (= name "shape-result") (= n 1)) (t/cat3 "(graph/shape-result (.g cx) " a ")")
+        (and (= name "shape-code-bytes") (= n 1)) (t/cat3 "(graph/shape-code-bytes (.g cx) " a ")")
+        (and (= name "shape-code-byte") (= n 2)) (cat5 "(graph/shape-code-byte (.g cx) " a " " b ")")
+        (and (= name "panic") (= n 1)) (t/cat3 "(panic " a ")")
+        ; Sets of small numbers, as the bits of a Word.
+        (and (= name "bit") (= n 1)) (t/cat3 "(<< (: 1 u64) (cast u64 " a "))")
+        (and (= name "has-bit") (= n 2)) (cat5 "(!= (& " a " (<< (: 1 u64) (cast u64 " b "))) 0)")
+        (and (= name "set-bit") (= n 2)) (cat5 "(| " a " (<< (: 1 u64) (cast u64 " b ")))")
+        (and (= name "clear-bit") (= n 2))
+          (cat5 "(& " a " (^ (<< (: 1 u64) (cast u64 " b ")) (: 0xFFFFFFFFFFFFFFFF u64)))")
+        (and (= name "lowest-bit") (= n 1)) (t/cat3 "(bv/lowest " a ")")
+        (and (= name "highest-bit") (= n 1)) (t/cat3 "(bv/highest " a ")")
+        (and (= name "bit-count") (= n 1)) (t/cat3 "(bv/count " a ")")
+        (and (= name "print") (>= n 1))
+          (let [(mut o) (t/out-new)]
+            (t/emit! (mut o) "(println")
+            (for arg args (t/emit! (mut o) (t/cat2 " " arg)))
+            (t/emit! (mut o) ")")
+            (t/text-of (mut o)))
+        (and (= name "grow-nodes") (= n 0)) "(st/grow-nodes! (mut cx))"
+        ; Forget everything the passes have worked out, keeping the graph.
+        (and (= name "start-over") (= n 0)) "(st/begin! (mut cx))"
+        ; Editing the graph.
+        (and (= name "replace-uses") (= n 2)) (cat5 "(graph/replace-uses! (mut (.g cx)) " a " " b ")")
+        (and (= name "drop") (= n 1)) (t/cat3 "(graph/drop! (mut (.g cx)) " a ")")
+        ; A node over again, for whoever is about to change an input of it.
+        (and (= name "copy") (= n 1)) (t/cat3 "(graph/copy! (mut (.g cx)) " a ")")
+        ; Whether a call of this symbol is known to write no memory.
+        ; Where a node came from, as whoever built the graph numbered it; 0 if it said nothing.
+        (and (= name "origin") (= n 1)) (t/cat3 "(graph/origin (.g cx) " a ")")
+        ; Nodes made from here on come from where this one came from (none: from nowhere).
+        (and (= name "from") (= n 1)) (t/cat3 "(graph/from! (mut (.g cx)) " a ")")
+        (and (= name "reads-only") (= n 1)) (t/cat3 "(graph/reads-only? (.g cx) " a ")")
+        ; Where the graph's builder was as it built: how many blocks it marked,
+        ; and for each the first node made in it and the control node it starts at.
+        ; In a unit over an IR said in `.ops`: its parameters, a block's k-th
+        ; instruction, the value a phi takes from a block, a switch's case values.
+        (and (= name "arg-count") (= n 0) (ops-mode? (.d k))) "(view/arg-count (.f cx))"
+        (and (= name "arg-value") (= n 1) (ops-mode? (.d k))) (t/cat3 "(cast i32 (+ (view/arg (.f cx) " a ") 1))")
+        (and (= name "arg-flags") (= n 1) (ops-mode? (.d k))) (t/cat3 "(view/arg-flags (.f cx) " a ")")
+        ; Whether an address of something in the function's frame escapes it.
+        (and (= name "frame-escapes") (= n 0) (ops-mode? (.d k))) "(view/frame-escapes? (.f cx))"
+        ; How parameter k, and operand i of a call, is passed, as rt.graph's PASS-… bits.
+        (and (= name "arg-passing") (= n 1) (ops-mode? (.d k))) (t/cat3 "(view/arg-passing (.f cx) " a ")")
+        (and (= name "operand-passing") (= n 2) (ops-mode? (.d k)))
+          (cat5 "(view/operand-passing (.f cx) (- (cast i64 " a ") 1) " b ")")
+        (and (= name "inst-at") (= n 1) (ops-mode? (.d k))) (t/cat3 "(cast i32 (+ (view/inst (.f cx) " a ") 1))")
+        (and (= name "incoming") (= n 2) (ops-mode? (.d k)))
+          (cat5 "(cast i32 (+ (view/incoming (.f cx) (- (cast i64 " a ") 1) (- (cast i64 " b ") 1)) 1))")
+        (and (= name "case-value") (= n 2) (ops-mode? (.d k)))
+          (cat5 "(view/case-value (.f cx) (- (cast i64 " a ") 1) " b ")")
+        ; A call that follows no convention: the register operand i is put in,
+        ; how many bytes of machine code it is, and its k-th.
+        (and (= name "pinned-register") (= n 2) (ops-mode? (.d k)))
+          (cat5 "(view/pinned-register (.f cx) (- (cast i64 " a ") 1) " b ")")
+        (and (= name "inline-count") (= n 1) (ops-mode? (.d k)))
+          (t/cat3 "(view/inline-count (.f cx) (- (cast i64 " a ") 1))")
+        (and (= name "inline-byte") (= n 2) (ops-mode? (.d k)))
+          (cat5 "(view/inline-byte (.f cx) (- (cast i64 " a ") 1) " b ")")
+        (and (= name "mark-count") (= n 0)) "(graph/mark-count (.g cx))"
+        ; The node control starts at.
+        (and (= name "start") (= n 0)) "(.start (.g cx))"
+        (and (= name "mark-first") (= n 1)) (t/cat3 "(graph/mark-first (.g cx) " a ")")
+        (and (= name "mark-head") (= n 1)) (t/cat3 "(graph/mark-head (.g cx) " a ")")
+        ; What else is known of the routine a symbol is: 0 nothing, 1 it only
+        ; reads, 2 memcpy, 3 memmove, 4 memset, 5 memcmp.
+        (and (= name "routine-kind") (= n 1)) (t/cat3 "(graph/routine-kind (.g cx) " a ")")
+        (and (= name "set-input") (= n 3))
+          (cat6 "(graph/set-input! (mut (.g cx)) " a " " b " " (t/cat2 (get args 2) ")"))
+        ; An edge is one use of a node: who uses it, and as which input.
+        (and (= name "edge-user") (= n 1)) (t/cat3 "(graph/user (.g cx) " a ")")
+        (and (= name "edge-slot") (= n 1)) (t/cat3 "(graph/slot (.g cx) " a ")")
+        :else (t/die (mut (.c k)) at (t/cat2 "no function named " name))))))
+
+;;; What follows a value: `.name`, `.name(args)`, `[index]`.
+(defn postfix [(k (mut K))] (-> E)
+  (let [(mut e) (primary (mut k))
+        (mut going) true]
+    (while going
+      (let [tok (t/peek (mut (.c k)))]
+        (cond
+          (and (t/tok-is? tok ".") (.glued tok))
+            (do (t/advance! (mut (.c k)))
+                (set! e (member (mut k) e)))
+          (and (t/tok-is? tok "[") (.glued tok))
+            (do (t/advance! (mut (.c k)))
+                (let [index (.code (expr (mut k) 0))]
+                  (t/expect! (mut (.c k)) "]")
+                  (set! e
+                        (if (= (.kind e) E-LISTS)
+                            (E :code (if (int-list? (.d k) (.x e))
+                                         (cat6 "(cast i64 (lists/nth (." (.x e) " cx) " (.y e) " "
+                                               (t/cat2 index "))"))
+                                         (cat6 "(lists/nth (." (.x e) " cx) " (.y e) " "
+                                               (t/cat2 index ")")))
+                               :kind E-INDEX :x (t/cat2 "!" (.x e)) :y (t/cat3 (.y e) " " index))
+                            (E :code (cat5 "(get " (.code e) " " index ")")
+                               :kind E-INDEX :x (.code e) :y index)))))
+          :else (set! going false))))
+    e))
+
+(defn member [(k (mut K)) (e E)] (-> E)
+  (let [tok (t/peek (mut (.c k)))
+        name (t/name! (mut (.c k)) "a name after `.`")
+        call (and (t/at? (mut (.c k)) "(") (.glued (t/peek (mut (.c k)))))
+        code (.code e)
+        g "(.g cx)"]
+    (cond
+      (= (.kind e) E-MODULE)
+        (let [module (alias-module (mut k) (.x e))
+              index (func-index (.d k) module name)]
+          (when (< index 0) (t/die (mut (.c k)) tok (t/cat4 module " has no function " name "")))
+          (t/expect! (mut (.c k)) "(")
+          (value (cat6 "(" (.x e) "/" (if (pass-module? (.d k) module) (local-name name) name) " (mut cx)"
+                       (t/cat2 (call-args (mut k) (get (.funcs (.d k)) index) tok) ")"))))
+      ; A module that is not a pass: its names as they are, its functions without the state.
+      (= (.kind e) E-RAW)
+        (if call
+            (do (t/advance! (mut (.c k)))
+                (let [args (plain-args (mut k))
+                      (mut o) (t/out-new)]
+                  (t/emit! (mut o) (cat5 "(" (.x e) "/" name ""))
+                  (for arg args (t/emit! (mut o) (t/cat2 " " arg)))
+                  (t/emit! (mut o) ")")
+                  (value (t/text-of (mut o)))))
+            (value (t/cat3 (.x e) "/" name)))
+      (= (.kind e) E-ENTITY)
+        (cond (= name "new")
+                (do (t/expect! (mut (.c k)) "(") (t/expect! (mut (.c k)) ")")
+                    (value (t/cat3 "(st/" (t/lower (.x e)) "-new! (mut cx))")))
+              (and (= name "count") (= (.x e) "Node")) (value "(- (graph/size (.g cx)) 1)")
+              (and (= name "count") (ops-mode? (.d k)) (= (.x e) "Value")) (value "(view/value-count (.f cx))")
+              (and (= name "count") (ops-mode? (.d k)) (= (.x e) "Block")) (value "(view/block-count (.f cx))")
+              (= name "count") (value (t/cat3 "(cast i64 (." (t/lower (.x e)) "-count cx))"))
+              :else (t/die (mut (.c k)) tok "an entity has `new()` and `count`"))
+      ; A list column's own operations.
+      (= (.kind e) E-LISTS)
+        (let [col (t/cat3 "(." (.x e) " cx)")]
+          (cond
+            (= name "len") (value (cat5 "(lists/count " col " " (.y e) ")"))
+            (= name "push")
+              (do (t/expect! (mut (.c k)) "(")
+                  (let [v (.code (expr (mut k) 0))]
+                    (t/expect! (mut (.c k)) ")")
+                    (value (if (int-list? (.d k) (.x e))
+                               (cat6 "(lists/push! (mut " col ") " (.y e) " (cast i32 " (t/cat2 v "))"))
+                               (cat6 "(lists/push! (mut " col ") " (.y e) " " (t/cat2 v ")"))))))
+            (= name "clear")
+              (do (t/expect! (mut (.c k)) "(") (t/expect! (mut (.c k)) ")")
+                  (value (cat5 "(lists/clear-key! (mut " col ") " (.y e) ")")))
+            :else (t/die (mut (.c k)) tok "a list column has len, push, clear, [i] and for")))
+      ; A column, read at this id.
+      (and (not call) (>= (column-index (.d k) name) 0))
+        (let [column (get (.columns (.d k)) (column-index (.d k) name))]
+          (if (list-type? (.type column))
+              (E :code "" :kind E-LISTS :x name :y code)
+              (let [raw (if (row-column? (.d k) (.key column) (.type column))
+                            (cat6 "(load (field (elem (mut (." (rows-field (.key column)) " cx)) (cast i64 " code (t/cat3 ")) " name "))") "")
+                            (cat5 "(get (." name " cx) (cast i64 " code "))"))]
+                (E :code (if (narrow-int? (.type column)) (t/cat3 "(cast i64 " raw ")") raw)
+                   :kind E-COLUMN :x name :y code))))
+      ; What the IR knows of a value or a block, in a unit over an IR said in
+      ; `.ops`: values and blocks are its numbers plus one.
+      (and (ops-mode? (.d k)) (not call)
+           (or (= name "op") (= name "type") (= name "arity") (= name "imm") (= name "imm2") (= name "aux")
+               (= name "name") (= name "role") (= name "targets") (= name "float")
+               (= name "first") (= name "end") (= name "term") (= name "phi-count")))
+        (let [x (t/cat3 "(- (cast i64 " code ") 1)")
+              f "(.f cx)"]
+          (value (cond (= name "op") (cat5 "(view/op " f " " x ")")
+                       (= name "type") (cat5 "(view/ty " f " " x ")")
+                       (= name "arity") (cat5 "(view/nops " f " " x ")")
+                       (= name "imm") (cat5 "(view/imm " f " " x ")")
+                       (= name "imm2") (cat5 "(view/imm2 " f " " x ")")
+                       (= name "aux") (cat5 "(view/aux " f " " x ")")
+                       (= name "name") (cat5 "(ops/name (view/op " f " " x "))")
+                       (= name "role") (cat5 "(ops/role (view/op " f " " x "))")
+                       (= name "targets") (cat5 "(view/targets " f " " x ")")
+                       (= name "float") (cat5 "(ops/type-float? (view/ty " f " " x "))")
+                       (= name "first") (cat5 "(view/block-first " f " " x ")")
+                       (= name "end") (cat5 "(view/block-end " f " " x ")")
+                       (= name "term") (cat5 "(cast i32 (+ (view/term " f " " x ") 1))")
+                       :else (cat5 "(view/phi-count " f " " x ")"))))
+      (and (ops-mode? (.d k)) call (or (= name "in") (= name "target") (= name "flags")))
+        (do (t/advance! (mut (.c k)))
+            (let [i (.code (expr (mut k) 0))
+                  x (t/cat3 "(- (cast i64 " code ") 1)")]
+              (t/expect! (mut (.c k)) ")")
+              (value (cond (= name "in") (cat5 "(cast i32 (+ (view/operand (.f cx) " x " " i ") 1))")
+                           (= name "target") (cat5 "(cast i32 (+ (view/target (.f cx) " x " " i ") 1))")
+                           :else (cat5 "(view/operand-flags (.f cx) " x " " i ")")))))
+      ; What the graph knows of a node.
+      (and (not call) (= name "op")) (value (cat5 "(graph/op " g " " code ")"))
+      (and (not call) (= name "type")) (value (cat5 "(graph/ty " g " " code ")"))
+      (and (not call) (= name "arity")) (value (cat5 "(graph/arity " g " " code ")"))
+      (and (not call) (= name "payload")) (value (cat5 "(graph/payload " g " " code ")"))
+      (and (not call) (= name "uses")) (value (cat5 "(graph/use-count " g " " code ")"))
+      (and (not call) (= name "dead")) (value (cat5 "(graph/dead? " g " " code ")"))
+      (and (not call) (= name "name")) (value (cat5 "(ir/name (graph/op " g " " code "))"))
+      (and (not call) (= name "role")) (value (cat5 "(ir/role (graph/op " g " " code "))"))
+      (and (not call) (= name "pure")) (value (cat5 "(ir/pure? (graph/op " g " " code "))"))
+      (and (not call) (= name "bits")) (value (cat5 "(ir/type-bits (graph/ty " g " " code "))"))
+      (and (not call) (= name "float")) (value (cat5 "(ir/type-float? (graph/ty " g " " code "))"))
+      (and call (= name "in"))
+        (do (t/advance! (mut (.c k)))
+            (let [i (.code (expr (mut k) 0))]
+              (t/expect! (mut (.c k)) ")")
+              (value (cat6 "(graph/input " g " " code " " (t/cat2 i ")")))))
+      ; A list's operations.
+      (and (not call) (= name "len")) (value (t/cat3 "(len " code ")"))
+      (and (not call) (= name "last")) (value (cat5 "(get " code " (- (len " code ") 1))"))
+      (and call (= name "push"))
+        (do (t/advance! (mut (.c k)))
+            (let [v (.code (expr (mut k) 0))]
+              (t/expect! (mut (.c k)) ")")
+              (value (cat5 "(lists/add! (mut " code ") " v ")"))))
+      (and call (= name "zeros"))
+        (do (t/advance! (mut (.c k)))
+            (let [v (.code (expr (mut k) 0))]
+              (t/expect! (mut (.c k)) ")")
+              (value (cat5 "(extend-zeroed! (mut " code ") " v ")"))))
+      (and call (= name "extend"))
+        (do (t/advance! (mut (.c k)))
+            (let [v (.code (expr (mut k) 0))]
+              (t/expect! (mut (.c k)) ")")
+              (value (cat5 "(extend! (mut " code ") (.data " v
+                           (t/cat3 ") (len " v "))")))))
+      (and call (= name "pop"))
+        (do (t/advance! (mut (.c k))) (t/expect! (mut (.c k)) ")")
+            (value (t/cat3 "(lists/take-last! (mut " code "))")))
+      (and call (= name "clear"))
+        (do (t/advance! (mut (.c k))) (t/expect! (mut (.c k)) ")")
+            (value (t/cat3 "(lists/empty! (mut " code "))")))
+      call (t/die (mut (.c k)) tok (t/cat2 "no operation named " name))
+      ; Otherwise a record's field.
+      :else (E :code (cat5 "(." name " " code ")") :kind E-FIELD :x code :y name))))
+
+(defn unary [(k (mut K))] (-> E)
+  (if (t/accept! (mut (.c k)) "not")
+      (value (t/cat3 "(not " (.code (unary (mut k))) ")"))
+      (postfix (mut k))))
+
+(defn level [(tok t/Tok)] (-> i64)
+  (let [op (.text tok)]
+    (cond (.first tok) 0
+          (and (!= (.kind tok) t/T-PUNCT) (!= (.kind tok) t/T-IDENT)) 0
+          (= op "or") 1
+          (= op "and") 2
+          (or (= op "==") (= op "!=") (= op "<") (= op "<=") (= op ">") (= op ">=") (= op "is")) 4
+          (= op "|") 5
+          (= op "^") 6
+          (= op "&") 7
+          (or (= op "<<") (= op ">>")) 8
+          (or (= op "+") (= op "-")) 9
+          (or (= op "*") (= op "/") (= op "%")) 10
+          :else 0)))
+
+(defn expr [(k (mut K)) (min i64)] (-> E)
+  (let [(mut left) (unary (mut k))
+        (mut going) true]
+    (while going
+      (let [tok (t/peek (mut (.c k)))
+            l (level tok)]
+        (if (and (> l 0) (> l min))
+            (do (t/advance! (mut (.c k)))
+                (if (= (.text tok) "is")
+                    ; `n is ADD`, `n is not ADD`: the node's operation.
+                    (let [negated (t/accept! (mut (.c k)) "not")
+                          at (t/peek (mut (.c k)))
+                          node (t/name! (mut (.c k)) "a node name")
+                          test (if (ops-mode? (.d k))
+                                   (cat5 "(= (view/op (.f cx) (- (cast i64 " (.code left) ") 1)) ops/" node ")")
+                                   (cat5 "(= (graph/op (.g cx) " (.code left) ") ir/" node ")"))]
+                      (when (if (ops-mode? (.d k))
+                                (< (ops/op-number (.ops (.d k)) node) 0)
+                                (= (ir/node-number (.spec (.d k)) node) 0))
+                        (t/die (mut (.c k)) at (t/cat2 "no operation named " node)))
+                      (set! left (value (if negated (t/cat3 "(not " test ")") test))))
+                    (let [right (expr (mut k) l)
+                          op (if (= (.text tok) "==") "=" (.text tok))]
+                      (set! left
+                            (value (cat6 "(" op " " (.code left) " " (t/cat2 (.code right) ")")))))))
+            (set! going false))))
+    left))
+
+;; ---------------------------------------------------------------- statements
+
+(defn assign [(k (mut K)) (place E) (v (slice u8)) (at t/Tok)] (-> (slice u8))
+  (cond
+    (= (.kind place) E-LOCAL) (cat5 "(set! " (.x place) " " v ")")
+    (= (.kind place) E-CELL) (cat5 "(set! (." (.x place) " cx) " v ")")
+    (= (.kind place) E-COLUMN)
+      (let [column (get (.columns (.d k)) (column-index (.d k) (.x place)))
+            value (cond (= (.type column) "Int32") (t/cat3 "(bv/int32 " v ")")
+                        (= (.type column) "Int8") (t/cat3 "(bv/int8 " v ")")
+                        :else v)]
+        (if (row-column? (.d k) (.key column) (.type column))
+            (cat6 "(store! (field (elem (mut (." (rows-field (.key column)) " cx)) (cast i64 " (.y place)
+                  (t/cat3 ")) " (.x place) ") ") (t/cat2 value ")"))
+            (cat6 "(set! (mut (." (.x place) " cx)) (cast i64 " (.y place) ") " (t/cat2 value ")"))))
+    (and (= (.kind place) E-INDEX) (> (len (.x place)) 0) (= (get (.x place) 0) #\!))
+      (if (int-list? (.d k) (t/slice-of (.x place) 1 (len (.x place))))
+          (cat6 "(lists/set-nth! (mut (." (t/slice-of (.x place) 1 (len (.x place))) " cx)) "
+                (.y place) " (cast i32 " (t/cat2 v "))"))
+          (cat6 "(lists/set-nth! (mut (." (t/slice-of (.x place) 1 (len (.x place))) " cx)) "
+                (.y place) " " (t/cat2 v ")")))
+    (= (.kind place) E-INDEX)
+      (cat6 "(set! (mut " (.x place) ") " (.y place) " " (t/cat2 v ")"))
+    (= (.kind place) E-FIELD) (cat6 "(set! (." (.y place) " " (.x place) ") " (t/cat2 v ")"))
+    :else (t/die (mut (.c k)) at "this cannot be assigned to")))
+
+;;; `{ statements }` as one Coil form, whose value is the last statement's.
+(defn block [(k (mut K))] (-> (slice u8))
+  (t/expect! (mut (.c k)) "{")
+  (let [(mut o) (t/out-new)
+        (mut open) 0
+        (mut needs-value) true
+        mark (len (.locals k))]
+    (t/emit! (mut o) "(do")
+    (while (not (t/accept! (mut (.c k)) "}"))
+      (let [tok (t/peek (mut (.c k)))]
+        (if (or (t/tok-is? tok "let") (t/tok-is? tok "var"))
+            (do (t/advance! (mut (.c k)))
+                (let [name (t/name! (mut (.c k)) "a name")
+                      type (if (t/accept! (mut (.c k)) ":") (parse-type (mut (.c k)) (.d k)) "")
+                      eq (t/expect! (mut (.c k)) "=")
+                      init (cond
+                             (and (t/at? (mut (.c k)) "[") (t/tok-is? (t/peek-at (mut (.c k)) 1) "]"))
+                               (do (t/advance! (mut (.c k))) (t/advance! (mut (.c k)))
+                                   (when (not (list-type? type))
+                                     (t/die (mut (.c k)) eq "an empty list needs its type: `var xs: [T] = []`"))
+                                   (t/cat3 "(ArrayList::new ["
+                                           (coil-type (.d k) (element-type type) "st/")
+                                           "] (.tmp cx))"))
+                             :else
+                               (let [first (t/peek (mut (.c k)))
+                                     e (.code (expr (mut k) 0))
+                                     literal (or (= (.kind first) t/T-NUM) (t/tok-is? first "none"))]
+                                 (if (and literal (!= type ""))
+                                     (cat5 "(: " e " " (coil-type (.d k) type "st/") ")")
+                                     e)))
+                      bind (if (or (t/tok-is? tok "var") (list-type? type))
+                               (t/cat3 "(mut " (local-name name) ")")
+                               (local-name name))]
+                  (push! (mut (.locals k)) name)
+                  (t/emit! (mut o) (cat5 " (let [" bind " " init "]"))
+                  (set! open (+ open 1))
+                  (set! needs-value true)))
+            (do (t/emit! (mut o) (t/cat2 " " (statement (mut k))))
+                (set! needs-value false)))))
+    (when needs-value (t/emit! (mut o) " 0"))
+    (for _ (range 0 open) (t/emit! (mut o) ")"))
+    (t/emit! (mut o) ")")
+    (while (> (len (.locals k)) mark) (pop! (mut (.locals k))))
+    (t/text-of (mut o))))
+
+;;; A block, or one statement on the rest of the line.
+(defn body [(k (mut K))] (-> (slice u8))
+  (if (t/at? (mut (.c k)) "{") (block (mut k)) (statement (mut k))))
+
+(defn if-statement [(k (mut K))] (-> (slice u8))
+  (let [test (.code (expr (mut k) 0))]
+    ; `if a then b else c` where a statement may stand: the expression.
+    (if (t/accept! (mut (.c k)) "then")
+        (let [yes (.code (expr (mut k) 0))]
+          (t/expect! (mut (.c k)) "else")
+          (cat6 "(if " test " " yes " " (t/cat2 (.code (expr (mut k) 0)) ")")))
+        (if-blocks (mut k) test))))
+
+(defn if-blocks [(k (mut K)) (test (slice u8))] (-> (slice u8))
+  (let [yes (block (mut k))]
+    (if (t/accept! (mut (.c k)) "else")
+        (let [no (if (t/accept! (mut (.c k)) "if") (if-statement (mut k)) (block (mut k)))]
+          (cat6 "(if " test " " yes " " (t/cat2 no ")")))
+        (cat5 "(when " test " " yes ")"))))
+
+;;; `match n { ADD(a, b) => …  CONST => …  _ => … }` on a node's operation.
+(defn match-statement [(k (mut K))] (-> (slice u8))
+  (let [subject (.code (expr (mut k) 0))
+        n (fresh (mut k) "m")
+        (mut o) (t/out-new)
+        (mut total) false]
+    (t/expect! (mut (.c k)) "{")
+    (t/emit! (mut o) (cat5 "(let [" n " " subject "] (cond"))
+    (while (not (t/accept! (mut (.c k)) "}"))
+      (let [tok (t/peek (mut (.c k)))
+            mark (len (.locals k))]
+        (if (t/accept! (mut (.c k)) "_")
+            (do (t/expect! (mut (.c k)) "=>")
+                (t/emit! (mut o) (t/cat2 " :else " (body (mut k))))
+                (set! total true))
+            (let [(mut test) (t/out-new)
+                  (mut binds) (t/out-new)
+                  (mut more) true
+                  (mut first) true]
+              (t/emit! (mut test) " (or")
+              (while more
+                (let [at (t/peek (mut (.c k)))
+                      node (t/name! (mut (.c k)) "a node name")]
+                  (when (= (ir/node-number (.spec (.d k)) node) 0)
+                    (t/die (mut (.c k)) at (t/cat2 "no node named " node)))
+                  (t/emit! (mut test) (cat5 " (= (graph/op (.g cx) " n ") ir/" node ")"))
+                  (when (and (t/at? (mut (.c k)) "(") (.glued (t/peek (mut (.c k)))))
+                    (t/advance! (mut (.c k)))
+                    (let [(mut i) 0]
+                      (while (not (t/accept! (mut (.c k)) ")"))
+                        (let [operand (t/name! (mut (.c k)) "a name or _")]
+                          (when (!= operand "_")
+                            (when first
+                              (t/emit! (mut binds)
+                                       (cat6 (local-name operand) " (graph/input (.g cx) " n " "
+                                             (t/int-text i) ") "))
+                              (push! (mut (.locals k)) operand)))
+                          (set! i (+ i 1))
+                          (t/accept! (mut (.c k)) ",")))))
+                  (set! first false))
+                (set! more (t/accept! (mut (.c k)) "|")))
+              (t/emit! (mut test) ")")
+              (t/expect! (mut (.c k)) "=>")
+              (t/emit! (mut o)
+                       (cat6 (t/text-of (mut test)) " (let [" (t/text-of (mut binds)) "] "
+                             (body (mut k)) ")"))))
+        (while (> (len (.locals k)) mark) (pop! (mut (.locals k))))))
+    (unless total (t/emit! (mut o) " :else 0"))
+    (t/emit! (mut o) "))")
+    (t/text-of (mut o))))
+
+(defn statement [(k (mut K))] (-> (slice u8))
+  (let [tok (t/peek (mut (.c k)))]
+    (cond
+      (t/accept! (mut (.c k)) "if") (if-statement (mut k))
+      (t/accept! (mut (.c k)) "match") (match-statement (mut k))
+      (t/accept! (mut (.c k)) "while")
+        (let [test (.code (expr (mut k) 0))
+              outer (.breaks k)]
+          (set! (.breaks k) false)
+          (let [inside (block (mut k))
+                broke (.breaks k)]
+            (set! (.breaks k) outer)
+            (if broke
+                (cat5 "(block :brk (while " test " " inside ") 0)")
+                (cat5 "(while " test " " inside ")"))))
+      (t/accept! (mut (.c k)) "for")
+        (let [var (t/name! (mut (.c k)) "a name")
+              mark (len (.locals k))
+              outer (.breaks k)]
+          (t/expect! (mut (.c k)) "in")
+          (let [it (parse-iter (mut k))]
+            (push! (mut (.locals k)) var)
+            (set! (.breaks k) false)
+            (let [inside (block (mut k))
+                  broke (.breaks k)
+                  loop (gen-for (mut k) var it inside)]
+              (set! (.breaks k) outer)
+              (while (> (len (.locals k)) mark) (pop! (mut (.locals k))))
+              (if broke (t/cat3 "(block :brk " loop " 0)") loop))))
+      (t/accept! (mut (.c k)) "break")
+        (do (set! (.breaks k) true) "(return-from :brk 0)")
+      (t/accept! (mut (.c k)) "return")
+        (do (set! (.returns k) true)
+            (if (or (t/at-line-start? (mut (.c k))) (t/at? (mut (.c k)) "}"))
+                "(return-from :ret 0)"
+                (t/cat3 "(return-from :ret " (.code (expr (mut k) 0)) ")")))
+      :else
+        (let [e (expr (mut k) 0)]
+          (if (and (t/at? (mut (.c k)) "=") (not (t/at-line-start? (mut (.c k)))))
+              (do (t/advance! (mut (.c k)))
+                  (assign (mut k) e (.code (expr (mut k) 0)) tok))
+              (.code e))))))
+
+;; ---------------------------------------------------------------- a pass's module
+
+(defn function-text [(k (mut K)) (f Func)] (-> (slice u8))
+  (let [(mut o) (t/out-new)
+        (mut params) (t/out-new)]
+    (clear! (mut (.locals k)))
+    (set! (.returns k) false)
+    (for param (.params f)
+      (push! (mut (.locals k)) (.name param))
+      (t/emit! (mut params)
+               (if (list-type? (.type param))
+                   (cat5 " (" (local-name (.name param)) " (mut " (coil-type (.d k) (.type param) "st/") "))")
+                   (cat5 " (" (local-name (.name param)) " " (coil-type (.d k) (.type param) "st/") ")"))))
+    ; A function that is one expression is inlined wherever it is called,
+    ; across modules too, unless it calls itself; so is one declared `inline`.
+    ; (Coil reads `:inline` between a function's name and its parameters.)
+    (let [one (t/accept! (mut (.c k)) "=")
+          inside (if one (.code (expr (mut k) 0)) (block (mut k)))
+          void (= (.result f) "Void")
+          inline (or (.inline k) (and one (< (t/index-of-text inside (t/cat3 "(" (local-name (.name f)) " ")) 0)))]
+      (t/emit! (mut o) (cat5 "(defn " (local-name (.name f)) (if inline " :inline (Always)" "") " [(cx (mut st/State))" (t/text-of (mut params))))
+      (t/line! (mut o) (t/cat3 "] (-> " (coil-type (.d k) (.result f) "st/") ")"))
+      (t/line! (mut o)
+               (cond (and (.returns k) void) (t/cat3 "  (do (block :ret " inside " 0) (do)))")
+                     (.returns k) (t/cat3 "  (block :ret " inside "))")
+                     void (t/cat3 "  (do " inside " (do)))")
+                     :else (t/cat3 "  " inside ")"))))
+    (t/text-of (mut o))))
+
+(defn pass-text [(context Code)] (-> (slice u8))
+  (let [p (project/open context)
+        path (t/path-of context)
+        src (t/source-of context)
+        (mut c) (t/cursor src path)]
+    (t/expect! (mut c) "pass")
+    (t/expect! (mut c) "in")
+    (let [at (t/peek (mut c))
+          unit (project/resolve p (module-name! (mut c)) (.line at) (.col at))
+          d (load-unit p (project/file-of p unit (.line at) (.col at)) path)
+          (mut k) (K
+                    :c c
+                    :d d
+                    :module (project/module-of p path)
+                    :locals (ArrayList::new [(slice u8)] (malloc-allocator))
+                    :aliases (ArrayList::new [Field] (malloc-allocator))
+                    :raws (ArrayList::new [(slice u8)] (malloc-allocator))
+                    :returns false
+                    :breaks false
+                    :inline false
+                    :tmp 0)
+          (mut o) (t/out-new)]
+      ; The node set is there under the name `ir`, for its builders and tables.
+      (push! (mut (.raws k)) "ir")
+      (t/emit! (mut o) (depends-text d))
+      (t/line! (mut o) "(import \"coil.arraylist\" :use [ArrayList])")
+      (t/line! (mut o) "(import \"declarative.rt.graph\" :as graph)")
+      (t/line! (mut o) "(import \"declarative.rt.lists\" :as lists)")
+      (t/line! (mut o) "(import \"declarative.rt.bits\" :as bv)")
+      (t/line! (mut o) (t/cat3 "(import \"" unit "\" :as st)"))
+      (if (ops-mode? d)
+          (do (t/line! (mut o) (t/cat3 "(import \"" (.ops-module d) "\" :as ops)"))
+              (t/line! (mut o) (t/cat3 "(import \"" (.view (.ops d)) "\" :as view)")))
+          (t/line! (mut o) (t/cat3 "(import \"" (.nodes-module d) "\" :as ir)")))
+      (while (not (t/eof? (mut (.c k))))
+        (let [tok (t/advance! (mut (.c k)))]
+          (cond
+            (t/tok-is? tok "use")
+              (let [module (project/resolve p (module-name! (mut (.c k))) (.line tok) (.col tok))]
+                (t/expect! (mut (.c k)) "as")
+                (let [alias (t/name! (mut (.c k)) "a name")]
+                  (push! (mut (.aliases k)) (Field :name alias :type module))
+                  (t/line! (mut o) (cat5 "(import \"" module "\" :as " alias ")"))))
+            (t/tok-is? tok "import")
+              (let [named (module-name! (mut (.c k)))
+                    module (cond (= named "target") (.target-module d)
+                                 (= named "abi") (.abi-module d)
+                                 :else named)]
+                (when (= module "") (t/die (mut (.c k)) tok (t/cat2 "the unit names no " named)))
+                (t/expect! (mut (.c k)) "as")
+                (let [alias (t/name! (mut (.c k)) "a name")]
+                  (push! (mut (.raws k)) alias)
+                  (t/line! (mut o) (cat5 "(import \"" module "\" :as " alias ")"))))
+            (t/tok-is? tok "fn")
+              (let [f (parse-signature (mut (.c k)) d (.module k))]
+                (t/emit! (mut o) (function-text (mut k) f)))
+            ; `inline fn`: written into whatever calls it, across modules too.
+            (t/tok-is? tok "inline")
+              (do (t/expect! (mut (.c k)) "fn")
+                  (let [f (parse-signature (mut (.c k)) d (.module k))]
+                    (set! (.inline k) true)
+                    (t/emit! (mut o) (function-text (mut k) f))
+                    (set! (.inline k) false)))
+            ; Storage is the unit's; here a declaration is only passed over.
+            (or (t/tok-is? tok "entity") (t/tok-is? tok "column") (t/tok-is? tok "state") (t/tok-is? tok "setting")
+                (t/tok-is? tok "tally") (t/tok-is? tok "record"))
+              (skip-body! (mut (.c k)))
+            :else (t/die (mut (.c k)) tok (t/cat2 "expected a declaration, found " (.text tok))))))
+      (t/text-of (mut o)))))

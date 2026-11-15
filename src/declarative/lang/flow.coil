@@ -1,0 +1,378 @@
+;;; The `.flow` language: facts about values, as equations over the nodes.
+;;;
+;;;   fact width                       # how many low bits of a value may be set
+;;;     CONST k          = bit-length(k)
+;;;     AND(x, y)        = min(width(x), width(y))
+;;;     SHR(x, CONST k)  = width(x) - k
+;;;     PHI              = join
+;;;
+;;; A fact is a number from 0 up to the width of the value's type. A node with
+;;; no equation has the type's width, which says nothing. `join` is the largest
+;;; of a node's value inputs' facts, as a phi's must be. Equations may read
+;;; each other through loops: the solver starts every node at 0 and raises
+;;; facts until none changes, so what it ends with holds on every path.
+;;;
+;;; From it: `solve`, and for each fact a function of a node, which answers the
+;;; type's width for a node made since the facts were solved.
+(module lang.flow)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "lang.text" :as t)
+(import "lang.ir" :as ir)
+(import "lang.project" :as project)
+
+(defstruct Binding [(name (slice u8)) (code (slice u8)) (is-node bool)])
+
+(defstruct F
+  [(c t/Cur) (nodes ir/Spec) (facts (ArrayList (slice u8))) (bindings (ArrayList Binding))
+   (holds (ArrayList (slice u8)))])
+
+;;; The names of the facts a `.flow` file declares.
+(defn fact-names [(src (slice u8)) (path (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut c) (t/cursor src path)
+        (mut out) (ArrayList::new [(slice u8)] (malloc-allocator))]
+    (while (not (t/eof? (mut c)))
+      (let [tok (t/advance! (mut c))]
+        (when (and (t/tok-is? tok "fact") (= (.col tok) 1))
+          (push! (mut out) (t/name! (mut c) "a fact name")))))
+    out))
+
+(defn binding-of [(f (mut F)) (name (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for i (range 0 (len (.bindings f)))
+      (when (= (.name (get (.bindings f) i)) name) (set! found i)))
+    found))
+
+(defn level [(op (slice u8))] (-> i64)
+  (cond (or (= op "+") (= op "-")) 1
+        (= op "*") 2
+        :else 0))
+
+(defn primary [(f (mut F))] (-> (slice u8))
+  (let [tok (t/advance! (mut (.c f)))
+        name (.text tok)]
+    (cond
+      (= (.kind tok) t/T-NUM) (t/int-text (cast i64 (.value tok)))
+      (t/tok-is? tok "(")
+        (let [e (expr (mut f) 0)]
+          (t/expect! (mut (.c f)) ")")
+          e)
+      (= name "join") "(join (mut cx) n)"
+      (= name "type-bits") "(ir/type-bits (graph/ty (.g cx) n))"
+      (and (t/at? (mut (.c f)) "(") (.glued (t/peek (mut (.c f)))))
+        (do (t/advance! (mut (.c f)))
+            (let [a (expr (mut f) 0)
+                  b (if (t/accept! (mut (.c f)) ",") (expr (mut f) 0) "")]
+              (t/expect! (mut (.c f)) ")")
+              (cond
+                (= name "min") (t/cat4 "(let [x* " a " y* " (t/cat2 b "] (if (< x* y*) x* y*))"))
+                (= name "max") (t/cat4 "(let [x* " a " y* " (t/cat2 b "] (if (> x* y*) x* y*))"))
+                (= name "bit-length") (t/cat3 "(bv/bit-length (primitive/cast u64 " a "))")
+                ; `mod(a, b)`: the remainder, taking both as unsigned.
+                (= name "mod") (t/cat4 "(primitive/cast i64 (bv/urem (primitive/cast u64 " a ") (primitive/cast u64 " (t/cat2 b ")))"))
+                (= name "bits") (t/cat3 "(ir/type-bits (graph/ty (.g cx) (primitive/cast i32 " a ")))")
+                ; Another node's fact, as far as the solver has raised it.
+                (>= (t/index-of (.facts f) name) 0)
+                  (t/cat4 "(current (mut cx) " (t/int-text (t/index-of (.facts f) name)) " (primitive/cast i32 "
+                          (t/cat2 a "))"))
+                :else (t/die (mut (.c f)) tok (t/cat2 "no function or fact named " name)))))
+      (>= (binding-of (mut f) name) 0)
+        (let [b (get (.bindings f) (binding-of (mut f) name))]
+          (if (.is-node b) (t/cat3 "(cast i64 " (.code b) ")") (.code b)))
+      :else (t/die (mut (.c f)) tok (t/cat2 "no such name in this equation: " name)))))
+
+(defn expr [(f (mut F)) (min i64)] (-> (slice u8))
+  (let [(mut left) (primary (mut f))
+        (mut going) true]
+    (while going
+      (let [tok (t/peek (mut (.c f)))
+            l (if (.first tok) 0 (level (.text tok)))]
+        (if (and (> l 0) (> l min))
+            (do (t/advance! (mut (.c f)))
+                (let [right (expr (mut f) l)]
+                  (set! left (t/cat4 (t/cat3 "(" (.text tok) " ") left " " (t/cat2 right ")")))))
+            (set! going false))))
+    left))
+
+;;; `a <= b` and the like, over the same arithmetic as equations.
+(defn compare [(f (mut F))] (-> (slice u8))
+  (let [left (expr (mut f) 0)
+        tok (t/advance! (mut (.c f)))
+        op (.text tok)]
+    (unless (or (= op "<=") (= op "<") (= op ">=") (= op ">") (= op "=="))
+      (t/die (mut (.c f)) tok "what a fact holds is a comparison"))
+    (t/cat4 (t/cat3 "(" (if (= op "==") "=" op) " ") left " " (t/cat2 (expr (mut f) 0) ")"))))
+
+;;; Coil that builds a random value of type `type`: for each node that is a
+;;; value of its inputs, a builder call whose operands are built the same way.
+(defn emit-random! [(o (mut t/Out)) (spec ir/Spec)] (-> void)
+  (let [(mut count) 0]
+    (for node (.nodes spec) (when (ir/foldable? node) (set! count (+ count 1))))
+    (t/line! (mut o) "(defn random-node! [(cx (mut st/State)) (rnd (mut Rnd)) (type i32) (depth i64)] (-> i32)")
+    (t/line! (mut o) "  (if (or (<= depth 0) (= (% (roll! (mut rnd)) 4) 0))")
+    (t/line! (mut o) "      (leaf! (mut cx) (mut rnd) type)")
+    (t/line! (mut o) "      (let [other (value-type! (mut rnd))]")
+    (t/line! (mut o) (t/cat3 "        (match (cast i64 (% (roll! (mut rnd)) " (t/int-text count) "))"))
+    (let [(mut k) 0]
+      (for node (.nodes spec)
+        (when (ir/foldable? node)
+          (let [typed (= (ir/type-number spec (.result node)) 0)
+                (mut call) (t/out-new)]
+            (t/emit! (mut call) (t/cat3 "(ir/" (ir/builder-name (.name node)) " (mut (.g cx))"))
+            (when typed (t/emit! (mut call) " type"))
+            (for operand (.operands node)
+              (t/emit! (mut call)
+                       (t/cat3 " (random-node! (mut cx) (mut rnd) "
+                               (cond (= (.type operand) (.result node)) "type"
+                                     (!= (ir/type-number spec (.type operand)) 0) (t/cat2 "ir/T-" (t/upper (.type operand)))
+                                     :else "other")
+                               " (- depth 1))")))
+            (t/emit! (mut call) ")")
+            ; A node of a fixed type stands only where that type is wanted.
+            (t/line! (mut o)
+                     (if typed
+                         (t/cat4 "          (" (t/int-text k) " " (t/cat2 (t/text-of (mut call)) ")"))
+                         (t/cat4 "          (" (t/int-text k)
+                                 (t/cat3 " (if (= type ir/T-" (t/upper (.result node)) ") ")
+                                 (t/cat2 (t/text-of (mut call)) " (leaf! (mut cx) (mut rnd) type)))"))))
+            (set! k (+ k 1))))))
+    (t/line! (mut o) "          (_ (leaf! (mut cx) (mut rnd) type))))))")))
+
+(defn emit-fact-checker! [(o (mut t/Out)) (f (mut F))] (-> void)
+  (t/line! (mut o) "(defstruct Rnd [(state u64)])")
+  (t/line! (mut o) "(defn roll! [(rnd (mut Rnd))] (-> u64)")
+  (t/line! (mut o) "  (let [(mut x) (.state rnd)]")
+  (t/line! (mut o) "    (set! x (^ x (<< x 13))) (set! x (^ x (>> x 7))) (set! x (^ x (<< x 17)))")
+  (t/line! (mut o) "    (set! (.state rnd) x)")
+  (t/line! (mut o) "    x))")
+  (t/line! (mut o) "(defn value-type! [(rnd (mut Rnd))] (-> i32)")
+  (t/line! (mut o) "  (let [(mut type) (: 0 i32)]")
+  (t/line! (mut o) "    (while (not (ir/value-type? type))")
+  (t/line! (mut o) "      (set! type (cast i32 (+ 1 (cast i64 (% (roll! (mut rnd)) (cast u64 ir/TYPES)))))))")
+  (t/line! (mut o) "    type))")
+  (t/line! (mut o) "(defn interesting! [(rnd (mut Rnd))] (-> u64)")
+  (t/line! (mut o) "  (let [k (% (roll! (mut rnd)) 12)]")
+  (t/line! (mut o) "    (cond (= k 0) (: 0 u64) (= k 1) (: 1 u64) (= k 2) (: 0xFFFFFFFFFFFFFFFF u64)")
+  (t/line! (mut o) "          (= k 3) (: 0x80 u64) (= k 4) (: 0xFF u64) (= k 5) (: 0x8000 u64)")
+  (t/line! (mut o) "          (= k 6) (: 0x80000000 u64) (= k 7) (: 0x8000000000000000 u64)")
+  (t/line! (mut o) "          (= k 8) (<< (: 1 u64) (% (roll! (mut rnd)) 64))")
+  (t/line! (mut o) "          (= k 9) (% (roll! (mut rnd)) 70)")
+  (t/line! (mut o) "          :else (roll! (mut rnd)))))")
+  (t/line! (mut o) ";;; A parameter or a constant.")
+  (t/line! (mut o) "(defn leaf! [(cx (mut st/State)) (rnd (mut Rnd)) (type i32)] (-> i32)")
+  (t/line! (mut o) "  (if (= (% (roll! (mut rnd)) 3) 0)")
+  (t/line! (mut o) "      (ir/make-const! (mut (.g cx)) type (bv/cut (interesting! (mut rnd)) (ir/type-bits type)))")
+  (t/line! (mut o) "      (ir/make-param! (mut (.g cx)) type (% (roll! (mut rnd)) 4))))")
+  (emit-random! (mut o) (.nodes f))
+  (t/line! (mut o) ";;; Every fact against the nodes' meanings: random values are built, the facts")
+  (t/line! (mut o) ";;; solved, and for 64 choices of the parameters each node's value must be what")
+  (t/line! (mut o) ";;; its facts promise. Prints what is wrong and returns how many facts are.")
+  (t/line! (mut o) "(defn check-facts [(cx (mut st/State)) (tries i64)] (-> i64)")
+  (t/line! (mut o) "  (let [(mut rnd) (Rnd :state (: 0x2545F4914F6CDD1D u64))")
+  (t/line! (mut o) "        (mut args) (ArrayList::new [u64] (.alc cx))")
+  (t/line! (mut o) "        (mut wrong) (ArrayList::new [bool] (.alc cx))")
+  (t/line! (mut o) "        (mut bad) 0]")
+  (t/line! (mut o) "    (for _ (range 0 8) (push! (mut args) 0))")
+  (t/line! (mut o) (t/cat3 "    (for _ (range 0 " (t/int-text (len (.facts f))) ") (push! (mut wrong) false))"))
+  (t/line! (mut o) "    (for _ (range 0 tries)")
+  (t/line! (mut o) "      (graph/release! (mut (.g cx)))")
+  (t/line! (mut o) "      (set! (.g cx) (graph/create (.alc cx)))")
+  (t/line! (mut o) "      (random-node! (mut cx) (mut rnd) (value-type! (mut rnd)) 4)")
+  (t/line! (mut o) "      (when (= (ir/verify (.g cx)) \"\")")
+  (t/line! (mut o) "        (st/begin! (mut cx))")
+  (t/line! (mut o) "        (solve (mut cx))")
+  (t/line! (mut o) "        (for _ (range 0 64)")
+  (t/line! (mut o) "          (for i (range 0 8) (set! (mut args) i (interesting! (mut rnd))))")
+  (t/line! (mut o) "          (for i (range 1 (graph/size (.g cx)))")
+  (t/line! (mut o) "            (let [n (cast i32 i)]")
+  (t/line! (mut o) "              (when (and (not (graph/dead? (.g cx) n)) (ir/value-type? (graph/ty (.g cx) n))")
+  (t/line! (mut o) "                         (not (ir/type-float? (graph/ty (.g cx) n))))")
+  (t/line! (mut o) "                (let [value* (ir/eval-node (.g cx) (slice args) n)]")
+  (for i (range 0 (len (.facts f)))
+    (t/line! (mut o) (t/cat3 "                  (unless (or (get wrong " (t/int-text i) ") "))
+    (t/line! (mut o) (t/cat3 "                              " (get (.holds f) i) ")"))
+    (t/line! (mut o) (t/cat4 "                    (println \"  WRONG fact " (get (.facts f) i)
+                             ": a {} {} has the value {:x}, and the fact says {}\""
+                             (t/cat3 " (ir/type-name (graph/ty (.g cx) n)) (ir/name (graph/op (.g cx) n)) value* ("
+                                     (get (.facts f) i) " (mut cx) n))")))
+    (t/line! (mut o) (t/cat3 "                    (set! (mut wrong) " (t/int-text i) " true))")))
+  (t/line! (mut o) "                  (do))))))))")
+  (t/line! (mut o) "    (for w wrong (when w (set! bad (+ bad 1))))")
+  (t/line! (mut o) "    bad))"))
+
+(defn module-name! [(c (mut t/Cur))] (-> (slice u8))
+  (let [(mut name) (t/name! (mut c) "a module name")]
+    (while (and (t/at? (mut c) ".") (.glued (t/peek (mut c))))
+      (t/advance! (mut c))
+      (set! name (t/cat3 name "." (t/name! (mut c) "a module name"))))
+    name))
+
+(defn module-text [(context Code)] (-> (slice u8))
+  (let [p (project/open context)
+        path (t/path-of context)
+        src (t/source-of context)
+        (mut c) (t/cursor src path)]
+    (t/expect! (mut c) "flow")
+    (t/expect! (mut c) "in")
+    (let [unit (project/resolve p (module-name! (mut c)) 1 1)
+          at (t/peek-at (mut c) 1)
+          nodes-module (do (t/expect! (mut c) "nodes") (module-name! (mut c)))
+          nodes-file (project/file-of p nodes-module (.line at) (.col at))
+          (mut f) (F
+                    :c c
+                    :nodes (ir/parse (project/read-file nodes-file path) nodes-file)
+                    :facts (fact-names src path)
+                    :bindings (ArrayList::new [Binding] (malloc-allocator))
+                    :holds (ArrayList::new [(slice u8)] (malloc-allocator)))
+          (mut o) (t/out-new)
+          (mut transfers) (t/out-new)
+          (mut fact) -1]
+      ; Each fact's equations become one function of a node.
+      (while (not (t/eof? (mut (.c f))))
+        (let [tok (t/advance! (mut (.c f)))]
+          (if (t/tok-is? tok "fact")
+              (do (when (>= fact 0) (t/line! (mut transfers) "    (_ (ir/type-bits (graph/ty (.g cx) n)))))"))
+                  (set! fact (+ fact 1))
+                  (let [name (t/name! (mut (.c f)) "a fact name")]
+                    ; `holds EXPR`: what the fact promises of a node's value,
+                    ; over `value` and the fact's own name.
+                    (if (t/accept! (mut (.c f)) "holds")
+                        (do (clear! (mut (.bindings f)))
+                            (push! (mut (.bindings f)) (Binding :name "value" :code "(primitive/cast i64 value*)" :is-node false))
+                            (push! (mut (.bindings f))
+                                   (Binding :name name :code (t/cat3 "(" name " (mut cx) n)") :is-node false))
+                            (push! (mut (.holds f)) (compare (mut f))))
+                        (push! (mut (.holds f)) "true")))
+                  (t/line! (mut transfers)
+                           (t/cat3 "(defn transfer-" (t/int-text fact) " [(cx (mut st/State)) (n i32)] (-> i64)"))
+                  (t/line! (mut transfers) "  (match (graph/op (.g cx) n)"))
+              (let [number (ir/node-number (.nodes f) (.text tok))]
+                (when (or (= number 0) (< fact 0))
+                  (t/die (mut (.c f)) tok (t/cat2 "expected fact or a node's equation, found " (.text tok))))
+                (clear! (mut (.bindings f)))
+                (cond
+                  (and (t/at? (mut (.c f)) "(") (.glued (t/peek (mut (.c f)))))
+                    (do (t/advance! (mut (.c f)))
+                        (let [(mut i) 0]
+                          (while (not (t/accept! (mut (.c f)) ")"))
+                            ; An operand is a name, `_`, or `CONST k` for a constant's value.
+                            (let [operand (if (t/accept! (mut (.c f)) "_") "_" (t/name! (mut (.c f)) "an operand"))
+                                  input (t/cat3 "(graph/input (.g cx) n " (t/int-text i) ")")]
+                              (cond
+                                (= operand "_") 0
+                                (!= (ir/node-number (.nodes f) operand) 0)
+                                  (let [payload (t/name! (mut (.c f)) "a name for the constant's value")]
+                                    (push! (mut (.bindings f))
+                                           (Binding :name payload
+                                                    :code (t/cat3 "(primitive/cast i64 (graph/payload (.g cx) " input "))")
+                                                    :is-node false))
+                                    (push! (mut (.bindings f))
+                                           (Binding :name (t/cat2 "?" operand) :code input :is-node true)))
+                                :else (push! (mut (.bindings f)) (Binding :name operand :code input :is-node true))))
+                            (set! i (+ i 1))
+                            (t/accept! (mut (.c f)) ","))))
+                  (and (t/at-ident? (mut (.c f))) (not (t/at? (mut (.c f)) "join")))
+                    (push! (mut (.bindings f))
+                           (Binding :name (t/name! (mut (.c f)) "a payload name")
+                                    :code "(primitive/cast i64 (graph/payload (.g cx) n))" :is-node false))
+                  :else 0)
+                (t/expect! (mut (.c f)) "=")
+                ; The equation holds only where an operand written `CONST k` is a constant.
+                (let [(mut guard) (t/out-new)]
+                  (for b (.bindings f)
+                    (when (and (> (len (.name b)) 0) (= (get (.name b) 0) #\?))
+                      (t/emit! (mut guard)
+                               (t/cat4 " (= (graph/op (.g cx) " (.code b) ") ir/"
+                                       (t/cat2 (t/slice-of (.name b) 1 (len (.name b))) ")")))))
+                  (t/line! (mut transfers)
+                           (t/cat4 "    (" (t/int-text number) " (if (and true"
+                                   (t/cat4 (t/text-of (mut guard)) ") " (expr (mut f) 0)
+                                           " (ir/type-bits (graph/ty (.g cx) n))))"))))))))
+      (when (>= fact 0) (t/line! (mut transfers) "    (_ (ir/type-bits (graph/ty (.g cx) n)))))"))
+      (t/line! (mut o) (t/cat3 "(depends-on \"" nodes-file "\")"))
+      (t/line! (mut o) "(import \"coil.primitive\" :as primitive)")
+      (t/line! (mut o) "(import \"coil.arraylist\" :use [ArrayList])")
+      (t/line! (mut o) "(import \"declarative.rt.graph\" :as graph)")
+      (t/line! (mut o) "(import \"declarative.rt.bits\" :as bv)")
+      (t/line! (mut o) (t/cat3 "(import \"" unit "\" :as st)"))
+      (t/line! (mut o) (t/cat3 "(import \"" nodes-module "\" :as ir)"))
+      ; A fact is stored as its value plus one; 0 is "not solved for this node".
+      (t/line! (mut o) "(defn stored [(cx (mut st/State)) (fact i64) (n i32)] (-> i64)")
+      (t/line! (mut o) "  (match fact")
+      (for i (range 0 (len (.facts f)))
+        (t/line! (mut o) (t/cat4 "    (" (t/int-text i) " (get (.fact-" (t/cat2 (get (.facts f) i) " cx) (cast i64 n)))"))))
+      (t/line! (mut o) "    (_ 0)))")
+      (t/line! (mut o) "(defn record! [(cx (mut st/State)) (fact i64) (n i32) (v i64)] (-> void)")
+      (t/line! (mut o) "  (match fact")
+      (for i (range 0 (len (.facts f)))
+        (t/line! (mut o) (t/cat4 "    (" (t/int-text i) " (set! (mut (.fact-"
+                                 (t/cat2 (get (.facts f) i) " cx)) (cast i64 n) v))"))))
+      (t/line! (mut o) "    (_ (do))))")
+      (t/line! (mut o) ";;; A fact while solving: what the node has been raised to so far.")
+      (t/line! (mut o) "(defn current [(cx (mut st/State)) (fact i64) (n i32)] (-> i64)")
+      (t/line! (mut o) "  (let [s (stored (mut cx) fact n)]")
+      (t/line! (mut o) "    (if (= s 0) (ir/type-bits (graph/ty (.g cx) n)) (- s 1))))")
+      (t/line! (mut o) ";;; The largest fact among a node's value inputs: all but the control a phi names.")
+      (t/line! (mut o) "(defn join-of [(cx (mut st/State)) (fact i64) (n i32)] (-> i64)")
+      (t/line! (mut o) "  (let [(mut most) 0]")
+      (t/line! (mut o) "    (for i (range 0 (graph/arity (.g cx) n))")
+      (t/line! (mut o) "      (let [d (graph/input (.g cx) n i)]")
+      (t/line! (mut o) "        (when (and (!= d 0) (ir/value-type? (graph/ty (.g cx) d)) (not (and (= i 0) (ir/control-node? (graph/op (.g cx) d)))))")
+      (t/line! (mut o) "          (let [v (current (mut cx) fact d)] (when (> v most) (set! most v))))))")
+      (t/line! (mut o) "    most))")
+      ; `join` inside transfer-K reads fact K.
+      (for i (range 0 (len (.facts f)))
+        (t/line! (mut o) (t/cat3 ";; equations of " (get (.facts f) i) "")))
+      (t/line! (mut o) "(defn join [(cx (mut st/State)) (n i32)] (-> i64) (join-of (mut cx) (.fired cx) n))")
+      (t/emit! (mut o) (t/text-of (mut transfers)))
+      (t/line! (mut o) "(defn transfer [(cx (mut st/State)) (fact i64) (n i32)] (-> i64)")
+      (t/line! (mut o) "  (set! (.fired cx) fact)")
+      (t/line! (mut o) "  (let [top (ir/type-bits (graph/ty (.g cx) n))")
+      (t/line! (mut o) "        v (match fact")
+      (for i (range 0 (len (.facts f)))
+        (t/line! (mut o) (t/cat4 "            (" (t/int-text i) " (transfer-" (t/cat2 (t/int-text i) " (mut cx) n))"))))
+      (t/line! (mut o) "            (_ top))]")
+      (t/line! (mut o) "    (cond (< v 0) 0 (> v top) top :else v)))")
+      (t/line! (mut o) ";;; Solve every fact for every node: each starts at 0 and is raised until its")
+      (t/line! (mut o) ";;; equation holds.")
+      (t/line! (mut o) "(defn solve [(cx (mut st/State))] (-> void)")
+      (t/line! (mut o) "  (let [(mut work) (ArrayList::new [i32] (.alc cx))")
+      (t/line! (mut o) "        (mut queued) (ArrayList::new [bool] (.alc cx))")
+      (t/line! (mut o) (t/cat3 "        facts " (t/int-text (len (.facts f))) "]"))
+      (t/line! (mut o) "    (st/grow-nodes! (mut cx))")
+      (t/line! (mut o) "    (for i (range 0 (graph/size (.g cx))) (push! (mut queued) false))")
+      (t/line! (mut o) "    (for i (range 1 (graph/size (.g cx)))")
+      (t/line! (mut o) "      (let [n (cast i32 (- (graph/size (.g cx)) i))]")
+      (t/line! (mut o) "        (unless (graph/dead? (.g cx) n)")
+      (t/line! (mut o) "          (for fact (range 0 facts) (record! (mut cx) fact n 1))")
+      (t/line! (mut o) "          (set! (mut queued) (cast i64 n) true)")
+      (t/line! (mut o) "          (push! (mut work) n))))")
+      (t/line! (mut o) "    (while (> (len work) 0)")
+      (t/line! (mut o) "      (let [n (get work (- (len work) 1))")
+      (t/line! (mut o) "            (mut raised) false]")
+      (t/line! (mut o) "        (pop! (mut work))")
+      (t/line! (mut o) "        (set! (mut queued) (cast i64 n) false)")
+      (t/line! (mut o) "        (for fact (range 0 facts)")
+      (t/line! (mut o) "          (let [v (transfer (mut cx) fact n)]")
+      (t/line! (mut o) "            (when (> (+ v 1) (stored (mut cx) fact n))")
+      (t/line! (mut o) "              (record! (mut cx) fact n (+ v 1))")
+      (t/line! (mut o) "              (set! raised true))))")
+      (t/line! (mut o) "        (when raised")
+      (t/line! (mut o) "          (let [(mut e) (graph/first-use (.g cx) n)]")
+      (t/line! (mut o) "            (while (>= e 0)")
+      (t/line! (mut o) "              (let [u (graph/user (.g cx) e)]")
+      (t/line! (mut o) "                (unless (get queued (cast i64 u))")
+      (t/line! (mut o) "                  (set! (mut queued) (cast i64 u) true)")
+      (t/line! (mut o) "                  (push! (mut work) u)))")
+      (t/line! (mut o) "              (set! e (graph/next-use (.g cx) e)))))))")
+      (t/line! (mut o) "    (free! (mut work))")
+      (t/line! (mut o) "    (free! (mut queued))))")
+      (for i (range 0 (len (.facts f)))
+        (t/line! (mut o) (t/cat3 ";;; The fact for `n`, or the width of its type if `n` is newer than the solving."
+                                 "" ""))
+        (t/line! (mut o) (t/cat3 "(defn " (get (.facts f) i) " [(cx (mut st/State)) (n i32)] (-> i64)"))
+        (t/line! (mut o) (t/cat3 "  (if (>= (cast i64 n) (len (.fact-" (get (.facts f) i) " cx)))"))
+        (t/line! (mut o) "      (ir/type-bits (graph/ty (.g cx) n))")
+        (t/line! (mut o) (t/cat3 "      (current (mut cx) " (t/int-text i) " n)))")))
+      (emit-fact-checker! (mut o) (mut f))
+      (t/text-of (mut o)))))

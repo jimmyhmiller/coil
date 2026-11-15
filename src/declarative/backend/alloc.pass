@@ -1,0 +1,695 @@
+# Register allocation: linear scan over live ranges with holes, splitting a
+# value's life into pieces when it cannot keep one register throughout.
+#
+# Positions: instruction i reads its operands at 2i and writes them at 2i + 1.
+# A virtual register is live over ranges of positions, with holes where the
+# layout passes through blocks it is not live in. Its life starts as one piece.
+# A piece is given a register that is free for all of it if there is one; if a
+# register is free only for a while, the piece keeps it that long and the rest
+# of the value's life waits in the frame until it is next needed, where a new
+# piece asks again. If nothing is free, the register whose holder is needed
+# furthest away is taken and that holder waits in the frame instead.
+#
+# A value that ever waits in the frame is stored there each time it is written,
+# so leaving a register costs nothing and coming back costs one load.
+pass in unit
+use cfg as cfg
+use mach as mach
+import target as isa
+import abi as abi
+
+entity Vreg
+column first-piece: Vreg -> Piece
+column at-piece: Vreg -> Piece         # where emission has got to in its pieces
+column slot: Vreg -> Int               # its frame slot + 1, once any piece waits there
+column hint: Vreg -> Int               # an operand it is copied to or from, or 0
+column class: Vreg -> Int              # which kind of register it lives in
+column wide: Vreg -> Bool              # it holds sixteen bytes: two frame slots, and no
+                                       # register a call gives back only half of
+column last-reg: Vreg -> Int           # the register + 1 its latest placed piece got
+column reads: Vreg -> [Int]            # the instructions that read it
+column writes: Vreg -> [Int]           # the instructions that write it
+column open-from: Vreg -> Int          # while building: where its range in this block began
+column last-touch: Vreg -> Int         # and the position after its last use so far
+column out-mark: Vreg -> Int           # the block it was last seen live out of
+column cost-asked: Vreg -> Block       # the loop `cost-is` was last worked out for,
+column cost-is: Vreg -> Int            # and what it was
+column weight: Vreg -> Int             # how much it is read and written: each time counts
+                                       # eight times as much for every loop it is in
+
+entity Range                           # positions from..to, `to` not included
+column from: Range -> Int
+column to: Range -> Int
+column next-range: Range -> Range
+
+entity Use                             # a position where a value must be in a register
+column pos: Use -> Int
+column next-use: Use -> Use
+
+entity Piece                           # a stretch of a value's life with one home
+column owner: Piece -> Vreg
+column ranges: Piece -> Range          # what is left of its ranges, in order
+column last-range: Piece -> Range
+column first-use: Piece -> Use         # what is left of its uses, in order
+column last-use: Piece -> Use
+column pstart: Piece -> Int
+column pend: Piece -> Int
+column reg: Piece -> Int               # its register + 1, or 0
+column in-frame: Piece -> Bool         # it waits in the frame: no register, no uses
+column next-piece: Piece -> Piece
+column prev-piece: Piece -> Piece
+
+# A machine register is taken wherever an instruction names it: from where it
+# is written to where it is last read.
+entity Phys
+column fixed: Phys -> Range
+column last-fixed: Phys -> Range
+column free-until: Phys -> Int
+column needed-at: Phys -> Int
+column blocked-at: Phys -> Int
+column giving-up: Phys -> Int          # what it costs to make whoever holds it wait
+
+column home: Inst -> Block
+column starts-even: Inst -> [Piece]    # pieces whose life starts as it reads
+column starts-odd: Inst -> [Piece]     # and as it writes
+column write-mark: Block -> Int        # the register last seen written in this block
+column write-first: Block -> Int       # and where it is first written there
+column live-mark: Block -> Int         # the register last found live into this block
+column live-in: Block -> [Vreg]
+
+state active: [Piece]                  # placed pieces live at the current position
+state inactive: [Piece]                # placed pieces in a hole at the current position
+state opened: [Vreg]
+state stack: [Block]
+state slots: Int
+state used: Word                       # every register a piece was given
+
+fn far() -> Int = 1152921504606846976
+
+fn reg-kind?(kind: Int) -> Bool = kind == isa.K-DEF or kind == isa.K-USE or kind == isa.K-MOD
+
+fn writes?(kind: Int) -> Bool = kind == isa.K-DEF or kind == isa.K-MOD
+
+# A function that moves the stack pointer as it runs keeps one register to
+# say where its frame is.
+fn allocatable?(r: Int) -> Bool = isa.in-set?(isa.ALLOCATABLE, r) and not (dynamic and r == abi.BASE)
+
+# What a copy reads, or 0 for an instruction that is not one.
+fn move-source(i: Inst) -> Int = if i.kind == 1 then i.copy-from else 0
+
+# A register `v` may live in: one the allocator may use, of `v`'s class.
+fn fits?(v: Vreg, r: Int) -> Bool =
+  allocatable?(r) and isa.reg-class(r) == v.class and not (v.wide and isa.in-set?(isa.CALLEE-SAVED, r))
+
+# ---------------------------------------------------------------- where the frame opens
+
+# Whether block `b` has something in it that needs the frame whatever
+# registers values get: a call, a frame object, an argument in the caller's
+# frame, a register the caller expects back named outright.
+fn needs-frame?(b: Block) -> Bool {
+  for at in b.first-inst..b.last-inst + 1 {
+    let i = id(at)
+    if i.kind >= 4 or i.calling or ((i.also-reads | i.also-writes) & isa.CALLEE-SAVED) != word(0) { return true }
+    let op = i.inst-op
+    for k in 0..isa.operand-count(op) {
+      let a = mach.arg(i, k)
+      if reg-kind?(isa.operand-kind(op, k)) and a < 0 and isa.in-set?(isa.CALLEE-SAVED, 0 - a - 1) { return true }
+    }
+  }
+  false
+}
+
+# Selection planned to open the frame at `frame-at`, going by the nodes. If an
+# instruction before there needs the frame after all, the plan is dropped.
+fn check-frame-plan() {
+  if frame-at != none and (any b in order: not b.framed and needs-frame?(b)) {
+    frame-at = none
+    unplanned = unplanned + 1
+  }
+}
+
+# ---------------------------------------------------------------- liveness
+
+fn fixed-range(p: Phys, a: Int, b: Int) {
+  let r = Range.new()
+  r.from = a
+  r.to = b
+  if p.last-fixed == none { p.fixed = r } else { p.last-fixed.next-range = r }
+  p.last-fixed = r
+}
+
+fn touch(i: Inst, kind: Int, a: Int, class: Int) {
+  let at = int(i)
+  if a > 0 {
+    let v = id(a)
+    v.class = class
+    v.weight = v.weight + (1 << (3 * min(i.home.loop-depth, 6)))
+    if kind != isa.K-DEF { v.reads.push(at) }
+    if writes?(kind) { v.writes.push(at) }
+  } else if allocatable?(0 - a - 1) {
+    let p = id(0 - a)
+    if kind != isa.K-DEF {
+      # Read without having been written here: it has held its value since entry.
+      if p.last-fixed == none { fixed-range(p, 0, 2 * at + 1) }
+      else if p.last-fixed.to < 2 * at + 1 { p.last-fixed.to = 2 * at + 1 }
+    }
+    if writes?(kind) { fixed-range(p, 2 * at + 1, 2 * at + 2) }
+  }
+}
+
+# The machine registers of `set`, read or written by `i` besides its operands.
+fn also(i: Inst, set: Word, kind: Int) {
+  var rest = set
+  while rest != word(0) {
+    let r = lowest-bit(rest)
+    touch(i, kind, 0 - r - 1, 0)
+    rest = clear-bit(rest, r)
+  }
+}
+
+fn occurrences() {
+  for n in 0..next-vreg { Vreg.new() }
+  for n in Node {
+    if not n.dead and n.bits == 128 {
+      let v: Vreg = id(int(n))
+      v.wide = true
+    }
+  }
+  for t in wide-temps {
+    let v: Vreg = id(t)
+    v.wide = true
+  }
+  for r in 0..isa.REGISTERS { Phys.new() }
+  for b in order {
+    for at in b.first-inst..b.last-inst + 1 {
+      let i = id(at)
+      let op = i.inst-op
+      # Before the frame is open, no register the caller expects back is to be had.
+      if at == b.first-inst and frame-at != none and not b.framed {
+        var rest = isa.CALLEE-SAVED
+        while rest != word(0) {
+          let r = lowest-bit(rest)
+          if allocatable?(r) { fixed-range(id(r + 1), 2 * b.first-inst, 2 * b.last-inst + 2) }
+          rest = clear-bit(rest, r)
+        }
+      }
+      i.home = b
+      for k in 0..isa.operand-count(op) {
+        let kind = isa.operand-kind(op, k)
+        if reg-kind?(kind) { touch(i, kind, mach.arg(i, k), isa.operand-class(op, k)) }
+      }
+      also(i, i.also-reads | isa.implicit-reads(op), isa.K-USE)
+      also(i, i.also-writes | isa.implicit-writes(op), isa.K-DEF)
+      # Each side of a copy would like the other's register.
+      let source = move-source(i)
+      if source != 0 {
+        let target = i.copy-to
+        if target > 0 and id(target).hint == 0 { id(target).hint = source }
+        if source > 0 and id(source).hint == 0 { id(source).hint = target }
+      }
+    }
+  }
+}
+
+# `v` is needed at the top of `b`: it is live into `b`, and into every block
+# before it that does not write it.
+fn live-into(v: Vreg, b: Block) {
+  if b.live-mark == int(v) { return }
+  b.live-mark = int(v)
+  b.live-in.push(v)
+  stack.push(b)
+  while stack.len > 0 {
+    let x = stack.pop()
+    for p in x.preds {
+      if p.write-mark != int(v) and p.live-mark != int(v) {
+        p.live-mark = int(v)
+        p.live-in.push(v)
+        stack.push(p)
+      }
+    }
+  }
+}
+
+fn liveness() {
+  for v in Vreg {
+    for w in v.writes {
+      let b = id(w).home
+      if b.write-mark != int(v) {
+        b.write-mark = int(v)
+        b.write-first = w
+      }
+    }
+    for r in v.reads {
+      let b = id(r).home
+      if not (b.write-mark == int(v) and b.write-first < r) { live-into(v, b) }
+    }
+  }
+}
+
+# ---------------------------------------------------------------- ranges
+
+fn add-use(p: Piece, at: Int) {
+  let u = Use.new()
+  u.pos = at
+  if p.last-use == none { p.first-use = u } else { p.last-use.next-use = u }
+  p.last-use = u
+}
+
+fn add-range(p: Piece, a: Int, b: Int) {
+  if a >= b { return }
+  let l = p.last-range
+  if l != none and l.to == a {
+    l.to = b
+  } else {
+    let r = Range.new()
+    r.from = a
+    r.to = b
+    if l == none { p.ranges = r } else { l.next-range = r }
+    p.last-range = r
+  }
+  if p.pstart == 0 { p.pstart = a }
+  p.pend = b
+}
+
+fn occurs(v: Vreg, at: Int, after: Int) {
+  add-use(v.first-piece, at)
+  if v.open-from == 0 {
+    v.open-from = at
+    opened.push(v)
+  }
+  if after > v.last-touch { v.last-touch = after }
+}
+
+# `v` is written afresh at `at`, nothing of what it held being read again:
+# between its last reading in this block and here it holds nothing, and its
+# register is free for something else.
+fn rewritten(v: Vreg, at: Int) {
+  if v.open-from != 0 and v.last-touch <= at {
+    add-range(v.first-piece, v.open-from, v.last-touch)
+    v.open-from = at
+    v.last-touch = 0
+  }
+}
+
+# Block by block in layout order: a value's range in a block runs from the
+# block's start if it is live in, else from where it is written, to the
+# block's end if it is live out, else to just after its last use.
+fn build-ranges() {
+  for v in Vreg {
+    if v.reads.len > 0 or v.writes.len > 0 {
+      let p = Piece.new()
+      p.owner = v
+      v.first-piece = p
+    }
+  }
+  for b in order {
+    let start = 2 * b.first-inst
+    let end = 2 * b.last-inst + 2
+    for s in b.succs { for v in s.live-in { v.out-mark = int(b) } }
+    for v in b.live-in {
+      v.open-from = start
+      opened.push(v)
+    }
+    for at in b.first-inst..b.last-inst + 1 {
+      let i = id(at)
+      let op = i.inst-op
+      # What the instruction reads, then what it writes: one that reads a
+      # value and writes it afresh reads the old one first.
+      for k in 0..isa.operand-count(op) {
+        let kind = isa.operand-kind(op, k)
+        let a = mach.arg(i, k)
+        if reg-kind?(kind) and a > 0 and kind != isa.K-DEF { occurs(id(a), 2 * at, 2 * at + 1) }
+      }
+      for k in 0..isa.operand-count(op) {
+        let kind = isa.operand-kind(op, k)
+        let a = mach.arg(i, k)
+        if reg-kind?(kind) and a > 0 and writes?(kind) {
+          if kind == isa.K-DEF { rewritten(id(a), 2 * at + 1) }
+          occurs(id(a), 2 * at + 1, 2 * at + 2)
+        }
+      }
+    }
+    for v in opened {
+      add-range(v.first-piece, v.open-from, if v.out-mark == int(b) then end else v.last-touch)
+      v.open-from = 0
+      v.last-touch = 0
+    }
+    opened.clear()
+  }
+}
+
+# ---------------------------------------------------------------- pieces
+
+fn enqueue(p: Piece) {
+  let i = id(p.pstart / 2)
+  if p.pstart % 2 == 0 { i.starts-even.push(p) } else { i.starts-odd.push(p) }
+}
+
+# The first position two chains of ranges share, or 0.
+fn meeting(a: Range, b: Range) -> Int {
+  var x = a
+  var y = b
+  while x != none and y != none {
+    if x.to <= y.from { x = x.next-range }
+    else if y.to <= x.from { y = y.next-range }
+    else { return max(x.from, y.from) }
+  }
+  0
+}
+
+# Where `p` is next needed in a register at or after `pos`, or far away.
+fn next-need(p: Piece, pos: Int) -> Int {
+  while p.first-use != none and p.first-use.pos < pos { p.first-use = p.first-use.next-use }
+  if p.first-use == none then far() else p.first-use.pos
+}
+
+# `p` from `at` on, as a new piece after it; `p` itself if it starts no earlier,
+# none if nothing of it is left by then.
+fn split(p: Piece, at: Int) -> Piece {
+  if at >= p.pend { return none }
+  if at <= p.pstart { return p }
+  let q = Piece.new()
+  let old-last = p.last-range
+  q.owner = p.owner
+  q.next-piece = p.next-piece
+  q.prev-piece = p
+  if p.next-piece != none { p.next-piece.prev-piece = q }
+  p.next-piece = q
+  var r = p.ranges
+  var before: Range = none
+  while r != none and r.to <= at {
+    before = r
+    r = r.next-range
+  }
+  if r.from < at {
+    let tail = Range.new()
+    tail.from = at
+    tail.to = r.to
+    tail.next-range = r.next-range
+    r.to = at
+    r.next-range = none
+    q.ranges = tail
+    q.last-range = if tail.next-range == none then tail else old-last
+    p.last-range = r
+  } else {
+    q.ranges = r
+    q.last-range = old-last
+    if before == none { p.ranges = none } else { before.next-range = none }
+    p.last-range = before
+  }
+  q.pstart = q.ranges.from
+  q.pend = p.pend
+  p.pend = at
+  var u = p.first-use
+  var kept: Use = none
+  while u != none and u.pos < at {
+    kept = u
+    u = u.next-use
+  }
+  q.first-use = u
+  q.last-use = if u == none then none else p.last-use
+  if kept == none { p.first-use = none } else { kept.next-use = none }
+  p.last-use = kept
+  q
+}
+
+# From `at` on, `p`'s value waits in the frame; where it is next needed, a new
+# piece asks for a register.
+fn to-frame-from(p: Piece, at: Int) {
+  let rest = split(p, at)
+  if rest == none { return }
+  if rest == p { p.reg = 0 }
+  let v = p.owner
+  if v.slot == 0 {
+    # Sixteen bytes take two slots, the first at a multiple of sixteen.
+    if v.wide and (out-slots + slots) % 2 != 0 { slots = slots + 1 }
+    slots = slots + 1
+    v.slot = slots
+    if v.wide { slots = slots + 1 }
+  }
+  let need = next-need(rest, rest.pstart)
+  if need == far() {
+    rest.in-frame = true
+    return
+  }
+  let back = split(rest, need)
+  if back != rest { rest.in-frame = true }
+  back.in-frame = false
+  back.reg = 0
+  enqueue(back)
+}
+
+fn place-in(p: Piece, r: Int) {
+  p.reg = r + 1
+  p.owner.last-reg = r + 1
+  used = set-bit(used, r)
+  active.push(p)
+}
+
+# The register `p` would like: the one its value is copied to or from.
+fn wanted(p: Piece) -> Int {
+  let h = p.owner.hint
+  let v = p.owner
+  if h > 0 and id(h).last-reg != 0 and fits?(v, id(h).last-reg - 1) { return id(h).last-reg - 1 }
+  if h < 0 and fits?(v, 0 - h - 1) { return 0 - h - 1 }
+  -1
+}
+
+# Pieces whose ranges have all passed are done; one in a hole waits; one whose
+# hole has ended is live again.
+fn advance(pos: Int) {
+  var kept = 0
+  for j in 0..active.len {
+    let a = active[j]
+    while a.ranges != none and a.ranges.to <= pos { a.ranges = a.ranges.next-range }
+    if a.ranges != none and pos < a.pend {
+      if a.ranges.from > pos { inactive.push(a) } else {
+        active[kept] = a
+        kept = kept + 1
+      }
+    }
+  }
+  while active.len > kept { active.pop() }
+  kept = 0
+  for j in 0..inactive.len {
+    let a = inactive[j]
+    while a.ranges != none and a.ranges.to <= pos { a.ranges = a.ranges.next-range }
+    if a.ranges != none and pos < a.pend {
+      if a.ranges.from <= pos { active.push(a) } else {
+        inactive[kept] = a
+        kept = kept + 1
+      }
+    }
+  }
+  while inactive.len > kept { inactive.pop() }
+}
+
+# A register nothing else holds for some way ahead; with `whole`, only one
+# free for all of the piece's life.
+fn try-free(p: Piece, whole: Bool) -> Bool {
+  let pos = p.pstart
+  for r in Phys { r.free-until = if fits?(p.owner, int(r) - 1) then far() else 0 }
+  for a in active { id(a.reg).free-until = 0 }
+  for a in inactive {
+    let x = meeting(a.ranges, p.ranges)
+    if x != 0 and x < id(a.reg).free-until { id(a.reg).free-until = x }
+  }
+  for r in Phys {
+    if r.free-until > 0 {
+      while r.fixed != none and r.fixed.to <= pos { r.fixed = r.fixed.next-range }
+      let x = meeting(r.fixed, p.ranges)
+      if x != 0 and x < r.free-until { r.free-until = x }
+    }
+  }
+  var best = -1
+  var until = 0
+  for r in Phys {
+    if r.free-until > until {
+      best = int(r) - 1
+      until = r.free-until
+    }
+  }
+  let want = wanted(p)
+  if want >= 0 and (id(want + 1).free-until >= p.pend or id(want + 1).free-until == until) and id(want + 1).free-until > pos {
+    best = want
+    until = id(want + 1).free-until
+  }
+  if until <= pos { return false }
+  if whole and until < p.pend { return false }
+  place-in(p, best)
+  if until < p.pend { to-frame-from(p, until) }
+  true
+}
+
+# Whether block `b` is in the loop whose head is `h`.
+fn inside?(b: Block, h: Block) -> Bool {
+  var x = b.loop-head
+  while x != none and x != h { x = x.loop-parent }
+  x == h
+}
+
+# What it costs to make `v` wait in the frame from position `pos`, where
+# nothing of it is needed for a while: it is brought back once each time
+# round the innermost loop about `pos` that reads or writes it anywhere, so
+# eight times as much for every loop that loop is in; once, if there is none.
+fn waiting-cost(v: Vreg, pos: Int) -> Int {
+  let i: Inst = id(pos / 2)
+  var h = i.home.loop-head
+  if h == none { return 1 }
+  if v.cost-asked == h { return v.cost-is }
+  let asked = h
+  var cost = 1
+  while h != none and cost == 1 {
+    var here = false
+    for r in v.reads { if not here and inside?(id(r).home, h) { here = true } }
+    for w in v.writes { if not here and inside?(id(w).home, h) { here = true } }
+    if here { cost = 1 << (3 * min(h.loop-depth, 6)) } else { h = h.loop-parent }
+  }
+  v.cost-asked = asked
+  v.cost-is = cost
+  cost
+}
+
+# Whether `v` is read or written anywhere in the loop whose head is `h`.
+fn used-in?(v: Vreg, h: Block) -> Bool =
+  (any r in v.reads: inside?(id(r).home, h)) or (any w in v.writes: inside?(id(w).home, h))
+
+# Where piece `a`, made to wait at `pos`, should wait from: the start of the
+# outermost loop about `pos` that neither reads nor writes its value, so that
+# it waits for the whole of that loop and is not brought back every time
+# round; `pos` itself if there is no such loop, or the piece begins inside it,
+# or its value is touched between the loop's start and `pos`.
+fn wait-from(a: Piece, pos: Int) -> Int {
+  let v = a.owner
+  let i: Inst = id(pos / 2)
+  var h = i.home.loop-head
+  var around: Block = none
+  if not cfg.on?(9) { return pos }
+  while h != none and not used-in?(v, h) {
+    around = h
+    h = h.loop-parent
+  }
+  if around == none { return pos }
+  var from = far()
+  for b in around.loop-blocks { from = min(from, 2 * b.first-inst) }
+  if from >= pos or from <= a.pstart { return pos }
+  for r in v.reads { if 2 * r >= from and 2 * r < pos { return pos } }
+  for w in v.writes { if 2 * w + 1 >= from and 2 * w + 1 < pos { return pos } }
+  from
+}
+
+# Take the register whose holder is needed furthest away; the holder waits in
+# the frame. With `far`, only a holder not needed for the whole of the piece's
+# life, so that the piece has the register throughout, and the one it costs
+# least to make wait, if that is less than the piece's value is read and
+# written: better that a value wanted after a loop waits than that one wanted
+# every time round is fetched every time round.
+fn take-blocked(p: Piece, far-only: Bool) -> Bool {
+  let pos = p.pstart
+  for r in Phys {
+    r.needed-at = if fits?(p.owner, int(r) - 1) then far() else 0
+    r.blocked-at = far()
+    r.giving-up = 0
+  }
+  for a in active {
+    let cost = if far-only then waiting-cost(a.owner, pos) else 0
+    let x = if far-only and cost >= p.owner.weight then pos else next-need(a, pos)
+    if x < id(a.reg).needed-at { id(a.reg).needed-at = x }
+    id(a.reg).giving-up = id(a.reg).giving-up + cost
+  }
+  for a in inactive {
+    if meeting(a.ranges, p.ranges) != 0 {
+      let cost = if far-only then waiting-cost(a.owner, pos) else 0
+      let x = if far-only and cost >= p.owner.weight then pos else next-need(a, pos)
+      if x < id(a.reg).needed-at { id(a.reg).needed-at = x }
+      id(a.reg).giving-up = id(a.reg).giving-up + cost
+    }
+  }
+  for r in Phys {
+    if r.needed-at > 0 {
+      let x = meeting(r.fixed, p.ranges)
+      if x != 0 {
+        r.blocked-at = x
+        if x < r.needed-at { r.needed-at = x }
+      }
+    }
+  }
+  var best = -1
+  var needed = 0
+  if far-only {
+    # Of the registers the piece could have throughout, the cheapest to give up.
+    for r in Phys {
+      if r.needed-at >= p.pend and r.blocked-at >= p.pend and (best < 0 or r.giving-up < id(best + 1).giving-up or (r.giving-up == id(best + 1).giving-up and r.needed-at > needed)) {
+        best = int(r) - 1
+        needed = r.needed-at
+      }
+    }
+    if best < 0 { return false }
+  } else {
+    for r in Phys {
+      if r.needed-at > needed {
+        best = int(r) - 1
+        needed = r.needed-at
+      }
+    }
+  }
+  if needed <= pos { panic("register allocation: every register is needed at once") }
+  var kept = 0
+  for j in 0..active.len {
+    let a = active[j]
+    if a.reg == best + 1 { to-frame-from(a, wait-from(a, pos)) } else {
+      active[kept] = a
+      kept = kept + 1
+    }
+  }
+  while active.len > kept { active.pop() }
+  kept = 0
+  for j in 0..inactive.len {
+    let a = inactive[j]
+    if a.reg == best + 1 and meeting(a.ranges, p.ranges) != 0 { to-frame-from(a, wait-from(a, pos)) } else {
+      inactive[kept] = a
+      kept = kept + 1
+    }
+  }
+  while inactive.len > kept { inactive.pop() }
+  place-in(p, best)
+  if id(best + 1).blocked-at < p.pend { to-frame-from(p, id(best + 1).blocked-at) }
+  true
+}
+
+# A register free for all of the piece's life; or one whose holder can wait
+# that long; or one free for a while; or the one whose holder is needed last.
+fn place(p: Piece) {
+  if p.in-frame { return }
+  advance(p.pstart)
+  if try-free(p, true) { return }
+  if take-blocked(p, true) { return }
+  if not try-free(p, false) { take-blocked(p, false) }
+}
+
+fn scan() {
+  for p in Piece { if p.pstart != 0 { enqueue(p) } }
+  for i in Inst {
+    for p in i.starts-even { place(p) }
+    for p in i.starts-odd { place(p) }
+  }
+}
+
+# The piece of `v` that holds it at `pos`.
+fn piece-at(v: Vreg, pos: Int) -> Piece {
+  var p = v.first-piece
+  while p.next-piece != none and pos >= p.pend { p = p.next-piece }
+  p
+}
+
+fn run() {
+  check-frame-plan()
+  occurrences()
+  liveness()
+  build-ranges()
+  # Where the frame opens, every value alive there may change its home.
+  if frame-at != none {
+    for v in frame-at.live-in { split(v.first-piece, 2 * frame-at.first-inst) }
+  }
+  scan()
+}

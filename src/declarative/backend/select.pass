@@ -1,0 +1,580 @@
+# Instruction selection: choose a rule for every node that must be computed,
+# then emit the rules' instructions block by block.
+pass in unit
+use cfg as cfg
+use mach as mach
+use lower as lower
+import target as isa
+import abi as abi
+
+state frame-at: Block                 # where the frame is opened, if that is not the function's start
+column framed: Block -> Bool          # the frame is open here: `frame-at` dominates the block
+column pair-with: Node -> Node        # for the first of two loads or stores done together: the second
+column pair-second: Node -> Bool      # the second of such a two,
+column pair-first: Node -> Node       # and its first
+column pair-base: Node -> Node        # for the first: the address both are offsets from,
+column pair-at: Node -> Int           # and the first's offset
+column homed: Node -> Bool            # for an argument: put in its frame object where the function begins
+tally paired: Int                     # how many such twos there were
+tally tabled: Int                     # how many switches went by a table
+
+# What address `a` is an offset from, and the offset.
+fn address-base(a: Node) -> Node =
+  if a is ADD and a.in(1) is CONST then a.in(0) else if a is ADD and a.in(0) is CONST then a.in(1) else a
+
+fn address-offset(a: Node) -> Int =
+  if a is ADD and a.in(1) is CONST then int(a.in(1).payload) else if a is ADD and a.in(0) is CONST then int(a.in(0).payload) else 0
+
+# Whether `n` is a plain load or store of a whole 64-bit integer.
+fn whole-word?(n: Node) -> Bool =
+  n.payload == 0 and ((n is LOAD and n.bits == 64 and not n.float) or (n is STORE and n.in(2).bits == 64 and not n.in(2).float))
+
+# Two loads, or two stores, one straight after the other, of two words next to
+# each other in memory, are one instruction where the machine has one.
+fn pair-up(b: Block) {
+  var c = cfg.follower(b.head)
+  while c != none and cfg.chain?(c) {
+    let next = cfg.follower(c)
+    if next != none and whole-word?(c) and whole-word?(next) and ((c is LOAD and next is LOAD) or (c is STORE and next is STORE)) and not c.pair-second {
+      let base = address-base(c.in(1))
+      let at = address-offset(c.in(1))
+      # Of a frame object near the frame record, the two words are reached
+      # from the frame register (at most 256 bytes below it, at a multiple of 8).
+      # Not for a program to be looked at as it runs: the debugger reads frame
+      # objects, and an argument must be in its own where the prologue ends.
+      let near = base is SLOT and not debugging and at >= 0 and at + 16 <= int(base.payload) and mach.object-offset(base) - at <= 256 and (mach.object-offset(base) - at) % 8 == 0
+      let reached = if base is SLOT then near else at >= 0 and at <= 496 and at % 8 == 0
+      if address-base(next.in(1)) == base and address-offset(next.in(1)) == at + 8 and reached and base != c {
+        c.pair-with = next
+        c.pair-base = base
+        c.pair-at = at
+        next.pair-second = true
+        next.pair-first = c
+        paired = paired + 1
+      }
+    }
+    c = next
+  }
+}
+
+# The argument, as it arrived, that store `n` puts into a frame object; else none.
+fn homing(n: Node) -> Node {
+  if not (n is STORE) or not (address-base(n.in(1)) is SLOT) { return none }
+  var v = n.in(2)
+  while v is SEXT or v is ZEXT or v is TRUNC { v = v.in(0) }
+  if v is PARAM then v else none
+}
+
+fn choose(n: Node) {
+  # A pair is emitted as one: neither has a rule of its own, and what they
+  # need in registers is their base and, for stores, what they store.
+  if n.pair-second { return }
+  if n.pair-with != none {
+    if not (n.pair-base is SLOT) { mach.need(n.pair-base) }
+    if n is STORE {
+      mach.need(n.in(2))
+      mach.need(n.pair-with.in(2))
+    }
+    return
+  }
+  let rule = lower.select(n)
+  if rule == 0 {
+    print("no rule computes {} (node {})", n.name, n)
+    panic("instruction selection failed")
+  }
+  n.tile = rule
+  lower.mark(n, rule)
+  if n is PHI or n is CALL or n is SWITCH or n is TAILCALL or n is RETURN or n is RESERVE {
+    for i in 1..n.arity { mach.need(n.in(i)) }
+  }
+}
+
+# An argument's value into register `d`. The convention wants an integer
+# narrower than 32 bits carried up to 32 by its own kind of extension.
+fn widened(d: Int, n: Node) {
+  if n.float or n.bits >= 32 { copy(d, n) } else { lower.move(d, lower.extended(n, 2)) }
+}
+
+# A value arriving in machine register `r`, a parameter or a call's result.
+# A boolean is kept as exactly 0 or 1, whatever the other side left above it.
+fn arrive(n: Node, r: Int) {
+  if n.float { lower.move-float(int(n), r) }
+  else if n.bits == 1 { lower.zero-extend(int(n), r, 1) }
+  else { lower.move(int(n), r) }
+}
+
+# Where the convention puts arguments, one after another: how many of each
+# kind's registers are taken, how many bytes of stack, and how many arguments
+# to come must follow the last one there.
+state ints: Int
+state floats: Int
+state stack-bytes: Int
+state following: Int
+state placed-bytes: Int               # how many bytes the last argument takes on the stack
+state placed-copy: Bool               # and whether it is bytes copied there, the argument being their address
+
+fn begin-placing() {
+  ints = 0
+  floats = 0
+  stack-bytes = 0
+  following = 0
+}
+
+# The next argument's place: a register, or -(n + 1) for n bytes above the
+# stack pointer as the call is made. `how` is what its shape says of it.
+fn place(type: Int, how: Word) -> Int {
+  let with = int(how & word(255))
+  placed-copy = false
+  # Bytes copied onto the stack, in whole words: at a multiple of 16 if asked.
+  if has-bit(how, 12) {
+    let bytes = int(how >> word(32))
+    let align = if has-bit(how, 10) then 16 else 8
+    let at = (stack-bytes + align - 1) / align * align
+    stack-bytes = at + (bytes + 7) / 8 * 8
+    placed-bytes = bytes
+    placed-copy = true
+    return 0 - at - 1
+  }
+  # Pinned: the register is said outright.
+  if has-bit(how, 11) { return with }
+  if has-bit(how, 8) and abi.INDIRECT-RESULT >= 0 { return abi.INDIRECT-RESULT }
+  let float = float-type?(id(type))
+  let unnamed = has-bit(how, 9)
+  if following > 0 { following = following - 1 }
+  else if not (unnamed and abi.VARIADIC-ON-STACK) {
+    if float and floats + with < abi.FLOAT-ARGS {
+      floats = floats + 1
+      return abi.float-arg(floats - 1)
+    }
+    if not float and ints + with < abi.INT-ARGS {
+      ints = ints + 1
+      return abi.int-arg(ints - 1)
+    }
+    following = with
+    if abi.REGISTERS-CLOSE { if float { floats = abi.FLOAT-ARGS } else { ints = abi.INT-ARGS } }
+  }
+  # A floating value is written as wide as it is; an integer fills its place.
+  let bytes = type-bytes(id(type))
+  let slot = if abi.STACK-PACKED and not unnamed then bytes else max(bytes, 8)
+  placed-bytes = if float then bytes else slot
+  let align = if has-bit(how, 10) then 16 else slot
+  let at = (stack-bytes + align - 1) / align * align
+  stack-bytes = at + slot
+  0 - at - 1
+}
+
+# `bytes` bytes from the address `a` holds to `at` bytes above the stack
+# pointer, a word at a time and then what is left.
+fn copy-out(a: Node, at: Int, bytes: Int) {
+  let from = lower.operand(a)
+  let t = mach.fresh()
+  var done = 0
+  var width = 8
+  while width > 0 {
+    while done + width <= bytes {
+      lower.from-stack(t, from, done, width)
+      lower.to-stack(t, at + done, width)
+      done = done + width
+    }
+    width = width / 2
+  }
+}
+
+# The arguments of call `n` to where its shape and the convention want them;
+# the registers that took any.
+fn pass-arguments(n: Node, staying: Bool) -> Word {
+  var passed = word(0)
+  let shape = int(n.payload)
+  begin-placing()
+  for i in 2..n.arity {
+    let a = n.in(i)
+    let at = place(int(a.type), shape-passing(shape, i - 2))
+    if at >= 0 {
+      widened(0 - at - 1, a)
+      passed = set-bit(passed, at)
+    } else {
+      if not staying {
+        # Leaving for good: the argument goes where this function's own
+        # arguments on the stack came, which is known when the frame is.
+        if placed-copy { panic("a tail call copies an argument onto the stack") }
+        let r = if a.float then lower.operand(a) else lower.extended(a, 2)
+        if a.float { lower.to-stack-float(r, 0, 8) } else { lower.to-stack(r, 0, 8) }
+        mach.to-caller(r, 0 - at - 1, placed-bytes)
+      }
+      else if placed-copy { copy-out(a, 0 - at - 1, placed-bytes) }
+      else if a.float { lower.to-stack-float(lower.operand(a), 0 - at - 1, placed-bytes) }
+      else { lower.to-stack(lower.extended(a, 2), 0 - at - 1, placed-bytes) }
+    }
+  }
+  if staying { out-slots = max(out-slots, (stack-bytes + 7) / 8) }
+  # Where the convention wants it, the number of floating registers used.
+  if shape-variadic(shape) and abi.VARIADIC-COUNT >= 0 {
+    lower.count-into(0 - abi.VARIADIC-COUNT - 1, min(floats, abi.FLOAT-ARGS))
+    passed = set-bit(passed, abi.VARIADIC-COUNT)
+  }
+  passed
+}
+
+# A call: arguments to where the convention wants them, the call, the results
+# out of their registers. The call reads the argument registers and may write
+# every register the convention does not preserve.
+fn call(n: Node) {
+  if shape-pinned(int(n.payload)) {
+    pinned-call(n)
+    return
+  }
+  let passed = pass-arguments(n, true)
+  # Something in the same image is called where it is; anything else through a register.
+  if n.in(1) is SYMBOL { lower.call-symbol(int(n.in(1).payload)) }
+  else { lower.call-register(lower.operand(n.in(1))) }
+  mach.mark-call()
+  mach.implicit(passed, if abi.LINK >= 0 then set-bit(isa.CALLER-SAVED, abi.LINK) else isa.CALLER-SAVED)
+  calls = true
+  for u in users(n) {
+    if u is RESULT and u.needed {
+      let r = if u.float then abi.float-result(int(u.payload)) else abi.int-result(int(u.payload))
+      if r < 0 { panic("a call's result is numbered past the convention's result registers") }
+      arrive(u, 0 - r - 1)
+    }
+  }
+}
+
+# A call that follows no convention: its arguments in the registers its shape
+# pins them to, then the call, or the machine code the shape carries in its
+# place. It writes the registers its shape says, and its result is where the
+# shape says.
+fn pinned-call(n: Node) {
+  let shape = int(n.payload)
+  let passed = pass-arguments(n, true)
+  let bytes = shape-code-bytes(shape)
+  var writes = shape-clobbers(shape)
+  # What it reads and writes is said of its first instruction: code that is
+  # bytes may be pieces of one instruction, with nothing to go between them.
+  let first = Inst.count + 1
+  if bytes > 0 {
+    var at = 0
+    while at < bytes {
+      var piece = 0
+      for k in 0..isa.CODE-UNIT { piece = piece | (shape-code-byte(shape, at + k) << (8 * k)) }
+      lower.machine-code(piece)
+      at = at + isa.CODE-UNIT
+    }
+  } else {
+    if n.in(1) is SYMBOL { lower.call-symbol(int(n.in(1).payload)) }
+    else { lower.call-register(lower.operand(n.in(1))) }
+    if abi.LINK >= 0 { writes = set-bit(writes, abi.LINK) }
+  }
+  let to = shape-result(shape)
+  if to >= 0 { writes = set-bit(writes, to) }
+  mach.mark-call-at(first)
+  mach.implicit-at(first, passed, writes)
+  pinned-writes = pinned-writes | writes
+  calls = true
+  # The registers the frame is found by are put back if the call wrote them.
+  if has-bit(writes, abi.FRAME) {
+    lower.frame-record(0 - abi.STACK - 1, 0)
+    mach.mark-restore(6)
+  }
+  if has-bit(writes, abi.BASE) {
+    lower.base-from-frame(0 - abi.BASE - 1, 0)
+    mach.mark-restore(7)
+  }
+  for u in users(n) {
+    if u is RESULT and u.needed {
+      if to < 0 { panic("a call that gives no result is asked for one") }
+      arrive(u, 0 - to - 1)
+    }
+  }
+}
+
+# The end of the function: each value to the register the convention returns
+# it in, then out.
+fn returns(n: Node) {
+  var given = word(0)
+  var ints = 0
+  var floats = 0
+  for i in 1..n.arity {
+    let a = n.in(i)
+    let r = if a.float then abi.float-result(floats) else abi.int-result(ints)
+    if a.float { floats = floats + 1 } else { ints = ints + 1 }
+    if r < 0 { panic("more values are returned than the convention has registers for") }
+    widened(0 - r - 1, a)
+    given = set-bit(given, r)
+  }
+  lower.leave()
+  mach.implicit(given, word(0))
+}
+
+# A tail call: arguments as for a call, all in registers, then out of this
+# function straight into the other. The target waits in a register the
+# function's exit does not touch.
+fn tail-call(n: Node) {
+  # The arguments on the stack go where this function's own came: if they
+  # need more room than that, or bytes are copied there, it is a call after
+  # all, and what the call returns, where it returns it, is returned.
+  let shape = int(n.payload)
+  begin-placing()
+  var copies = false
+  for i in 2..n.arity {
+    place(int(n.in(i).type), shape-passing(shape, i - 2))
+    if placed-copy { copies = true }
+  }
+  let wanted = stack-bytes
+  begin-placing()
+  for j in 0..param-count() { place(int(param-type(j)), param-passing(j)) }
+  if copies or wanted > stack-bytes {
+    let given = pass-arguments(n, true)
+    if n.in(1) is SYMBOL { lower.call-symbol(int(n.in(1).payload)) }
+    else { lower.call-register(lower.operand(n.in(1))) }
+    mach.mark-call()
+    mach.implicit(given, if abi.LINK >= 0 then set-bit(isa.CALLER-SAVED, abi.LINK) else isa.CALLER-SAVED)
+    calls = true
+    lower.leave()
+    return
+  }
+  let passed = pass-arguments(n, false)
+  if n.in(1) is SYMBOL {
+    lower.tail-symbol(int(n.in(1).payload))
+    mach.implicit(passed, word(0))
+  } else {
+    lower.move(0 - isa.SCRATCH0 - 1, lower.operand(n.in(1)))
+    lower.tail-register(0 - isa.SCRATCH0 - 1)
+    mach.implicit(passed, word(0))
+  }
+}
+
+# Memory sized as the function runs: the stack pointer goes down by the bytes
+# asked for, and the memory is what is then just above the arguments for calls.
+fn reserve(n: Node) {
+  dynamic = true
+  lower.reserve(lower.operand(n.in(1)))
+  lower.above-arguments(int(n), 0)
+  mach.above-arguments(int(n))
+}
+
+# A switch whose cases are many and close together goes by a table: for each
+# value from the lowest case to the highest, where that value goes.
+fn table-switch(n: Node, low: Int, high: Int) {
+  if isa.TABLES == 0 { panic("a switch by table on a machine whose description has none") }
+  tabled = tabled + 1
+  let v = n.in(1)
+  let otherwise = first u in users(n): u is DEFAULT
+  lower.table-jump(if v.bits == 64 then 1 else 0, lower.extended(v, 0), low, high - low, int(otherwise.block-of))
+  for k in low..high + 1 {
+    let to = first u in users(n): u is CASE and int(u.payload) == k
+    lower.table-entry(int(if to == none then otherwise.block-of else to.block-of))
+  }
+}
+
+# A switch: its value against each case in turn, then the default.
+fn switch(n: Node) {
+  let v = n.in(1)
+  if isa.TABLES == 1 and cfg.on?(15) {
+    var cases = 0
+    var low = 4095
+    var high = 0
+    var fits = true
+    for u in users(n) {
+      if u is CASE {
+        cases = cases + 1
+        if u.payload > word(4000) { fits = false } else {
+          low = min(low, int(u.payload))
+          high = max(high, int(u.payload))
+        }
+      }
+    }
+    if fits and cases >= 5 and high - low < 3 * cases {
+      table-switch(n, low, high)
+      return
+    }
+  }
+  let w = if v.bits == 64 then 1 else 0
+  for u in users(n) {
+    if u is CASE { lower.branch-if-equal(w, lower.extended(v, 0), int(u.payload), int(u.block-of)) }
+  }
+  let otherwise = first u in users(n): u is DEFAULT
+  lower.jump(int(otherwise.block-of))
+}
+
+# A parameter: out of its register, or out of the caller's frame. Where it
+# arrives depends on the parameters before it.
+fn param(n: Node) {
+  let k = int(n.payload)
+  begin-placing()
+  for j in 0..k { place(int(param-type(j)), param-passing(j)) }
+  let at = place(int(n.type), param-passing(k))
+  if at >= 0 {
+    arrive(n, 0 - at - 1)
+  } else if placed-copy {
+    # The parameter is the address of the bytes the caller copied.
+    lower.frame-address(int(n), 0 - abi.STACK - 1, 0 - at - 1)
+    mach.caller-address(int(n), 0 - at - 1)
+  } else {
+    if n.float { lower.from-stack-float(int(n), 0 - abi.STACK - 1, 0 - at - 1, placed-bytes) }
+    else { lower.from-stack(int(n), 0 - abi.STACK - 1, 0 - at - 1, placed-bytes) }
+    mach.from-caller(int(n), 0 - at - 1, placed-bytes)
+  }
+}
+
+fn phi-of?(u: Node, h: Node) -> Bool = u is PHI and u.in(0) == h
+
+# `n`'s value into register `d`: computed straight into it if `n` is computed
+# per block, copied otherwise.
+fn copy(d: Int, n: Node) {
+  if lower.local?(n) { lower.emit(n, n.tile, d) } else { transfer(d, lower.operand(n), n) }
+}
+
+# Register `s` into register `d`; both hold a value of `like`'s kind.
+fn transfer(d: Int, s: Int, like: Node) {
+  if like.float { lower.move-float(d, s) } else { lower.move(d, s) }
+}
+
+# The moves that give a region's phis their values on the edge from `b`. Where
+# one phi's value is another phi of the same region, every value is read
+# before any phi is written.
+fn phi-moves(b: Block, s: Block) {
+  var k = 0
+  var index = 0
+  for p in s.preds {
+    if p == b { k = index }
+    index = index + 1
+  }
+  let h = s.head
+  let cyclic = any u in users(h): phi-of?(u, h) and phi-of?(u.in(k + 1), h) and u.in(k + 1) != u
+  if cyclic {
+    var temps: [Int] = []
+    for u in users(h) {
+      if phi-of?(u, h) {
+        let t = mach.fresh-like(u)
+        temps.push(t)
+        copy(t, u.in(k + 1))
+      }
+    }
+    var j = 0
+    for u in users(h) {
+      if phi-of?(u, h) {
+        transfer(int(u), temps[j], u)
+        j = j + 1
+      }
+    }
+  } else {
+    for u in users(h) {
+      if phi-of?(u, h) and u.in(k + 1) != u { copy(int(u), u.in(k + 1)) }
+    }
+  }
+}
+
+# Whether block `b` has a node that needs the frame whatever registers values
+# get: a call, memory sized as the function runs, or a frame object's address
+# (which is made again wherever it is read, straight or with an offset added).
+fn frame-node?(b: Block) -> Bool {
+  for n in b.seq {
+    if n is CALL or n is RESERVE { return true }
+    for i in inputs(n) {
+      if i != none and (i is SLOT or (i is ADD and (i.in(0) is SLOT or i.in(1) is SLOT))) { return true }
+    }
+  }
+  false
+}
+
+# Whether the blocks `e` dominates are left only by returning, or from a block
+# that goes one way only, where the frame can be closed as it goes: to a
+# block where ways meet that started before the frame was opened.
+fn closed?(e: Block) -> Bool =
+  all b in order: not cfg.dominates(e, b) or b.succs.len == 1 or (all s in b.succs: cfg.dominates(e, s))
+
+# A function that often leaves early, before anything that needs the frame,
+# opens its frame later: at the block that dominates every block needing it,
+# if that block is entered by a branch, is in no loop, and is left only by
+# returning or to where ways that never opened it meet. Until there, values keep to registers the caller does not expect
+# back; from there on they may move. The blocks before it are put first in the
+# code, so that "before the frame" is also earlier in the code. `frame-at`
+# stays none if there is no such block short of the function's start; and the
+# passes after this one drop the plan if the frame turns out to be used
+# before `frame-at` after all.
+fn plan-frame() {
+  frame-at = none
+  if not cfg.on?(14) { return }
+  var e: Block = none
+  for b in order {
+    if frame-node?(b) { e = cfg.join(e, b) }
+    if any n in b.seq: n is RESERVE { return }
+  }
+  if e == none { return }
+  let root = cfg.entry()
+  while e != root and (e.loop-depth > 0 or e.preds.len != 1 or e.preds[0].succs.len < 2 or not closed?(e)) { e = e.idom }
+  if e == root { return }
+  frame-at = e
+  var first: [Block] = []
+  var rest: [Block] = []
+  for b in order {
+    b.framed = cfg.dominates(e, b)
+    if b.framed { rest.push(b) } else { first.push(b) }
+  }
+  order.clear()
+  for b in first { order.push(b) }
+  for b in rest { order.push(b) }
+  for i in 0..order.len { order[i].rpo = i }
+}
+
+fn run() {
+  plan-frame()
+  next-vreg = Node.count
+  if cfg.on?(12) { for b in order { pair-up(b) } }
+  for b in order {
+    for n in b.seq { if cfg.control?(n) or n is PHI { mach.need(n) } }
+  }
+  while worklist.len > 0 { choose(worklist.pop()) }
+  # Where a debugger stops on entering the function, the arguments it shows
+  # must already be where it reads them: in their frame objects. The entry
+  # block begins by putting each there; up to the last of those, what it
+  # computes comes from no place.
+  var homed: Node = none
+  if debugging {
+    var leading = true
+    for n in cfg.entry().seq {
+      if leading and cfg.control?(n) and not (n is START) {
+        let p = homing(n)
+        if p == none or p.homed { leading = false } else {
+          p.homed = true
+          homed = n
+        }
+      }
+    }
+  }
+  for b in order {
+    b.first-inst = Inst.count + 1
+    emitting = b
+    var prologue = b == cfg.entry() and homed != none
+    for n in b.seq {
+      emitting-from = if prologue then 0 else origin(n)
+      if n == homed { prologue = false }
+      if n is CALL { call(n) }
+      else if n is SWITCH { switch(n) }
+      else if n is TAILCALL { tail-call(n) }
+      else if n is RETURN { returns(n) }
+      else if n is RESERVE { reserve(n) }
+      else if n is PARAM { if n.tile != 0 { param(n) } }
+      # Two loads are made where the first stands, for whatever reads it before
+      # the second; two stores where the second stands, when both values are there.
+      else if n.pair-with != none {
+        if n is LOAD and n.pair-base is SLOT { lower.load-pair-object(int(n), int(n.pair-with), mach.object-offset(n.pair-base) - n.pair-at) }
+        else if n is LOAD { lower.load-pair(int(n), int(n.pair-with), lower.operand(n.pair-base), n.pair-at) }
+      } else if n.pair-second {
+        if n is STORE {
+          let first = n.pair-first
+          if first.pair-base is SLOT { lower.store-pair-object(lower.operand(first.in(2)), lower.operand(n.in(2)), mach.object-offset(first.pair-base) - first.pair-at) }
+          else { lower.store-pair(lower.operand(first.in(2)), lower.operand(n.in(2)), lower.operand(first.pair-base), first.pair-at) }
+        }
+      }
+      else if n.tile != 0 and not lower.local?(n) { lower.emit(n, n.tile, int(n)) }
+    }
+    if not cfg.end?(b.last) {
+      for s in b.succs {
+        phi-moves(b, s)
+        lower.jump(int(s))
+      }
+    }
+    b.last-inst = Inst.count
+  }
+}
