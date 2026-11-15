@@ -52,6 +52,11 @@ def check_split() -> None:
     stray = [p.relative_to(SOURCES) for p in SOURCES.rglob("*.coil")
              if p.relative_to(SOURCES).parts[0] not in allowed and p.name != "generate.coil"]
     in_adapter = [p.relative_to(SOURCES) for p in (SOURCES / "adapter").glob("*.coil") if p.name != "machine.coil"]
+    native = ROOT / "src" / "compiler" / "native"
+    handwritten_native = sorted(native.glob("*.coil"))
+    if handwritten_native:
+        fail("native infrastructure must be generated from src/declarative/native: "
+             + " ".join(str(p.relative_to(ROOT)) for p in handwritten_native))
     if stray or in_adapter:
         fail("the sources hold Coil that should be written in a language: "
              + " ".join(str(p) for p in stray + in_adapter))

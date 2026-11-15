@@ -205,7 +205,8 @@ Use this format:
   command; the rest is grouped by stage: `frontend/` (parser, loader, resolve, expander, check,
   mono), `meta/` (the metaprogram engine, the code operations and the bytecode
   interpreter), `backend/` (LLVM, wasm and native codegen; the native backend's IR and assembler
-  are the package `native/`, and the backend itself the package `declarative/`, whose
+  are generated in the package `native/generated/` from `src/declarative/native/*.pass`,
+  and the backend itself the package `declarative/`, whose
   `generated/` is what the languages of `src/declarative/` make of its sources: edit those
   and run `scripts/compiler/gen-declarative.py`; each has its NOTICE),
   `object/` (instruction encoders, Mach-O/ELF/DWARF/wasm writers), `jit/` (with `session.coil`,

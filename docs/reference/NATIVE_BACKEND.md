@@ -52,13 +52,11 @@ uses LLVM instead.
   on: signatures, layouts and their natural C offsets (which compile-time readback
   walks), statics and their initializers, `export-c` thunks, argument
   classification, string interning, DWARF types, and the Mach-O object.
-- `src/compiler/native/` — CIR (`cir.coil`; `cir_copies.coil`, copy forwarding)
-  and the assembler the code goes into (`asm.coil`, `buf.coil`), from
-  [coil-tpde](https://github.com/jimmyhmiller/coil-tpde) (`NOTICE`). CIR's
-  types and operations are said once, in `src/declarative/cir/cir.ops`: the
-  module of their numbers, `native.cir-ops` (`generated/cir-ops.coil`), is
-  written from it, as are the direct compile's tables and CIR's reference
-  interpreter.
+- `src/compiler/native/generated/` — generated CIR, aggregate-copy analysis,
+  assembler, byte buffer, and operation numbers. Their sources are
+  `src/declarative/native/*.pass` and `src/declarative/cir/cir.ops`; edit those
+  and run `scripts/compiler/gen-declarative.py`. The package's `NOTICE` retains
+  the [coil-tpde](https://github.com/jimmyhmiller/coil-tpde) provenance.
 - `src/declarative/` — the backend's sources, a Coil project of its own whose
   `Coil.toml` gives each file type its language (`[readers]`) and each file its
   module (`[modules]`):
@@ -66,8 +64,8 @@ uses LLVM instead.
     module: `.ir` (a node set), `.isa` (a machine's instructions and encodings),
     `.abi` (a calling convention), `.lower` (from nodes to instructions),
     `.rewrite` (rules, each checked against the nodes' meanings), `.flow`
-    (facts), `.pass` (an algorithm over the graph), `.unit` (which of them make a
-    compiler), `.pipeline` (the order passes run in at each level), `.layout`
+    (facts), `.pass` (graph algorithms, or libraries with explicit arguments
+    and storage schemas), `.unit` (which of them make a compiler), `.pipeline` (the order passes run in at each level), `.layout`
     (an object file format), `.ops` (CIR's operations, read from CIR itself),
     `.select` (instructions for each CIR operation, for the compile straight
     from CIR), `.numbers` (CIR's numbers, from its `.ops` file) and
@@ -76,7 +74,14 @@ uses LLVM instead.
   - `backend/` — the node set and the passes both machines share; `a64/` and
     `x64/` — each machine's instructions, convention, lowering, rules and passes,
     for the graph route (`-O2`/`-O3`); `direct/`, `a64-direct/`, `x64-direct/` —
-    the compile straight from CIR (`-O0`/`-O1`); `cir/` — CIR's operations.
+    the compile straight from CIR (`-O0`/`-O1`); `cir/` — CIR's operations;
+    `native/` — its storage, SSA builder, copy analysis and assembler library
+    passes. Library records declare their field types and initial values;
+    `construct` and `release` generate allocation and cleanup of list fields.
+    A `byte-buffer` schema declares capacity and integer encodings, including
+    LEB128. Its generated implementation handles memory and byte order.
+    The source project reads these passes directly; it excludes native's
+    generated Coil, so standalone tests exercise the same source definitions.
   - `adapter/machine.coil` — from CIR to the graph, written once:
     `machine-a64.instance` and `machine-x64.instance` make it a module for each
     machine.

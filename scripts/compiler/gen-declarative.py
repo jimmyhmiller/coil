@@ -7,7 +7,8 @@ The compiler's own build does not run them, as no stage-0 compiler and no
 installed toolchain need to, so what they make is kept as plain Coil, the way
 src/compiler/cli/guide.coil is kept from the language reference: a module named
 declarative.* in src/compiler/declarative/generated, and one named native.*
-(CIR's numbers, from cir/cir.ops) in src/compiler/native/generated.
+(CIR, copy analysis, assembler, buffer and operation numbers) in
+src/compiler/native/generated.
 
     gen-declarative.py [--compiler COIL]           # rewrite generated/
     gen-declarative.py --check [--compiler COIL]   # exit 1 if generated/ is not what the sources say
