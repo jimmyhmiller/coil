@@ -15,7 +15,9 @@ passes themselves. There is one implementation for both uses.
   addresses remain stable as later chunks are added.
 - `buf.pass`: the byte-buffer schema: growth capacity, little-endian integer
   widths and LEB128. Appends, reads and patches are generated from the same
-  encoding declaration and accept unaligned offsets.
+  encoding declaration and accept unaligned offsets. Native and LLVM builds
+  use a width-specific memory operation with alignment 1; the portable wasm
+  backend uses byte operations selected at expansion, without a runtime branch.
 
 Library mode in `.pass` has explicit function parameters instead of an implicit
 graph state. `record` declares storage. List fields default to empty owned
