@@ -11,7 +11,7 @@ build/native-benchmark --compiler "$PWD/build/bin/coil-candidate" \
 ```
 
 Use an existing output directory dedicated to the run: the harness overwrites
-`llvm`, `tpde`, `stogir` and their `.o` files there. Do not run other builds or
+`llvm`, `native-o1`, `native`, `llvm-o0` and their `.o` files there. Do not run other builds or
 benchmarks concurrently. Preserve the compiler's matching SDK/stdlib and record
 its `.toolchain` sidecar and checkout revision with the results.
 
@@ -20,9 +20,10 @@ starting child compilers (namespace roots, manifest, package, units, prelude,
 stdlib settings and metaprogram JIT override). Each source therefore uses its own
 project discovery.
 
-Each round compiles the identical source with `emit-obj -O3 --no-debug`, links it
+Each round compiles the identical source with `emit-obj --no-debug` (LLVM -O3,
+native -O1, native -O3, LLVM -O0), links it
 with the system `cc -lm`, then executes it with the same iteration count and seed.
-Order rotates LLVM/TPDE/stogir between rounds. Sample zero is warmup; exclude it
+Order rotates the engines between rounds. Sample zero is warmup; exclude it
 from summaries. The CSV contains raw monotonic wall-clock nanoseconds for each
 phase, including subprocess creation, capture and reaping. Compile time includes
 the frontend, lowering and code generation. Run time includes program startup;
@@ -37,11 +38,10 @@ best run. Increase iterations if runtime is too close to process-startup cost.
 
 The header records compiler version, executable/source SHA-256, host, flags and
 inputs. This small mixed kernel is an initial comparison, not a representative
-language workload suite. The experimental stogir backend still has corpus gaps,
-including pinned calls, i128 and proper tail calls. Run its full corpus manually:
+language workload suite. Run the native backend's full corpus manually:
 
 ```sh
-python3 scripts/oracle.py corpus stogir --all --compiler build/bin/coil-candidate
+python3 scripts/oracle.py corpus native --all --compiler build/bin/coil-candidate
 ```
 
 ## Optimization-sensitive stencil
@@ -67,8 +67,8 @@ platform dependent. The harness records their sum as `ir-codegen` and preserves
 the individual records as CSV comments. Missing, malformed or unexpected
 compiler diagnostics fail the run.
 
-The inputs at this boundary are the constructed library graph for stogir,
-finished native CIR for TPDE, and lowered LLVM IR for LLVM. IR construction,
+The inputs at this boundary are finished CIR for the native backend (from which
+-O3 builds its graph) and lowered LLVM IR for LLVM. IR construction,
 frontend work and target-context setup are excluded. Validation performed by the
 code generator, optimization, selection/allocation, code emission, module merging
 and relocatable-object serialization are included. LLVM uses its memory-buffer

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Prove single-form compilation and default Var policy through the real REPL.
 
-    jit-single-form.py COMPILER [REPL-ARGS...]   (e.g. --backend tpde)
+    jit-single-form.py COMPILER [REPL-ARGS...]   (e.g. --backend native)
 """
 from collections import Counter
 from pathlib import Path
@@ -14,7 +14,7 @@ raw_compiler = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("COIL")
 if not raw_compiler:
     raise SystemExit("usage: jit-single-form.py COMPILER (or set $COIL)")
 compiler = Path(raw_compiler).resolve()
-# Further arguments go to `coil repl`: comprehensive runs this again with tpde.
+# Further arguments go to `coil repl`: comprehensive runs this again with the native backend named.
 repl_args = sys.argv[2:]
 source = """(defn proof-old [] (-> i64) 7)
 (defn proof-new [] (-> i64) (+ (proof-old) 1))

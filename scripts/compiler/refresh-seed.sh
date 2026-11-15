@@ -123,7 +123,7 @@ if [ "$WHICH" = all ] || [ "$WHICH" = wasm ]; then
   [ -x "$wasm_compiler" ] || { echo "[wasm] no verified compiler to build it with"; exit 1; }
   W="$RUN_DIR/wasm"
   mkdir -p "$W"
-  "$wasm_compiler" build src/compiler/main_wasm.coil --target wasm64-unknown-unknown \
+  "$wasm_compiler" build src/compiler/main_wasm.coil --release --target wasm64-unknown-unknown \
       --wasm-stack-size=64 -o "$W/coilc.wasm" >/dev/null \
     || { echo "[wasm] building the portable compiler FAILED — seed NOT updated"; exit 1; }
   if command -v wasm-tools >/dev/null 2>&1; then
@@ -143,7 +143,7 @@ if [ "$WHICH" = all ] || [ "$WHICH" = wasm ]; then
     stage0_compat_run "$W/coil-bootstrap" check "$src" >/dev/null \
       || { echo "[wasm] the translated seed cannot check $src — seed NOT updated"; exit 1; }
   done
-  stage0_compat_run "$W/coil-bootstrap" build src/compiler/main_a64.coil --backend arm64 \
+  stage0_compat_run "$W/coil-bootstrap" build src/compiler/main_a64.coil --backend native \
       -o "$W/stage1" >/dev/null \
     || { echo "[wasm] the translated seed cannot build a native stage1 — seed NOT updated"; exit 1; }
   "$W/stage1" run src/examples/fib.coil >/dev/null 2>&1

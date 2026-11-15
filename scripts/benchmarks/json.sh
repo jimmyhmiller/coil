@@ -31,7 +31,7 @@ fetch_fixture twitter a08b769f32b95f426cbc3abafcec65c1a19d3eb544d4ddf320eae142c9
 fetch_fixture citm_catalog a73e7a883f6ea8de113dff59702975e60119b4b58d451d518a929f31c92e2059
 fetch_fixture canada f83b3b354030d5dd58740c68ac4fecef64cb730a0d12a90362a7f23077f50d78
 
-"$COIL" build src/benchmarks/json_tape.coil -o "$out_dir/json_tape"
+"$COIL" build src/benchmarks/json_tape.coil --release -o "$out_dir/json_tape"
 
 results=src/benchmarks/JSON_RESULTS.md
 {

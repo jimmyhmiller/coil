@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# C-ABI gate for the native backend (tpde) on x86-64 Linux: the SysV eightbyte
+# C-ABI gate for the native backend on x86-64 Linux: the SysV eightbyte
 # rules, checked against a real gcc-compiled translation unit.
 #
 # Why this gate exists and the corpus cannot replace it. For calls between Coil
@@ -193,7 +193,7 @@ run_one() {  # run_one <label> <backend-args...>
 }
 
 # The native backend is what this gate protects.
-run_one "tpde (x64)    <-> gcc" --backend x64
+run_one "native        <-> gcc" --backend native
 
 # The LLVM backend is the CONTROL: it must agree with gcc too, which is what
 # proves the expected values above are right and not merely self-consistent.
@@ -201,7 +201,7 @@ run_one "tpde (x64)    <-> gcc" --backend x64
 # into two separate `double` parameters instead of demoting it to byval once
 # the SSE registers ran out. c-signature now tracks register consumption across
 # the parameter list, exactly as clang does, so both backends agree here.)
-run_one "LLVM backend  <-> gcc (control)"
+run_one "LLVM backend  <-> gcc (control)" --release
 
 echo
 [ "$fail" = 0 ] && { echo "x64 gate-cabi: PASS"; exit 0; } || { echo "x64 gate-cabi: $fail case(s) FAILED"; exit 1; }

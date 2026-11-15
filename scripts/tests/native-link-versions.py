@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Every backend's macOS program records the same platform, minos and sdk.
 
-The single-object native backends (Stogir, arm64) link with ld directly; the
+The single-object native backend links with ld directly; the
 LLVM backend links through the cc driver. Both must record what the driver
 records: `sdk` is the version of the SDK linked against (the system picks,
 among other things, its allocator by it) and `minos` is the deployment target
@@ -28,7 +28,7 @@ COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ['COIL']).resolv
 ENV = {k: v for k, v in os.environ.items()
        if not k.startswith('COIL_') and k != 'MACOSX_DEPLOYMENT_TARGET'}
 ENV['COIL_LIBRARY_STATE'] = '0'
-BACKENDS = ('llvm', 'stogir', 'arm64')
+BACKENDS = ('llvm', 'native')
 
 PROGRAM = '''(defn main [] (-> i64) (println "linked") 0)
 '''
@@ -72,7 +72,7 @@ with tempfile.TemporaryDirectory(prefix='native-link-versions-') as temporary:
 
     plain = {backend: link(source, temporary / f'plain-{backend}', backend) for backend in BACKENDS}
     assert len(set(plain.values())) == 1, f'programs differ in build version: {plain}'
-    assert plain['stogir'][2] == sdk, f'sdk {plain["stogir"][2]} is not the SDK version {sdk}'
+    assert plain['native'][2] == sdk, f'sdk {plain["native"][2]} is not the SDK version {sdk}'
 
     env = {backend: link(source, temporary / f'env-{backend}', backend, MACOSX_DEPLOYMENT_TARGET='13.1')
            for backend in BACKENDS}
@@ -95,7 +95,7 @@ with tempfile.TemporaryDirectory(prefix='native-link-versions-') as temporary:
     newer = {backend: link(source, temporary / f'newer-{backend}', backend, SDKROOT=str(later))
              for backend in BACKENDS}
     assert len(set(newer.values())) == 1, f'an SDK newer than the system: {newer}'
-    assert newer['stogir'][2] == '99.0' and newer['stogir'][1] != '99.0', newer
+    assert newer['native'][2] == '99.0' and newer['native'][1] != '99.0', newer
 
     named = {backend: link(source, temporary / f'named-{backend}', backend,
                            '--target', 'arm64-apple-macosx14.0.0', MACOSX_DEPLOYMENT_TARGET='13.1')

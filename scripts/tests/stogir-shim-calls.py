@@ -23,7 +23,7 @@ import stogir_target
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ['COIL']).resolve()
-ENV = dict(os.environ, COIL_LIBRARY_STATE='0', COIL_TPDE_SERIAL='1')
+ENV = dict(os.environ, COIL_LIBRARY_STATE='0', COIL_NATIVE_SERIAL='1')
 
 
 def compile_to(command, source, output, flags):
@@ -42,7 +42,7 @@ with tempfile.TemporaryDirectory(prefix='stogir-shims-') as temporary:
     for name in ('tests/backend/stogir-shim-calls.coil', 'tests/corpus/machine_code.coil'):
         source = ROOT / name
         compile_to('build', source, work / 'llvm', [])
-        compile_to('build', source, work / 'stogir', ['--backend', 'stogir'])
+        compile_to('build', source, work / 'stogir', ['--backend', 'native'])
         expected = run(work / 'llvm')
         actual = run(work / 'stogir')
         assert expected.returncode == 0, f'{name}: LLVM program failed\n{expected.stdout}'

@@ -12,7 +12,7 @@ import stogir_target
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ['COIL']).resolve()
 SIZES = [0, 1, 7, 8, 15, 16, 17, 127, 128, 129, 135, 136, 255, 256, 257, 416, 1024]
-ENV = dict(os.environ, COIL_LIBRARY_STATE='0', COIL_TPDE_SERIAL='1')
+ENV = dict(os.environ, COIL_LIBRARY_STATE='0', COIL_NATIVE_SERIAL='1')
 
 
 def run(*args):
@@ -75,7 +75,7 @@ int main(void) {
 }
 ''')
     obj = d / 'matrix.o'
-    run(COMPILER, 'emit-obj', fixture, '--backend', 'stogir', '-O3', '--no-debug', '-o', obj)
+    run(COMPILER, 'emit-obj', fixture, '--backend', 'native', '-O3', '--no-debug', '-o', obj)
     assembly = run(stogir_target.OBJDUMP, '-dr', obj)
     bodies = re.split(r'^[0-9a-f]+ <([^>]+)>:\s*$', assembly, flags=re.M)
     functions = dict(zip(bodies[1::2], bodies[2::2]))

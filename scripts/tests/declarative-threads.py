@@ -184,7 +184,7 @@ def failing_static_program():
 
 
 def emit(source, output, settings, expect=0):
-    result = subprocess.run([str(COMPILER), 'emit-obj', str(source), '--backend', 'stogir',
+    result = subprocess.run([str(COMPILER), 'emit-obj', str(source), '--backend', 'native',
                              '-O3', '--no-debug', '-o', str(output)],
                             cwd=ROOT, env=dict(BASE, **settings),
                             capture_output=True, text=True, timeout=600)
@@ -206,12 +206,12 @@ with tempfile.TemporaryDirectory(prefix='declarative-threads-') as temporary:
     for source in [generated, closing, events, ROOT / 'tests/cli/stogir-live-emission.coil',
                    ROOT / 'tests/backend/stogir-shim-calls.coil']:
         serial = directory / 'serial.o'
-        emit(source, serial, {'COIL_TPDE_SERIAL': '1', 'DECLARATIVE_THREADS': '1'})
+        emit(source, serial, {'COIL_NATIVE_SERIAL': '1', 'DECLARATIVE_THREADS': '1'})
         expected = serial.read_bytes()
         assert expected, 'empty object'
         settings = [{'DECLARATIVE_THREADS': str(n)} for n in (1, 2, 3, 8, 16)]
         # The default thread count, and the serial switch with a thread count.
-        settings += [{}, {'COIL_TPDE_SERIAL': '1'}, {'COIL_TPDE_SERIAL': '1', 'DECLARATIVE_THREADS': '8'}]
+        settings += [{}, {'COIL_NATIVE_SERIAL': '1'}, {'COIL_NATIVE_SERIAL': '1', 'DECLARATIVE_THREADS': '8'}]
         for setting in settings:
             # Repetitions give scheduling a chance to differ.
             for attempt in range(1 if setting.get('DECLARATIVE_THREADS') == '1' else 4):
@@ -226,7 +226,7 @@ with tempfile.TemporaryDirectory(prefix='declarative-threads-') as temporary:
                                 'duplicate static storage symbol')]:
         failing = directory / f'{name}.coil'
         failing.write_text(text)
-        expected_failure = emit(failing, directory / 'failing.o', {'COIL_TPDE_SERIAL': '1'},
+        expected_failure = emit(failing, directory / 'failing.o', {'COIL_NATIVE_SERIAL': '1'},
                                 expect=1)
         assert marker in expected_failure, expected_failure
         for setting in [{'DECLARATIVE_THREADS': str(n)} for n in (2, 3, 8, 16)] + [{}]:

@@ -34,7 +34,7 @@ SEED=bootstrap/seeds/native/coil-seed
 # prune would otherwise index stray tree copies (e.g. .claude/worktrees/*) and
 # report every namespace as declared twice. Roots must be relative to the repo
 # root; absent roots are fine (find's nonzero exit is already tolerated).
-# src holds the tpde backend's package too (vendored at src/compiler/tpde).
+# src holds the native package too (src/compiler/native).
 export COIL_NAMESPACE_ROOTS="${COIL_NAMESPACE_ROOTS:-src:tests:scripts}"
 # In-repo, an import of a `coil.*` namespace that is missing from the bundled
 # stdlib manifest still resolves via the namespace scan above, so the build stays
@@ -95,11 +95,11 @@ else
   # stage1 with an error that reads like a compiler bug. See stage0-check.sh.
   . "$(dirname "$0")/stage0-check.sh"
   stage0_check "$STAGE0" "$SEED" "$SRC" "${LF[@]}" || exit 1
-  stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$RB1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
+  stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$RB1" --release ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
 fi
 
 echo "=== stage2: stage1 rebuilds the compiler ==="
-"$RB1" build "$SRC" -o "$RL2" "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
+"$RB1" build "$SRC" -o "$RL2" --release "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
 
 echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="
 # The two emissions are independent; run them at once.

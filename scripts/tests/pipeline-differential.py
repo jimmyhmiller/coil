@@ -48,7 +48,7 @@ def corpus():
 
 def namespace_roots():
     # The roots scripts/compiler/stage0.py builds the compiler with: its own
-    # sources (the vendored tpde package included), so a reference compiler whose
+    # sources (the native and declarative packages included), so a reference compiler whose
     # bundled manifest predates a new compiler module still finds it.
     return ":".join(["src", "tests", "scripts", "src/compiler", "src/stdlib"])
 

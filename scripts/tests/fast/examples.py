@@ -3,7 +3,7 @@
 
     examples.py build              build every package, run six on their bundled data
     examples.py test [PKG...]      `coil test` in each package (all ten by default)
-    examples.py arm64              `coil test --backend arm64` in huffman and calc
+    examples.py native             `coil test --backend native` in huffman and calc
     examples.py safety             huffman under coil.safety: a compress/decompress round trip
     examples.py fmt                `coil fmt --check` in each package
 
@@ -122,10 +122,10 @@ def test(selected: list[str]) -> None:
     print(f"examples: {passed} tests passed")
 
 
-def arm64() -> None:
+def native() -> None:
     for package in ("huffman", "calc"):
-        if run([COIL, "test", "--backend", "arm64"], EXAMPLES / package, timeout=120).returncode == 0:
-            print(f"ok   coil test --backend arm64 in examples/{package}")
+        if run([COIL, "test", "--backend", "native"], EXAMPLES / package, timeout=120).returncode == 0:
+            print(f"ok   coil test --backend native in examples/{package}")
 
 
 def safety() -> None:
@@ -162,7 +162,7 @@ def main(argv: list[str]) -> int:
     if unknown:
         print(f"unknown example package(s): {unknown}")
         return 2
-    {"build": lambda: build(), "test": lambda: test(rest), "arm64": lambda: arm64(),
+    {"build": lambda: build(), "test": lambda: test(rest), "native": lambda: native(),
      "safety": lambda: safety(), "fmt": lambda: fmt()}[command]()
     if failures:
         print(f"examples {command}: {len(failures)} failed")

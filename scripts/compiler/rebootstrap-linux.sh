@@ -100,11 +100,11 @@ echo "=== stage1: stage0 builds the self-host compiler ==="
 # explicit --link-flag inputs before auto-discovered archives, so an ordinary
 # early -lz is discarded by GNU ld's --as-needed. Retain zlib for this one
 # bootstrap link; stage1 and later append -lz after their curl archives.
-stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$S1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} "${LF[@]}" \
+stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$S1" --release ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} "${LF[@]}" \
   --link-flag "-Wl,--no-as-needed" --link-flag -lz --link-flag "-Wl,--as-needed" \
   || { echo "stage1 FAILED"; exit 1; }
 echo "=== stage2: stage1 rebuilds it ==="
-"$S1" build "$SRC" -o "$S2" "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
+"$S1" build "$SRC" -o "$S2" --release "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
 echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="
 # The two emissions are independent; run them at once.
 "$S1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" & stage2_pid=$!

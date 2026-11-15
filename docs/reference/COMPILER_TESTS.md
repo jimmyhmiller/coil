@@ -96,22 +96,23 @@ a line per section and returns its count of failed checks, so exit 0 means every
 check held. Its reference is `tests/corpus/reference/<name>.{stdout,exit}`:
 
 ```sh
-python3 scripts/oracle.py corpus arm64 --compiler <coil> [--only types_traits]
+python3 scripts/oracle.py corpus native --compiler <coil> [--only types_traits]
 python3 scripts/oracle.py corpus bless --compiler <coil> [--only types_traits]
 ```
 
 `bless` writes a reference from the LLVM build only after checking that the
-arm64 build agrees with it. The lanes are `arm64`, `llvm`, `x64`, `tpde`, `stogir`,
-`declarative`, `declarative-debug`, `interp`, `safety`, `meta-interp` and `opt3`; `--all` puts every program in the `safety`
+native build agrees with it. The lanes are `llvm`, `native`, `native-debug`,
+`native-quick`, `native-quick-debug`, `interp`, `safety`, `meta-interp` and
+`opt3`; `--all` puts every program in the `safety`
 and `meta-interp` lanes. The `meta-interp` lane always includes the programs
 marked `meta-interp-refused=`: only the interpreted engine refuses them, so the
 refusal proves `COIL_META_INTERP=1` selected it and the lane is not silently
 running the native engine. The LLVM-free and x64 bootstraps run the corpus on
-the native backend, tpde. The `arm64`, `x64` and `tpde` lanes all compile with
-tpde: `arm64` and `x64` name it for one architecture, `tpde` for the target's.
-The `stogir` and `declarative` lanes compile with the declarative backend,
-which both names choose (`STOGIR_BACKEND.md`), and `declarative-debug` does so
-with debug information; its checks in FAST are the Stogir rows of
+the native backend (`native-quick`). The `native*` lanes compile with the native
+backend (`NATIVE_BACKEND.md`): `native` at `-O3`, `native-debug` at `-O3` with
+debug information, `native-quick` at `-O0`, and `native-quick-debug` as a debug
+build; `llvm`, `safety` and `opt3` are release builds through LLVM. Its checks in
+FAST are the Stogir rows of
 `scripts/tests/fast/cli.sh objects`, and `scripts/tests/stogir-x86-sweep.py`
 compares it with LLVM over the corpus, the demos, the stdlib suites and the
 examples at -O1, -O2 and -O3. Its own tests (rewrite rules, random programs
@@ -157,7 +158,7 @@ nothing else heavy is running: the build steps peak near 10 GB.
 | `guide-demos` | every `src/examples` demo builds and exits as `tests/demos.txt` says |
 | `regex-reference`, `prop`, `fuzz`, `simd` | breadth: regex conformance, property tests, the fuzz engine, SIMD in full |
 | `freestanding` | every `src/examples/freestanding` program links bare-metal (aarch64, riscv32, ESP32-C3) with `ld.lld --gc-sections` and no undefined symbols, then boots under QEMU; needs `brew install lld qemu` |
-| `x64/host` | on the x86-64 Linux host over ssh: the Linux bootstrap, the corpus on LLVM, the C ABI checks, tpde's x86-64 fixpoint and gates, the LLVM-free Linux bootstrap |
+| `x64/host` | on the x86-64 Linux host over ssh: the Linux bootstrap, the corpus on LLVM, the C ABI checks, the native backend's x86-64 fixpoint and gates, the LLVM-free Linux bootstrap |
 
 The x64 step uses `COIL_X64_HOST` (default `computer.jimmyhmiller.com`). That
 host may be unreachable; the step then fails and says so, rather than passing

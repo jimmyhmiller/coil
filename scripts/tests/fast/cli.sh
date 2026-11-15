@@ -271,8 +271,8 @@ EOF
     expect_rc 42 "-O0 tail calls that pass a pointer or never return run in constant stack" "$T/tail"
   fi
   expect_rc 42 "the interpreter runs those tail calls in constant stack too" "$COIL" interp "$T/tail.coil"
-  if [ "$HOST_ARCH" = arm64 ] && build "$T/tail.coil" "$T/tail-arm64" --backend arm64; then
-    expect_rc 42 "the arm64 backend runs a never-returning self tail call as a jump" "$T/tail-arm64"
+  if [ "$HOST_ARCH" = arm64 ] && build "$T/tail.coil" "$T/tail-arm64" --backend native; then
+    expect_rc 42 "the native backend runs a never-returning self tail call as a jump" "$T/tail-arm64"
   fi
 }
 
@@ -336,7 +336,7 @@ section_usage() {
   [ "$rc" = 7 ] && ok "build -o OUT FILE (flags before the file)" || bad "build -o OUT FILE" "exit $rc"
   [ ! -e "$T/a.o" ] && ok "build leaves only the requested executable" \
                      || bad "build leaves only the requested executable" "$T/a.o exists"
-  "$COIL" build --quiet "$T/seven.coil" --backend arm64 -o "$T/a2" >/dev/null 2>&1; "$T/a2"; rc=$?
+  "$COIL" build --quiet "$T/seven.coil" --backend native -o "$T/a2" >/dev/null 2>&1; "$T/a2"; rc=$?
   [ "$rc" = 7 ] && ok "build FILE with flags on both sides" || bad "build FILE with flags on both sides" "exit $rc"
 
 }
@@ -637,7 +637,7 @@ EOF
     "check: a definition swallowed by a missing ) is reported as one" "$COIL" check "$T/swallowed.coil"
   # A backend name is one of the backends, never a typo that builds with LLVM.
   printf '(module backend-typo)\n(defn main [] (-> i64) 0)\n' > "$T/backend-typo.coil"
-  expect_rc_out 1 "unknown backend 'arm46': expected llvm, arm64, x64, wasm, tpde, stogir or declarative" \
+  expect_rc_out 1 "unknown backend 'arm46': expected llvm, native or wasm" \
     "build: an unknown --backend is an error" "$COIL" build "$T/backend-typo.coil" -o "$T/backend-typo" --backend arm46
   # A nested dependency owns its namespaces and its exclusions; the consumer
   # excludes it from its own package, without making the dependency disappear.
@@ -1102,7 +1102,7 @@ Point obj_make_point(int64_t, int64_t);
 int main(void) { Point p = obj_make_point(3, 4); return (int)(obj_scale(7) + p.x + p.y - 49); }
 EOF
   local backend rc
-  for backend in llvm arm64; do
+  for backend in llvm native; do
     if "$COIL" emit-obj "$T/lib.coil" --backend "$backend" -o "$T/lib-$backend.o" >/dev/null 2>&1 \
        && cc "$T/driver.c" "$T/lib-$backend.o" -o "$T/driver-$backend" 2>/dev/null; then
       "$T/driver-$backend"; rc=$?
@@ -1112,11 +1112,11 @@ EOF
       bad "emit-obj ($backend) links into a C program" "emit-obj or cc failed"
     fi
   done
-  # The Stogir backend generates code for the machine the compiler was built
-  # for: AArch64 macOS or x86-64 Linux. Checks that read AArch64 instruction
-  # shapes or Mach-O load commands follow in the Darwin block.
+  # The native backend generates code for AArch64 macOS and x86-64 Linux.
+  # Checks that read AArch64 instruction shapes or Mach-O load commands follow
+  # in the Darwin block.
   if [ "$HOST_OS-$HOST_ARCH" = Darwin-arm64 ] || [ "$HOST_OS-$HOST_ARCH" = Linux-x86_64 ]; then
-    for backend in llvm tpde stogir; do
+    for backend in llvm native; do
       expect_rc 42 "native ABI, control flow, memory and atomics ($backend)" \
         "$COIL" run "$ROOT/tests/cli/native-backends.coil" --backend "$backend" -O3 --no-debug
       expect_rc 42 "native graph-call results, loops and observations ($backend)" \
@@ -1131,13 +1131,11 @@ EOF
       fi
       expect_rc 42 "IR timing preserves native program behavior ($backend)" \
         env COIL_CODEGEN_TIMINGS=1 "$COIL" run "$ROOT/tests/cli/native-backends.coil" --backend "$backend" -O3 --no-debug
-      if env COIL_TPDE_SERIAL=1 COIL_CODEGEN_TIMINGS=0 "$COIL" emit-obj "$T/lib.coil" --backend "$backend" --no-debug -o "$T/serial-$backend.o" > "$T/serial-$backend.log" 2>&1 \
-         && env COIL_TPDE_SERIAL=1 COIL_CODEGEN_TIMINGS=1 "$COIL" emit-obj "$T/lib.coil" --backend "$backend" --no-debug -o "$T/measured-$backend.o" > "$T/measured-$backend.out" 2> "$T/measured-$backend.err" \
+      if env COIL_NATIVE_SERIAL=1 COIL_CODEGEN_TIMINGS=0 "$COIL" emit-obj "$T/lib.coil" --backend "$backend" --no-debug -o "$T/serial-$backend.o" > "$T/serial-$backend.log" 2>&1 \
+         && env COIL_NATIVE_SERIAL=1 COIL_CODEGEN_TIMINGS=1 "$COIL" emit-obj "$T/lib.coil" --backend "$backend" --no-debug -o "$T/measured-$backend.o" > "$T/measured-$backend.out" 2> "$T/measured-$backend.err" \
          && cmp -s "$T/serial-$backend.o" "$T/measured-$backend.o"; then
         local timing_output label=$backend
         timing_output=$(cat "$T/measured-$backend.err")
-        # Records name the code generator: `stogir` is the declarative backend.
-        [ "$backend" = stogir ] && label=declarative
         case "$timing_output" in
           *"coil-codegen"*"$label"*"ir-codegen"*) ok "IR timing produces identical serial object bytes ($backend)" ;;
           *) bad "IR timing produces identical serial object bytes ($backend)" "missing timing records: $timing_output" ;;
@@ -1152,28 +1150,28 @@ EOF
       "$COIL" run "$ROOT/tests/backend/cir-aggregate-ownership.coil" --backend llvm -O1 --no-debug --debug-checks --sanitize=address
     expect_rc 0 "CIR aggregate copy forwarding under ASAN" \
       "$COIL" run "$ROOT/tests/backend/cir-copy-forwarding.coil" --backend llvm -O1 --no-debug --debug-checks --sanitize=address
-    expect_rc 0 "scalar def reads fold to their initializer bytes (Stogir O3)" \
-      "$COIL" run "$ROOT/tests/backend/static-literal-reads.coil" --backend stogir -O3 --no-debug --debug-checks
-    expect_rc 0 "scalar def reads fold to their initializer bytes (TPDE)" \
-      "$COIL" run "$ROOT/tests/backend/static-literal-reads.coil" --backend tpde --no-debug --debug-checks
+    expect_rc 0 "scalar def reads fold to their initializer bytes (native -O3)" \
+      "$COIL" run "$ROOT/tests/backend/static-literal-reads.coil" --backend native -O3 --no-debug --debug-checks
+    expect_rc 0 "scalar def reads fold to their initializer bytes (native -O1)" \
+      "$COIL" run "$ROOT/tests/backend/static-literal-reads.coil" --backend native --no-debug --debug-checks
     expect_rc 0 "Stogir aggregate snapshots and zero-fill boundaries" \
       python3 "$ROOT/scripts/tests/stogir-runtime-bulk.py" "$COIL"
     expect_rc 0 "a cached unit is keyed on the declarative backend's settings" \
       python3 "$ROOT/scripts/tests/declarative-unit-settings.py" "$COIL"
     expect_rc 0 "loops calling memcmp reload only what a store can change (Stogir O3)" \
-      "$COIL" run "$ROOT/tests/backend/stogir-readonly-library-calls.coil" --backend stogir -O3 --no-debug --debug-checks
+      "$COIL" run "$ROOT/tests/backend/stogir-readonly-library-calls.coil" --backend native -O3 --no-debug --debug-checks
     expect_rc 0 "a returned aggregate piece used on one path only is computed on every path (Stogir O3)" \
-      "$COIL" run "$ROOT/tests/backend/stogir-return-piece-placement.coil" --backend stogir -O3 --no-debug
+      "$COIL" run "$ROOT/tests/backend/stogir-return-piece-placement.coil" --backend native -O3 --no-debug
     expect_rc 0 "a returned aggregate piece used by a debug check only (Stogir O1, debug checks)" \
-      "$COIL" run "$ROOT/tests/backend/stogir-return-piece-placement.coil" --backend stogir -O1 --no-debug --debug-checks
+      "$COIL" run "$ROOT/tests/backend/stogir-return-piece-placement.coil" --backend native -O1 --no-debug --debug-checks
     expect_rc 0 "calls in tail position run in constant stack (Stogir O3)" \
-      "$COIL" run "$ROOT/tests/backend/stogir-tail-calls.coil" --backend stogir -O3 --no-debug
+      "$COIL" run "$ROOT/tests/backend/stogir-tail-calls.coil" --backend native -O3 --no-debug
     expect_rc 0 "calls in tail position run in constant stack (Stogir O1, debug checks)" \
-      "$COIL" run "$ROOT/tests/backend/stogir-tail-calls.coil" --backend stogir -O1 --no-debug --debug-checks
+      "$COIL" run "$ROOT/tests/backend/stogir-tail-calls.coil" --backend native -O1 --no-debug --debug-checks
     expect_rc 0 "128-bit arithmetic by literal powers of two (Stogir O3)" \
-      "$COIL" run "$ROOT/tests/backend/stogir-wide-powers.coil" --backend stogir -O3 --no-debug
+      "$COIL" run "$ROOT/tests/backend/stogir-wide-powers.coil" --backend native -O3 --no-debug
     expect_rc 0 "128-bit arithmetic by literal powers of two (Stogir O1)" \
-      "$COIL" run "$ROOT/tests/backend/stogir-wide-powers.coil" --backend stogir -O1 --no-debug
+      "$COIL" run "$ROOT/tests/backend/stogir-wide-powers.coil" --backend native -O1 --no-debug
   fi
   if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
     expect_rc 0 "every backend's program records the same platform, minos and sdk" \
@@ -1181,7 +1179,7 @@ EOF
     expect_rc 0 "volatile accesses reach Stogir machine code one for one" \
       python3 "$ROOT/scripts/tests/stogir-volatile.py" "$COIL"
     expect_rc 0 "random conditional call crossings keep their values (Stogir O3)" \
-      "$COIL" run "$ROOT/tests/backend/stogir-frame-split.coil" --backend stogir -O3 --no-debug
+      "$COIL" run "$ROOT/tests/backend/stogir-frame-split.coil" --backend native -O3 --no-debug
     expect_rc 0 "native Mach-O data-in-code serialization and JIT loader" \
       "$COIL" run "$ROOT/src/compiler/selftest/jit_selftest.coil" --backend llvm
   fi
@@ -1283,18 +1281,18 @@ EOF
        (if (p/icmp-eq (negative) minus) 100 0)
        (if (p/icmp-eq (p/load BIG) minus) 1000 0))))
 EOF
-  # tpde names each symbol it imports once, however many modules declare it
+  # The native backend names each symbol it imports once, however many modules declare it
   # (the library declares write, abort and others in several modules).
   printf '%s\n' '(module objlib.plain)' '(extern puts [(ptr i8)] (-> i32))' '(defn answer [] (-> i64) (puts c"answer") 42)' '(export-c [answer :as "answer"])' > "$T/plain.coil"
   local syms undefined dups
-  if "$COIL" emit-obj "$T/plain.coil" --backend tpde -o "$T/plain.o" >/dev/null 2>&1; then
+  if "$COIL" emit-obj "$T/plain.coil" --backend native -o "$T/plain.o" >/dev/null 2>&1; then
     syms=$(nm "$T/plain.o" 2>&1)
     undefined=$(awk '$1 == "U" { print $2 }' <<<"$syms")
     dups=$(sort <<<"$undefined" | uniq -d)
-    if [ -n "$undefined" ] && [ -z "$dups" ]; then ok "a tpde object imports each undefined symbol once"
-    else bad "a tpde object imports each undefined symbol once" "duplicates: $dups (undefined: $(wc -l <<<"$undefined"))"; fi
+    if [ -n "$undefined" ] && [ -z "$dups" ]; then ok "a native object imports each undefined symbol once"
+    else bad "a native object imports each undefined symbol once" "duplicates: $dups (undefined: $(wc -l <<<"$undefined"))"; fi
   else
-    bad "a tpde object imports each undefined symbol once" "emit-obj --backend tpde failed"
+    bad "a native object imports each undefined symbol once" "emit-obj --backend native failed"
   fi
 
   local opt
@@ -1364,14 +1362,6 @@ EOF
                               || bad "a cross build with comptime links an x86_64 Mach-O executable" "exit $rc: $out" ;;
       *) bad "a cross build with comptime links an x86_64 Mach-O executable" "exit $rc: $out / $kind" ;;
     esac
-    out=$("$COIL" build "$T/xseven.coil" -o "$T/xseven-tpde" --backend x64 --target x86_64-apple-macosx11.0.0 2>&1); rc=$?
-    if [ "$rc" = 0 ] && arch -x86_64 /usr/bin/true 2>/dev/null; then
-      arch -x86_64 "$T/xseven-tpde"; rc=$?
-      [ "$rc" = 7 ] && ok "--backend x64 cross build with comptime runs under Rosetta" \
-                    || bad "--backend x64 cross build with comptime runs under Rosetta" "exit $rc"
-    elif [ "$rc" != 0 ]; then
-      bad "--backend x64 cross build with comptime runs under Rosetta" "exit $rc: $out"
-    fi
     # The macOS version a --target names is the executable's deployment minimum.
     out=$("$COIL" build "$T/seven.coil" -o "$T/seven13" --target arm64-apple-macosx13.0.0 2>&1); rc=$?
     kind=$(vtool -show-build "$T/seven13" 2>&1)
@@ -1777,13 +1767,13 @@ int main(void) {
 }
 EOF
   if [ "$HOST_OS:$HOST_ARCH" = Darwin:arm64 ]; then
-    if "$COIL" emit-obj "$T/arm.coil" --backend arm64 -o "$T/arm.o" >/dev/null 2>&1 \
+    if "$COIL" emit-obj "$T/arm.coil" --backend native -o "$T/arm.o" >/dev/null 2>&1 \
        && cc "$T/arm.c" "$T/arm.o" -o "$T/arm" 2>/dev/null; then
       "$T/arm"; rc=$?
       [ "$rc" = 0 ] && ok "export-c on arm64: scalars, a struct return and a by-value struct parameter" \
                     || bad "export-c on arm64 called from C" "exit $rc"
     else
-      bad "export-c on arm64 called from C" "emit-obj --backend arm64 or cc failed"
+      bad "export-c on arm64 called from C" "emit-obj --backend native or cc failed"
     fi
   else
     echo "  (skip: an arm64 Mach-O object runs only on the macOS arm64 host)"
@@ -1925,9 +1915,8 @@ section_debuginfo() {
     *) bad "lldb shows a parameter and a local after its initializer" "$(tail -8 <<<"$after")" ;;
   esac
   # Every macOS backend describes the same program the same way (the shared
-  # model, src/compiler/backend/debuginfo.coil): arm64 and tpde by default, LLVM with
-  # -g, tpde for x86-64 too (run under Rosetta). Lines, parameters, locals,
-  # a struct behind a pointer, a sum.
+  # model, src/compiler/backend/debuginfo.coil): native by default, LLVM with
+  # -g. Lines, parameters, locals, a struct behind a pointer, a sum.
   printf '%s\n' '(module dbgv)' \
     '(defstruct Pt [(x i64) (y i64)])' \
     '(defsum Sh (Sq [(s i64)]) (Nil))' \
@@ -1938,22 +1927,10 @@ section_debuginfo() {
     '    (+ (+ sum twice) (+ (.x pt) (match sh (Sq [s] s) (Nil [] 0))))))' \
     '(defn main [] (-> i64) (checkpoint 41 (Pt :x 1 :y 2)))' > "$T/dbgv.coil"
   local variant label flags out
-  for variant in "arm64 by default|--backend arm64" "tpde by default|--backend tpde" \
-                 "LLVM -g|--backend llvm -g -O0" "tpde x86-64|--backend tpde --target x86_64-apple-macosx11.0.0"; do
+  for variant in "native by default|--backend native" "LLVM -g|--backend llvm -g -O0"; do
     label=${variant%%|*}; flags=${variant#*|}
-    case $label in *x86-64*) arch -x86_64 /usr/bin/true 2>/dev/null || continue ;; esac
     # shellcheck disable=SC2086
     "$COIL" build "$T/dbgv.coil" $flags -o "$T/dbgv" >/dev/null 2>&1
-    # A CI runner's VM hangs launching an x86-64 program under lldb (and what it
-    # leaves hangs later steps): there, only the line table is read.
-    if [ "${CI:-}" = true ] && [[ $label == *x86-64* ]]; then
-      out=$(timeout -k 5 60 "$lldb" -b "$T/dbgv" -o "breakpoint set --file dbgv.coil --line 8" 2>&1)
-      if grep -qE 'Breakpoint 1: where = .*dbgv\.coil:8:' <<<"$out"; then
-        ok "debug info ($label): a line breakpoint (CI: not run under Rosetta)"
-      else bad "debug info ($label): a line breakpoint" "$(tail -4 <<<"$out")"; fi
-      rm -rf "$T/dbgv" "$T/dbgv.dSYM"
-      continue
-    fi
     out=$(timeout -k 5 60 "$lldb" -b "$T/dbgv" -o "breakpoint set --file dbgv.coil --line 8" -o run \
           -o "frame variable" -o "p *pt" -o kill 2>&1)
     case "$out" in
@@ -1978,16 +1955,16 @@ section_debuginfo() {
     '      (set! sum (+ sum (.wall stage)))' \
     '      (- (+ sum (.cpu stage)) 100))))' \
     '(defn main [] (-> i64) (checkpoint 1))' > "$T/dbgs.coil"
-  "$COIL" build "$T/dbgs.coil" --backend tpde -o "$T/dbgs" >/dev/null 2>&1
+  "$COIL" build "$T/dbgs.coil" --backend native -o "$T/dbgs" >/dev/null 2>&1
   out=$(timeout -k 5 60 "$lldb" -b "$T/dbgs" -o "breakpoint set --file dbgs.coil --line 10" -o run \
         -o "frame variable stage.wall stage.cpu sum" -o kill 2>&1)
   case "$out" in
-    *"stage.wall = 42"*"stage.cpu = 52"*"sum = 48"*) ok "debug info (tpde): a local declared after a fused snapshot" ;;
-    *) bad "debug info (tpde): a local declared after a fused snapshot" "$(tail -6 <<<"$out")" ;;
+    *"stage.wall = 42"*"stage.cpu = 52"*"sum = 48"*) ok "debug info (native): a local declared after a fused snapshot" ;;
+    *) bad "debug info (native): a local declared after a fused snapshot" "$(tail -6 <<<"$out")" ;;
   esac
   pkill -f "$T/dbgs" 2>/dev/null
   rm -rf "$T/dbgs" "$T/dbgs.dSYM"
-  "$COIL" build "$T/dbgv.coil" --backend tpde -g0 -o "$T/dbgv" >/dev/null 2>&1
+  "$COIL" build "$T/dbgv.coil" --backend native -g0 -o "$T/dbgv" >/dev/null 2>&1
   [ ! -d "$T/dbgv.dSYM" ] && ok "-g0 turns the default debug info off" || bad "-g0 turns the default debug info off" "$T/dbgv.dSYM exists"
 }
 
@@ -2065,8 +2042,8 @@ EOF
   if build "$T/ubsan.coil" "$T/ubsan" --sanitize=undefined -O1; then
     expect_out 'undefined behavior: signed integer overflow' "--sanitize=undefined reports a signed overflow" "$T/ubsan"
   fi
-  expect_rc_out 1 'requires the LLVM backend' "a sanitizer with --backend arm64 is rejected" \
-    "$COIL" build "$T/seven.coil" -o "$T/san-arm64" --sanitize=address --backend arm64
+  expect_rc_out 1 'requires the LLVM backend' "a sanitizer with --backend native is rejected" \
+    "$COIL" build "$T/seven.coil" -o "$T/san-arm64" --sanitize=address --backend native
 }
 # expect_crash_or_fail <regex> <name> <cmd...>   a nonzero exit whose output matches
 expect_crash_or_fail() {

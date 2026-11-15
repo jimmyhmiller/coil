@@ -31,7 +31,7 @@ cleanup() { rm -rf "$RUN_DIR"; }
 trap cleanup EXIT
 
 read -r -a LINK <<<"$(scripts/compiler/llvm-link-flags.sh dynamic)"
-python3 scripts/compiler/stage0.py "$STAGE0" build src/compiler/main.coil -o "$RUN_DIR/coil-emitter" "${LINK[@]}"
+python3 scripts/compiler/stage0.py "$STAGE0" build src/compiler/main.coil -o "$RUN_DIR/coil-emitter" --release "${LINK[@]}"
 "$RUN_DIR/coil-emitter" emit-ir src/compiler/main.coil --target x86_64-unknown-linux-gnu > "$RUN_DIR/coil-linux.ll"
 "$LLVM_BINDIR/llvm-as" "$RUN_DIR/coil-linux.ll" -o /dev/null \
   || { echo "emit-linux-ir: LLVM $("$LLVM_CONFIG" --version) cannot parse the emitted IR" >&2; exit 1; }

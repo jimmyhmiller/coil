@@ -145,11 +145,11 @@ EOF
   else
     bad "a coil.jit application builds from the installed toolchain" "$(tail -20 "$T/sdk.log")"
   fi
-  # --jit=tpde: the same program, publishing through tpde alone, links no LLVM.
-  # tpde publishes runtime code only on macOS arm64; Linux has LLVM alone.
+  # --jit=native: the same program, publishing through the native backend alone,
+  # links no LLVM. This check reads Mach-O dependencies, so it runs on macOS.
   if [ "$HOST_OS" = Darwin ]; then
-    cat > "$T/sdk/tpde-refuses-llvm.coil" <<'EOF'
-(module jit-tpde-refuses-llvm)
+    cat > "$T/sdk/native-refuses-llvm.coil" <<'EOF'
+(module jit-native-refuses-llvm)
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.jit" :as jit)
 (defn main [] (-> i64)
@@ -163,24 +163,24 @@ EOF
               (Err [error]
                    (match error (jit/UnsupportedBackend [_] 0) (jit/InvalidOptLevel [_] 3)))))))
 EOF
-    if (cd "$T/sdk" && "$COIL" build main.coil -o app-tpde --jit=tpde) >"$T/sdk-tpde.log" 2>&1; then
-      expect_rc 0 "a --jit=tpde coil.jit application runs" \
-        bash -c 'cd "$1" && PATH="$2:$3:$PATH" ./app-tpde' _ "$T/sdk" "$T/no-cc" "$PREFIX/bin"
-      local tpde_deps; tpde_deps=$(otool -L "$T/sdk/app-tpde" 2>&1)
-      case "$tpde_deps" in
-        *libLLVM*) bad "a --jit=tpde coil.jit application links no LLVM" "$tpde_deps" ;;
-        *libSystem*) ok "a --jit=tpde coil.jit application links no LLVM" ;;
-        *) bad "a --jit=tpde coil.jit application links no LLVM" "otool printed no dependencies: $tpde_deps" ;;
+    if (cd "$T/sdk" && "$COIL" build main.coil -o app-native --jit=native) >"$T/sdk-native.log" 2>&1; then
+      expect_rc 0 "a --jit=native coil.jit application runs" \
+        bash -c 'cd "$1" && PATH="$2:$3:$PATH" ./app-native' _ "$T/sdk" "$T/no-cc" "$PREFIX/bin"
+      local native_deps; native_deps=$(otool -L "$T/sdk/app-native" 2>&1)
+      case "$native_deps" in
+        *libLLVM*) bad "a --jit=native coil.jit application links no LLVM" "$native_deps" ;;
+        *libSystem*) ok "a --jit=native coil.jit application links no LLVM" ;;
+        *) bad "a --jit=native coil.jit application links no LLVM" "otool printed no dependencies: $native_deps" ;;
       esac
-      [ -f "$units/llvm/jit-tpde/coil.compiler.jit_api/unit.o" ] \
+      [ -f "$units/llvm/jit-native/coil.compiler.jit_api/unit.o" ] \
         && [ -f "$units/llvm/jit-llvm/coil.compiler.jit_api/unit.o" ] \
-        && ok "--jit=tpde builds its own coil.jit unit beside the llvm one" \
-        || bad "--jit=tpde builds its own coil.jit unit beside the llvm one" "$(ls -R "$units" 2>&1 | head -20)"
+        && ok "--jit=native builds its own coil.jit unit beside the llvm one" \
+        || bad "--jit=native builds its own coil.jit unit beside the llvm one" "$(ls -R "$units" 2>&1 | head -20)"
     else
-      bad "a --jit=tpde coil.jit application builds from the installed toolchain" "$(tail -20 "$T/sdk-tpde.log")"
+      bad "a --jit=native coil.jit application builds from the installed toolchain" "$(tail -20 "$T/sdk-native.log")"
     fi
-    expect_rc 0 "a --jit=tpde coil.jit refuses the Llvm backend as unsupported" \
-      bash -c 'cd "$1" && "$2" run tpde-refuses-llvm.coil --jit=tpde' _ "$T/sdk" "$COIL"
+    expect_rc 0 "a --jit=native coil.jit refuses the Llvm backend as unsupported" \
+      bash -c 'cd "$1" && "$2" run native-refuses-llvm.coil --jit=native' _ "$T/sdk" "$COIL"
   fi
   # A build that imports coil.jit loads the warmed unit, a second copy of the
   # compiler that exports its own metaprogram callbacks. An interpreted macro must

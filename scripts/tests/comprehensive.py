@@ -67,9 +67,10 @@ def steps(x64: bool) -> list[Step]:
         Step("installed/jit-sdk", [installed, "jit-sdk"]),
         Step("installed/repl", [installed, "repl"]),
         Step("jit/repl-forms", [PY, "scripts/tests/jit-single-form.py"]),
-        # The tpde JIT backend exists where the native one does: macOS arm64.
-        *([Step("jit/repl-forms-tpde", [PY, "scripts/tests/jit-single-form.py", "{compiler}", "--backend", "tpde"])]
-          if sys.platform == "darwin" and os.uname().machine == "arm64" else []),
+        # The native JIT backend, named: macOS arm64 and Linux x86-64.
+        *([Step("jit/repl-forms-native", [PY, "scripts/tests/jit-single-form.py", "{compiler}", "--backend", "native"])]
+          if (sys.platform == "darwin" and os.uname().machine == "arm64")
+          or (sys.platform.startswith("linux") and os.uname().machine == "x86_64") else []),
         Step("jit/sessions", [PY, "scripts/tests/jit-static-session.py"]),
         Step("generated/modules", [PY, "scripts/tests/generated-modules.py"]),
         Step("memory/generated-units", [PY, "scripts/tests/generated-unit-memory.py", "--units", "64"]),

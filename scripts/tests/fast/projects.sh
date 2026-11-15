@@ -64,14 +64,20 @@ replace "$W/app/Coil.toml" "@GITLIB_URL@" "$GIT"
 replace "$W/app/Coil.toml" "@GITLIB_SHA@" "$SHA"
 replace "$W/app/Coil.toml" "@LINK_FLAG@" "$LINK_FLAG"
 APP="$W/app"
+# A default build, and a unit built the same way, use the native backend where
+# it compiles (macOS on AArch64, Linux on x86-64), else LLVM.
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64|Linux-x86_64) UNIT_BACKEND=native ;;
+  *) UNIT_BACKEND=llvm ;;
+esac
 
 echo "== app: build, artifacts and dependencies"
 run "$APP" "$COIL" build
-expect 0 "wrote build/release/pfapp" "a bare build builds the package and its artifacts (src/banner.coil, a header-less script, declares no module)"
+expect 0 "wrote build/debug/pfapp" "a bare build builds the package and its artifacts (src/banner.coil, a header-less script, declares no module)"
 [ -x "$APP/build/tools/tool" ] && [ -f "$APP/build/runtime.o" ] \
   && ok "the executable and object artifacts are written where the manifest says" \
   || bad "artifact outputs" "$(ls -R "$APP/build" 2>&1)"
-[ -f "$APP/.coil/units/llvm/engine/unit.o" ] \
+[ -f "$APP/.coil/units/$UNIT_BACKEND/engine/unit.o" ] \
   && ok "a prebuilt dependency is compiled once into .coil/units/<backend>" \
   || bad "prebuilt dependency unit" "$(ls -R "$APP/.coil/units" 2>&1)"
 checkouts=$(find "$APP/.coil/deps" -mindepth 1 -maxdepth 1 -type d -name "*-$SHA")
@@ -87,7 +93,7 @@ engine 2
 native 42
 libm 42
 dialect 42"
-run "$APP" ./build/release/pfapp
+run "$APP" ./build/debug/pfapp
 [ "$RC" = 0 ] && [ "$OUT" = "$APP_WANT" ] \
   && ok "the program reaches a placement-independent module, a reader-served module, a path dependency's C code through a dependency cycle, a git dependency, a prebuilt dependency, [cc], [link] and the project transform" \
   || bad "the built program's output" "exit $RC: $OUT"
@@ -98,6 +104,8 @@ case "$symbols" in
   *pfapp_runtime_answer*) ok "the object artifact exports its C symbol" ;;
   *) bad "object artifact symbol" "$symbols" ;;
 esac
+run "$APP" "$COIL" build --release
+expect 0 "wrote build/release/pfapp" "--release builds into build/release"
 run "$APP" ./build/release/pfapp overflow
 expect 0 "-9223372036854775807" "a release build wraps on overflow"
 
@@ -268,7 +276,7 @@ expect 0 "[test/sample.txt] found" "run beside a pointer runs its package, start
 run "$W" "$COIL" run pointer -- pointer/test/sample.txt
 expect 0 "[pointer/test/sample.txt] found" "run DIR follows a pointer in DIR and starts the program where it was typed"
 run "$P" "$COIL" build
-[ "$RC" = 0 ] && case "$OUT" in *"wrote /"*"/pointer/app/build/release/pfptr"*) true ;; *) false ;; esac \
+[ "$RC" = 0 ] && case "$OUT" in *"wrote /"*"/pointer/app/build/debug/pfptr"*) true ;; *) false ;; esac \
   && ok "build beside a pointer builds the package and names the output absolutely" \
   || bad "build beside a pointer" "exit $RC: $OUT"
 run "$P" "$COIL" build app/src/main.coil -o pfptr-here
@@ -300,7 +308,7 @@ echo "== units: build-unit and a consumer"
 run "$W/units" env COIL_NAMESPACE_ROOTS="$W/units" "$COIL" build-unit mathlib.coil -o "$W/mathlib-unit"
 expect 0 "unit.o" "build-unit writes an interface and an object"
 unit_key=$(cat "$W/mathlib-unit/unit.key" 2>&1)
-[ -f "$W/mathlib-unit/interface.coil" ] && case "$unit_key" in *"backend llvm"*) true ;; *) false ;; esac \
+[ -f "$W/mathlib-unit/interface.coil" ] && case "$unit_key" in *"backend $UNIT_BACKEND"*) true ;; *) false ;; esac \
   && ok "the unit has an interface and records its backend" \
   || bad "unit artifacts" "$(ls "$W/mathlib-unit" 2>&1) $unit_key"
 run "$W/units" env COIL_NAMESPACE_ROOTS="$W/units" "$COIL" build consumer.coil --unit "$W/mathlib-unit" -o "$W/consumer"
@@ -368,7 +376,7 @@ run "$WS" "$COIL" check
 expect 0 "workspace check: 2/2 members ok" "check fans out over the members, skipping a directory with no Coil.toml"
 run "$WS" "$COIL" build
 expect 0 "workspace build: 1/1 members ok" "build fans out over the members with an entry"
-run "$WS" ./members/cli/build/release/cli
+run "$WS" ./members/cli/build/debug/cli
 expect 0 "cli 7 area 21 version 2" "a member's program calls into a library member, the workspace's dependency and its C code, and its own dependency"
 run "$WS/members/cli" "$COIL" run src/main.coil
 expect 0 "cli 7 area 21 version 2" "a member's file, run from its directory, compiles inside the workspace with both dependencies"

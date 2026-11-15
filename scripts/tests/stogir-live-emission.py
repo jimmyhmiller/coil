@@ -10,7 +10,7 @@ import stogir_target
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ['COIL']).resolve()
-ENV = dict(os.environ, COIL_LIBRARY_STATE='0', COIL_TPDE_SERIAL='1')
+ENV = dict(os.environ, COIL_LIBRARY_STATE='0', COIL_NATIVE_SERIAL='1')
 
 
 def run(*args):
@@ -50,7 +50,7 @@ def emit(directory, name, settings):
     environment = dict(ENV, **settings)
     obj = directory / f'{name}.o'
     command = [str(COMPILER), 'emit-obj', str(SOURCE),
-               '--backend', 'stogir', '-O3', '--no-debug', '-o']
+               '--backend', 'native', '-O3', '--no-debug', '-o']
     plain = subprocess.run(command + [str(obj)], cwd=ROOT, env=environment,
                            capture_output=True, text=True, timeout=120)
     assert plain.returncode == 0, plain.stdout + plain.stderr
@@ -102,7 +102,7 @@ with tempfile.TemporaryDirectory(prefix='stogir-emission-') as temporary:
                        '(defn first [(x i64)] (-> i64) (+ x 7))\n'
                        '(defn second [(x i64)] (-> i64) (* x 3))\n')
     unit = directory / 'unit'
-    run(COMPILER, 'build-unit', library, '--backend', 'stogir', '-O3', '-o', unit)
+    run(COMPILER, 'build-unit', library, '--backend', 'native', '-O3', '-o', unit)
     unit_symbols = run('nm', unit / 'unit.o')
     assert stogir_target.symbol('emission.unit.first') in unit_symbols
     assert stogir_target.symbol('emission.unit.second') in unit_symbols
@@ -111,5 +111,5 @@ with tempfile.TemporaryDirectory(prefix='stogir-emission-') as temporary:
                         '(import "emission.unit" :as lib)\n'
                         '(defn main [] (-> i64) '
                         '(if (= (+ (lib/first 5) (lib/second 9)) 39) 0 1))\n')
-    run(COMPILER, 'run', consumer, '--unit', unit, '--backend', 'stogir', '-O3', '--no-debug')
+    run(COMPILER, 'run', consumer, '--unit', unit, '--backend', 'native', '-O3', '--no-debug')
 print('post-inline symbols, native roots, recursion and prebuilt-unit retention: PASS')

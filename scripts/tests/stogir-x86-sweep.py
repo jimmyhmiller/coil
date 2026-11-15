@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Correctness sweep of the Stogir backend against the LLVM backend.
 
-Builds each program with `--backend stogir` at -O1, -O2 and -O3 and with the
+Builds each program with `--backend native` at -O1, -O2 and -O3 and with the
 LLVM backend, runs both, and compares stdout and the exit status. Groups:
 
   corpus    tests/corpus/corpus.txt (with each program's argv)
@@ -120,7 +120,7 @@ class Case:
             return {level: ('reference', f'LLVM program unusable: {want and want[0]}') for level in LEVELS}
         outcome = {}
         for level in LEVELS:
-            exe, built = self.build(work, level, ['--backend', 'stogir', level])
+            exe, built = self.build(work, level, ['--backend', 'native', level])
             if exe is None:
                 outcome[level] = ('compile', explain(built))
                 save(self, level, built)
@@ -159,7 +159,7 @@ class TestCase(Case):
             return {level: ('reference', 'LLVM tests do not pass') for level in LEVELS}
         outcome = {}
         for level in LEVELS:
-            got, result = self.summary(['--backend', 'stogir', level])
+            got, result = self.summary(['--backend', 'native', level])
             if got == want:
                 outcome[level] = ('ok', '')
             else:

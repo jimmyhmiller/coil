@@ -87,7 +87,7 @@ def main() -> None:
             run(str(compiler_path), 'build-unit', str(ROOT / 'src/compiler/jit_api.coil'),
                 '-o', str(unit), '--backend', 'llvm', '-O3', '--quiet')
             unit_flags = ['--unit', str(unit)]
-        run(str(compiler_path), 'build', str(source), '-o', str(executable),
+        run(str(compiler_path), 'build', str(source), '--release', '-o', str(executable),
             *unit_flags, '--quiet')
         toolbin = directory / 'bin'
         toolbin.mkdir()

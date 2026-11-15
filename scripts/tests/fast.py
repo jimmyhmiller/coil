@@ -44,11 +44,11 @@ def steps(quick: bool) -> list[Step]:
         Step("examples/build", [PY, f"{FAST}/examples.py", "build"]),
         Step("examples/test", [PY, f"{FAST}/examples.py", "test"]),
         Step("examples/test-core", [PY, f"{FAST}/examples.py", "test", "calc", "huffman"], quick=True),
-        Step("examples/arm64", [PY, f"{FAST}/examples.py", "arm64"]),
+        Step("examples/native", [PY, f"{FAST}/examples.py", "native"]),
         Step("examples/safety", [PY, f"{FAST}/examples.py", "safety"]),
         Step("examples/fmt", [PY, f"{FAST}/examples.py", "fmt"]),
         # The consolidated runtime corpus, one lane per way of running a program.
-        Step("corpus/arm64", [*corpus, "arm64"], quick=True),
+        Step("corpus/native", [*corpus, "native"], quick=True),
         Step("corpus/llvm", [*corpus, "llvm"], quick=True),
         Step("corpus/interp", [*corpus, "interp"]),
         Step("corpus/safety", [*corpus, "safety"]),

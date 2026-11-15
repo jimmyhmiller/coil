@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ['COIL']).resolve()
 SOURCE = ROOT / 'tests/backend/stogir-symbol-addresses.coil'
 MODULE = 'tests.backend.stogir-symbol-addresses'
-ENV = dict(os.environ, COIL_LIBRARY_STATE='0', COIL_TPDE_SERIAL='1')
+ENV = dict(os.environ, COIL_LIBRARY_STATE='0', COIL_NATIVE_SERIAL='1')
 
 
 def functions(assembly):
@@ -57,7 +57,7 @@ with tempfile.TemporaryDirectory(prefix='stogir-symbols-') as temporary:
     obj = Path(temporary) / 'program.o'
     exe = Path(temporary) / 'program'
     for command, output in ((['emit-obj'], obj), (['build'], exe)):
-        result = subprocess.run([str(COMPILER), *command, str(SOURCE), '--backend', 'stogir',
+        result = subprocess.run([str(COMPILER), *command, str(SOURCE), '--backend', 'native',
                                  '-O3', '--no-debug', '-o', str(output)],
                                 cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=300)
         assert result.returncode == 0, result.stdout + result.stderr

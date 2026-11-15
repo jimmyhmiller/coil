@@ -6,8 +6,8 @@ compiler=${COIL_REGEX_COMPILER:-build/bin/coil}
 out=${COIL_REGEX_BENCH_OUT:-/tmp/coil-regex-benchmark}
 mkdir -p "$out"
 
-"$compiler" build src/benchmarks/regex_literal.coil -o "$out/coil-literal"
-"$compiler" build src/benchmarks/regex_nfa.coil -o "$out/coil-nfa"
+"$compiler" build src/benchmarks/regex_literal.coil --release -o "$out/coil-literal"
+"$compiler" build src/benchmarks/regex_nfa.coil --release -o "$out/coil-nfa"
 cargo build --release --manifest-path scripts/benchmarks/regex-rust/Cargo.toml \
   --target-dir "$out/rust-target"
 rust="$out/rust-target/release/coil-regex-benchmark-rust"

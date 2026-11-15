@@ -39,7 +39,7 @@ S = args.library.resolve()
 D = args.output.resolve()
 D.mkdir(parents=True, exist_ok=True)
 E = {k: v for k, v in os.environ.items() if not k.startswith('COIL_')}
-E.update(COIL_LIBRARY_STATE='0', COIL_TPDE_SERIAL='1', COIL_CODEGEN_TIMINGS='1')
+E.update(COIL_LIBRARY_STATE='0', COIL_NATIVE_SERIAL='1', COIL_CODEGEN_TIMINGS='1')
 # Host evidence is outside every measured interval. Process names exclude
 # command arguments; samples describe load, not an automatic acceptance rule.
 host = {'logical_cpus': os.cpu_count(), 'snapshots': [], 'round_loads': []}

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The coil.jit session API: retained environments, lifetime, policy and projects.
 
-    jit-static-session.py [COMPILER] [--jit=llvm|tpde]        (default: $COIL)
+    jit-static-session.py [COMPILER] [--jit=llvm|native]        (default: $COIL)
 
 Each fixture in tests/jit/ is an SDK host program whose `main` returns 0 on
 success. They are grouped into a few host programs, each of which imports its
@@ -13,8 +13,8 @@ The unit comes from COIL_TEST_JIT_UNIT (the comprehensive tier passes the
 installed toolchain's warmed one); without it this builds one, which compiles
 the whole compiler.
 
-`--jit=tpde` builds the unit and every host with coil.jit's tpde-only
-implementation: no LLVM is linked, every session publishes through tpde (as
+`--jit=native` builds the unit and every host with coil.jit's native-only
+implementation: no LLVM is linked, every session publishes through the native backend (as
 Mach-O on macOS, as ELF on Linux), and the fixture that exercises the LLVM
 backend is left out.
 """
@@ -36,11 +36,11 @@ cleanup_on_signal.install()
 
 ARGS = [arg for arg in sys.argv[1:] if not arg.startswith("--jit=")]
 JIT = next((arg.split("=", 1)[1] for arg in sys.argv[1:] if arg.startswith("--jit=")), "llvm")
-if JIT not in ("llvm", "tpde"):
-    raise SystemExit(f"--jit must be llvm or tpde, not {JIT}")
+if JIT not in ("llvm", "native"):
+    raise SystemExit(f"--jit must be llvm or native, not {JIT}")
 raw_compiler = ARGS[0] if ARGS else os.environ.get("COIL")
 if not raw_compiler:
-    raise SystemExit("usage: jit-static-session.py COMPILER [--jit=llvm|tpde] (or set $COIL)")
+    raise SystemExit("usage: jit-static-session.py COMPILER [--jit=llvm|native] (or set $COIL)")
 COMPILER = Path(raw_compiler).resolve()
 TOOLCHAIN_ENV = os.environ.copy()
 TOOLCHAIN_ENV.pop("COIL_NAMESPACE_ROOTS", None)
@@ -257,7 +257,7 @@ def main() -> None:
         for group, fixtures in GROUPS.items():
             if sys.platform != "darwin":
                 fixtures = [f for f in fixtures if f != "scratch_footprint"]
-            if JIT == "tpde":
+            if JIT == "native":
                 fixtures = [f for f in fixtures if f != "llvm_backend"]
             source = work / f"host_{group.replace('-', '_')}.coil"
             source.write_text(host_source(group, fixtures))

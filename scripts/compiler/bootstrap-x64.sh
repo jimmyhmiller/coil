@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Self-host the compiler THROUGH THE NATIVE BACKEND (tpde) ON x86-64 LINUX, and
+# Self-host the compiler THROUGH THE NATIVE BACKEND ON x86-64 LINUX, and
 # prove it.
 #
 # The x86-64 sibling of the arm64 bootstrap. Independent checks, because "it
 # compiled" is not evidence that a backend is correct:
 #
-#   FIXPOINT : stage2.o == stage3.o byte-identical. A compiler built by tpde for
+#   FIXPOINT : stage2.o == stage3.o byte-identical. A compiler built natively for
 #              x86-64, rebuilding itself the same way, must land on the
 #              same bytes. This catches nondeterminism and most miscompiles of
 #              the compiler's own code — a subtly wrong stage2 almost never
@@ -19,7 +19,7 @@
 #   ENCODE   : every instruction the encoder emits still matches llvm-mc.
 #
 # stage1 comes from whatever compiler you point at (default build/bin/coil, the
-# LLVM-backed build) — only stages 2 and 3 go through `--backend x64`, tpde.
+# LLVM-backed build) — only stages 2 and 3 go through `--backend native` (-O1).
 #
 # Usage: scripts/compiler/bootstrap-x64.sh [install-dest]   (default dest: build/bin/coil-x64)
 #        STAGE0=/path/to/coil scripts/compiler/bootstrap-x64.sh
@@ -50,21 +50,22 @@ LF=(--link-flag "-L$libdir" --link-flag "-Wl,-rpath,$libdir" --link-flag -lLLVM
     --link-flag -lstdc++ --link-flag -lm --link-flag -lpthread --link-flag -ldl)
 
 echo "=== stage1: stage0 builds the compiler (its own backend) ==="
-"$STAGE0" build "$SRC" -o "$S1" "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
-echo "=== stage2: stage1 rebuilds it with --backend x64 ==="
-"$S1" build "$SRC" -o "$S2" --backend x64 "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
-echo "=== stage3: stage2 rebuilds it with --backend x64 ==="
-"$S2" build "$SRC" -o "$S3" --backend x64 "${LF[@]}" || { echo "stage3 FAILED"; exit 1; }
+"$STAGE0" build "$SRC" -o "$S1" --release "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
+NATIVE=(--backend native -O1)
+echo "=== stage2: stage1 rebuilds it with the native backend ==="
+"$S1" build "$SRC" -o "$S2" --release "${NATIVE[@]}" "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
+echo "=== stage3: stage2 rebuilds it with the native backend ==="
+"$S2" build "$SRC" -o "$S3" --release "${NATIVE[@]}" "${LF[@]}" || { echo "stage3 FAILED"; exit 1; }
 
 echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="
-"$S1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" --backend x64 || { echo "stage2 object emission FAILED"; exit 1; }
-"$S2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" --backend x64 || { echo "stage3 object emission FAILED"; exit 1; }
-cmp "$RUN_DIR/stage2.o" "$RUN_DIR/stage3.o" || { echo "FIXPOINT FAIL — x64 objects differ"; exit 2; }
-echo "  ok — byte-identical, the compiler reproduces itself through the x64 backend"
+"$S1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" "${NATIVE[@]}" || { echo "stage2 object emission FAILED"; exit 1; }
+"$S2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" "${NATIVE[@]}" || { echo "stage3 object emission FAILED"; exit 1; }
+cmp "$RUN_DIR/stage2.o" "$RUN_DIR/stage3.o" || { echo "FIXPOINT FAIL — native objects differ"; exit 2; }
+echo "  ok — byte-identical, the compiler reproduces itself through the native backend"
 
 echo "=== GATE: the x64-built compiler must itself pass the corpus ==="
-python3 scripts/oracle.py corpus x64 --compiler "$S2" >/dev/null 2>&1 \
-  || { echo "corpus on x64 FAIL (run scripts/oracle.py corpus x64 --compiler <stage2> to see which)"; exit 1; }
+python3 scripts/oracle.py corpus native-quick --compiler "$S2" >/dev/null 2>&1 \
+  || { echo "corpus on native FAIL (run scripts/oracle.py corpus native-quick --compiler <stage2> to see which)"; exit 1; }
 echo "  ok — every corpus program matches its reference"
 
 echo "=== CABI: the SysV rules agree with a gcc-compiled translation unit ==="

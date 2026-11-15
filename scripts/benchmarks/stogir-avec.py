@@ -31,7 +31,7 @@ S = args.library.resolve()
 D = args.output.resolve()
 D.mkdir(parents=True, exist_ok=True)
 E = {k: v for k, v in os.environ.items() if not k.startswith('COIL_')}
-E.update(COIL_LIBRARY_STATE='0', COIL_TPDE_SERIAL='1', COIL_CODEGEN_TIMINGS='1')
+E.update(COIL_LIBRARY_STATE='0', COIL_NATIVE_SERIAL='1', COIL_CODEGEN_TIMINGS='1')
 cases = [('current-stogir', C, 'stogir'), ('llvm', C, 'llvm'), ('tpde', C, 'tpde')]
 if args.before:
     cases.insert(0, ('before-stogir', args.before.resolve(), 'stogir'))

@@ -53,7 +53,7 @@ runner.
 
 - **Scratch** belongs to one compile call: syntax trees, the expander's state, the
   checker context, checked bodies of ordinary functions, monomorphization, LLVM and
-  tpde state. It is the compile's arena, freed in full when the compile returns.
+  native-backend state. It is the compile's arena, freed in full when the compile returns.
 - **The `Env`** is the session's persistent compiler state. It is one value, owned
   by its holder (the REPL session, a `coil.jit` session, a saved file), in memory
   allocated by and for the `Env` alone. Nothing in it points into scratch, and
@@ -661,7 +661,7 @@ What is added: the `Persist` derive in the stdlib (~1,200 lines with its tests, 
 reusable by any program) and the `Env` type with its accept and read paths (well
 under the inheritance code it replaces).
 
-**Target:** the compiler (`src/compiler`, excluding the vendored tpde package) is
+**Target:** the compiler (`src/compiler`, excluding the `native` and `declarative` packages) is
 net smaller after step 3, by at least 1,000 lines, and smaller again after step 5.
 Every step's commit message reports lines added and removed in `src/compiler`, so
 the trend is visible as it happens. A step that adds a parallel path must delete

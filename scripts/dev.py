@@ -43,7 +43,7 @@ def build_tools(compiler: Path) -> None:
     for tool in TOOLS:
         output = compiler.parent / f"coil-{tool}"
         result = toolchain_build(compiler, "build", str(ROOT / "src" / "tools" / f"{tool}.coil"),
-                                 "-o", str(output))
+                                 "--release", "-o", str(output))
         if result.returncode != 0:
             raise SystemExit(f"building coil-{tool} failed:\n{result.stdout}{result.stderr}")
         print(f"built {output}")
@@ -66,7 +66,7 @@ def build(args: argparse.Namespace) -> None:
         # stage-lib.sh, and a candidate build needs them just the same.
         execute(str(ROOT / "scripts/native/build-curl.sh"))
         execute(sys.executable, str(ROOT / "scripts/compiler/stage0.py"), compiler,
-                "build", str(ROOT / "src/compiler/main.coil"), "-o", str(output),
+                "build", str(ROOT / "src/compiler/main.coil"), "--release", "-o", str(output),
                 *llvm_flags("dynamic"))
         toolchain_stamp.stamp_path(output).write_text(stamp)
         print(f"built compiler candidate -> {output}")
@@ -188,7 +188,7 @@ def install_library(prefix: Path) -> Path:
     # out of stdlib/ so ordinary programs never discover or link compiler modules.
     sdk_staged = libdir / "compiler.incoming"
     shutil.rmtree(sdk_staged, ignore_errors=True)
-    # The tpde backend's package (tpde.*) is vendored in src/compiler/tpde.
+    # The native package (native.*: CIR and the assembler) is src/compiler/native.
     shutil.copytree(ROOT / "src" / "compiler", sdk_staged)
     sdk_live = libdir / "compiler"
     sdk_previous = libdir / "compiler.previous"
@@ -338,7 +338,7 @@ def warm_jit_unit(compiler: Path, libdir: Path) -> None:
     second. A unit's object follows the calling convention of the backend that
     emitted it, and Coil's backends do not share one for every aggregate, so
     there is one unit per backend, and per coil.jit implementation (`--jit=llvm`
-    links LLVM's ORC JIT, `--jit=tpde` does not):
+    links LLVM's ORC JIT, `--jit=native` does not):
     `<lib>/coil/units/<backend>/jit-<implementation>/coil.compiler.jit_api`
     (the layout `shipped-unit-dir` in driver.coil reads). A consumer links only
     the unit built by its own backend, and the compiler builds a missing one on
@@ -500,8 +500,8 @@ def bootstrap_wasm32(args: argparse.Namespace) -> None:
     provided = os.environ.get("COIL_SEED32")
     seed = Path(provided) if provided and os.access(provided, os.X_OK) else output / "coil-seed32"
     if seed == output / "coil-seed32":
-        execute(str(compiler), "build", "src/compiler/main.coil", "-o", str(seed), *llvm_flags("dynamic"))
-    execute(str(seed), "build", "src/compiler/main_wasm.coil", "--target", "wasm32-unknown-unknown",
+        execute(str(compiler), "build", "src/compiler/main.coil", "--release", "-o", str(seed), *llvm_flags("dynamic"))
+    execute(str(seed), "build", "src/compiler/main_wasm.coil", "--release", "--target", "wasm32-unknown-unknown",
             "--wasm-stack-size=64", "-o", str(output / "coilc32.wasm"))
     execute(cc, "-O2", "-o", str(output / "wasm2c"), str(source / "wasm2c.c"))
     execute(str(output / "wasm2c"), str(output / "coilc32.wasm"), str(output / "coilc32.c"), "little")

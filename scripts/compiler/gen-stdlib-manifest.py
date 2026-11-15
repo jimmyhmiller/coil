@@ -149,8 +149,8 @@ def collect_sdk() -> list[tuple[str, str]]:
 
 
 def sdk_file_list() -> list[str]:
-    """Every file shipped under <lib>/compiler/, relative to it. The tpde backend's
-    package is vendored at src/compiler/tpde/, so it ships with the rest."""
+    """Every file shipped under <lib>/compiler/, relative to it. The native
+    package (CIR and the assembler) is src/compiler/native/, so it ships with the rest."""
     return sorted(p.relative_to(SDK).as_posix() for p in SDK.rglob("*.coil"))
 
 

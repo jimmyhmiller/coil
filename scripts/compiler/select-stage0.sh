@@ -2,7 +2,9 @@
 # Shared native-first stage-zero selection.
 #
 # Usage after `cd` to the repository root:
-#   select_stage0 <native-seed> <compiler-source> <fallback-backend> [check flags...]
+#   select_stage0 <native-seed> <compiler-source> <old-native-name> [check flags...]
+# <old-native-name> is what a seed from before `--backend native` called the
+# native backend for this machine (arm64 or x64).
 #
 # Run an old compiler outside the checkout so it cannot mistake the new package
 # manifest for one it understands. Namespace roots carry the source graph explicitly.
@@ -19,6 +21,20 @@ stage0_compat_run() {
     *) source="$repo/$source" ;;
   esac
   python3 "$repo/scripts/compiler/stage0.py" "$stage0" "$command" "$source" "$@"
+}
+
+# The name stage zero knows the native backend by: `native`, or, for a seed from
+# before that name, the machine's (`arm64` or `x64`, which the caller passes).
+stage0_native_backend() {
+  local stage0="$1" old="$2" probe
+  probe=$(mktemp -d "${TMPDIR:-/tmp}/coil-stage0-probe.XXXXXX") || return 1
+  printf '(module probe)\n(defn main [] (-> i64) 0)\n' > "$probe/probe.coil"
+  if stage0_compat_run "$stage0" check "$probe/probe.coil" --backend native >/dev/null 2>&1; then
+    echo native
+  else
+    echo "$old"
+  fi
+  rm -rf "$probe"
 }
 
 # Sets STAGE0 and STAGE0_BUILD_FLAGS. An explicit STAGE0 is authoritative. Without
@@ -76,7 +92,7 @@ select_stage0() {
     || { echo "WASM stage0 construction failed" >&2; return 1; }
   STAGE0="$PWD/build/bootstrap/c/coil-bootstrap"
   STAGE0_SOURCE=wasm
-  STAGE0_BUILD_FLAGS=(--backend "$fallback_backend")
+  STAGE0_BUILD_FLAGS=(--backend "$(stage0_native_backend "$STAGE0" "$fallback_backend")")
   stage0_compat_run "$STAGE0" check "$src" "$@" >/dev/null 2>&1 \
     || { echo "WASM stage0 cannot compile the current source tree" >&2; return 1; }
   STAGE0_VERIFIED="$STAGE0"
@@ -95,7 +111,7 @@ stage1_from_seed() {
   [ -z "${STAGE0:-}" ] && [ "${COIL_FORCE_WASM_STAGE0:-0}" != 1 ] && [ -x "$native_seed" ] || return 1
   local log
   log=$(mktemp "${TMPDIR:-/tmp}/coil-seed-stage1.XXXXXX") || return 1
-  if stage0_compat_run "$native_seed" build "$src" -o "$out" "$@" >"$log" 2>&1; then
+  if stage0_compat_run "$native_seed" build "$src" -o "$out" --release "$@" >"$log" 2>&1; then
     rm -f "$log"
     STAGE0="$native_seed"
     STAGE0_SOURCE=native

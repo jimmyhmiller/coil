@@ -6,10 +6,10 @@
 Copies this working tree's tracked files to the host, then there: bootstraps the
 LLVM Linux compiler from the committed seed (no install), runs the runtime corpus
 on it with the LLVM backend, the coil.jit sessions and the REPL through LLVM ORC
-and through tpde (`--jit=tpde`), the C ABI checks and the SIMD tests, self-hosts through the native
-backend, tpde (fixpoint, the corpus on `--backend x64`, the SysV C ABI against
+and through the native backend alone (`--jit=native`), the C ABI checks and the SIMD tests, self-hosts
+through the native backend (fixpoint, the corpus on `--backend native`, the SysV C ABI against
 gcc, the encoder against llvm-mc), bootstraps the LLVM-free Linux compiler, and
-checks the ELF writer. The host needs LLVM 21, a C compiler, python3 and node.
+checks the ELF writer and the ELF reader's section count. The host needs LLVM 21, a C compiler, python3 and node.
 
 When the host is unreachable this fails and says so: an x64 run that silently
 did nothing would read as a pass. Run `dev.py test comprehensive --no-x64` to
@@ -36,21 +36,23 @@ echo "== bootstrap the LLVM Linux compiler (no install)"
 COIL_SKIP_INSTALL=1 python3 scripts/dev.py build linux
 echo "== runtime corpus on Linux, LLVM backend"
 python3 scripts/oracle.py corpus llvm --compiler build/bin/coil
-echo "== coil.jit sessions and the REPL, through LLVM ORC and through tpde alone (--jit=tpde)"
+echo "== coil.jit sessions and the REPL, through LLVM ORC and through the native backend alone (--jit=native)"
 python3 scripts/tests/jit-static-session.py build/bin/coil
-python3 scripts/tests/jit-static-session.py build/bin/coil --jit=tpde
+python3 scripts/tests/jit-static-session.py build/bin/coil --jit=native
 python3 scripts/tests/jit-single-form.py build/bin/coil
-python3 scripts/tests/jit-single-form.py build/bin/coil --backend tpde
-echo "== the C ABI on Linux: LLVM and tpde, each against the other"
+python3 scripts/tests/jit-single-form.py build/bin/coil --backend native
+echo "== the C ABI on Linux: LLVM and native, each against the other"
 python3 scripts/tests/c-abi.py --compiler build/bin/coil
 echo "== SIMD semantics and differential tests, as CI's Linux job runs them"
 python3 scripts/tests/comprehensive.py --compiler build/bin/coil --only simd
-echo "== self-host through tpde: fixpoint, corpus, C ABI, encoder"
+echo "== self-host through the native backend: fixpoint, corpus, C ABI, encoder"
 python3 scripts/dev.py build x64
 echo "== the LLVM-free Linux bootstrap"
 python3 scripts/dev.py build nollvm-linux
 echo "== ELF output"
 scripts/compiler/oracle/x64/gate-elf.sh build/bin/coil-x64
+echo "== an LLVM -O0 object with more sections than e_shnum counts still links"
+python3 scripts/tests/elf-many-sections.py build/bin/coil
 echo "x64 host: PASS"
 """
 

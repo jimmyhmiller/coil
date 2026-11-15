@@ -9,8 +9,8 @@
 
 The differential program is generated: for each lane type and width it fills two
 vectors from a noinline PRNG and compares every lane of every operation with the
-scalar computation, 128 rounds each. The native backend is arm64 on Apple
-silicon and x64 on x86-64; elsewhere only LLVM runs.
+scalar computation, 128 rounds each. The native backend runs on Apple silicon
+and on x86-64 Linux; elsewhere only LLVM runs.
 
 Usage: simd.py fast|full [--compiler COIL]
 """
@@ -60,9 +60,9 @@ class Failed(Exception):
 def native_backend() -> str | None:
     machine = platform.machine()
     if machine == "arm64" and sys.platform == "darwin":
-        return "arm64"
-    if machine in ("x86_64", "AMD64"):
-        return "x64"
+        return "native"
+    if machine in ("x86_64", "AMD64") and sys.platform.startswith("linux"):
+        return "native"
     return None
 
 
@@ -160,7 +160,7 @@ def codegen(coil: str, work: Path) -> None:
     config = os.environ.get("LLVM_CONFIG", "llvm-config")
     bindir = Path(run([config, "--bindir"], "llvm-config --bindir").stdout.strip())
     library = work / ("probe.dylib" if platform.system() == "Darwin" else "probe.so")
-    run([coil, "build", SIMD / "codegen.coil", "--shared", "-O3", "-o", library, "--quiet"], "build codegen.coil")
+    run([coil, "build", SIMD / "codegen.coil", "--shared", "--release", "-o", library, "--quiet"], "build codegen.coil")
     assembly = run([bindir / "llvm-objdump", "--disassemble", library], "disassemble").stdout
     functions = dict(re.findall(r"^[0-9a-f]+ <_?(simd_\w+)>:\n(.*?)(?=\n\n|\Z)", assembly, re.M | re.S))
     for name in ("simd_lookup16", "simd_lookup32", "simd_lookup64", "simd_classify16", "simd_scan16"):
@@ -215,12 +215,13 @@ def main() -> int:
     args = parser.parse_args()
     coil = args.compiler
     native = native_backend()
-    backends = [[]] + ([["--backend", native]] if native else [])
+    # LLVM, named (a build that names no profile is a debug build), and native.
+    backends = [["--release"]] + ([["--backend", native]] if native else [])
     if args.mode == "fast":
         steps = [lambda work: differential(coil, FAST_SHAPES, backends, work),
                  lambda work: codegen(coil, work)]
     else:
-        semantic_builds = [["-O0"], ["-O3"]] + ([["--backend", native]] if native else [])
+        semantic_builds = [["--backend", "llvm", "-O0"], ["--release"]] + ([["--backend", native]] if native else [])
         steps = [lambda work: differential(coil, ALL_SHAPES, backends, work),
                  *[(lambda work, flags=flags: build_and_run(coil, SIMD / "semantics.coil", flags, work,
                                                             f"semantics {' '.join(flags)}"))

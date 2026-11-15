@@ -13,8 +13,8 @@
 # The seed is re-verified from source on every run, three independent ways, so a
 # stale/tampered seed cannot slip through:
 #   * NO-LLVM : otool proves stage2 links no libLLVM
-#   * FIXPOINT: stage2.o == stage3.o byte-identical (arm64 backend is deterministic)
-#   * GATE    : the runtime corpus (tests/corpus) on --backend arm64 matches its
+#   * FIXPOINT: stage2.o == stage3.o byte-identical (the native backend is deterministic)
+#   * GATE    : the runtime corpus (tests/corpus) on --backend native matches its
 #               blessed references.
 #
 # Requirements: a C compiler (cc). That's the whole toolchain.
@@ -34,7 +34,7 @@ S1="$RUN_DIR/coil-nl1"; S2="$RUN_DIR/coil-nl2"
 # Scope the namespace scan: a seed that predates the loader's hidden-directory
 # prune would otherwise index stray tree copies (e.g. .claude/worktrees/*) and
 # report every namespace as declared twice.
-# src holds the tpde backend's package too (vendored at src/compiler/tpde).
+# src holds the native package too (src/compiler/native).
 export COIL_NAMESPACE_ROOTS="${COIL_NAMESPACE_ROOTS:-src:tests:scripts}"
 # In-repo, an import of a `coil.*` namespace that is missing from the bundled
 # stdlib manifest still resolves via the namespace scan above, so the build stays
@@ -56,10 +56,13 @@ else
   # stage1 with an error that reads like a compiler bug. See stage0-check.sh.
   . "$(dirname "$0")/stage0-check.sh"
   stage0_check "$STAGE0" "$SEED" "$SRC" || exit 1
-  stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$S1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} || { echo "stage1 FAILED"; exit 1; }
+  stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$S1" --release ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} || { echo "stage1 FAILED"; exit 1; }
 fi
-echo "=== stage2: stage1 rebuilds it with --backend arm64 ==="
-"$S1" build "$SRC" -o "$S2" --backend arm64 || { echo "stage2 FAILED"; exit 1; }
+# The native backend's quick compile (-O1, straight from CIR) for every later
+# stage, as a release build: no debug information.
+NATIVE=(--backend native -O1)
+echo "=== stage2: stage1 rebuilds it with the native backend ==="
+"$S1" build "$SRC" -o "$S2" --release "${NATIVE[@]}" || { echo "stage2 FAILED"; exit 1; }
 echo "=== NO-LLVM: stage2 must link no libLLVM ==="
 otool_output=$(otool -L "$S2") || { echo "  FAIL — otool could not inspect stage2"; exit 3; }
 dependencies=$(printf '%s\n' "$otool_output" | tail -n +2)
@@ -70,17 +73,17 @@ echo "  ok — links only:$(printf '%s\n' "$dependencies" | awk '{printf " %s", 
 
 echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="
 # The two emissions are independent; run them at once.
-"$S1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" --backend arm64 & stage2_pid=$!
-"$S2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" --backend arm64 & stage3_pid=$!
+"$S1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" "${NATIVE[@]}" & stage2_pid=$!
+"$S2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" "${NATIVE[@]}" & stage3_pid=$!
 wait "$stage2_pid" || { wait "$stage3_pid"; echo "stage2 object emission FAILED"; exit 1; }
 wait "$stage3_pid" || { echo "stage3 object emission FAILED"; exit 1; }
-cmp "$RUN_DIR/stage2.o" "$RUN_DIR/stage3.o" || { echo "FIXPOINT FAIL — arm64 objects differ"; exit 2; }
+cmp "$RUN_DIR/stage2.o" "$RUN_DIR/stage3.o" || { echo "FIXPOINT FAIL — native objects differ"; exit 2; }
 echo "  ok — byte-identical, the compiler reproduces itself"
 
-echo "=== GATE: the runtime corpus on --backend arm64 ==="
-python3 scripts/oracle.py corpus arm64 --compiler "$S2" \
-  || { echo "corpus on arm64 FAIL"; exit 1; }
-echo "  corpus on arm64: PASS (every program matches its reference)"
+echo "=== GATE: the runtime corpus on --backend native ==="
+python3 scripts/oracle.py corpus native-quick --compiler "$S2" \
+  || { echo "corpus on native FAIL"; exit 1; }
+echo "  corpus on native: PASS (every program matches its reference)"
 
 stage_lib_cleanup
 

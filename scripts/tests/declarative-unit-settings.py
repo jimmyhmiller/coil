@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A cached unit is keyed on the declarative backend's settings.
 
-The declarative backend (`--backend stogir` or `--backend declarative`)
+The native backend (`--backend native`)
 generates different code under different DECLARATIVE_* settings. A unit built
 under one setting must not be reported up to date under another. This checks,
 with one compiler and one output directory, that
@@ -9,7 +9,7 @@ with one compiler and one output directory, that
     unset, and the rebuilt object equals a build into a fresh directory;
   - every setting that changes code changes the key, and the same settings
     leave the unit up to date;
-  - how many threads compile (DECLARATIVE_THREADS, COIL_TPDE_SERIAL) is no
+  - how many threads compile (DECLARATIVE_THREADS, COIL_NATIVE_SERIAL) is no
     part of the key, and changes no object;
   - a unit of another backend records no declarative settings;
   - the key names every field of the adapter's Settings but those that only
@@ -28,7 +28,7 @@ import stogir_target
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ['COIL']).resolve()
-ADAPTER = ROOT / 'src/compiler/declarative/declarative/cir.coil'
+ADAPTER = ROOT / 'src/compiler/declarative/declarative/machine-a64.coil'
 BASE = {k: v for k, v in os.environ.items() if not k.startswith(('COIL_', 'DECLARATIVE_'))}
 BASE['COIL_LIBRARY_STATE'] = '0'
 
@@ -39,7 +39,7 @@ LIBRARY = '''(module unitsettings.lib)
 '''
 
 
-def build(source, out, backend='stogir', **settings):
+def build(source, out, backend='native', **settings):
     result = subprocess.run([str(COMPILER), 'build-unit', str(source), '--backend', backend,
                              '-O3', '-o', str(out)], cwd=source.parent,
                             env=dict(BASE, **settings), capture_output=True, text=True, timeout=300)
@@ -61,7 +61,7 @@ source = ADAPTER.read_text()
 structure = re.search(r'\(defstruct Settings\s*\[(.*?)\]\)', source, re.S)
 assert structure, 'Settings structure not found'
 fields = re.findall(r'\(([a-z-]+) [^()]*?(?:\([^()]*\))?\)', structure.group(1))
-UNKEYED = {'check', 'show', 'threads'}
+UNKEYED = {'check', 'show', 'threads', 'times'}
 keyed = [f for f in fields if f not in UNKEYED]
 assert len(keyed) >= 7, fields
 VARIABLES = {f: 'DECLARATIVE_' + f.upper().replace('-', '_') for f in keyed}
@@ -104,7 +104,7 @@ with tempfile.TemporaryDirectory(prefix='declarative-unit-settings-') as tempora
     # for every count, so a unit is reused across them.
     build(library, unit)
     for settings in [{'DECLARATIVE_THREADS': '1'}, {'DECLARATIVE_THREADS': '2'},
-                     {'DECLARATIVE_THREADS': '8'}, {'COIL_TPDE_SERIAL': '1'}]:
+                     {'DECLARATIVE_THREADS': '8'}, {'COIL_NATIVE_SERIAL': '1'}]:
         assert build(library, unit, **settings), f'{settings} rebuilt an up-to-date unit'
         assert settings_line(unit) == default, f'{settings} entered the unit key'
         rebuilt = temporary / 'workers'
@@ -113,14 +113,14 @@ with tempfile.TemporaryDirectory(prefix='declarative-unit-settings-') as tempora
         assert digest(rebuilt) == digest(fresh), f'{settings} changed the unit object'
         shutil.rmtree(rebuilt)
 
-    bad = subprocess.run([str(COMPILER), 'build-unit', str(library), '--backend', 'stogir', '-O3',
+    bad = subprocess.run([str(COMPILER), 'build-unit', str(library), '--backend', 'native', '-O3',
                           '-o', str(unit)], cwd=temporary, env=dict(BASE, DECLARATIVE_SMALL='many'),
                          capture_output=True, text=True, timeout=300)
     assert bad.returncode != 0 and 'DECLARATIVE_SMALL' in bad.stdout + bad.stderr, bad.stdout + bad.stderr
 
     other = temporary / 'other'
-    build(library, other, backend=stogir_target.TPDE_BACKEND, DECLARATIVE_SMALL='0')
+    build(library, other, backend='llvm', DECLARATIVE_SMALL='0')
     assert settings_line(other) is None
-    assert build(library, other, backend=stogir_target.TPDE_BACKEND), 'another backend keys on declarative settings'
+    assert build(library, other, backend='llvm'), 'another backend keys on declarative settings'
 
 print('declarative unit settings: ok')

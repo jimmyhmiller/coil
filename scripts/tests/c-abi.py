@@ -7,9 +7,8 @@ results abi.coil calls through raw addresses. It is built
 
   - by LLVM at -O0, and at -O2 under AddressSanitizer (which traps a read past
     an exact-size C object or a store past a coerced aggregate's slot);
-  - by the host's native backend, tpde (`--backend arm64` on Apple silicon,
-    `--backend x64` on x86-64 Linux), and on Apple silicon by tpde for x86-64
-    Mach-O, run under Rosetta;
+  - by the native backend (`--backend native`, on Apple silicon and on x86-64
+    Linux);
   - across backends: a native program linking an LLVM-built lib.o, and an LLVM
     program linking a native lib.o, so both must agree where each result travels.
 
@@ -38,9 +37,9 @@ FIXTURE = ROOT / "tests" / "cabi"
 def native_backend() -> str | None:
     machine = platform.machine()
     if machine == "arm64" and sys.platform == "darwin":
-        return "arm64"
-    if machine in ("x86_64", "AMD64"):
-        return "x64"
+        return "native"
+    if machine in ("x86_64", "AMD64") and sys.platform.startswith("linux"):
+        return "native"
     return None
 
 
@@ -69,18 +68,6 @@ def main() -> int:
             libs[native] = work / f"lib-{native}.o"
             run([coil, "emit-obj", FIXTURE / "lib.coil", "--backend", native, "-o", libs[native]],
                 f"emit lib.coil ({native})")
-        x64_target = ["--target", "x86_64-apple-macosx11.0.0"]
-        rosetta = native == "arm64" and subprocess.run(["arch", "-x86_64", "/usr/bin/true"],
-                                          capture_output=True).returncode == 0
-        if rosetta:
-            x64_c_object = work / "abi_c_x64.o"
-            run(["cc", "-arch", "x86_64", "-O1", "-c", FIXTURE / "abi.c", "-o", x64_c_object], "compile abi.c (x86-64)")
-            libs["llvm-x64"] = work / "lib-llvm-x64.o"
-            libs["tpde-x64"] = work / "lib-tpde-x64.o"
-            run([coil, "emit-obj", FIXTURE / "lib.coil", "-O2", *x64_target, "-o", libs["llvm-x64"]],
-                "emit lib.coil (llvm, x86-64)")
-            run([coil, "emit-obj", FIXTURE / "lib.coil", "--backend", "tpde", *x64_target, "-o", libs["tpde-x64"]],
-                "emit lib.coil (tpde, x86-64)")
 
         variants = [("llvm -O0", ["-O0"], "llvm"),
                     ("llvm -O2 + ASan", ["-O2", "--sanitize=address"], "llvm")]
@@ -90,14 +77,10 @@ def main() -> int:
                          (f"llvm program + {native} lib", ["-O2"], native)]
         else:
             print("note: no native backend runs on this host; native and cross-backend variants skipped")
-        if rosetta:
-            variants += [("tpde x86-64", ["--backend", "tpde", *x64_target], "tpde-x64"),
-                         ("tpde x86-64 program + llvm lib", ["--backend", "tpde", *x64_target], "llvm-x64"),
-                         ("llvm x86-64 program + tpde lib", ["-O2", *x64_target], "tpde-x64")]
         for index, (label, flags, lib) in enumerate(variants):
             executable = work / f"abi-{index}"
             run([coil, "build", FIXTURE / "abi.coil", *flags,
-                 "--link-flag", x64_c_object if lib.endswith("-x64") else c_object,
+                 "--link-flag", c_object,
                  "--link-flag", libs[lib], "-o", executable, "--quiet"], f"build {label}")
             ran = subprocess.run([str(executable)], cwd=ROOT, capture_output=True, text=True, timeout=60)
             if ran.returncode == 0 and ran.stdout.strip().endswith("failures: 0"):

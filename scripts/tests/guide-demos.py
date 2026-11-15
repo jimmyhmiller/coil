@@ -36,7 +36,7 @@ def main() -> int:
                 problem = None if result.returncode == 0 else f"coil test exited {result.returncode}"
             else:
                 exe = Path(raw) / Path(source).stem
-                result = subprocess.run([coil, "build", source, "--backend", "arm64", "-o", str(exe)],
+                result = subprocess.run([coil, "build", source, "--backend", "native", "-o", str(exe)],
                                         cwd=ROOT, capture_output=True, timeout=120)
                 if result.returncode:
                     problem = "build failed"

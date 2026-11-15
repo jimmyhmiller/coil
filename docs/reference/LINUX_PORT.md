@@ -56,19 +56,20 @@ Linux:
 - COMPREHENSIVE's `x64/host` step (`scripts/tests/x64-host.py`, run from a Mac over
   ssh) bootstraps on the Linux host, runs the runtime corpus on the LLVM backend
   (`python3 scripts/oracle.py corpus llvm`), then self-hosts through the native
-  backend, tpde, runs its gates (see `X64_BACKEND.md`), and bootstraps the
+  backend, runs its gates (see `NATIVE_BACKEND.md`), and bootstraps the
   LLVM-free Linux compiler.
 - CI's `linux` job builds with `dev.py build linux` and runs the SIMD slice of
   COMPREHENSIVE.
 - `python3 scripts/dev.py test fast --compiler build/bin/coil` runs on Linux too;
-  its arm64-only and Mach-O-only checks (the arm64 lanes, `-g` with dsymutil and
-  lldb, Mach-O cross-links) are macOS-host checks.
+  its Mach-O-only checks (`-g` with dsymutil and lldb, Mach-O cross-links) are
+  macOS-host checks.
 
 ## Known gaps (by design or deferred)
 
-- `--backend arm64`, the nollvm build (`main_a64`, Mach-O writer), and the MObj
-  in-memory JIT are macOS/arm64-only. `emit-obj --backend arm64` still works on
-  Linux (codegen is host-independent); you just can't run the result here.
+- The AArch64 nollvm build (`main_a64`, Mach-O writer) and the MObj in-memory JIT
+  are macOS/arm64-only. `--backend native --target aarch64-apple-darwin` still
+  works on Linux (every compiler carries both machines); you just can't run the
+  result here.
 - Cross-LINKING from Linux (e.g. `--target` an Apple triple) is not orchestrated by
   the driver (no `-arch` on ELF; you'd need a cross toolchain).
 - `-g` on Linux: DWARF is emitted into the object/executable but the lldb/dsymutil

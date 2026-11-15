@@ -93,7 +93,7 @@ def census(body):
 with tempfile.TemporaryDirectory(prefix='stogir-volatile-') as temporary:
     for level in (1, 2, 3):
         exe = Path(temporary) / f'program{level}'
-        built = subprocess.run([str(COMPILER), 'build', str(SOURCE), '--backend', 'stogir',
+        built = subprocess.run([str(COMPILER), 'build', str(SOURCE), '--backend', 'native',
                                 f'-O{level}', '--no-debug', '-o', str(exe)],
                                cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=600)
         assert built.returncode == 0, built.stderr

@@ -34,8 +34,8 @@ there. A directory with no `Coil.toml` is an error, not a project.
 
 ```sh
 coil run                    # build and run the package; args after -- go to the program
-coil build                  # build/release/<package-name>
-coil build --debug          # DWARF symbols, build/debug/<package-name>
+coil build                  # a debug build: -O0, DWARF, build/debug/<package-name>
+coil build --release        # an optimized build: -O3, no DWARF, build/release/<package-name>
 coil build --profile safe   # a [profile.safe] build, build/safe/<package-name>
 coil check                  # typecheck the entry graph and every test file; no codegen
 coil test                   # run the test suites (see TESTING.md)
@@ -52,7 +52,7 @@ links, so it validates `[link]` and `[cc]`. The install root is
 
 Naming a file inside a project changes only the entry point. `coil build src/tool.coil` uses the same dependencies, native
 inputs and metaprograms as a bare `coil build`, and writes
-`build/release/tool`. Outside a project, a file is compiled on its own.
+`build/debug/tool`. Outside a project, a file is compiled on its own.
 
 ## Manifest reference
 
@@ -99,10 +99,10 @@ programs under `exclude` so they are neither indexed nor linted.
 ```toml
 [build]
 out = "build/app"          # the executable's path from Coil.toml, in every profile
-optimization = 2           # default -O level; an explicit -O flag wins
+optimization = 2           # the -O level of a release build; an explicit -O flag wins
 target = "wasm32-unknown-unknown"
-debug = true               # same as passing --debug
-jit = "tpde"               # coil.jit without LLVM; same as --jit=tpde
+debug = true               # DWARF in every profile, release builds included
+jit = "native"             # coil.jit without LLVM; same as --jit=native
 
 [run]
 args = ["--verbose"]
@@ -317,13 +317,14 @@ manifest and must all differ.
 
 ## Build profiles
 
-A profile is a named build configuration. `release` is the default and `debug`
-is what `--debug` selects; a `[profile.NAME]` section defines another, or adds to
-one of those two.
+A profile is a named build configuration. As with Cargo, `debug` is the default
+(`-O0` with DWARF, by the native backend where it compiles for the target) and
+`release` is what `--release` selects (`-O3`, no DWARF); a `[profile.NAME]`
+section defines another, or adds to one of those two.
 
 ```toml
 [profile.safe]
-inherits = "release"          # start from release (the default) or debug
+inherits = "release"          # start from release or debug (the default)
 use = ["coil.safety"]         # metaprograms added to [metaprograms] use
 
 [profile.checked]
@@ -351,12 +352,13 @@ coil test --profile safe    # the tests, built under coil.safety
 ```
 
 - `--profile NAME` selects one for `build`, `run`, `check`, `test`, `lint` and
-  `install`; `--debug` is `--profile debug`. With neither, `[build] debug = true`
-  selects `debug`, and otherwise `release`.
+  `install`; `--release` is `--profile release`. With neither, `debug`.
 - The output goes to `build/<NAME>/`.
-- `[build] optimization` is where every profile starts; a profile's own
-  `optimization` replaces it. A flag on the command line (`-O2`) still wins.
-  `jit` works the same way, and `--jit=` wins over both.
+- `debug` starts at `-O0`; `release`, and a profile that starts from it, at
+  `[build] optimization` (`-O3` unless it says). A profile's own `optimization`
+  replaces either, and a flag on the command line (`-O2`) still wins. `[build]
+  debug = true` gives every profile DWARF. `jit` works like `optimization`, and
+  `--jit=` wins over both.
 - A profile inherits everything its `inherits` names, and its own keys take
   precedence. A profile with no `inherits` starts from `release`.
 - Only the package's own profiles apply; a dependency's are ignored. Outside a

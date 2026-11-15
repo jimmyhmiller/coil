@@ -13,7 +13,7 @@
 #      a wrong exit code.
 #   5. check the link produced no warnings (a missing .note.GNU-stack silently
 #      gives the whole program an executable stack).
-#   6. link two objects tpde wrote with debug info and verify the result: a
+#   6. link two objects the native backend wrote with debug info and verify the result: a
 #      linker concatenates their debug sections, so each object's offsets into
 #      .debug_str, .debug_line and .debug_abbrev must be relocated, or the
 #      second compile unit reads the first one's strings and lines.
@@ -95,11 +95,11 @@ cat > "$WORK/gemain.coil" <<'EOF'
 EOF
 DWARFDUMP="$(llvm-config --bindir 2>/dev/null)/llvm-dwarfdump"
 [ -x "$DWARFDUMP" ] || DWARFDUMP=$(command -v llvm-dwarfdump-21 || command -v llvm-dwarfdump || true)
-if "$BIN" emit-obj "$WORK/gelib.coil" --backend x64 -g -o "$WORK/gelib.o" >/dev/null 2>&1 \
-   && "$BIN" emit-obj "$WORK/gemain.coil" --backend x64 -g -o "$WORK/gemain.o" >/dev/null 2>&1 \
+if "$BIN" emit-obj "$WORK/gelib.coil" --backend native -g -o "$WORK/gelib.o" >/dev/null 2>&1 \
+   && "$BIN" emit-obj "$WORK/gemain.coil" --backend native -g -o "$WORK/gemain.o" >/dev/null 2>&1 \
    && cc "$WORK/gemain.o" "$WORK/gelib.o" -o "$WORK/ge" 2>/dev/null; then
   "$WORK/ge"; rc=$?
-  [ "$rc" = 42 ] && echo "  ok   — two tpde objects with debug info link and run" \
+  [ "$rc" = 42 ] && echo "  ok   — two native objects with debug info link and run" \
                  || { echo "  FAIL — the two-object program exited $rc, want 42"; fail=$((fail+1)); }
   if [ -z "$DWARFDUMP" ]; then
     echo "  FAIL — no llvm-dwarfdump to verify the linked debug info"; fail=$((fail+1))

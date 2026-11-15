@@ -55,7 +55,7 @@ RESULTS="src/benchmarks/RESULTS.md"
 
 for b in "${BENCHES[@]}"; do
   echo "=== $b ==="
-  "$COIL" build "src/benchmarks/$b.coil" -o "$T/$b.coil" >/dev/null
+  "$COIL" build "src/benchmarks/$b.coil" --release -o "$T/$b.coil" >/dev/null
   "$CC" -O3 "src/benchmarks/$b.c" -o "$T/$b.c3"
 
   oc=$("$T/$b.coil"); o3=$("$T/$b.c3")

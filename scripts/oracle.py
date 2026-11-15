@@ -5,7 +5,7 @@ corpus: tests/corpus/*.coil are a handful of large, self-checking programs, each
 covering one area of the language. Every lane builds or runs each program its own
 way and compares stdout and the exit status with tests/corpus/reference/:
 
-    python3 scripts/oracle.py corpus arm64|llvm|x64|tpde|interp|safety|meta-interp|opt3 [--all] [--compiler C]
+    python3 scripts/oracle.py corpus llvm|native|native-debug|native-quick|native-quick-debug|interp|safety|meta-interp|opt3 [--all] [--compiler C]
     python3 scripts/oracle.py corpus bless [--compiler C]     # rewrite the references (LLVM lane)
 
 tests/corpus/corpus.txt lists the programs. After the file name come options:
@@ -54,7 +54,8 @@ ROOT = Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "tests" / "corpus"
 DIAG = ROOT / "tests" / "diag"
 DIAG_SETS = ("compile", "link", "no-hang")
-LANES = ("arm64", "llvm", "x64", "tpde", "stogir", "declarative", "declarative-debug", "interp", "safety", "meta-interp", "opt3")
+LANES = ("llvm", "native", "native-debug", "native-quick", "native-quick-debug", "interp", "safety",
+         "meta-interp", "opt3")
 BUILD_TIMEOUT = 120
 RUN_TIMEOUT = 30
 
@@ -103,18 +104,21 @@ def read_corpus() -> list[Program]:
 
 
 def lane_build_flags(lane: str) -> list[str]:
+    # A build with no profile named is a debug build (-O0, DWARF, the native
+    # backend where it compiles); each lane names what it tests.
     return {
-        "arm64": ["--backend", "arm64"],
-        "meta-interp": ["--backend", "tpde"],
-        "x64": ["--backend", "x64"],
-        "tpde": ["--backend", "tpde"],
-        "stogir": ["--backend", "stogir", "--no-debug"],
-        "declarative": ["--backend", "declarative", "--no-debug"],
-        # With debug information: functions compiled one at a time, frame objects kept in memory.
-        "declarative-debug": ["--backend", "declarative", "-g"],
-        "llvm": [],
-        "safety": ["--use", "coil.safety"],
-        "opt3": ["-O3"],
+        "meta-interp": ["--backend", "native"],
+        # -O3, the whole module at once.
+        "native": ["--backend", "native", "--release"],
+        # -O3 with debug information: functions compiled one at a time.
+        "native-debug": ["--backend", "native", "-O3"],
+        # -O0: the quick compile, straight from CIR.
+        "native-quick": ["--backend", "native", "-O0", "--no-debug"],
+        # the debug profile itself.
+        "native-quick-debug": ["--backend", "native"],
+        "llvm": ["--release"],
+        "safety": ["--release", "--use", "coil.safety"],
+        "opt3": ["--release", "-O3"],
     }[lane]
 
 
@@ -230,7 +234,7 @@ def corpus(compiler: str, lane: str, everything: bool, only: list[str] | None) -
 
 def bless(compiler: str, only: list[str] | None) -> int:
     """Write each program's reference from the LLVM lane, after checking that the
-    arm64 lane agrees with it, so a reference never records one backend's bug."""
+    native lane agrees with it, so a reference never records one backend's bug."""
     (CORPUS / "reference").mkdir(exist_ok=True)
     failures = 0
     with tempfile.TemporaryDirectory(prefix="coil-corpus-bless-") as raw:
@@ -238,15 +242,15 @@ def bless(compiler: str, only: list[str] | None) -> int:
             if only and program.stem not in only:
                 continue
             llvm = run_program(compiler, program, "llvm", Path(raw))
-            arm64 = run_program(compiler, program, "arm64", Path(raw))
-            if isinstance(llvm, str) or isinstance(arm64, str):
+            native = run_program(compiler, program, "native", Path(raw))
+            if isinstance(llvm, str) or isinstance(native, str):
                 failures += 1
-                print(f"FAIL {program.stem}: {llvm if isinstance(llvm, str) else arm64}")
+                print(f"FAIL {program.stem}: {llvm if isinstance(llvm, str) else native}")
                 continue
-            if llvm[0] != arm64[0] or llvm[2] != arm64[2]:
+            if llvm[0] != native[0] or llvm[2] != native[2]:
                 failures += 1
-                print(f"FAIL {program.stem}: arm64 and LLVM disagree "
-                      f"(exit {arm64[2]} vs {llvm[2]}; {first_difference(llvm[0], arm64[0])})")
+                print(f"FAIL {program.stem}: native and LLVM disagree "
+                      f"(exit {native[2]} vs {llvm[2]}; {first_difference(llvm[0], native[0])})")
                 continue
             base = CORPUS / "reference" / program.stem
             Path(f"{base}.stdout").write_bytes(llvm[0])

@@ -77,7 +77,7 @@ for n in "${SIZES[@]}"; do
   gen "$n" "$src"
   loc=$(wc -l < "$src" | tr -d ' ')
   fe=$(timeit "$COIL" emit-ir "$src")
-  bd=$(timeit "$COIL" build "$src" -o "$T/scale_$n")
+  bd=$(timeit "$COIL" build "$src" --release -o "$T/scale_$n")
   fems=$(python3 -c "print(f'{1000*$fe/$n:.3f}')")
   bdms=$(python3 -c "print(f'{1000*$bd/$n:.3f}')")
   printf "%8s %8s %12s %10s\n" "$n" "$loc" "$fe" "$bd"

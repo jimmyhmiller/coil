@@ -1,20 +1,19 @@
 # DWARF debug info
 
 Every backend describes a program to `lldb`/`gdb` the same way: source lines,
-functions, parameters and locals, and their types. What is on by default:
+functions, parameters and locals, and their types. A debug build (the default:
+`coil build` without `--release`) emits it; `--release -g` adds it to an
+optimized build, and `-g0` (or `--no-debug`) turns it off.
 
-| Backend | Debug info | How a variable is found |
-|---|---|---|
-| native: `--backend tpde`, `arm64`, `x64` | **by default** | parameters and mutable variables: a shadow slot; immutable `let`s: location lists from the register allocator |
-| LLVM (`coil build`, `-O…`) | with `-g` (`--backend llvm -g`) | `llvm.dbg.declare` on its storage |
+| Backend | How a variable is found |
+|---|---|
+| native (`--backend native`, a debug build's default) | parameters and mutable variables: a shadow slot; immutable `let`s: location lists, below `-O2` |
+| LLVM (`--backend llvm`) | `llvm.dbg.declare` on its storage |
 
-`-g0` (or `--no-debug`) turns the default off. `-g` with no `--backend` still
-picks the native backend (`--backend arm64` on Apple silicon, `x64` on x86-64
-Linux), which never optimizes; `-g` with a named backend keeps it. Under `-g`
-the native backend also keeps every function's debug frame, so a parameter
-stays visible after its last use.
+A debug build keeps every function's debug frame, so a parameter stays visible
+after its last use.
 
-    coil build src/examples/fib.coil -o /tmp/fib --backend tpde
+    coil build src/examples/fib.coil -o /tmp/fib
     lldb /tmp/fib
     (lldb) breakpoint set --file fib.coil --line 7
     (lldb) run
@@ -48,28 +47,23 @@ union of the variants:
 
 Read `tag`, then the payload member it names.
 
-## tpde: variables in registers
+## The native backend: variables in registers
 
-tpde keeps values in registers that change, so a variable needs a location the
-debugger can read without slowing the program:
+The native backend keeps values in registers that change, so a variable needs a
+location the debugger can read without slowing the program:
 
 - **Parameters and mutable variables** have a shadow slot in a per-function
   debug frame: binding stores the value there, and every assignment to a
   mutable variable stores again. They are visible with their current value for
   the whole scope.
-- **Immutable `let`s** cost no code: at every line row (where a debugger
-  stops) the compiler records where the value is (a register, its spill slot,
-  or nowhere), and the variable gets a location list. After its last use it
-  may show as unavailable.
+- **Immutable `let`s** cost no code: below `-O2`, as each instruction is
+  written, the compiler notes where the value is (a register, its spill slot,
+  or nowhere) when that changes, and the variable gets a location list. A value
+  a debugger follows is always computed (never folded into what reads it) and
+  kept until the end of its region. From `-O2`, a value only in registers has no
+  location.
 - **Constants** are described as their value.
-- A small **leaf function** whose only stack slot would be the debug frame
-  drops it: its parameters are tracked like immutable locals instead (giving it
-  a frame cost hot leaves up to 75%).
-
-Cost, against `-g0`: none on most benchmarks; about 15% on call-heavy code
-with many parameters (`prop_bench`, still 0.84× LLVM -O0's run time).
-Compile time: debug info is encoded on its own thread, and tpde stays ≥10×
-faster than LLVM -O0 (`src/compiler/tpde/docs/BENCH.md`).
+Compile time: debug info is encoded on its own thread.
 
 ## Relocations (the part that makes `dsymutil` work)
 
@@ -77,7 +71,7 @@ On Mach-O the linker records a debug map pointing at the temporary `.o`, so a
 build that emits DWARF runs **`dsymutil`** to gather `<exe>.dSYM` before that
 object is removed. Every DWARF address carries a relocation — the CU's and each
 subprogram's `low_pc`, each lexical block's, and the line program's
-`set_address` (one per function in tpde's line program) — as an 8-byte
+`set_address` (one per function in the native backend's line program) — as an 8-byte
 **unsigned section relocation** against `__text` with the offset as the addend,
 clang's Mach-O scheme. Location list entries are relative to the CU's base and
 need none. Without the relocations `dsymutil` rejects the object ("No valid
@@ -90,14 +84,14 @@ linker resolves them; there is no separate gathering step.
 ## Gaps
 
 - Function-name breakpoints need the module-qualified name (`app.add`).
-- tpde's line rows are per line (the column is that of the line's first
-  expression).
-- tpde describes a variable whose value is an address into the frame as that
-  address (a pointer); `p *q` shows the value.
+- The native backend's line rows are per line (the column is that of the line's
+  first expression).
+- The native backend describes a variable whose value is an address into the
+  frame as that address (a pointer); `p *q` shows the value.
 - No lexical blocks in the LLVM backend: every local is visible in its whole
   function.
 
 Gated in FAST's `cli/debuginfo` step (`scripts/tests/fast/cli.sh`): a line
-breakpoint from the `.dSYM` alone, and on each macOS backend (tpde by default,
-LLVM with `-g`, tpde for x86-64 under Rosetta) parameters, locals, a
-sum and a struct at a line breakpoint; `-g0` gathers nothing.
+breakpoint from the `.dSYM` alone, and on each macOS backend (native in a debug
+build, LLVM with `-g`) parameters, locals, a sum and a struct at a line
+breakpoint; `-g0` gathers nothing.

@@ -33,9 +33,9 @@ coil> (Point :x 1 :y 2 :next (cast (ptr Point) 0))
 (Point :x 1 :y 2 :next #<(ptr Point) 0x0>)
 ```
 
-`coil repl --backend tpde` compiles each submission with the tpde backend
-instead of the host's default (`native` on macOS arm64); `--backend native` and
-`--backend llvm` name the others (see [Backends](#backends-and-optimization)).
+`coil repl --backend native` compiles each submission with the native backend
+(the default on macOS arm64), and `--backend llvm` with LLVM's ORC JIT (see
+[Backends](#backends-and-optimization)).
 
 A pointer prints its address and is not followed, and a type with no visible
 structure prints as `#<T>`. Nothing is derived: the program gains no impl, so
@@ -141,25 +141,25 @@ prebuilt unit, so building against it is quick after the first time per
 backend. `jit-session-new` finds the matching toolchain through `coil` on
 `PATH`; `jit-session-new-with-toolchain` takes an explicit compiler command.
 
-### Choosing the implementation: `--jit=llvm|tpde`
+### Choosing the implementation: `--jit=llvm|native`
 
 `coil.jit` has two implementations of the same interface, chosen per build:
 
 | `--jit=` | Backends | Links |
 |---|---|---|
-| `llvm` (the default) | `Native`, `Tpde` and `Llvm` | libLLVM, a shared library of about 170 MB |
-| `tpde` | `Native` and `Tpde` | no LLVM: only the system's own libraries |
+| `llvm` (the default) | `Native` and `Llvm` | libLLVM, a shared library of about 170 MB |
+| `native` | `Native` | no LLVM: only the system's own libraries |
 
 ```sh
-coil build app.coil --jit=tpde      # or [build] jit = "tpde" in Coil.toml
+coil build app.coil --jit=native    # or [build] jit = "native" in Coil.toml
 ```
 
-The source does not change: a `--jit=tpde` program still imports `coil.jit`, and
+The source does not change: a `--jit=native` program still imports `coil.jit`, and
 asking it for `(Llvm)` gets `(Err (UnsupportedBackend (Llvm)))`. The
 `src/examples/jit_sdk.coil` program is 3.3 MB at `-O3` either way; built
-`--jit=tpde` it depends on nothing else. Each implementation has its own prebuilt
-unit. tpde publishes runtime code on macOS arm64 (as Mach-O) and Linux x86-64 (as
-ELF); on any other target a `--jit=tpde` build has no backend and
+`--jit=native` it depends on nothing else. Each implementation has its own prebuilt
+unit. The native backend publishes runtime code on macOS arm64 (as Mach-O) and
+Linux x86-64 (as ELF); on any other target a `--jit=native` build has no backend and
 `jit-supported?` is false.
 
 ### Session API
@@ -209,12 +209,11 @@ imported by name like one on disk.
 
 ### Backends and optimization
 
-A session publishes runtime code through one of three backends:
+A session publishes runtime code through one of two backends:
 
 | Backend | Hosts | Compiles | Generated code |
 |---|---|---|---|
-| `(Native)` | macOS arm64 (the default there), Linux x86-64 (the default in a `--jit=tpde` build) | fast, about 5 ms for a small submission | unoptimized; roughly `-O0` or slower |
-| `(Tpde)` | macOS arm64, Linux x86-64 | as fast as `Native` | unoptimized, but several times faster than `Native`'s or LLVM `-O0`'s |
+| `(Native)` | macOS arm64 (the default there), Linux x86-64 (the default in a `--jit=native` build) | fast, about 5 ms for a small submission | the native backend's straight-from-CIR compile; several times faster than LLVM `-O0`'s |
 | `(Llvm)` | macOS arm64, Linux x86-64 (the default there), in a `--jit=llvm` build | slower, and more so as `opt-level` rises | LLVM's `default<ON>` pipeline, like an AOT `-ON` build |
 
 `jit-session-new` uses the host's default at level 0. To choose, pass a
@@ -254,7 +253,7 @@ runtime code, and the level applies only to runtime code. The session keeps its
 backend and level across `jit-reset!`; `(jit-session-backend s)` reports the
 backend, and `JitBackend` implements `Eq` and `Debug`. The options are refused with `(Err …)`, before anything is created,
 when the host lacks the backend (`UnsupportedBackend`) or `opt-level` is
-outside 0–3 or nonzero for `Native` or `Tpde` (`InvalidOptLevel`);
+outside 0–3 or nonzero for `Native` (`InvalidOptLevel`);
 `jit-options-error-message` describes either.
 
 On an Apple M-series machine, a benchmark that generates, parses and hashes
@@ -262,19 +261,20 @@ On an Apple M-series machine, a benchmark that generates, parses and hashes
 
 | | JSON | integer | float | first compile |
 |---|---|---|---|---|
-| `Native` | 956 ms | 4801 ms | 2015 ms | 362 ms |
 | `Llvm`, level 0 | 522 ms | 2945 ms | 1344 ms | 564 ms |
 | `Llvm`, level 2 | 42 ms | 599 ms | 296 ms | 651 ms |
 | AOT `coil build -O3` | 46 ms | 600 ms | 296 ms | |
 
-`Tpde` compiles in about the time `Native` does, since the front end dominates
-a submission, and its code is several times faster. An integer loop (10⁹
-iterations) and a floating-point one (3·10⁸), same machine:
+`Native` compiles about as fast as `Llvm` at level 0, since the front end
+dominates a submission, and its code is several times faster. An integer loop
+(10⁹ iterations) and a floating-point one (3·10⁸), same machine (`Native`
+measured when the native backend was tpde; the compile straight from CIR that
+replaced it builds a Coil compiler that runs 4% faster than tpde's on AArch64
+and 10% faster on x86-64):
 
 | | integer | float | a warm compile of both | a one-function submission |
 |---|---|---|---|---|
-| `Native` | 3835 ms | 3197 ms | 58 ms | 26 ms |
-| `Tpde` | 670 ms | 697 ms | 59 ms | 26 ms |
+| `Native` | 670 ms | 697 ms | 59 ms | 26 ms |
 | `Llvm`, level 0 | 3005 ms | 2289 ms | | 26 ms |
 
 Later small submissions cost about 15 ms with any backend. Pick `Llvm` at
@@ -728,12 +728,12 @@ sources.
 
 ## Platforms
 
-On macOS arm64 a session uses Coil's own arm64 backend unless you choose
-`Llvm`; Coil links the toolchain's libLLVM into a program that imports
-`coil.jit` automatically, unless it is built `--jit=tpde`. On Linux x86-64 a
-session defaults to LLVM's ORC JIT (`jit-backend` reports `"llvm-orc"`) and
-`(Native)` or `(Tpde)` publish through tpde as ELF. A `--jit=tpde` build has only
-those (`jit-backend` reports `"x86_64-elf"`) and links no LLVM; otherwise a program
+On macOS arm64 a session uses the native backend unless you choose `Llvm`; Coil
+links the toolchain's libLLVM into a program that imports `coil.jit`
+automatically, unless it is built `--jit=native`. On Linux x86-64 a session
+defaults to LLVM's ORC JIT (`jit-backend` reports `"llvm-orc"`) and `(Native)`
+publishes through the native backend as ELF. A `--jit=native` build has only that
+(`jit-backend` reports `"x86_64-elf"`) and links no LLVM; otherwise a program
 embedding `coil.jit` there must link LLVM:
 
 ```sh
@@ -741,7 +741,7 @@ coil build app.coil --link-flag "-L$(llvm-config --libdir)" --link-flag -lLLVM
 ```
 
 The stock `coil repl` is already linked against LLVM; the LLVM-free Linux compiler's
-REPL publishes through tpde. On both platforms, old
+REPL publishes through the native backend. On both platforms, old
 code stays mapped for function pointers that captured it. Each new
 generation's `alloc-static` storage keeps the addresses the previous
 generation gave it.

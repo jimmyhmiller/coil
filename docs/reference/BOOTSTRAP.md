@@ -9,10 +9,12 @@ compiler (and, for the LLVM backend, libLLVM) — in three flavors:
 | **LLVM-free** | `python3 scripts/dev.py build nollvm` | just `cc` | Native backend for the host |
 | Full | `python3 scripts/dev.py build full` | `cc` + LLVM 21 | LLVM + native backends |
 
-The compiler includes the tpde backend, whose package (`tpde.*`) is vendored at
-`src/compiler/tpde/` from [coil-tpde](https://github.com/jimmyhmiller/coil-tpde);
-`src/compiler/tpde/NOTICE` names the commit. It is a package of its own (its
-modules are not `coil.compiler.*`), which the workspace depends on by path.
+The compiler includes the native backend (`NATIVE_BACKEND.md`): its IR and
+assembler are the `native` package at `src/compiler/native/`, from
+[coil-tpde](https://github.com/jimmyhmiller/coil-tpde) (`src/compiler/native/NOTICE`
+names the commit), and the backend itself the `declarative` package at
+`src/compiler/declarative/`. Each is a package of its own (its modules are not
+`coil.compiler.*`), which the workspace depends on by path.
 
 Both commands select the host implementation automatically: macOS/ARM64 uses the
 Mach-O bootstrap and Linux/x86-64 uses the ELF bootstrap. The explicit `linux` and
@@ -61,12 +63,12 @@ Uses the committed seed `bootstrap/seeds/native/coil-seed-nollvm` (a ~2.1 MB sel
 compiler that links **only libSystem** — no libLLVM). The whole toolchain a fresh
 machine needs is a C compiler. The produced compiler is built from
 `src/compiler/main_a64.coil`, which omits the LLVM backend: it compiles programs via
-the native **arm64** backend (`build --backend arm64`, the default for this binary)
+the native backend (`build --backend native`, the default for this binary)
 and emits Mach-O objects directly. Commands that require the LLVM backend
 (`emit-ir`, `dump-ir`, `__normalize` — textual LLVM IR) fail loudly with a clear
 diagnostic instead of doing nothing.
 
-## Full: LLVM + arm64 backends
+## Full: LLVM + native backends
 
 ```sh
 python3 scripts/dev.py build full          # verifies, then installs locally and globally
@@ -136,12 +138,12 @@ source on every run and proves the result faithful independently, so a stale or
 tampered seed cannot slip through:
 
 1. **Fixpoint** — `stage0 → stage1 → stage2 → stage3`, then `stage2.o` must be
-   byte-identical to `stage3.o`. The native arm64 backend is fully deterministic, so
+   byte-identical to `stage3.o`. The native backend is fully deterministic, so
    a faithful compiler reproduces its own object exactly. (stage1 is lowered by
-   stage0's default backend; stage2/stage3 use `--backend arm64`. Only the
+   stage0's default backend; stage2/stage3 use `--backend native -O1`. Only the
    stage2==stage3 fixpoint is required.)
-2. **Gates** — the LLVM-free path runs `python3 scripts/oracle.py corpus arm64` (the
-   runtime corpus built on arm64 produces the reference stdout and exit status) and
+2. **Gates** — the LLVM-free path runs `python3 scripts/oracle.py corpus native-quick`
+   (the runtime corpus built natively produces the reference stdout and exit status) and
    asserts the binary links no libLLVM. The full path proves the fixpoint only; its
    tests are `dev.py test fast` and `dev.py test comprehensive`.
 
@@ -170,7 +172,7 @@ refresh the native seeds and the WASM seed together so ordinary builds retain th
 path and the portable recovery path remains current.
 
 ```sh
-build/bin/coil build src/compiler/main_a64.coil -o /tmp/nl --backend arm64
+build/bin/coil build src/compiler/main_a64.coil -o /tmp/nl --release --backend native -O1
 STAGE0=/tmp/nl ./scripts/compiler/refresh-seed.sh nollvm    # re-verifies, then updates the seed
 python3 scripts/dev.py build nollvm                      # confirm it self-sustains with no override
 ```
