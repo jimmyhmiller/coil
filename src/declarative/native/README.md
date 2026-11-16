@@ -7,9 +7,13 @@ The source project's manifest excludes that generated directory and reads the
 passes themselves. There is one implementation for both uses.
 
 - `cir.pass`: CIR records, instruction builders, sealed-block SSA construction,
-  definition-table generations, function reuse, debug positions and snapshots.
-- `cir-copies.pass`: aggregate copy analysis, dominators, address escape and
-  liveness checks, argument summaries, and module forwarding phases.
+  definition-table generations, function reuse, debug positions, snapshots,
+  control-flow helpers, and CIR's edits: `retire!`, `hoist!`, `insert-before!`,
+  `detached2!`, `make-anywhere!`, and `commit!`, which places what is pending
+  and compacts away retired instructions, PHIs and allocas.
+- `cir-copies.pass`: aggregate copy forwarding: facts about where addresses
+  point and what touches them, the two rewrites they allow, sinking copies out
+  of PHIs, argument summaries, and module forwarding phases.
 - `asm.pass`: sections, relocations, symbols and their stable chunked storage.
   The symbol lock still protects insertion after `share!`; readers' symbol
   addresses remain stable as later chunks are added.
@@ -65,16 +69,15 @@ The declarations already used by the native sources are:
 - `gather`: column-major ragged rows with a declared resolver. The language
   reserves and publishes the row before resolving its inputs, so recursive
   construction can append more rows without invalidating the reserved offsets.
-- `dominators`: graph adjacency and immediate-dominator equations. The language
-  derives reverse postorder, sparse predecessor intersection and convergence;
-  unreachable nodes retain the declared absent value.
+- `graph`: a control-flow graph said once: block count, each block's run of
+  positions, successors and predecessors. The language owns the storage and
+  derives the block of each position, immediate dominators (reverse postorder
+  and sparse intersection), `dominates?` on positions, and forward and backward
+  stopped reachability for `reach`, each with its own generation stamp.
 - `epoch-map`: key/value storage, a hash equation, initial capacity and load
   policy. The language derives probing, growth, rehashing and epoch-wrap clearing.
 - `consensus`: agreement over a pure row query, with an explicit empty identity.
   Trivial-PHI removal uses this aggregate and a typed guarded rewrite.
-- `region`: stopped reachability over ordered graph segments. Bounds, partition
-  and adjacency are declared; the language derives directional scanning,
-  generation stamps and block scheduling.
 - `predicate` and `rewrite`: named bindings, requirements, derived row views and
   path queries. All constraints precede effects. Typed rewrites specify a rejection value and result; `create`
   bindings execute only after constraints succeed. `resource` binds mutable
@@ -127,6 +130,15 @@ facts Memory(st: ref[State]) in memory {
     if with addr(d) = a, from u in users(st, d), let t = address-use(st, u, a.off);
 }
 ```
+
+`tabulate!(borrow(xs), n, i: value)` refills a list from an equation.
+
+What an operation does to memory is not said in any pass: the `.ops` language
+reads it off each operation's meaning by abstract interpretation (lang/effects)
+and gives `native.cir-ops` `memory-effect` (read or write of an operand at a
+constant offset and extent, an address derived from it, a use of its value, or
+an operation with no meaning) and `clobbers?`. An operation with no meaning
+may say `memory reads` or `memory none`.
 
 Pure equations support `let`, `all`, `any`, `count` and `tabulate`; generated `all` and `any`
 short-circuit. Expressions in rows and constraints reject explicit mutation,
