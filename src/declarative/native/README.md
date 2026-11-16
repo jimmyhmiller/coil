@@ -138,7 +138,14 @@ reads it off each operation's meaning by abstract interpretation (lang/effects)
 and gives `native.cir-ops` `memory-effect` (read or write of an operand at a
 constant offset and extent, an address derived from it, a use of its value, or
 an operation with no meaning) and `clobbers?`. An operation with no meaning
-may say `memory reads` or `memory none`.
+may say `memory reads`, `memory none` or `memory allocates`.
+
+Frame-address provenance comes from the same reading: `carries?(op, k)`
+(operand k may flow into the result: arithmetic, bits, conversions, either
+arm of a select, but not a truth value or a load), `stores?(op, k)` (its value
+goes into memory, or to an operation with no meaning: a call, a return, an
+atomic update) and `allocates?(op)`. `cir.pass` applies them in `set-ops!`,
+so no builder says which operations propagate or leak a stack address.
 
 Pure equations support `let`, `all`, `any`, `count` and `tabulate`; generated `all` and `any`
 short-circuit. Expressions in rows and constraints reject explicit mutation,
