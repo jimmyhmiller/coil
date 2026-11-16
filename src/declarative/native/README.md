@@ -38,13 +38,12 @@ requires this strict mode for every native infrastructure source.
 
 The declarations already used by the native sources are:
 
+- `facts`: relations over dense keys and the rules that state them. The engine
+  owns storage, reset, indexing and evaluation; see below.
 - `follow`: terminal and next-node equations, optionally with an accumulated
   fold. These compile to a single loop even at O0, without recursive stack use.
 - `tally`: dense cardinalities derived from pure key rows.
 - `reduce`: an ordered fold over pure rows with an explicit empty identity.
-- `worklist`: append-discovered rows in FIFO order, or a consuming LIFO stack.
-  The effect declares discovery; the language derives the traversal cursor.
-  FIFO effects may append but cannot remove or reorder queue entries.
 - `intern`: dense bounded-domain or ordered keyed interning. The constructor
   runs once on a miss; hits preserve object identity.
 - `mutex` and `stable-index`: a resource lifecycle and a bounded chunked index.
@@ -60,9 +59,6 @@ The declarations already used by the native sources are:
 - `insert`: one logical row across declared columns, returning its ordinal.
   Values observe the pre-insertion state; the language derives column appends.
   CIR values, operands, variables and blocks use this declaration.
-- `relation`: ordered rows and output columns. The language derives a compressed
-  inverse index, including counts, prefix sums and placement. A query can bind
-  ordinary ranges, linked chains or ragged segments without client cursors.
 - `sealed-ssa`: definitions, predecessor constraints, deferred merge storage and
   merge-building hooks. The solver publishes a cyclic merge before reading its
   predecessors and discharges deferred merges when a block seals.
@@ -76,9 +72,6 @@ The declarations already used by the native sources are:
   policy. The language derives probing, growth, rehashing and epoch-wrap clearing.
 - `consensus`: agreement over a pure row query, with an explicit empty identity.
   Trivial-PHI removal uses this aggregate and a typed guarded rewrite.
-- `meet`: descending bit facts constrained by the indexed dependency relation.
-  A change schedules dependent rows; recursive components converge without a
-  client worklist. Unknown callees have an explicit boundary fact.
 - `region`: stopped reachability over ordered graph segments. Bounds, partition
   and adjacency are declared; the language derives directional scanning,
   generation stamps and block scheduling.
@@ -98,15 +91,40 @@ The declarations already used by the native sources are:
   invoke those destructors; snapshots reject opaque ownership without a fresh
   policy.
 
-For example, operand redirection names the relation and destination cells:
+A `facts NAME(context: T, ...) in FIELD { ... }` block declares relations,
+stored in the context's FIELD, and rules. A relation is keyed by a dense
+integer over a declared domain:
+
+- `one R(k: K) -> T over N absent A`: at most one value per key; a second is a
+  hard error. A key with none reads as A.
+- `many R(k: K) -> T over N`: any number of values per key, read back as a slice.
+- `flag R(k: K) over N`: whether it holds.
+- `fold R(k: K) -> T over N from X by OP`: X combined (`&`, `|`, `+`, `max`)
+  with every value stated.
+
+A rule states one or more heads, each optionally `when` a condition, for every
+row of its body (the row-query clauses `from`, `let`, `where`, `segments`).
+`with R(k) = v` as the first clause runs the rule once per fact of a `one`
+relation, or each time a `fold` changes. That is how facts recurse: the engine
+runs each driven rule until nothing new is stated. A rule reads its own block's
+relations only through `with`; earlier blocks' relations are read by calling
+them with the context. `NAME-derive!(...)` resets the storage and derives
+everything.
+
+Copy forwarding's analysis is three such blocks. For example, where every
+address points and what its uses do:
 
 ```text
-scatter redirect-root-uses!(st: ref[State], old: u32, new: u32) {
-  from u in range(cir::i64-of(st.use-start[cir::i64-of(old)]),
-                  cir::i64-of(st.use-start[cir::i64-of(old) + 1]));
-  let user = st.use-user[u];
-  let x = cir::val(st.f, user);
-  write st.f.operands at cir::i64-of(x.opb + st.use-index[u]) = new;
+facts Memory(st: ref[State]) in memory {
+  one addr(value: u32) -> Address over len(st.f.values) absent make Address { root = none(); off = 0; };
+  many touches(root: u32) -> Access over len(st.f.values);
+  flag escaped?(root: u32) over len(st.f.values);
+  ...
+  rule addr(a) = make Address { root = a; off = 0; } if from a in st.f.allocas;
+  rule addr(u.user) = make Address { root = a.root; off = t.lo; } when t.kind == K-DERIVE,
+       touches(a.root) = t when t.kind != K-DERIVE and t.kind != K-ESCAPE,
+       escaped?(a.root) when t.kind == K-ESCAPE
+    if with addr(d) = a, from u in users(st, d), let t = address-use(st, u, a.off);
 }
 ```
 
@@ -128,7 +146,7 @@ After editing:
 
 The second client in `toy/storage.pass`, called by `tests/toy.coil`, exercises
 the same declarations with noncompiler data: recursive and unknown-boundary
-facts, cyclic stopped paths, rejected and accepted rewrites, cell updates,
+facts (a fold over a cyclic graph, an index, and a 10001-fact chain), cyclic stopped paths, rejected and accepted rewrites, cell updates,
 snapshot isolation, retained scratch, ownership, dominator diamonds and cycles,
 epoch-map collisions/growth/wrap, agreement, cyclic/deferred SSA merges, reserved
 rows across nested appends, pruning cascades, segment-local anchors, stable
