@@ -6,6 +6,12 @@ that still implement public let/fn/defn in their parser must compile the current
 compiler with those built-ins, before the new binary can load coil.binding.
 Only their staged prelude omits the two new binding imports. Compiler sources,
 including the new metaprogram ABI text embedded in the result, stay unchanged.
+
+Stage zero runs outside the checkout, so that it never reads a manifest newer than
+it understands, and is handed the source graph explicitly instead: the namespace
+roots, and what the workspace's dependencies say of their own files -- the
+native backend's [readers] and [modules], which make its files in its languages
+Coil as they compile (`project_graph`).
 """
 from __future__ import annotations
 
@@ -15,12 +21,41 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 BINDING_IMPORTS = {
     '(import "coil.binding" :use [let fn defn] :reexport)',
     '(import "coil.binding.runtime" :as binding-runtime)',
 }
+
+
+def project_graph() -> tuple[dict[str, str], list[str]]:
+    """The environment that configures a compile of the checkout as its
+    manifests would, and the `--use` arguments naming its readers: the compiler
+    and the library as roots, and each dependency of the workspace's Coil.toml
+    with its roots, excludes, readers and module map, its paths absolute."""
+    roots = [ROOT / "src/compiler", ROOT / "src/stdlib"]
+    excludes: list[Path] = []
+    readers: dict[str, str] = {}
+    modules: dict[str, Path] = {}
+    workspace = tomllib.loads((ROOT / "Coil.toml").read_text())
+    for dependency in workspace.get("dependencies", {}).values():
+        package = ROOT / dependency["path"]
+        manifest = tomllib.loads((package / "Coil.toml").read_text())
+        roots += [(package / r).resolve() for r in manifest["package"].get("source-roots", ["."])]
+        excludes += [(package / e).resolve() for e in manifest["package"].get("exclude", [])]
+        readers.update(manifest.get("readers", {}))
+        modules.update({name: (package / file).resolve()
+                        for name, file in manifest.get("modules", {}).items()})
+    environment = {
+        "COIL_NAMESPACE_ROOTS": ":".join(str(r) for r in roots),
+        "COIL_NAMESPACE_EXCLUDES": "".join(f"{e}\n" for e in excludes),
+        "COIL_READERS": "".join(f"{suffix}={module}\n" for suffix, module in readers.items()),
+        "COIL_MODULE_MAP": "".join(f"{name}={file}\n" for name, file in modules.items()),
+    }
+    uses = [argument for module in sorted(set(readers.values())) for argument in ("--use", module)]
+    return environment, uses
 
 
 def run(compiler: Path, arguments: list[str]) -> int:
@@ -50,6 +85,7 @@ def run(compiler: Path, arguments: list[str]) -> int:
         library.mkdir(parents=True)
         (library / "stdlib").symlink_to(ROOT / "src/stdlib", target_is_directory=True)
         (library / "compiler").symlink_to(ROOT / "src/compiler", target_is_directory=True)
+        (library / "declarative").symlink_to(ROOT / "src/declarative", target_is_directory=True)
         prelude = ROOT / "src/compiler/prelude.coil"
         if primitive_bindings:
             (library / "prelude.coil").symlink_to(prelude)
@@ -65,12 +101,10 @@ def run(compiler: Path, arguments: list[str]) -> int:
         # stage-zero compiler is missing from its bundled manifest, and only the
         # namespace scan can find it (COIL_STRICT_BUNDLE=0 permits that fallback;
         # every module the bundle does name still resolves through the bundle).
-        # src/compiler holds the native package (src/compiler/native) too.
-        roots = [ROOT / "src/compiler", ROOT / "src/stdlib"]
-        environment["COIL_NAMESPACE_ROOTS"] = ":".join(str(r) for r in roots)
+        graph, uses = project_graph()
+        environment.update(graph)
         environment["COIL_STRICT_BUNDLE"] = "0"
-        # The old stage zero cannot interpret the current workspace manifest.
-        return subprocess.run([str(binary), *arguments], cwd=tempfile.gettempdir(),
+        return subprocess.run([str(binary), *arguments, *uses], cwd=tempfile.gettempdir(),
                               env=environment).returncode
 
 

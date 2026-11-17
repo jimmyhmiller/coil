@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-TREES = ("src/stdlib", "src/compiler")
+TREES = ("src/stdlib", "src/compiler", "src/declarative")
 
 
 def digest(root: Path = ROOT) -> str:

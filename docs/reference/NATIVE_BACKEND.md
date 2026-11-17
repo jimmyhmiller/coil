@@ -1,14 +1,13 @@
 # The native backend
 
 `--backend native` is Coil's own code generator. It is written in small
-languages: its sources are `src/declarative/` (the languages in `lang/`, and the
-files written in them), and what the languages make of them is kept as plain
-Coil in `src/compiler/declarative/generated/`, which
-`scripts/compiler/gen-declarative.py` writes (see [Files](#files)). It replaced
+languages: it is `src/declarative/` (the languages in `lang/`, and the files
+written in them), a package the compiler depends on, whose readers make each of
+its files Coil as the compiler compiles (see [Files](#files)). It replaced
 both the tpde backend (a port of TPDE, which `--backend tpde`, `arm64` and `x64`
 named) and the earlier Stogir library, a port of IR; it was developed in the
 coil-stogir-declarative project before it moved here. That history, and the
-credits, are in `src/compiler/declarative/NOTICE`, git and `docs/benchmarks/`.
+credits, are in `src/declarative/NOTICE`, git and `docs/benchmarks/`.
 The old names are errors that say to use `native`.
 
 It is the default of a debug build (`coil build` without `--release`: `-O0`
@@ -52,14 +51,16 @@ uses LLVM instead.
   on: signatures, layouts and their natural C offsets (which compile-time readback
   walks), statics and their initializers, `export-c` thunks, argument
   classification, string interning, DWARF types, and the Mach-O object.
-- `src/compiler/native/generated/` — generated CIR, aggregate-copy analysis,
-  assembler, byte buffer, and operation numbers. Their sources are
-  `src/declarative/native/*.pass` and `src/declarative/cir/cir.ops`; edit those
-  and run `scripts/compiler/gen-declarative.py`. The package's `NOTICE` retains
-  the [coil-tpde](https://github.com/jimmyhmiller/coil-tpde) provenance.
-- `src/declarative/` — the backend's sources, a Coil project of its own whose
-  `Coil.toml` gives each file type its language (`[readers]`) and each file its
-  module (`[modules]`):
+- `src/declarative/` — the backend, CIR and the assembler: a package the
+  workspace's `Coil.toml` depends on, whose own `Coil.toml` gives each file type
+  its language (`[readers]`) and each file its module (`[modules]`). Nothing is
+  generated ahead of time: a compile that imports one of its modules runs the
+  reader its extension names, as it would for any project's guest files, so an
+  edit to a file here is in the next build. An installed toolchain ships it as
+  `<lib>/coil/declarative`, beside the compiler's sources, and a program that
+  reads the SDK from source (one importing `coil.jit` with no unit for it) reads
+  these files with the same readers (`sdk-reader-for-suffix`, generated with the
+  SDK's tables by `scripts/compiler/gen-stdlib-manifest.py`):
   - `lang/` — the languages, each a reader from a file of its own to a Coil
     module: `.ir` (a node set), `.isa` (a machine's instructions and encodings),
     `.abi` (a calling convention), `.lower` (from nodes to instructions),
@@ -79,21 +80,16 @@ uses LLVM instead.
     passes. Library records declare their field types and initial values;
     `construct` and `release` generate allocation and cleanup of list fields.
     A `byte-buffer` schema declares capacity and integer encodings, including
-    LEB128. Its generated implementation handles memory and byte order.
-    The source project reads these passes directly; it excludes native's
-    generated Coil, so standalone tests exercise the same source definitions.
-  - `adapter/machine.coil` — from CIR to the graph, written once:
-    `machine-a64.instance` and `machine-x64.instance` make it a module for each
-    machine.
-  - `tests/` and `toy/` — the backend's own tests, and the languages' second
-    client, a calculator (see [Gates](#gates)).
-- `src/compiler/declarative/` — the package Coil compiles: `rt/` (the runtime
-  the languages' output stands on) and `adapter/` (CIR's view, the targets),
-  written by hand; `generated/`, written by `scripts/compiler/gen-declarative.py`
-  and never by hand. After editing a file in `src/declarative/`, run that script
-  and commit both; FAST's `declarative/generated` step fails when they disagree.
-  The compiler's own build does not run the languages, so that every stage-0
-  compiler and every installed toolchain can build it.
+    LEB128. The Coil its language makes of it handles memory and byte order.
+    `native/NOTICE` retains the
+    [coil-tpde](https://github.com/jimmyhmiller/coil-tpde) provenance.
+  - `rt/` — the runtime the languages' output stands on, written by hand.
+  - `adapter/` — from the compiler's CIR to the backend: CIR's view and the
+    targets, written by hand, and `machine.coil`, from CIR to the graph, written
+    once: `machine-a64.instance` and `machine-x64.instance` make it a module for
+    each machine.
+  - `tests/` — the backend's own tests, a project of its own, with `toy/`, the
+    languages' second client, a calculator (see [Gates](#gates)).
 - `src/compiler/object/` — the Mach-O and ELF writers, DWARF, and the encoders the
   JIT's stubs, `:shim` trampolines and the self-tests use.
 - `src/compiler/jit/jit_elf.coil` — maps an in-memory ELF object into this process

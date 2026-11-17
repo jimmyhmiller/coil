@@ -204,11 +204,8 @@ Use this format:
   for `coil.core`), with `pipeline.coil`, what compiling a program takes, shared by every
   command; the rest is grouped by stage: `frontend/` (parser, loader, resolve, expander, check,
   mono), `meta/` (the metaprogram engine, the code operations and the bytecode
-  interpreter), `backend/` (LLVM, wasm and native codegen; the native backend's IR and assembler
-  are generated in the package `native/generated/` from `src/declarative/native/*.pass`,
-  and the backend itself the package `declarative/`, whose
-  `generated/` is what the languages of `src/declarative/` make of its sources: edit those
-  and run `scripts/compiler/gen-declarative.py`; each has its NOTICE),
+  interpreter), `backend/` (LLVM, wasm and native codegen; the native backend itself,
+  with its IR and assembler, is the package `src/declarative/`),
   `object/` (instruction encoders, Mach-O/ELF/DWARF/wasm writers), `jit/` (with `session.coil`,
   a live session, and `terminal.coil`, the terminal REPL over one), `artifact/` (units and
   artifact identity), `cli/` (one module per command
@@ -216,13 +213,13 @@ Use this format:
   it, and nothing imports a command but `driver.coil`), `support/` and `selftest/`.
   Module names do not follow the folders: a module is found by its declared
   `(module coil.compiler.NAME)`, so moving a file changes no import.
-- `src/declarative/` — the native backend's sources, a project of its own: the
-  languages it is written in (`lang/`), the files written in them (`backend/`,
-  `a64/`, `x64/`, `*-direct/`, `cir/`), and its tests (`scripts/tests/declarative.py`
-  runs them). Coil compiles what the languages make of them, kept in
-  `src/compiler/declarative/generated/`: after an edit here run
-  `scripts/compiler/gen-declarative.py` and commit both (FAST checks they agree).
-  See `docs/reference/NATIVE_BACKEND.md`.
+- `src/declarative/` — the native backend, CIR and the assembler: a package the
+  workspace depends on. The languages it is written in (`lang/`), the files
+  written in them (`backend/`, `a64/`, `x64/`, `*-direct/`, `cir/`, `native/`),
+  the runtime (`rt/`) and the adapter from CIR (`adapter/`). Its `[readers]` make
+  each file in a language Coil as the compiler compiles, so an edit is in the next
+  build; nothing is generated. Its tests are `tests/`, a project of their own
+  (`scripts/tests/declarative.py` runs them). See `docs/reference/NATIVE_BACKEND.md`.
 - `tests/` — what the two test tiers run: `corpus` (the runtime programs), `diag`
   (diagnostic goldens), `cli`, `projects`, `stdlib`, `meta`, `readers`, `cabi`,
   `wasm`, `simd`, `jit`, `http`, `comprehensive`, plus `prop` and `fuzz` (property

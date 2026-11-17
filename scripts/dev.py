@@ -186,17 +186,20 @@ def install_library(prefix: Path) -> Path:
         shutil.rmtree(libdir / leftover, ignore_errors=True)
     # `coil.jit` is an optional source-linked compiler SDK. Keep its implementation
     # out of stdlib/ so ordinary programs never discover or link compiler modules.
-    sdk_staged = libdir / "compiler.incoming"
-    shutil.rmtree(sdk_staged, ignore_errors=True)
-    # The native package (native.*: CIR and the assembler) is src/compiler/native.
-    shutil.copytree(ROOT / "src" / "compiler", sdk_staged)
-    sdk_live = libdir / "compiler"
-    sdk_previous = libdir / "compiler.previous"
-    shutil.rmtree(sdk_previous, ignore_errors=True)
-    if sdk_live.exists():
-        sdk_live.rename(sdk_previous)
-    sdk_staged.rename(sdk_live)
-    shutil.rmtree(sdk_previous, ignore_errors=True)
+    # The SDK is the compiler's sources and, beside them, the native backend's
+    # (src/declarative: CIR, the assembler and the backend, in the languages its
+    # lang/ reads), without the backend's own tests.
+    for name, ignore in (("compiler", None), ("declarative", shutil.ignore_patterns("tests"))):
+        sdk_staged = libdir / f"{name}.incoming"
+        shutil.rmtree(sdk_staged, ignore_errors=True)
+        shutil.copytree(ROOT / "src" / name, sdk_staged, ignore=ignore)
+        sdk_live = libdir / name
+        sdk_previous = libdir / f"{name}.previous"
+        shutil.rmtree(sdk_previous, ignore_errors=True)
+        if sdk_live.exists():
+            sdk_live.rename(sdk_previous)
+        sdk_staged.rename(sdk_live)
+        shutil.rmtree(sdk_previous, ignore_errors=True)
     return libdir
 
 

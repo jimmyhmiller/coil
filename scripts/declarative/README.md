@@ -2,8 +2,7 @@
 
 Development tools for the backend in `src/declarative/`, run from anywhere
 after `python3 scripts/dev.py build candidate` (they use
-`build/bin/coil-candidate`). Its tests are `scripts/tests/declarative.py`, and
-its generated Coil is `scripts/compiler/gen-declarative.py`'s.
+`build/bin/coil-candidate`). Its tests are `scripts/tests/declarative.py`.
 
 - `selfcheck.sh` — the compiler built by the backend at -O2 rebuilds itself to
   the same object (`build/bin/coil-self`).

@@ -34,6 +34,8 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts" / "compiler"))
+import stage0  # noqa: E402
 DUMPS = ("dump-checked", "dump-mono")
 COMPILER = ROOT / "src/compiler/main.coil"
 
@@ -46,11 +48,14 @@ def corpus():
     return files
 
 
-def namespace_roots():
-    # The roots scripts/compiler/stage0.py builds the compiler with: its own
-    # sources (the native and declarative packages included), so a reference compiler whose
-    # bundled manifest predates a new compiler module still finds it.
-    return ":".join(["src", "tests", "scripts", "src/compiler", "src/stdlib"])
+def project_graph():
+    """The source graph scripts/compiler/stage0.py builds the compiler with (its
+    sources, the library, and the native backend with its readers), so a
+    reference compiler whose bundled manifest predates a new compiler module
+    still finds it; and the rest of the tree, for the corpus."""
+    environment, uses = stage0.project_graph()
+    roots = [environment["COIL_NAMESPACE_ROOTS"], *(str(ROOT / r) for r in ("src", "tests", "scripts"))]
+    return {**environment, "COIL_NAMESPACE_ROOTS": ":".join(roots)}, uses
 
 
 def failure_report(result):
@@ -68,8 +73,9 @@ def failure_report(result):
 
 
 def dump(compiler, command, path):
-    env = {**os.environ, "COIL_NAMESPACE_ROOTS": namespace_roots(), "COIL_STRICT_BUNDLE": "0"}
-    result = subprocess.run([str(compiler), command, str(path)], cwd=ROOT, env=env,
+    graph, uses = project_graph()
+    env = {**os.environ, **graph, "COIL_STRICT_BUNDLE": "0"}
+    result = subprocess.run([str(compiler), command, str(path), *uses], cwd=ROOT, env=env,
                             capture_output=True, timeout=900)
     if result.returncode not in (0, 1):
         raise RuntimeError(

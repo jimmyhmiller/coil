@@ -32,12 +32,19 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 STDLIB = ROOT / "src" / "stdlib"
 SDK = ROOT / "src" / "compiler"
 PRELUDE = ROOT / "src" / "compiler" / "prelude.coil"
+# The native backend, a package beside the SDK and shipped with it, whose modules
+# are mostly files in its own languages: its [modules] names them and its
+# [readers] reads them.
+BACKEND = ROOT / "src" / "declarative"
+# The backend's own tests, a project of their own that the SDK does not ship.
+BACKEND_TESTS = BACKEND / "tests"
 TARGET = ROOT / "src" / "compiler" / "frontend" / "stdlib_manifest.coil"
 
 BEGIN = ";; BEGIN GENERATED -- regenerate with scripts/compiler/gen-stdlib-manifest.py"
@@ -130,10 +137,38 @@ def collect() -> list[tuple[str, str]]:
     return sorted(out.items())
 
 
+def backend_manifest() -> dict:
+    return tomllib.loads((BACKEND / "Coil.toml").read_text())
+
+
+def bundled_name(path: Path) -> str:
+    """A shipped SDK file's name: `compiler/…` or `declarative/…` (bundled-path in
+    loader.coil)."""
+    return path.relative_to(SDK.parent).as_posix()
+
+
+def sdk_sources() -> list[Path]:
+    """The SDK's Coil files: the compiler's and the backend's, its tests left out."""
+    return [p for p in sorted([*SDK.rglob("*.coil"), *BACKEND.rglob("*.coil")])
+            if not p.is_relative_to(BACKEND_TESTS)]
+
+
+def backend_modules() -> list[tuple[str, str]]:
+    """(namespace, bundled name) of every backend module its [modules] maps to a
+    file in one of its languages."""
+    return sorted((name, bundled_name(BACKEND / file))
+                  for name, file in backend_manifest()["modules"].items())
+
+
+def sdk_readers() -> list[tuple[str, str]]:
+    """(suffix, reader module) for the SDK's files in the backend's languages."""
+    return sorted(backend_manifest()["readers"].items())
+
+
 def collect_sdk() -> list[tuple[str, str]]:
     """Compiler implementation modules shipped for opt-in source linking."""
-    out: dict[str, str] = {}
-    for path in sorted(SDK.rglob("*.coil")):
+    out: dict[str, str] = dict(backend_modules())
+    for path in sdk_sources():
         # Host-specific replacement with the same logical namespace.
         if path.name == "metashim_wasm.coil":
             continue
@@ -144,14 +179,16 @@ def collect_sdk() -> list[tuple[str, str]]:
         # such as `app`; they are shipped as include assets but are not imported by
         # the SDK facade. Keep the first namespace mapping deterministically.
         if name not in out:
-            out[name] = path.relative_to(SDK).as_posix()
+            out[name] = bundled_name(path)
     return sorted(out.items())
 
 
 def sdk_file_list() -> list[str]:
-    """Every file shipped under <lib>/compiler/, relative to it. The native
-    package (CIR and the assembler) is src/compiler/native/, so it ships with the rest."""
-    return sorted(p.relative_to(SDK).as_posix() for p in SDK.rglob("*.coil"))
+    """The bundled name of every module file shipped under <lib>/compiler/ and
+    <lib>/declarative/: the compiler's Coil, and the backend's Coil and files in
+    its languages."""
+    return sorted([bundled_name(p) for p in sdk_sources()]
+                  + [file for _, file in backend_modules()])
 
 
 def public_namespaces(entries: list[tuple[str, str]]) -> list[str]:
@@ -203,15 +240,24 @@ def render(entries: list[tuple[str, str]], sdk_entries: list[tuple[str, str]]) -
     add("; Compiler SDK modules live beside, but not inside, the ordinary stdlib.")
     add("; They enter a program's module graph only through an explicit coil.jit import.")
     add("(defn sdk-file-for-namespace [(name (slice u8))] (-> (slice u8))")
-    body = [f'(= name "{ns}") "compiler/{fn}"' for ns, fn in sdk_entries]
+    body = [f'(= name "{ns}") "{fn}"' for ns, fn in sdk_entries]
     add("  (cond " + "\n        ".join(body))
     add('        ""))')
     add("")
     add("(defn sdk-manifest-file? [(name (slice u8))] (-> bool)")
     sdk_files = sdk_file_list()
-    body = [f'(= name "compiler/{fn}") true' for fn in sdk_files]
+    body = [f'(= name "{fn}") true' for fn in sdk_files]
     add("  (cond " + "\n        ".join(body))
     add("        false))")
+    add("")
+    add("; The reader of an SDK file in one of the native backend's languages, by its")
+    add("; suffix: src/declarative/Coil.toml's [readers], which reads them for")
+    add("; any build of the compiler as a project. A program that imports coil.jit")
+    add("; reads the SDK from the toolchain instead, through these.")
+    add("(defn sdk-reader-for-suffix [(suffix (slice u8))] (-> (slice u8))")
+    body = [f'(= suffix "{sfx}") "{mod}"' for sfx, mod in sdk_readers()]
+    add("  (cond " + "\n        ".join(body))
+    add('        ""))')
     add("")
     add(END)
     return "\n".join(lines)
@@ -335,7 +381,7 @@ def stale_tables(current: str,
     checks = (
         ("src/stdlib/ file", "stdlib-manifest-file?", {fn for _, fn in entries}),
         ("src/stdlib/ namespace", "stdlib-file-for-namespace", {ns for ns, _ in entries}),
-        ("src/compiler/ (SDK) file", "sdk-manifest-file?", {f"compiler/{fn}" for fn in sdk_file_list()}),
+        ("src/compiler/ (SDK) file", "sdk-manifest-file?", set(sdk_file_list())),
         ("src/compiler/ (SDK) namespace", "sdk-file-for-namespace", {ns for ns, _ in sdk_entries}),
     )
     for what, table, wanted in checks:

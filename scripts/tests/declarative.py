@@ -6,8 +6,9 @@
 On the host's machine (macOS on AArch64, Linux on x86-64), each test built by
 COIL and run:
 
-  - the split: the backend's sources hold no Coil outside lang/, adapter/ and
-    tests/, so that everything else is written in the languages;
+  - the split: the backend holds no Coil outside lang/ (the languages), rt/
+    (the runtime their output stands on), adapter/ (from the compiler's CIR)
+    and tests/, so that everything else is written in the languages;
   - rules: every rewrite rule and every fact, checked against the meanings of
     the nodes;
   - toy: the languages' independent calculator and storage/analysis clients,
@@ -50,24 +51,18 @@ def fail(message: str) -> None:
 
 
 def check_split() -> None:
-    allowed = {"lang", "adapter", "tests"}
+    allowed = {"lang", "rt", "adapter", "tests"}
     stray = [p.relative_to(SOURCES) for p in SOURCES.rglob("*.coil")
-             if p.relative_to(SOURCES).parts[0] not in allowed and p.name != "generate.coil"]
-    in_adapter = [p.relative_to(SOURCES) for p in (SOURCES / "adapter").glob("*.coil") if p.name != "machine.coil"]
-    native = ROOT / "src" / "compiler" / "native"
-    handwritten_native = sorted(native.glob("*.coil"))
-    if handwritten_native:
-        fail("native infrastructure must be generated from src/declarative/native: "
-             + " ".join(str(p.relative_to(ROOT)) for p in handwritten_native))
-    if stray or in_adapter:
-        fail("the sources hold Coil that should be written in a language: "
-             + " ".join(str(p) for p in stray + in_adapter))
+             if p.relative_to(SOURCES).parts[0] not in allowed]
+    if stray:
+        fail("the backend holds Coil that should be written in a language: "
+             + " ".join(str(p) for p in stray))
     for source in (SOURCES / "native").glob("*.pass"):
         declarations = [line.strip() for line in source.read_text().splitlines()
                         if line.strip() and not line.lstrip().startswith("#")]
         if not declarations or declarations[0] != "library declarative":
             fail(f"native infrastructure must use the strict declarative language: {source.name}")
-    print("ok   the split: no Coil outside lang/, adapter/machine.coil and tests/")
+    print("ok   the split: no Coil outside lang/, rt/, adapter/ and tests/")
 
 
 def check_library_boundary(coil: str, work: Path) -> None:
@@ -133,7 +128,7 @@ def main() -> int:
         exe = work / (name if backend is None else f"{name}-{backend}-O{level}")
         flags = ["--release", f"-O{level}"] + (["--backend", backend] if backend else [])
         result = subprocess.run([coil, "build", str(SOURCES / "tests" / f"{name}.coil"), *flags,
-                                 "-o", str(exe)], cwd=SOURCES, stdout=subprocess.PIPE,
+                                 "-o", str(exe)], cwd=SOURCES / "tests", stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True)
         if result.returncode != 0:
             fail(f"tests/{name}.coil did not build:\n{result.stdout[-3000:]}")

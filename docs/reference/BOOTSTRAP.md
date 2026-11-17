@@ -9,12 +9,16 @@ compiler (and, for the LLVM backend, libLLVM) — in three flavors:
 | **LLVM-free** | `python3 scripts/dev.py build nollvm` | just `cc` | Native backend for the host |
 | Full | `python3 scripts/dev.py build full` | `cc` + LLVM 21 | LLVM + native backends |
 
-The compiler includes the native backend (`NATIVE_BACKEND.md`): its IR and
-assembler are the `native` package at `src/compiler/native/`, from
-[coil-tpde](https://github.com/jimmyhmiller/coil-tpde) (`src/compiler/native/NOTICE`
-names the commit), and the backend itself the `declarative` package at
-`src/compiler/declarative/`. Each is a package of its own (its modules are not
-`coil.compiler.*`), which the workspace depends on by path.
+The compiler includes the native backend (`NATIVE_BACKEND.md`): the
+`declarative` package at `src/declarative/`, which holds the backend, its IR (CIR)
+and its assembler, from [coil-tpde](https://github.com/jimmyhmiller/coil-tpde)
+(`src/declarative/native/NOTICE` names the commit). It is a package of its own
+(its modules are not `coil.compiler.*`), which the workspace depends on by path,
+and most of its files are in languages of its own that its `[readers]` make Coil
+as the compiler compiles. Stage zero runs outside the checkout so that it never
+reads a manifest newer than it understands; `scripts/compiler/stage0.py` hands it
+the source graph explicitly instead, the backend's roots, readers and module map
+among it.
 
 Both commands select the host implementation automatically: macOS/ARM64 uses the
 Mach-O bootstrap and Linux/x86-64 uses the ELF bootstrap. The explicit `linux` and

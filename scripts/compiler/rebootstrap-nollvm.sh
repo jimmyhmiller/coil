@@ -31,11 +31,8 @@ SEED=bootstrap/seeds/native/coil-seed-nollvm
 RUN_DIR=$(mktemp -d /tmp/coil-rebootstrap-nollvm.XXXXXX) || exit 1
 trap 'stage_lib_cleanup; rm -rf "$RUN_DIR"' EXIT
 S1="$RUN_DIR/coil-nl1"; S2="$RUN_DIR/coil-nl2"
-# Scope the namespace scan: a seed that predates the loader's hidden-directory
-# prune would otherwise index stray tree copies (e.g. .claude/worktrees/*) and
-# report every namespace as declared twice.
-# src holds the native package too (src/compiler/native).
-export COIL_NAMESPACE_ROOTS="${COIL_NAMESPACE_ROOTS:-src:tests:scripts}"
+# Stage zero is handed the source graph explicitly (scripts/compiler/stage0.py);
+# the stages after it read the workspace's manifest, as any build in it does.
 # In-repo, an import of a `coil.*` namespace that is missing from the bundled
 # stdlib manifest still resolves via the namespace scan above, so the build stays
 # green while the shipped compiler cannot serve it (this is how coil.socket,

@@ -81,7 +81,6 @@ toolchain), and `$COIL_TEST_SCRATCH`, a directory the harness removes afterwards
 | `wasm` | wasm32 and wasm64 programs under node, validated | `scripts/tests/fast/wasm.py`, `tests/wasm/` |
 | `memory/*` | generated units and the namespace index stay within their memory bounds; the REPL's resident set and time per submission are reported | `scripts/tests/generated-unit-memory.py`, `project-scan-memory.py`, `repl-growth.py` |
 | `readers` | reader-provider projects and provider artifacts | `scripts/tests/fast/readers.sh`, `tests/readers/` |
-| `declarative/generated` | the native backend's generated Coil is what its sources say: the languages run again and their output compared with `src/compiler/declarative/generated` | `scripts/compiler/gen-declarative.py --check`, `src/declarative/` |
 | `meta` | code->code programs, hygiene both ways, lint suggestions, staged entries, transforms | `scripts/tests/fast/meta.sh`, `tests/meta/` |
 | `simd` | the SIMD differential on both backends and the vectorized codegen check | `scripts/tests/simd.py fast`, `tests/simd/` |
 | `stdlib/*` | seven deftest suites over the standard library | `tests/stdlib/` |
@@ -117,9 +116,7 @@ FAST are the Stogir rows of
 `scripts/tests/fast/cli.sh objects`, and `scripts/tests/stogir-x86-sweep.py`
 compares it with LLVM over the corpus, the demos, the stdlib suites and the
 examples at -O1, -O2 and -O3. Its own tests (rewrite rules, random programs
-interpreted against compiled, linking) are COMPREHENSIVE's `declarative` step,
-and FAST's `declarative/generated` keeps its generated Coil what its sources
-(`src/declarative`) say.
+interpreted against compiled, linking) are COMPREHENSIVE's `declarative` step.
 
 ### Diagnostics
 

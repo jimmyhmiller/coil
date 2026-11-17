@@ -1,10 +1,8 @@
 # Native infrastructure sources
 
 These library passes supply the `native.*` modules to both the standalone
-backend and Coil's compiler. `src/compiler/native/generated/` is their build
-artifact, written by `scripts/compiler/gen-declarative.py` and checked by FAST.
-The source project's manifest excludes that generated directory and reads the
-passes themselves. There is one implementation for both uses.
+backend and Coil's compiler: each is read by `lang.readers` as it is compiled,
+so there is one implementation for both uses and nothing generated.
 
 - `cir.pass`: CIR records, instruction builders, sealed-block SSA construction,
   definition-table generations, function reuse, debug positions, snapshots,
@@ -153,14 +151,13 @@ imperative control flow and effectful `!` calls. Called functions must follow
 the language's naming convention for effects.
 
 The native public types and entry points retain their ABI. The compiler and
-standalone backend both consume these sources; generated Coil is an artifact.
+standalone backend both consume these sources.
 Tests and measurements must cover both uses before claiming completion or
 performance parity. Source-size accounting includes the declaration compilers.
 The standalone suite runs the independent clients under LLVM O1 and native O0.
 
 After editing:
 
-    python3 scripts/compiler/gen-declarative.py
     python3 scripts/tests/declarative.py /absolute/path/to/coil
 
 The second client in `toy/storage.pass`, called by `tests/toy.coil`, exercises

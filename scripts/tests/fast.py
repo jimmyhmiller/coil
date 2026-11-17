@@ -90,8 +90,6 @@ def steps(quick: bool) -> list[Step]:
         # REPL resident set and time per submission (reported, not yet bounded).
         Step("memory/repl-growth", [PY, "scripts/tests/repl-growth.py", "--submissions", "30"]),
         Step("readers", [f"{FAST}/readers.sh"]),
-        # The native backend's generated Coil is what its sources say.
-        Step("declarative/generated", [PY, "scripts/compiler/gen-declarative.py", "--check"]),
         # Macros, transforms, checkers and hygiene.
         Step("meta", [f"{FAST}/meta.sh"]),
         Step("simd", [PY, "scripts/tests/simd.py", "fast"]),
