@@ -151,6 +151,7 @@ def check_translation_diagnostics(coil: str, work: Path) -> None:
     driver = fixture / "check.coil"
     driver.write_text('(module translation.check)\n(import "check.rules" :as rules)\n')
     cases = [
+        ("CLZ(a) => lower ZEXT(a, w);", "lower requires an earlier translation rule"),
         ("MISSING(a) => NEG(a) at ptr;", "unknown source operation"),
         ("SUB(a, b) => MISSING(a, b) at ptr;", "unknown target node"),
         ("SUB(a, b) => SUB(b, missing) at ptr;", "unbound operand missing"),
