@@ -120,19 +120,51 @@ def check_pipeline_diagnostics(coil: str, work: Path) -> None:
     driver.write_text('(module toy.pipeline-check)\n(import "toy.steps" :as steps)\n')
     source = fixture / "toy" / "steps.pipeline"
     cases = [
-        ("plan broken { absent.run }", "no step absent.run"),
-        ("plan broken { broken }", "no earlier plan named broken"),
-        ("plan broken { measure.depth-of }", "pipeline steps cannot take arguments"),
-        ("plan broken { until-stable { known.solve } }", "until-stable needs a pass that reports changes"),
+        ("plan broken { run absent.run; }", "no step absent.run"),
+        ("plan broken { include broken; }", "no earlier plan named broken"),
+        ("plan broken { run measure.depth-of; }", "pipeline steps cannot take arguments"),
+        ("plan broken { repeat { run known.solve; } }", "repeat needs an observed pass"),
+        ("plan broken { repeat { observe known.solve; } }", "observed pass must report a change count"),
+        ("plan broken { observe tidy.run; }", "observe is only allowed directly in a repeat block"),
         ("plan p {} plan p-timed {}", "duplicate pipeline export p-timed"),
     ]
     for body, diagnostic in cases:
-        source.write_text(f"pipeline in unit\n{body}\n")
+        source.write_text(f"schedule for unit\n{body}\n")
         result = subprocess.run([coil, "check", str(driver)], cwd=fixture,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         if result.returncode == 0 or diagnostic not in result.stdout or "steps.pipeline" not in result.stdout:
             fail(f"pipeline did not report {diagnostic!r} at its source:\n{result.stdout[-3000:]}")
     print("ok   pipeline diagnostics: invalid steps, fixed points and plan exports rejected")
+
+
+def check_translation_diagnostics(coil: str, work: Path) -> None:
+    fixture = work / "translation"
+    fixture.mkdir()
+    (fixture / "Coil.toml").write_text(
+        '[package]\nname = "translation-check"\n'
+        f'source-roots = [".", {json.dumps(str(SOURCES / "lang"))}]\n'
+        '[readers]\n".translate" = "lang.readers"\n'
+        '[modules]\n"check.rules" = "rules.translate"\n'
+        '"check.cir" = "cir.ops"\n"check.nodes" = "nodes.ir"\n')
+    shutil.copyfile(SOURCES / "cir" / "cir.ops", fixture / "cir.ops")
+    shutil.copyfile(SOURCES / "backend" / "nodes.ir", fixture / "nodes.ir")
+    driver = fixture / "check.coil"
+    driver.write_text('(module translation.check)\n(import "check.rules" :as rules)\n')
+    cases = [
+        ("MISSING(a) => NEG(a) at ptr;", "unknown source operation"),
+        ("SUB(a, b) => MISSING(a, b) at ptr;", "unknown target node"),
+        ("SUB(a, b) => SUB(b, missing) at ptr;", "unbound operand missing"),
+        ("SUB(a, b) => SUB(a, b) at ctrl;", "unknown graph value type"),
+        ("SUB(a, b) => NEG(a, b) at ptr;", "expected a pure node with matching operand count"),
+    ]
+    source = fixture / "rules.translate"
+    for rule, diagnostic in cases:
+        source.write_text(f"translate from check.cir to check.nodes {{ {rule} }}\n")
+        result = subprocess.run([coil, "check", str(driver)], cwd=fixture,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if result.returncode == 0 or diagnostic not in result.stdout or "rules.translate" not in result.stdout:
+            fail(f"translation did not report {diagnostic!r} at its source:\n{result.stdout[-3000:]}")
+    print("ok   translation diagnostics: unknown operations, unbound operands and invalid nodes rejected")
 
 
 def main() -> int:
@@ -151,6 +183,7 @@ def main() -> int:
     (work / "out").mkdir()
     check_library_boundary(coil, work)
     check_pipeline_diagnostics(coil, work)
+    check_translation_diagnostics(coil, work)
 
     def build(name: str, *, backend: str | None = None, level: int = 1) -> Path:
         exe = work / (name if backend is None else f"{name}-{backend}-O{level}")
@@ -179,6 +212,8 @@ def main() -> int:
         if name == "toy":
             out = run([build(name, backend="native", level=0)], "toy, native O0")
             print(f"ok   toy/native-O0: {out.strip().splitlines()[-1] if out.strip() else ''}")
+            out = run([build(name, backend="native", level=3)], "toy, native O3")
+            print(f"ok   toy/native-O3: {out.strip().splitlines()[-1] if out.strip() else ''}")
 
     link = build("link")
     cc = os.environ.get("CC", "cc")
