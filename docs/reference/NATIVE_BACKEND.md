@@ -141,6 +141,16 @@ guarantees; a program that breaks one is undefined.
 - Two frame objects never overlap, and a store to a frame object nothing else
   can reach changes no memory reached another way.
 
+A call to a C function that returns twice (`setjmp` and the rest the language
+guide lists; CIR's `returns-twice` on the function) is correct because of how
+values are kept, not because of anything done at the call: no two values ever
+share a frame slot at either level, a caller-saved register holds nothing across
+a call, and a callee-saved one is what `longjmp` puts back. So the second return
+finds every value alive over the call where the first left it. What the flag
+changes is the frame's life: a tail call in the function becomes a call and a
+return, a call of itself is not made a loop, and the function is not inlined.
+Sharing frame slots between values would break this.
+
 ## The `llvm-ir` escape hatch
 The corpus' inline-IR surface is finite and straight-line (no control flow, no
 phi). `codegen_native_ir.coil` lowers a small IR subset, with the line tokenizer
