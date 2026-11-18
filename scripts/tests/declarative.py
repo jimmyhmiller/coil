@@ -156,7 +156,11 @@ def check_translation_diagnostics(coil: str, work: Path) -> None:
         ("SUB(a, b) => SUB(b, missing) at ptr;", "unbound operand missing"),
         ("SUB(a, b) => SUB(a, b) at ctrl;", "unknown graph value type"),
         ("SUB(a, b) => SUB(a, b) at f32;", "f32 is outside target type set int"),
-        ("ROTL(a, n) => SHL(a, n) at ptr;", "translation requires a value operation without immediates"),
+        ("ROTL(a, n) => SHL(a, n) at ptr;", "translation must match the operation's immediate"),
+        ("FRINT(a) => match typo { otherwise => ROUND-EVEN(a) at result; };",
+         "match must name the source operation's first immediate"),
+        ("FRINT(a) => match mode { 0 => ROUND-EVEN(a) at result; 0 => ROUND-UP(a) at result; };",
+         "duplicate immediate case"),
         ("SUB(a, b) => NEG(a, b) at ptr;", "expected a pure node with matching operand count"),
     ]
     source = fixture / "rules.translate"
