@@ -72,20 +72,6 @@ uses LLVM instead.
     from CIR), `.numbers` (CIR's numbers, from its `.ops` file) and
     `.instance` (one Coil file as a module for each machine). A
     file whose text is `same OTHER` stands for OTHER.
-    A schedule binds plans to a unit with `schedule for unit`. It can specialize
-    shared plans with `using "relative/path.pipeline"`. In a plan, `run pass.function;`
-    calls a unit pass, `include plan-name;` expands the schedule with an earlier
-    plan call, and `invalidate;` resets derived state. A `repeat { ... }` block
-    repeats when a step marked `observe pass.function;` reports a positive
-    change count. At least one directly observed pass is required in each block.
-    The reader emits plain and timed functions and their top-level step labels.
-
-    The `.translate` language maps fixed-arity CIR value operations to graph
-    nodes. Its reader resolves both schemas, operand bindings and the target
-    type rule. For example, `LSHR(value, count) => SHR(value, count) at ptr;`
-    builds a graph shift at the backend's word type, and `at result` selects
-    the graph type determined from the CIR result. The optimized adapter calls
-    the generated translation for scalar arithmetic.
   - `backend/` — the node set and the passes both machines share; `a64/` and
     `x64/` — each machine's instructions, convention, lowering, rules and passes,
     for the graph route (`-O2`/`-O3`); `direct/`, `a64-direct/`, `x64-direct/` —
