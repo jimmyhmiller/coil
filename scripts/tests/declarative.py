@@ -160,7 +160,7 @@ def check_translation_diagnostics(coil: str, work: Path) -> None:
          "literal must name a source operation immediate"),
         ("FRINT(a) => match typo { otherwise => ROUND-EVEN(a) at result; };",
          "match must name a source operation immediate"),
-        ("FRINT(a) => match mode { 0 => ROUND-EVEN(a) at result; 0 => ROUND-UP(a) at result; };",
+        ("FRINT(a) => match mode { 0, 1 => ROUND-EVEN(a) at result; 1 => ROUND-UP(a) at result; };",
          "duplicate immediate case"),
         ("SUB(a, b) => NEG(a, b) at ptr;", "expected a pure node with matching operand count"),
     ]
