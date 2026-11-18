@@ -72,6 +72,13 @@ uses LLVM instead.
     from CIR), `.numbers` (CIR's numbers, from its `.ops` file) and
     `.instance` (one Coil file as a module for each machine). A
     file whose text is `same OTHER` stands for OTHER.
+    A pipeline starts with `pipeline in unit`. Inside `plan NAME { ... }`,
+    `pass.function` runs a unit pass with no explicit arguments, a bare name
+    calls an earlier plan, and `start-over` resets derived state. An
+    `until-stable { ... }` block needs a direct pass call that reports its
+    change count as `Int`. After each iteration, any positive count schedules
+    another one. The reader resolves the steps before emitting each plan's
+    plain and timed Coil functions and its top-level step labels.
   - `backend/` — the node set and the passes both machines share; `a64/` and
     `x64/` — each machine's instructions, convention, lowering, rules and passes,
     for the graph route (`-O2`/`-O3`); `direct/`, `a64-direct/`, `x64-direct/` —

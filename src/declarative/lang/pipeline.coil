@@ -1,119 +1,222 @@
-;;; The `.pipeline` language: which steps make a compile, as named plans.
-;;;
-;;;   plan quick   { cfg.build  schedule.build  select.run  alloc.run  emit.run }
-;;;   plan default { until-stable { simplify.run }  quick }
-;;;
-;;; A step is a function of a pass, a rewrite or another plan. `until-stable`
-;;; repeats its steps while any of them reports a change (a step that answers a
-;;; number answers how much it changed). A plan is one function of the compile's
-;;; state; nothing else is shared, so plans may run on as many threads as there
-;;; are states.
-;;;
-;;; Each plan is also `NAME-timed`, which adds the nanoseconds each of its steps
-;;; took to a list of totals, and `NAME-STEPS` names those steps.
+;;; A pipeline declares named plans over the passes of one compilation unit.
+;;; A plan may call another plan. A fixed point repeats a block until all its
+;;; change-reporting passes return zero. Timing measures each top-level step.
 (module lang.pipeline)
-(import "coil.alloc" :use [malloc-allocator])
+(import "coil.meta" :as meta)
 (import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as primitive)
 (import "lang.text" :as t)
 (import "lang.pass" :as pass)
 (import "lang.project" :as project)
 
-(defstruct P [(c t/Cur) (d pass/Decls) (plans (ArrayList (slice u8))) (modules (ArrayList (slice u8)))
-              (names (ArrayList (slice u8)))])
+(defsum Step
+  (Call [(owner t/Tok) (function (slice u8))])
+  (PlanCall [(name t/Tok)])
+  (Reset)
+  (FixedPoint [(at t/Tok) (body (ArrayList Step))]))
 
-;;; The steps up to `}`, as Coil, one text for each. `counted` wraps each step
-;;; so that what it changed is added to `changed*`.
-(defn step-list [(p (mut P)) (counted bool)] (-> (ArrayList (slice u8)))
-  (let [(mut list) (ArrayList::new [(slice u8)] (malloc-allocator))]
-    (while (not (t/accept! (mut (.c p)) "}"))
-      (let [tok (t/advance! (mut (.c p)))
-            name (.text tok)
-            (mut label) name]
-        (cond
-          (= name "until-stable")
-            (do (t/expect! (mut (.c p)) "{")
-                (push! (mut list)
-                       (t/cat3 " (let [(mut changed*) 1] (while (> changed* 0) (set! changed* 0)"
-                               (steps (mut p) true) "))")))
-          ; `start-over`: forget everything the passes have worked out, keeping
-          ; the graph, as after a pass that changed it.
-          (= name "start-over") (push! (mut list) " (st/begin! (mut cx))")
-          ; Another plan, in full.
-          (>= (t/index-of (.plans p) name) 0) (push! (mut list) (t/cat3 " (" name " (mut cx))"))
-          :else
-            ; `module.function`, where the module is named by its last part.
-            (let [(mut module) ""]
-              (t/expect! (mut (.c p)) ".")
-              (let [function (t/name! (mut (.c p)) "a function")
-                    (mut result) ""]
-                (set! label (t/cat3 name "." function))
-                (for f (.funcs (.d p))
-                  (when (and (= (.name f) function) (t/ends-with (.module f) (t/cat2 "." name)))
-                    (set! module (.module f))
-                    (set! result (.result f))))
-                (when (= module "")
-                  (t/die (mut (.c p)) tok (t/cat4 "no step " name "." function)))
-                (when (< (t/index-of (.modules p) module) 0) (push! (mut (.modules p)) module))
-                  (let [call (t/cat4 "(" (t/cat3 "m" (t/int-text (t/index-of (.modules p) module)) "/")
-                                   (if (pass/pass-module? (.d p) module) (pass/local-name function) function)
-                                   " (mut cx))")]
-                  (push! (mut list)
-                         (if (and counted (= result "Int"))
-                             (t/cat3 " (set! changed* (+ changed* " call "))")
-                             (t/cat2 " " call)))))))
-        ; The names of a plan's own steps, not of those inside them.
-        (unless counted (push! (mut (.names p)) label))))
-    list))
+(defstruct Plan [(name t/Tok) (body (ArrayList Step))])
 
-(defn steps [(p (mut P)) (counted bool)] (-> (slice u8))
-  (let [(mut o) (t/out-new)]
-    (for step (step-list (mut p) counted) (t/emit! (mut o) step))
-    (t/text-of (mut o))))
+(defn parse-block [(c (mut t/Cur))] (-> (ArrayList Step))
+  (t/expect! (mut c) "{")
+  (let [(mut steps) (ArrayList::new [Step] (meta/expansion-allocator))]
+    (while (not (t/accept! (mut c) "}"))
+      (let [tok (t/peek (mut c))
+            name (t/name! (mut c) "a pipeline step or `}`")]
+        (push! (mut steps)
+               (cond (= name "until-stable")
+                       (FixedPoint tok (parse-block (mut c)))
+                     (= name "start-over") (Reset)
+                     (t/accept! (mut c) ".")
+                       (Call tok (t/name! (mut c) "a pass function"))
+                     :else (PlanCall tok)))))
+    steps))
 
-(defn module-text [(context Code)] (-> (slice u8))
-  (let [project (project/open context)
-        path (t/path-of context)
-        src (t/source-of context)
-        (mut c) (t/cursor src path)]
+(defn parse-plans [(c (mut t/Cur))] (-> (ArrayList Plan))
+  (let [(mut plans) (ArrayList::new [Plan] (meta/expansion-allocator))
+        (mut exports) (ArrayList::new [(slice u8)] (meta/expansion-allocator))]
+    (while (not (t/eof? (mut c)))
+      (t/expect! (mut c) "plan")
+      (let [tok (t/peek (mut c))
+            name (t/name! (mut c) "a plan name")]
+        (when (or (= name "until-stable") (= name "start-over"))
+          (t/die (mut c) tok "reserved pipeline name"))
+        (for export [name
+                     (t/cat2 name "-timed")
+                     (t/cat2 (t/upper name) "-STEPS")]
+          (when (>= (t/index-of exports export) 0)
+            (t/die (mut c) tok (t/cat2 "duplicate pipeline export " export)))
+          (push! (mut exports) export))
+        (push! (mut plans) (Plan :name tok :body (parse-block (mut c))))))
+    plans))
+
+(defsum Action
+  (RunPass [(module-id i64) (function (slice u8)) (reports-change bool)])
+  (RunPlan [(plan-id i64)])
+  (ResetState)
+  (Repeat [(body (ArrayList CheckedStep))]))
+
+(defstruct CheckedStep [(label (slice u8)) (action Action)])
+
+(defstruct Check
+  [(path (slice u8))
+   (decls pass/Decls)
+   (plans (ArrayList Plan))
+   (modules (ArrayList (slice u8)))])
+
+(defn fail [(k Check) (at t/Tok) (msg (slice u8))] (-> never)
+  (t/fail-at (.path k) (.line at) (.col at) msg))
+
+(defn plan-id [(k Check) (name t/Tok) (before i64)] (-> i64)
+  (let [(mut id) (- 0 1)]
+    (for i (range 0 before)
+      (when (= (.text (.name (get (.plans k) i))) (.text name)) (set! id i)))
+    (when (< id 0) (fail k name (t/cat2 "no earlier plan named " (.text name))))
+    id))
+
+(defn resolve-call [(k (mut Check)) (owner t/Tok) (function (slice u8))]
+  (-> CheckedStep)
+  (let [label (t/cat3 (.text owner) "." function)
+        suffix (t/cat2 "." (.text owner))
+        (mut module) ""
+        (mut result) ""
+        (mut arity) 0]
+    (for f (.funcs (.decls k))
+      (when (and (= (.name f) function) (t/ends-with (.module f) suffix))
+        (when (and (!= module "") (!= module (.module f)))
+          (fail k owner (t/cat2 "ambiguous step " label)))
+        (set! module (.module f))
+        (set! result (.result f))
+        (set! arity (len (.params f)))))
+    (when (= module "") (fail k owner (t/cat2 "no step " label)))
+    (when (!= arity 0)
+      (fail k owner (t/cat2 "pipeline steps cannot take arguments: " label)))
+    (let [(mut id) (t/index-of (.modules k) module)]
+      (when (< id 0)
+        (set! id (len (.modules k)))
+        (push! (mut (.modules k)) module))
+      (CheckedStep
+        :label label
+        :action
+          (RunPass id
+                   (if (pass/pass-module? (.decls k) module)
+                       (pass/local-name function)
+                       function)
+                   (= result "Int"))))))
+
+(defn check-block [(k (mut Check)) (steps (ArrayList Step)) (before i64)]
+  (-> (ArrayList CheckedStep))
+  (let [(mut body) (ArrayList::new [CheckedStep] (meta/expansion-allocator))]
+    (for step steps
+      (push! (mut body)
+             (match step
+               (Call [owner f] (resolve-call (mut k) owner f))
+               (PlanCall [name]
+                         (CheckedStep
+                           :label (.text name)
+                           :action (RunPlan (plan-id k name before))))
+               (Reset [] (CheckedStep :label "start-over" :action (ResetState)))
+               (FixedPoint [at block]
+                           (let [checked (check-block (mut k) block before)
+                                 (mut reports) false]
+                             (for s checked
+                               (match (.action s)
+                                 (RunPass [_ _ changes]
+                                          (when changes (set! reports true)))
+                                 (_ (do))))
+                             (unless reports
+                               (fail k
+                                     at
+                                     "until-stable needs a pass that reports changes"))
+                             (CheckedStep
+                               :label "until-stable"
+                               :action (Repeat checked)))))))
+    body))
+
+(defn lower-step [(plans (ArrayList Plan)) (step CheckedStep) (counted bool)]
+  (-> Code)
+  (match (.action step)
+    (RunPass [id f changes]
+             (let [call `(~(primitive/code-symbol "m" id "/" f) (mut cx))]
+               (if (and counted changes)
+                   `(when (> ~call 0) (set! changed* true))
+                   call)))
+    (RunPlan [id]
+             `(~(primitive/code-symbol (.text (.name (get plans id)))) (mut cx)))
+    (ResetState [] `(st/begin! (mut cx)))
+    (Repeat [body]
+            (let [(mut forms) (primitive/code-list-new)]
+              (for s body (push! (mut forms) (lower-step plans s true)))
+              `(let [(mut changed*) true]
+                 (while changed*
+                   (set! changed* false)
+                   ~@forms))))))
+
+(defn lower-plan [(plans (ArrayList Plan))
+                  (plan Plan)
+                  (body (ArrayList CheckedStep))] (-> Code)
+  (let [name (.text (.name plan))
+        (mut plain) (primitive/code-list-new)
+        (mut timed) (primitive/code-list-new)
+        (mut names) (primitive/code-list-new)]
+    (for i (range 0 (len body))
+      (let [step (get body i)
+            form (lower-step plans step false)]
+        (push! (mut plain) form)
+        (push! (mut timed)
+               `(let [t* (clock/now)] ~form (clock/add! (mut times) ~i t*)))
+        (push! (mut names) `~(.label step))))
+    `((defn ~(primitive/code-symbol name) [(cx (mut st/State))] (-> void)
+        ~@plain
+        (do)) (defn ~(primitive/code-symbol name "-timed") [(cx (mut st/State))
+                                                            (times (mut (ArrayList i64)))]
+                (-> void)
+                ~@timed
+                (do))
+        (def ~(primitive/code-symbol (t/upper name) "-STEPS") [~@names]))))
+
+(defn compile-module [(project project/Project)
+                      (path (slice u8))
+                      (src (slice u8))] (-> Code)
+  (let [(mut c) (t/cursor src path)]
     (t/expect! (mut c) "pipeline")
     (t/expect! (mut c) "in")
     (let [at (t/peek (mut c))
-          unit (project/resolve project (pass/module-name! (mut c)) (.line at) (.col at))
-          d (pass/load-unit project (project/file-of project unit (.line at) (.col at)) path)
-          (mut p) (P :c c :d d
-                     :plans (ArrayList::new [(slice u8)] (malloc-allocator))
-                     :modules (ArrayList::new [(slice u8)] (malloc-allocator))
-                     :names (ArrayList::new [(slice u8)] (malloc-allocator)))
-          (mut body) (t/out-new)
-          (mut o) (t/out-new)]
-      (while (not (t/eof? (mut (.c p))))
-        (let [tok (t/advance! (mut (.c p)))]
-          (unless (t/tok-is? tok "plan") (t/die (mut (.c p)) tok (t/cat2 "expected plan, found " (.text tok))))
-          (let [name (t/name! (mut (.c p)) "a plan name")]
-            (t/expect! (mut (.c p)) "{")
-            (clear! (mut (.names p)))
-            (let [list (step-list (mut p) false)
-                  (mut plain) (t/out-new)
-                  (mut timed) (t/out-new)
-                  (mut names) (t/out-new)]
-              (for i (range 0 (len list))
-                (t/emit! (mut plain) (get list i))
-                (t/emit! (mut timed) (t/cat4 " (let [t* (clock/now)]" (get list i)
-                                             " (clock/add! (mut times) " (t/cat2 (t/int-text i) " t*))")))
-                (t/emit! (mut names) (t/cat3 " \"" (get (.names p) i) "\"")))
-              (t/line! (mut body)
-                       (t/cat4 "(defn " name " [(cx (mut st/State))] (-> void) (do"
-                               (t/cat2 (t/text-of (mut plain)) " (do)))")))
-              (t/line! (mut body)
-                       (t/cat4 "(defn " name "-timed [(cx (mut st/State)) (times (mut (ArrayList i64)))] (-> void) (do"
-                               (t/cat2 (t/text-of (mut timed)) " (do)))")))
-              (t/line! (mut body) (t/cat4 "(def " (t/upper name) "-STEPS [" (t/cat2 (t/text-of (mut names)) "])"))))
-            (push! (mut (.plans p)) name))))
-      (t/emit! (mut o) (pass/depends-text d))
-      (t/line! (mut o) (t/cat3 "(import \"" unit "\" :as st)"))
-      (t/line! (mut o) "(import \"coil.arraylist\" :use [ArrayList])")
-      (t/line! (mut o) "(import \"declarative.rt.clock\" :as clock)")
-      (for i (range 0 (len (.modules p)))
-        (t/line! (mut o) (t/cat4 "(import \"" (get (.modules p) i) "\" :as m" (t/cat2 (t/int-text i) ")"))))
-      (t/emit! (mut o) (t/text-of (mut body)))
-      (t/text-of (mut o)))))
+          unit
+            (project/resolve project
+                             (pass/module-name! (mut c))
+                             (.line at)
+                             (.col at))
+          plans (parse-plans (mut c))
+          decls
+            (pass/load-unit project
+                            (project/file-of project unit (.line at) (.col at))
+                            path)
+          (mut k)
+            (Check
+              :path path
+              :decls decls
+              :plans plans
+              :modules (ArrayList::new [(slice u8)] (meta/expansion-allocator)))
+          (mut definitions) (primitive/code-list-new)
+          (mut imports) (primitive/code-list-new)
+          (mut dependencies) (primitive/code-list-new)]
+      (for i (range 0 (len plans))
+        (let [plan (get plans i)
+              body (check-block (mut k) (.body plan) i)
+              forms (lower-plan plans plan body)]
+          (for j (range 0 (primitive/code-count forms))
+            (push! (mut definitions) (primitive/code-nth forms j)))))
+      (for file (.files decls) (push! (mut dependencies) `~file))
+      (for i (range 0 (len (.modules k)))
+        (push! (mut imports)
+               `(import ~(get (.modules k) i)
+                        :as
+                        ~(primitive/code-symbol "m" i))))
+      `(do
+         (depends-on ~@dependencies)
+         (import ~unit :as st)
+         (import "coil.arraylist" :use [ArrayList])
+         (import "declarative.rt.clock" :as clock)
+         ~@imports
+         ~@definitions))))

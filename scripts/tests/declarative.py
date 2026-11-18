@@ -108,6 +108,33 @@ def check_library_boundary(coil: str, work: Path) -> None:
     print("ok   declarative boundary: equations accepted; procedural forms, invalid storage and malformed schemas rejected")
 
 
+def check_pipeline_diagnostics(coil: str, work: Path) -> None:
+    fixture = work / "pipeline"
+    fixture.mkdir()
+    original = SOURCES / "tests"
+    shutil.copytree(original / "toy", fixture / "toy")
+    manifest = (original / "Coil.toml").read_text()
+    (fixture / "Coil.toml").write_text(
+        manifest.replace('path = ".."', f"path = {json.dumps(str(SOURCES))}"))
+    driver = fixture / "check.coil"
+    driver.write_text('(module toy.pipeline-check)\n(import "toy.steps" :as steps)\n')
+    source = fixture / "toy" / "steps.pipeline"
+    cases = [
+        ("plan broken { absent.run }", "no step absent.run"),
+        ("plan broken { broken }", "no earlier plan named broken"),
+        ("plan broken { measure.depth-of }", "pipeline steps cannot take arguments"),
+        ("plan broken { until-stable { known.solve } }", "until-stable needs a pass that reports changes"),
+        ("plan p {} plan p-timed {}", "duplicate pipeline export p-timed"),
+    ]
+    for body, diagnostic in cases:
+        source.write_text(f"pipeline in unit\n{body}\n")
+        result = subprocess.run([coil, "check", str(driver)], cwd=fixture,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if result.returncode == 0 or diagnostic not in result.stdout or "steps.pipeline" not in result.stdout:
+            fail(f"pipeline did not report {diagnostic!r} at its source:\n{result.stdout[-3000:]}")
+    print("ok   pipeline diagnostics: invalid steps, fixed points and plan exports rejected")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("compiler")
@@ -123,6 +150,7 @@ def main() -> int:
     work = Path(tempfile.mkdtemp(prefix="declarative-tests."))
     (work / "out").mkdir()
     check_library_boundary(coil, work)
+    check_pipeline_diagnostics(coil, work)
 
     def build(name: str, *, backend: str | None = None, level: int = 1) -> Path:
         exe = work / (name if backend is None else f"{name}-{backend}-O{level}")
