@@ -155,6 +155,8 @@ def check_translation_diagnostics(coil: str, work: Path) -> None:
         ("SUB(a, b) => MISSING(a, b) at ptr;", "unknown target node"),
         ("SUB(a, b) => SUB(b, missing) at ptr;", "unbound operand missing"),
         ("SUB(a, b) => SUB(a, b) at ctrl;", "unknown graph value type"),
+        ("SUB(a, b) => SUB(a, b) at f32;", "f32 is outside target type set int"),
+        ("ROTL(a, n) => SHL(a, n) at ptr;", "translation requires a value operation without immediates"),
         ("SUB(a, b) => NEG(a, b) at ptr;", "expected a pure node with matching operand count"),
     ]
     source = fixture / "rules.translate"
