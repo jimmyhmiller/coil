@@ -1049,7 +1049,8 @@ open(sys.argv[1], "w").write(
   # A project's own before-expand transform is part of the program a project-wide
   # lint checks: here it adds `generated` to every module the program has, which
   # their code calls. What it adds is not the user's code (`code-from-user?`),
-  # in a module that imports it or one that does not.
+  # in a module that imports it or one that does not, and neither is what a
+  # macro it calls there expands to.
   mkdir -p "$T/lint-transform/src/app" "$T/lint-transform/tools"
   printf '[package]\nname = "lint-transform"\nentry = "src/app.coil"\nsource-roots = ["src", "tools"]\n' > "$T/lint-transform/Coil.toml"
   printf '%s' '(module tools.gen)
@@ -1061,6 +1062,13 @@ open(sys.argv[1], "w").write(
 (defn adds? [(f Code)] (-> bool)
   (and (primitive/code-list? f) (> (primitive/code-count f) 1)
        (= (primitive/code-source (primitive/code-nth f 1)) "generated")))
+;; a macro call no source wrote: a list built, not a template quoted
+(defn fresh-when [] (-> Code)
+  (let [l (primitive/code-list-new)]
+    (primitive/code-list-push! l (primitive/syntax->datum (primitive/code-symbol "when")))
+    (primitive/code-list-push! l `(> 2 1))
+    (primitive/code-list-push! l `1)
+    (primitive/code-list-done l)))
 (defn with-generated [(m Code)] (-> Code)
   (if (not (mine? m))
       m
@@ -1071,7 +1079,9 @@ open(sys.argv[1], "w").write(
           (primitive/code-list-push! out (primitive/code-nth m i)))
         (unless seen
           (primitive/code-list-push! out
-            `(defn* ~(primitive/syntax->datum (primitive/code-symbol "generated")) [] (-> i64) 1)))
+            `(defn* ~(primitive/syntax->datum (primitive/code-symbol "generated")) [] (-> i64)
+               ~(fresh-when)
+               1)))
         (primitive/code-list-like m (primitive/code-list-done out)))))
 (defn gen [(modules Code)] (-> Code)
   (let [out (primitive/code-list-new)]
@@ -1079,14 +1089,20 @@ open(sys.argv[1], "w").write(
       (primitive/code-list-push! out (with-generated (primitive/code-nth modules i))))
     `(do ~@(primitive/code-list-done out))))
 (transform gen :phase (phase/BeforeExpand))
+(defn judge-node [(n Code) (file (slice u8))] (-> i64)
+  (when (and (primitive/code-from-user? n) (= (primitive/code-file n) file))
+    (primitive/report n "the transform'"'"'s form counts as the user'"'"'s"))
+  (when (primitive/code-list? n)
+    (for [i 0 (primitive/code-count n)] (judge-node (primitive/code-nth n i) file)))
+  0)
 (defn judge [(modules Code)] (-> Code)
   (for [i 0 (primitive/code-count modules)]
     (let [m (primitive/code-nth modules i)]
       (when (mine? m)
         (for [k 1 (primitive/code-count m)]
           (let [f (primitive/code-nth m k)]
-            (when (and (adds? f) (primitive/code-from-user? f))
-              (primitive/report f "the transform'"'"'s form counts as the user'"'"'s")))))))
+            (when (adds? f)
+              (judge-node f (primitive/code-file (primitive/code-nth m (- (primitive/code-count m) 2))))))))))
   `0)
 (checker judge)
 ' > "$T/lint-transform/tools/gen.coil"
