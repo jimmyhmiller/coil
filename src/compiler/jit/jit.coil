@@ -21,6 +21,14 @@
 ; own text, and the branch is retargeted to it. x16 (IP0) is the ABI's
 ; inter-procedural scratch register, so clobbering it at a call boundary is safe.
 ;
+; ADRP ISLANDS. An adrp carries a page count of +/-4GB, and the code takes the address
+; of an import, or of a static cell an earlier image or the process already holds
+; (jit-static-storage: a generic's cell is the process's), with a direct adrp. Such
+; a target can be farther than that from our mapping. Every adrp whose target may
+; be therefore gets a 5-instruction island after the veneers; when the target is out
+; of reach, the adrp becomes a branch to the island, which materializes the target's
+; page in the same register with movz/movk and branches back.
+;
 ; __DWARF sections are not loaded (nothing executes debug info) and their
 ; relocations — which target section ordinals rather than symbol indices — are
 ; skipped. The metaprogram object builder passes emit-dwarf=false anyway.
@@ -581,6 +589,56 @@
     (set! (primitive/index buf n) (: 0 u8))
     (primitive/cast (ptr i8) buf)))
 
+;;; Whether an adrp naming SY may point outside this image: SY is an import, or
+;;; a static cell that keeps the storage an earlier image or the process gave it
+;;; (jit-static-storage), which the image's code still reaches with a direct
+;;; adrp because the object defines it.
+(defn jit-far-page-target? [(sy (ptr MSym))] (-> bool)
+  (or (= (.sect sy) 0) (jit-reload-static? (.name sy))))
+
+(defn jit-page-reaches? [(loc (ptr u8)) (tgt (ptr i8))] (-> bool)
+  (let [imm
+          (primitive/ishr (primitive/isub (primitive/iand (primitive/cast i64 tgt)
+                                                          (jit-not 4095))
+                                          (primitive/iand (primitive/cast i64 loc)
+                                                          (jit-not 4095)))
+                          12)]
+    (and (<= imm 1048575) (>= imm -1048576))))
+
+;;; `b` from FROM to TO, both in this image's text.
+(defn jit-b [(from i64) (to i64)] (-> i64)
+  (primitive/ior (a64-b-raw)
+                 (primitive/iand (primitive/ishr (primitive/isub to from) 2)
+                                 67108863)))
+
+;;; Route the adrp at LOC, whose target TGT is over 4GB away, through the island at
+;;; IP: the adrp becomes a branch to the island, which puts TGT's page in the adrp's
+;;; register and branches back. The paired PAGEOFF12 (an add, load or store) is
+;;; untouched and still right, since it only ever supplies the low 12 bits.
+(defn jit-emit-adrp-island! [(loc (ptr u8)) (ip (ptr u8)) (tgt (ptr i8))]
+  (-> (Result i64 (slice u8)))
+  (let [rd (primitive/iand (jit-ld32 loc) 31)
+        page (primitive/iand (primitive/cast i64 tgt) (jit-not 4095))
+        l (primitive/cast i64 loc)
+        i (primitive/cast i64 ip)
+        reach (primitive/isub i l)]
+    (if (or (>= reach (branch26-max))
+            (< reach (primitive/isub 0 (branch26-max))))
+        (Err [i64 (slice u8)]
+             "jit: an adrp island is out of branch range of its adrp (compiler bug)")
+        (do
+          (jit-st32! (primitive/index ip 0) (a64-movz rd (primitive/iand page 65535) 0))
+          (jit-st32! (primitive/index ip 4)
+                     (a64-movk rd (primitive/iand (primitive/ishr page 16) 65535) 1))
+          (jit-st32! (primitive/index ip 8)
+                     (a64-movk rd (primitive/iand (primitive/ishr page 32) 65535) 2))
+          (jit-st32! (primitive/index ip 12)
+                     (a64-movk rd (primitive/iand (primitive/ishr page 48) 65535) 3))
+          (jit-st32! (primitive/index ip 16)
+                     (jit-b (primitive/iadd i 16) (primitive/iadd l 4)))
+          (jit-st32! loc (jit-b l i))
+          (Ok [i64 (slice u8)] 0)))))
+
 ; write an absolute-jump veneer to `tgt` at `vp`
 (defn jit-emit-veneer! [(vp (ptr u8)) (tgt i64)] (-> i64)
   (do
@@ -621,11 +679,10 @@
                     (primitive/isub (primitive/iand (load s) (jit-not 4095))
                                     (primitive/iand p (jit-not 4095)))
                   imm (primitive/ishr delta 12)]
-              ; adrp carries a signed 21-bit PAGE count: +/-4GB. Taking the ADDRESS of
-              ; an undefined symbol (rather than calling it) could land outside that,
-              ; and the veneer trick does not apply — a veneer redirects a branch, not
-              ; an address computation. Fail loudly; reaching this means the fix is a
-              ; GOT-style indirection, not a wider mask.
+              ; adrp carries a signed 21-bit PAGE count: +/-4GB. A target that may
+              ; lie outside the image has an island and never reaches here out of
+              ; range (jit-emit-adrp-island!); one that does is a symbol of this
+              ; image, which cannot be that far, so this is a loader bug.
               (if (or (> imm 1048575)
                       (< imm -1048576))
                   (Err [i64 (slice u8)]
@@ -764,8 +821,23 @@
                               (slice::new (primitive/cast (ptr (ptr i8))
                                                           0)
                                           0)))))
+            ; per relocation: its adrp island's index, or -1
+            isl
+              (data (match (alloc [i64]
+                                  a
+                                  (if (> nrel 0)
+                                      nrel
+                                      1))
+                      (Some [s] s)
+                      (None []
+                            (do
+                              (oom-at c"compiler jit" -1)
+                              (slice::new (primitive/cast (ptr i64)
+                                                          0)
+                                          0)))))
             (mut cur) 0
             (mut nven) 0
+            (mut nisl) 0
             (mut ngot) 0
             (mut i) 0]
 
@@ -824,7 +896,14 @@
                                      (< (load (primitive/index vidx sym))
                                         0))
                             (store! (primitive/index vidx sym) (load nven))
-                            (store! nven (primitive/iadd (load nven) 1))))))
+                            (store! nven (primitive/iadd (load nven) 1)))))
+                      ; and an island for every adrp whose target may be far
+                      (store! (primitive/index isl (load i)) -1)
+                      (when (and (= (load (field r rtype)) (reloc-page21))
+                                 (and (>= sym 0) (< sym nsym)))
+                        (when (jit-far-page-target? (al-at [MSym] (field o syms) sym))
+                          (store! (primitive/index isl (load i)) (load nisl))
+                          (store! nisl (primitive/iadd (load nisl) 1)))))
                     (store! i (primitive/iadd (load i) 1)))))
 
         ; pass 1 — __TEXT sections, in order
@@ -846,12 +925,16 @@
                                                                   buf)))))))
                     (store! i (primitive/iadd (load i) 1)))))
 
-        ; the veneer area sits at the end of text, so it is covered by the same R+X flip
+        ; the veneer and island areas sit at the end of text, so they are covered by
+        ; the same R+X flip
         (store! cur (jit-align-up (load cur) 4))
-        (let [venbase (load cur)]
+        (let [venbase (load cur)
+              islbase
+                (primitive/iadd venbase
+                                (primitive/imul (load nven) (veneer-bytes)))]
           (store! cur
-                  (primitive/iadd (load cur)
-                                  (primitive/imul (load nven)
+                  (primitive/iadd islbase
+                                  (primitive/imul (load nisl)
                                                   (veneer-bytes))))
 
           ; the text/data boundary is a page boundary: mprotect works in whole pages,
@@ -1162,10 +1245,23 @@
                                                                                                        (veneer-bytes))))
                                                       (load (primitive/index addrs
                                                                              sym))))]
-                                        (match (jit-patch! loc
-                                                           tgt
-                                                           (load (field r
-                                                                        rtype)))
+                                        (match (let [k
+                                                       (load (primitive/index isl
+                                                                              (load i)))]
+                                                 (if (and (>= k 0)
+                                                          (not (jit-page-reaches? loc
+                                                                                  tgt)))
+                                                     (jit-emit-adrp-island! loc
+                                                                            (primitive/cast (ptr u8)
+                                                                                            (primitive/index base
+                                                                                                             (primitive/iadd islbase
+                                                                                                                             (primitive/imul k
+                                                                                                                                             (veneer-bytes)))))
+                                                                            tgt)
+                                                     (jit-patch! loc
+                                                                 tgt
+                                                                 (load (field r
+                                                                              rtype)))))
                                           (Err [m]
                                                (do
                                                  (jit-image-unmap! base total)
