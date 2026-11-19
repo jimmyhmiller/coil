@@ -1046,6 +1046,56 @@ open(sys.argv[1], "w").write(
   [ "$rc" != 0 ] && cmp -s "$T/broken-main.orig" "$T/broken-project/src/main.coil" \
     && ok "project lint --fix that cannot compile rolls back every file" \
     || bad "project lint --fix that cannot compile rolls back every file" "exit $rc"
+  # A project's own before-expand transform is part of the program a project-wide
+  # lint checks: here it adds `generated` to every module the program has, which
+  # their code calls. What it adds is not the user's code (`code-from-user?`),
+  # in a module that imports it or one that does not.
+  mkdir -p "$T/lint-transform/src/app" "$T/lint-transform/tools"
+  printf '[package]\nname = "lint-transform"\nentry = "src/app.coil"\nsource-roots = ["src", "tools"]\n' > "$T/lint-transform/Coil.toml"
+  printf '%s' '(module tools.gen)
+(import "coil.primitive" :as primitive)
+(import "coil.phase" :as phase)
+(defn mine? [(m Code)] (-> bool)
+  (let [n (primitive/code-source (primitive/code-nth m 0))]
+    (or (= n "app") (= n "app.other"))))
+(defn adds? [(f Code)] (-> bool)
+  (and (primitive/code-list? f) (> (primitive/code-count f) 1)
+       (= (primitive/code-source (primitive/code-nth f 1)) "generated")))
+(defn with-generated [(m Code)] (-> Code)
+  (if (not (mine? m))
+      m
+      (let [out (primitive/code-list-new)
+            (mut seen) false]
+        (for [i 0 (primitive/code-count m)]
+          (when (adds? (primitive/code-nth m i)) (set! seen true))
+          (primitive/code-list-push! out (primitive/code-nth m i)))
+        (unless seen
+          (primitive/code-list-push! out
+            `(defn* ~(primitive/syntax->datum (primitive/code-symbol "generated")) [] (-> i64) 1)))
+        (primitive/code-list-like m (primitive/code-list-done out)))))
+(defn gen [(modules Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count modules)]
+      (primitive/code-list-push! out (with-generated (primitive/code-nth modules i))))
+    `(do ~@(primitive/code-list-done out))))
+(transform gen :phase (phase/BeforeExpand))
+(defn judge [(modules Code)] (-> Code)
+  (for [i 0 (primitive/code-count modules)]
+    (let [m (primitive/code-nth modules i)]
+      (when (mine? m)
+        (for [k 1 (primitive/code-count m)]
+          (let [f (primitive/code-nth m k)]
+            (when (and (adds? f) (primitive/code-from-user? f))
+              (primitive/report f "the transform'"'"'s form counts as the user'"'"'s")))))))
+  `0)
+(checker judge)
+' > "$T/lint-transform/tools/gen.coil"
+  printf '(module app)\n(import "tools.gen")\n(import "app.other" :as other)\n(defn main [] (-> i64) (+ (generated) (other/twice 1)))\n' > "$T/lint-transform/src/app.coil"
+  printf '(module app.other)\n(defn twice [(n i64)] (-> i64) (* n (generated)))\n' > "$T/lint-transform/src/app/other.coil"
+  expect_rc 0 "a project-wide lint runs the project's before-expand transform" \
+    sh -c 'cd "$1" && "$2" lint' _ "$T/lint-transform" "$COIL"
+  expect_rc 0 "what a transform adds is not the user's code, in a module that does not import it" \
+    sh -c 'cd "$1" && "$2" check' _ "$T/lint-transform" "$COIL"
   # The authored-source view (coil.meta's source-modules, imports, references and
   # their bindings): import-aliases plans a qualification and suggests it as one
   # group.
