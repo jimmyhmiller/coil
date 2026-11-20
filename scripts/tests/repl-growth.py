@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Measure how `coil repl` grows with the number of accepted submissions.
 
-    repl-growth.py [COMPILER] [--submissions N] [--max-rss-slope-kb K]
+    repl-growth.py [COMPILER] [--submissions N] [--retire] [--max-rss-slope-kb K]
                    [--max-time-slope-ms T] [--max-env-slope-kb E] [--rss-cap-mb M]
 
 Submits N forms, alternating a new `defn` and a call to it, and samples the
@@ -17,6 +17,11 @@ session report after every accept what each account of compiler memory holds
 prints) and how many bytes the compiler state it serves owns
 (`memory.env.owned`), and reports the slope of each: what grows, named by
 whoever holds it.
+
+With `--retire` each `defn` is the same function again: a submission retires
+it and defines it anew (`:compile (retire-defn grow) (defn grow …)`), as a live
+session replacing a function does all day. What the compiler state keeps of a
+retired definition goes with it, so `memory.env.owned` should stay flat.
 
 It fails only on what is asked: `--max-rss-slope-kb`, `--max-time-slope-ms` and
 `--max-env-slope-kb` (what the compiler state owns) bound the slopes.
@@ -71,6 +76,8 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("compiler", nargs="?", default=os.environ.get("COIL", "coil"))
     p.add_argument("--submissions", type=int, default=40)
+    p.add_argument("--retire", action="store_true",
+                   help="retire and define again the same function instead of a new one each time")
     p.add_argument("--max-rss-slope-kb", type=float)
     p.add_argument("--max-time-slope-ms", type=float)
     p.add_argument("--max-env-slope-kb", type=float)
@@ -85,13 +92,13 @@ def main() -> int:
     try:
         read_until_prompt(proc.stdout)
         for i in range(args.submissions):
-            form = submission(i)
+            form = submission(i, args.retire)
             start = time.perf_counter()
             proc.stdin.write(form.encode() + b"\n")
             proc.stdin.flush()
             answer = read_until_prompt(proc.stdout)[:-len(PROMPT)].decode(errors="replace")
             times.append((time.perf_counter() - start) * 1000)
-            want = "; ok" if i % 2 == 0 else str(i // 2 + 1)
+            want = ("" if args.retire else "; ok") if i % 2 == 0 else str(i // 2 + 1)
             if answer.strip() != want:
                 print(f"submission {i} ({form}) answered {answer.strip()!r}, wanted {want!r}")
                 return 1
@@ -138,8 +145,13 @@ def main() -> int:
     return 1 if failed else 0
 
 
-def submission(i: int) -> str:
+def submission(i: int, retire: bool) -> str:
     k = i // 2
+    if retire:
+        # the first defines it; each after retires the one before
+        before = "(retire-defn grow) " if k > 0 else ""
+        return (f":compile {before}(defn grow [(x i64)] (-> i64) (+ x {k}))" if i % 2 == 0
+                else "(grow 1)")
     return (f"(defn grow{k} [(x i64)] (-> i64) (+ x {k}))" if i % 2 == 0
             else f"(grow{k} 1)")
 
@@ -155,7 +167,7 @@ def account_slopes(args) -> dict[str, tuple[int, int, float]] | None:
         try:
             read_until_prompt(proc.stdout)
             for i in range(args.submissions):
-                proc.stdin.write(submission(i).encode() + b"\n")
+                proc.stdin.write(submission(i, args.retire).encode() + b"\n")
                 proc.stdin.flush()
                 read_until_prompt(proc.stdout)
                 resident = rss_kb(proc.pid)
