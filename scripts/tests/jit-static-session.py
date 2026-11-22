@@ -299,7 +299,10 @@ def main() -> None:
         consumer.mkdir()
         entry = consumer / "entry.coil"
         dependency = consumer / "arbitrary-file-name.coil"
-        entry.write_text('(module graph.entry)\n(import "graph.dependency" :as dep)\n'
+        # It imports coil.jit, which the toolchain's unit serves, as in a build:
+        # the SDK's sources are not the program's, and are not read.
+        entry.write_text('(module graph.entry)\n(import "coil.jit" :as jit)\n'
+                         '(import "graph.dependency" :as dep)\n'
                          '(defn main [] (-> i64) (dep/value))\n')
         dependency.write_text('(module graph.dependency)\n(defn value [] (-> i64) 42)\n')
         graph_env = dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(consumer))
@@ -327,6 +330,22 @@ def main() -> None:
             "--emit-state", other_state, *flags)
         run(adopted, other_state, "foreign")
         print("PASS: a program's session adopts the state the program was built with", flush=True)
+
+        # A state finds a namespace where its build's loader did: in the roots
+        # the build scanned, under its configuration. The program runs from
+        # another directory with no project environment, and finds a module file
+        # written into its project after the build.
+        ns_project = work / "ns-project"
+        ns_project.mkdir()
+        (ns_project / "app.coil").write_text((FIXTURES / "namespace_file.coil").read_text())
+        ns_binary, ns_state = work / "ns-app", work / "ns-app.state"
+        run(COMPILER, "build", ns_project / "app.coil", "-o", ns_binary,
+            "--emit-state", ns_state, *flags,
+            env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(ns_project)))
+        helper = ns_project / "helper.coil"
+        helper.write_text("(module ns.helper)\n(defn value [] (-> i64) 1)\n")
+        run(ns_binary, ns_state, helper.resolve(), cwd=Path("/"))
+        print("PASS: a program's state finds a module file added under its build's roots", flush=True)
 
         # The demo in src/examples/jit_expose: a metaprogram hands an application to a
         # session, which type checks new code against it. Its output is its contract.
