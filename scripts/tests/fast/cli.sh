@@ -2049,6 +2049,30 @@ EOF
   if build "$T/asan.coil" "$T/asan" --sanitize=address -O0; then
     expect_crash_or_fail 'AddressSanitizer: heap-use-after-free' "--sanitize=address reports a use-after-free" "$T/asan"
   fi
+  # An owner taken by value arrives in ABI slots and is stored to the stack. ASan's
+  # pass reorders stores of arguments; a function with other aggregate temporaries
+  # must still see the value it was passed.
+  cat > "$T/asan-owner-arg.coil" <<'EOF'
+(module asan-owner-arg)
+(import "coil.alloc" :as alloc)
+(defstruct Held [(at (ptr i64))])
+(impl Drop Held (drop [(self (mut Held))] (-> void) 0))
+(defn keep! [T] [(slot (ptr T)) (value T)] (-> void)
+  (when false (alloc/free (alloc/malloc-allocator) (slice::new [T] slot 1)))
+  (store! slot value)
+  0)
+(defn main [] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        n (alloc/unwrap-ptr [i64] (alloc/create [i64] a))
+        slot (alloc/unwrap-ptr [Held] (alloc/create [Held] a))]
+    (store! n 41)
+    (keep! slot (Held :at n))
+    (println "{}" (+ 1 (load (load (field slot at)))))
+    0))
+EOF
+  if build "$T/asan-owner-arg.coil" "$T/asan-owner-arg" --sanitize=address -O0; then
+    expect_out "42" "--sanitize=address keeps an owner passed by value" "$T/asan-owner-arg"
+  fi
   # An arena tells ASan what it hands out and takes back (`asan-poison!`): a write past a
   # block, a read after a rewind to a mark, a read after a recycle. Each argument
   # count picks one.
