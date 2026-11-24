@@ -163,11 +163,13 @@ def run_program(compiler: str, program: Program, lane: str, scratch: Path) -> tu
         if built.returncode:
             return "build failed:\n" + (built.stdout + built.stderr).decode(errors="replace")[-3000:]
         command = [str(executable), *program.args]
+    # `coil interp` compiles the program and then runs it, so it gets the time of both.
+    limit = BUILD_TIMEOUT + RUN_TIMEOUT if lane == "interp" else RUN_TIMEOUT
     try:
         ran = subprocess.run(command, cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
-                             capture_output=True, timeout=RUN_TIMEOUT)
+                             capture_output=True, timeout=limit)
     except subprocess.TimeoutExpired:
-        return f"did not finish in {RUN_TIMEOUT}s"
+        return f"did not finish in {limit}s"
     return ran.stdout, ran.stderr, ran.returncode
 
 
