@@ -2051,12 +2051,20 @@ EOF
   fi
   # An owner taken by value arrives in ABI slots and is stored to the stack. ASan's
   # pass reorders stores of arguments; a function with other aggregate temporaries
-  # must still see the value it was passed.
+  # must still see the value it was passed. A sanitized build also verifies the
+  # module: a C-convention pointer to a function that takes a struct by value and
+  # returns one with no fields is a function that returns nothing.
   cat > "$T/asan-owner-arg.coil" <<'EOF'
 (module asan-owner-arg)
 (import "coil.alloc" :as alloc)
+(import "coil.cc" :as cc)
 (defstruct Held [(at (ptr i64))])
 (impl Drop Held (drop [(self (mut Held))] (-> void) 0))
+(defstruct Pair [(a i64) (b i64)])
+(defstruct Empty [])
+(defn add-then-empty [(to (ptr i64)) (by Pair)] (-> Empty)
+  (store! to (+ (load to) (.a by) (.b by)))
+  (Empty))
 (defn keep! [T] [(slot (ptr T)) (value T)] (-> void)
   (when false (alloc/free (alloc/malloc-allocator) (slice::new [T] slot 1)))
   (store! slot value)
@@ -2064,8 +2072,10 @@ EOF
 (defn main [] (-> i64)
   (let [a (alloc/malloc-allocator)
         n (alloc/unwrap-ptr [i64] (alloc/create [i64] a))
-        slot (alloc/unwrap-ptr [Held] (alloc/create [Held] a))]
-    (store! n 41)
+        slot (alloc/unwrap-ptr [Held] (alloc/create [Held] a))
+        add (: (fnptr-of add-then-empty) (fnptr (cc/C) [(ptr i64) Pair] Empty))]
+    (store! n 38)
+    (let [nothing (add n (Pair :a 1 :b 2))] 0)
     (keep! slot (Held :at n))
     (println "{}" (+ 1 (load (load (field slot at)))))
     0))
