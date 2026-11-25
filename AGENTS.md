@@ -127,12 +127,17 @@ Use this format:
   the line from it, as the `safety-traps` table in `cli.sh` and the `tests/diag`
   goldens do. A file that must stay unformatted is not named `*.coil`
   (`tests/cli/fmt/*_input.coil.in`).
-- ⚠ **`build full` peaks near 5.3 GB of memory, and that is expected.** Compiling
-  the compiler once costs about 2.7 GB (measured: the largest single process), and
-  the fixpoint step in `scripts/compiler/rebootstrap.sh` deliberately emits the
-  stage 2 and stage 3 objects at the same time, so two such compiles are live at
-  once (5.33 GB for the whole process tree, install included, 2026-10-24; it was
-  9.4 GB on 2026-10-04). The install step that follows (`build full` without
+- ⚠ **`build full` peaks near 10.3 GB of memory.** Compiling the compiler once
+  costs about 5.2 GB (measured 2026-11-24: the largest single process of `build
+  candidate`), and the fixpoint step in `scripts/compiler/rebootstrap.sh`
+  deliberately emits the stage 2 and stage 3 objects at the same time, so two such
+  compiles are live at once (10.27 GB for the whole process tree, install
+  included). It was 5.33 GB on 2026-10-24, when one compile cost 2.7 GB. Of one
+  compile's 3.5 GB of frontend memory, expansion holds 1.5 GB (0.6 GB then), the
+  final check 1.3 GB (0.85 GB) and mono 0.46 GB (0.3 GB). Expansion keeps what
+  each of its ten generations resolved (35 MB apiece) and what each of its three
+  whole-program expansions made (210 MB apiece) until the compilation ends. The
+  install step that follows (`build full` without
   `--no-install`, or `dev.py install`) warms the `coil.jit` unit with
   `coil build-unit jit_api.coil`, which compiles the whole compiler at -O3 in a
   single process; it stayed under that same peak. Do not run anything
