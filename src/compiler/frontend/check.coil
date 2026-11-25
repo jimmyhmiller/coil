@@ -21132,6 +21132,29 @@
                        (ok-ep (mk-expr (EOffsetOf ty ffld) elo ehi esrc ectxt)
                               (TInt 64 true))))))))))
 
+;;; The function `(fnptr-of NAME)` points at: NAME, or for a `Type::method` the
+;;; resolver qualified, the method of the one inherent impl written for exactly
+;;; that type that declares it. A pointer has no receiver to choose among impls
+;;; by, so a method more than one such impl declares is left as written, and
+;;; reported unknown.
+(defn fnptr-target-name [(a (dyn Allocator)) (cx (ptr Cx)) (name (slice u8))]
+  (-> (slice u8))
+  (let [cc (find-coloncolon name)]
+    (if (or (< cc 0) (!= (primitive/cast i64 (sig-find cx name)) 0))
+        name
+        (let [owner (subslice name 0 cc)
+              m (subslice name (primitive/iadd cc 2) (len name))
+              (mut found) (primitive/cast (ptr ImplDef) 0)
+              (mut count) 0]
+          (for [i 0 (cx-impl-count cx)]
+            (let [ip (cx-impl cx i)]
+              (when (and (not (impl-is-trait ip))
+                         (= (.for_type ip) owner)
+                         (!= (primitive/cast i64 (impl-find-method ip m)) 0))
+                (set! found ip)
+                (set! count (+ count 1)))))
+          (if (= count 1) (inherent-fn-name a found m) name)))))
+
 (defn synth-fnptr [(a (dyn Allocator))
                    (name (slice u8))
                    (cx (ptr Cx))
@@ -23045,7 +23068,8 @@
                            ehi
                            esrc
                            ectxt))
-      (EFnPtrOf [name]
+      (EFnPtrOf [written]
+                (let [name (fnptr-target-name a cx written)]
                 (if (generic-sig? cx name)
                     (synth-fnptr-inst a
                                       name
@@ -23069,8 +23093,9 @@
                                           elo
                                           ehi
                                           esrc
-                                          ectxt)))
-      (EFnPtrInst [name targs]
+                                          ectxt))))
+      (EFnPtrInst [written targs]
+                  (let [name (fnptr-target-name a cx written)]
                   (if (generic-sig? cx name)
                       (synth-fnptr-inst a
                                         name
@@ -23090,7 +23115,7 @@
                                            (sconcat3 a
                                                      "fnptr-of: '"
                                                      (display-ident name)
-                                                     "' is not generic, so it takes no type arguments; write (fnptr-of NAME)")))))
+                                                     "' is not generic, so it takes no type arguments; write (fnptr-of NAME)"))))))
       (ECallPtr [fp args]
                 (synth-callptr a fp args env cx tps fname elo ehi esrc ectxt))
       (EConstruct [sum variant args]
@@ -23953,7 +23978,14 @@
    ; it refers to, which no binding between it and an exit may shadow.
    (cleanup (ptr Expr))
    (uses (ptr (ArrayList i64)))
-   (pinned (ptr (ArrayList (slice u8))))])
+   (pinned (ptr (ArrayList (slice u8))))
+   ; The parts moved out of it, field paths below the binding (`a`, `a.b`), each
+   ; between `;`s, in order: `;a;b.c;`, or empty when it is whole. A struct with a
+   ; part moved out is dropped part by part, and only what is still there.
+   (parts (slice u8))
+   ; An exclusive reference parameter, not an owner: never dropped, and a part
+   ; moved out through it must be given a value again before the function returns.
+   (lent bool)])
 
 (defstruct OwnershipLoop
   [(label (Option (slice u8)))
@@ -24021,9 +24053,176 @@
       (set! (.cleanup st) (primitive/cast (ptr Expr) 0))
       (set! (.uses st) (primitive/cast (ptr (ArrayList i64)) 0))
       (set! (.pinned st) (primitive/cast (ptr (ArrayList (slice u8))) 0))
+      (set! (.parts st) "")
+      (set! (.lent st) false)
       (push! [MoveState] states (load st)))
     0)
   0)
+
+;;; Register the exclusive reference parameter BID, whose referent is of type TY,
+;;; so that a part moved out through it is tracked until it is given back.
+(defn ownership-register-lent! [(states (ptr (ArrayList MoveState)))
+                                (bid i64)
+                                (name (slice u8))
+                                (ty (ptr Type))
+                                (lo i64)
+                                (hi i64)
+                                (source i64)
+                                (ctxt i64)] (-> i64)
+  ; found by its binding when it has one, else by its name
+  (let [st (primitive/alloc-stack MoveState)]
+    (set! (.bid st) bid)
+    (set! (.moved st) false)
+    (set! (.name st) name)
+    (set! (.ty st) ty)
+    (set! (.lo st) lo)
+    (set! (.hi st) hi)
+    (set! (.source st) source)
+    (set! (.ctxt st) ctxt)
+    (set! (.cleanup st) (primitive/cast (ptr Expr) 0))
+    (set! (.uses st) (primitive/cast (ptr (ArrayList i64)) 0))
+    (set! (.pinned st) (primitive/cast (ptr (ArrayList (slice u8))) 0))
+    (set! (.parts st) "")
+    (set! (.lent st) true)
+    (push! [MoveState] states (load st)))
+  0)
+
+; ---- parts moved out of a binding ---------------------------------------------
+
+;;; The field path below its binding that the place E names: empty for the
+;;; binding, `a.b` for `(.b (.a x))`. None when a step is not a field.
+(defn ownership-part-path [(a (dyn Allocator)) (e (ptr Expr))] (-> (Option (slice u8)))
+  (match (.kind e)
+    (EVar [_] (Some ""))
+    (ELoad [inner] (ownership-part-path a inner))
+    (ESpillRef [inner] (ownership-part-path a inner))
+    (EMovePlace [inner] (ownership-part-path a inner))
+    (EField [base name]
+            (match (ownership-part-path a base)
+              (Some [p] (Some (if (= (len p) 0) name (sconcat3 a p "." name))))
+              (None [] (None [(slice u8)]))))
+    (_ (None [(slice u8)]))))
+
+;;; The path of the part a use of E may touch: an element of an array stands
+;;; for the whole array.
+(defn ownership-reach-path [(a (dyn Allocator)) (e (ptr Expr))] (-> (slice u8))
+  (match (.kind e)
+    (ELoad [inner] (ownership-reach-path a inner))
+    (ESpillRef [inner] (ownership-reach-path a inner))
+    (EMovePlace [inner] (ownership-reach-path a inner))
+    (EIndex [base _] (ownership-reach-path a base))
+    (EField [base name]
+            (let [p (ownership-reach-path a base)]
+              (if (= (len p) 0) name (sconcat3 a p "." name))))
+    (_ "")))
+
+;;; Is the path INNER below or equal to OUTER? Every path is below the empty one.
+(defn part-within? [(inner (slice u8)) (outer (slice u8))] (-> bool)
+  (or (= (len outer) 0)
+      (= inner outer)
+      (and (> (len inner) (len outer))
+           (starts-with inner outer)
+           (= (primitive/cast i64 (get inner (len outer))) 46))))
+
+;;; The paths PARTS holds.
+(defn parts-each [(a (dyn Allocator)) (parts (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] a)
+        (mut start) 1]
+    (for i (range 1 (len parts))
+      (when (= (primitive/cast i64 (get parts i)) 59)
+        (push! (mut out) (subslice parts start i))
+        (set! start (+ i 1))))
+    out))
+
+(defn parts-of-list [(a (dyn Allocator)) (paths (ptr (ArrayList (slice u8))))] (-> (slice u8))
+  (if (= (len (load paths)) 0)
+      ""
+      (let [(mut sb) (StrBuf::new a)]
+        (push-str! (mut sb) ";")
+        (for i (range 0 (len (load paths)))
+          (push-str! (mut sb) (get (load paths) i))
+          (push-str! (mut sb) ";"))
+        (str sb))))
+
+;;; Does a moved part overlap the part at PATH: inside it, or holding it?
+(defn parts-overlap? [(a (dyn Allocator)) (parts (slice u8)) (path (slice u8))] (-> bool)
+  (block :found
+    (for seg (iter (parts-each a parts))
+      (when (or (part-within? seg path) (part-within? path seg)) (break :found true)))
+    false))
+
+;;; The moved part that holds the part at PATH, strictly, if any.
+(defn parts-holding [(a (dyn Allocator)) (parts (slice u8)) (path (slice u8))] (-> (Option (slice u8)))
+  (block :found
+    (for seg (iter (parts-each a parts))
+      (when (and (!= seg path) (part-within? path seg)) (break :found (Some seg))))
+    (None [(slice u8)])))
+
+;;; PARTS without those at or below PATH.
+(defn parts-without [(a (dyn Allocator)) (parts (slice u8)) (path (slice u8))] (-> (slice u8))
+  (let [(mut kept) (ArrayList::new [(slice u8)] a)]
+    (for seg (iter (parts-each a parts))
+      (unless (part-within? seg path) (push! (mut kept) seg)))
+    (parts-of-list a (mut kept))))
+
+;;; PARTS with PATH added (and any part inside it dropped from the list).
+(defn parts-with [(a (dyn Allocator)) (parts (slice u8)) (path (slice u8))] (-> (slice u8))
+  (let [(mut kept) (parts-each a (parts-without a parts path))]
+    (push! (mut kept) path)
+    (parts-of-list a (mut kept))))
+
+;;; Do X and Y hold the same parts, in whatever order?
+(defn parts-same? [(a (dyn Allocator)) (x (slice u8)) (y (slice u8))] (-> bool)
+  (let [xs (parts-each a x)
+        ys (parts-each a y)]
+    (and (= (len xs) (len ys))
+         (block :all
+           (for seg (iter xs)
+             (unless (block :has
+                       (for other (iter ys) (when (= other seg) (break :has true)))
+                       false)
+               (break :all false)))
+           true))))
+
+(defn parts-union [(a (dyn Allocator)) (x (slice u8)) (y (slice u8))] (-> (slice u8))
+  (let [(mut out) x]
+    (for seg (iter (parts-each a y))
+      (set! out (parts-with a out seg)))
+    out))
+
+(defn move-state-parts [(states (ptr (ArrayList MoveState))) (bid i64)] (-> (slice u8))
+  (let [st (move-state-find states bid)]
+    (if (= (primitive/cast i64 st) 0) "" (.parts st))))
+
+;;; The state of the binding the variable ROOT names, an owner or an exclusive
+;;; reference parameter, or null: found as `ownership-root-state` finds it.
+(defn ownership-var-state [(root (ptr Expr)) (states (ptr (ArrayList MoveState)))] (-> (ptr MoveState))
+  (if (= (primitive/cast i64 root) 0)
+      (primitive/cast (ptr MoveState) 0)
+      (let [bid (bind-map-lookup (.node-id root))
+            by-bid (if (> bid 0) (move-state-find states bid) (primitive/cast (ptr MoveState) 0))]
+        (if (!= (primitive/cast i64 by-bid) 0)
+            by-bid
+            ; a parameter is registered by name: no binding of its own resolves it
+            (match (.kind root)
+              (EVar [name]
+                    (let [st (move-state-find-name states name)]
+                      (if (and (!= (primitive/cast i64 st) 0) (or (<= bid 0) (.lent st)))
+                          st
+                          (primitive/cast (ptr MoveState) 0))))
+              (_ (primitive/cast (ptr MoveState) 0)))))))
+
+;;; The state of the binding at the root of the place E, an owner or an exclusive
+;;; reference parameter, when it has parts moved out; else null.
+(defn ownership-part-state [(e (ptr Expr)) (states (ptr (ArrayList MoveState)))] (-> (ptr MoveState))
+  (let [st (ownership-var-state (ownership-place-root-var e) states)]
+    (if (and (!= (primitive/cast i64 st) 0) (> (len (.parts st)) 0))
+        st
+        (primitive/cast (ptr MoveState) 0))))
+
+;;; `(.name st)` with the part PATH: `x.a`.
+(defn part-name [(a (dyn Allocator)) (st (ptr MoveState)) (path (slice u8))] (-> (slice u8))
+  (if (= (len path) 0) (.name st) (sconcat3 a (.name st) "." path)))
 
 (defn move-state-cleanup? [(st (ptr MoveState))] (-> bool)
   (!= (primitive/cast i64 (.cleanup st)) 0))
@@ -24084,6 +24283,12 @@
               (break)
               (do
                 (let [from (elem src (load i))]
+                  ; a part moved on the way to any exit is moved after it
+                  (when (> (len (.parts from)) 0)
+                    (let [to (move-state-find dst (.bid from))]
+                      (if (= (primitive/cast i64 to) 0)
+                          (push! [MoveState] dst (load from))
+                          (set! (.parts to) (parts-union (.alc dst) (.parts to) (.parts from))))))
                   (when (.moved from)
                     (let [to (move-state-find dst (.bid from))]
                       (if (= (primitive/cast i64 to) 0)
@@ -24114,7 +24319,8 @@
     (loop (if (>= (load i) ln)
               (break)
               (let [st (elem left (load i))]
-                (when (!= (.moved st) (move-state-moved? right (.bid st)))
+                (when (or (!= (.moved st) (move-state-moved? right (.bid st)))
+                          (not (parts-same? (.alc left) (.parts st) (move-state-parts right (.bid st)))))
                   (store! mismatch st)
                   (break))
                 (set! i (primitive/iadd (load i) 1)))))
@@ -24123,7 +24329,8 @@
       (loop (if (>= (load i) rn)
                 (break)
                 (let [st (elem right (load i))]
-                  (when (!= (.moved st) (move-state-moved? left (.bid st)))
+                  (when (or (!= (.moved st) (move-state-moved? left (.bid st)))
+                            (not (parts-same? (.alc right) (.parts st) (move-state-parts left (.bid st)))))
                     (store! mismatch st)
                     (break))
                   (store! i (primitive/iadd (load i) 1))))))
@@ -24223,12 +24430,16 @@
   (let [root (ownership-place-root-var e)]
     (if (= (primitive/cast i64 root) 0)
         (primitive/cast (ptr MoveState) 0)
-        (let [bid (bind-map-lookup (.node-id root))]
-          (if (> bid 0)
-              (move-state-find states bid)
-              (match (.kind root)
-                (EVar [name] (move-state-find-name states name))
-                (_ (primitive/cast (ptr MoveState) 0))))))))
+        (let [bid (bind-map-lookup (.node-id root))
+              st (if (> bid 0)
+                     (move-state-find states bid)
+                     (match (.kind root)
+                       (EVar [name] (move-state-find-name states name))
+                       (_ (primitive/cast (ptr MoveState) 0))))]
+          ; an exclusive reference parameter is tracked for its parts alone
+          (if (and (!= (primitive/cast i64 st) 0) (.lent st))
+              (primitive/cast (ptr MoveState) 0)
+              st)))))
 
 ; Type of a place projection rooted in `root-type`. Whole-binding move checking
 ; rejects a move out of a projection (see `ownership-require-movable`); overwrite
@@ -24333,10 +24544,26 @@
                     (match (.kind root)
                       (EVar [name] (move-state-find-name states name))
                       (_ (primitive/cast (ptr MoveState) 0))))]
-          (if (and (<= bid 0)
-                   (= (primitive/cast i64 old) 0))
+          (if (or (and (<= bid 0)
+                       (= (primitive/cast i64 old) 0))
+                  (and (!= (primitive/cast i64 old) 0) (.lent old) (= (len (.parts old)) 0)))
               (Ok [i64 Diag] 0)
               (let []
+                (if (and (!= (primitive/cast i64 old) 0) (> (len (.parts old)) 0))
+                    (Err [i64 Diag]
+                         (derr-at-src (.source root)
+                                      (.lo root)
+                                      (.hi root)
+                                      (sconcat a
+                                               (sconcat4 a
+                                                         "in '"
+                                                         fname
+                                                         "': use of '"
+                                                         (.name old))
+                                               (sconcat3 a
+                                                         "' while '"
+                                                         (part-name a old (get (parts-each a (.parts old)) 0))
+                                                         "' is moved out of it; give that part a value again first"))))
                 (if (and (!= (primitive/cast i64 old) 0)
                          (.moved old))
                     (Err [i64 Diag]
@@ -24357,25 +24584,49 @@
                                  0)
                         (set! (.moved old) true)
                         0)
-                      (Ok [i64 Diag] 0)))))))))
+                      (Ok [i64 Diag] 0))))))))))
 
 (defn ownership-require-live-root [(a (dyn Allocator))
                                    (e (ptr Expr))
                                    (states (ptr (ArrayList MoveState)))
                                    (fname (slice u8))] (-> (Result i64 Diag))
-  (let [st (ownership-root-state e states)]
-    (if (and (!= (primitive/cast i64 st) 0) (.moved st))
-        (Err [i64 Diag]
-             (derr-at-src (.source e)
-                          (.lo e)
-                          (.hi e)
-                          (sconcat a
-                                   (sconcat3 a
-                                             "in '"
-                                             fname
-                                             "': use of moved value '")
-                                   (sconcat a (.name st) "'"))))
-        (Ok [i64 Diag] 0))))
+  (let [st (ownership-root-state e states)
+        partly (ownership-part-state e states)]
+    (cond (and (!= (primitive/cast i64 st) 0) (.moved st))
+            (Err [i64 Diag]
+                 (derr-at-src (.source e)
+                              (.lo e)
+                              (.hi e)
+                              (sconcat a
+                                       (sconcat3 a
+                                                 "in '"
+                                                 fname
+                                                 "': use of moved value '")
+                                       (sconcat a (.name st) "'"))))
+          ; a part moved out is not there to use, nor is anything that holds it
+          (and (!= (primitive/cast i64 partly) 0)
+               (parts-overlap? a (.parts partly) (ownership-reach-path a e)))
+            (let [path (ownership-reach-path a e)
+                  moved-part (block :found
+                               (for seg (iter (parts-each a (.parts partly)))
+                                 (when (or (part-within? seg path) (part-within? path seg))
+                                   (break :found seg)))
+                               path)]
+              (Err [i64 Diag]
+                   (derr-at-src (.source e)
+                                (.lo e)
+                                (.hi e)
+                                (if (part-within? path moved-part)
+                                    (sconcat a
+                                             (sconcat3 a "in '" fname "': use of moved value '")
+                                             (sconcat a (part-name a partly moved-part) "'"))
+                                    (sconcat a
+                                             (sconcat4 a "in '" fname "': use of '" (part-name a partly path))
+                                             (sconcat3 a
+                                                       "' while '"
+                                                       (part-name a partly moved-part)
+                                                       "' is moved out of it; give that part a value again first"))))))
+          :else (Ok [i64 Diag] 0))))
 
 (defn ownership-drop-call [(a (dyn Allocator))
                            (cx (ptr Cx))
@@ -24657,6 +24908,137 @@
                   0))
         (_ 0)))
   0)
+
+;;; The drop glue of the part at PATH of PLACE, of type TY, with the parts PARTS
+;;; (paths from the binding) moved out: a part moved out is skipped, a struct
+;;; with a part moved out of it is dropped field by field, and anything else
+;;; whole. A struct a part was moved out of has no drop of its own: moving one
+;;; out of such a struct is refused.
+(defn ownership-append-partial-drop-glue! [(a (dyn Allocator))
+                                           (cx (ptr Cx))
+                                           (out (ptr (ArrayList Expr)))
+                                           (place (ptr Expr))
+                                           (ty (ptr Type))
+                                           (parts (slice u8))
+                                           (path (slice u8))
+                                           (lo i64)
+                                           (hi i64)
+                                           (source i64)
+                                           (ctxt i64)] (-> i64)
+  (let [inside (block :any
+                 (for seg (iter (parts-each a parts))
+                   (when (part-within? seg path) (break :any true)))
+                 false)
+        gone (block :any
+               (for seg (iter (parts-each a parts))
+                 (when (part-within? path seg) (break :any true)))
+               false)]
+    (cond (not inside) (ownership-append-drop-glue! a cx out place ty lo hi source ctxt)
+          gone 0
+          :else
+            (try (let [fields (try-or! (struct-fields a ty cx) 0)]
+                   (let [(mut i) (primitive/isub (len (load fields)) 1)]
+                     (loop (if (< (load i) 0)
+                               (break)
+                               (do
+                                 (let [fp (elem fields (load i))]
+                                   (when (type-needs-drop a cx (field fp ty))
+                                     (ownership-append-partial-drop-glue!
+                                       a
+                                       cx
+                                       out
+                                       (box-expr a
+                                                 (mk-expr (EField (box-expr a (load place)) (.name fp))
+                                                          lo
+                                                          hi
+                                                          source
+                                                          ctxt))
+                                       (field fp ty)
+                                       parts
+                                       (if (= (len path) 0) (.name fp) (sconcat3 a path "." (.name fp)))
+                                       lo
+                                       hi
+                                       source
+                                       ctxt)
+                                     0))
+                                 (set! i (primitive/isub (load i) 1)))))
+                     0)))))
+  0)
+
+;;; Move the part PLACE names out of the binding whose state is ST: record it,
+;;; after checking that it is there, and that no struct it is part of (below the
+;;; binding) has a drop of its own, which would run with the part gone.
+(defn ownership-move-part! [(a (dyn Allocator))
+                            (cx (ptr Cx))
+                            (place (ptr Expr))
+                            (st (ptr MoveState))
+                            (fname (slice u8))] (-> (Result i64 Diag))
+  (match (ownership-part-path a place)
+    (None []
+          (Err [i64 Diag]
+               (derr-at-src (.source place)
+                            (.lo place)
+                            (.hi place)
+                            (sconcat a
+                                     (sconcat4 a
+                                               "in '"
+                                               fname
+                                               "': cannot move an owned value out of an element of '"
+                                               (.name st))
+                                     "'; move the whole value, or take the element out with move-out! or take!"))))
+    (Some [path]
+          (cond (.moved st)
+                  (Err [i64 Diag]
+                       (derr-at-src (.source place)
+                                    (.lo place)
+                                    (.hi place)
+                                    (sconcat a
+                                             (sconcat3 a "in '" fname "': use of moved value '")
+                                             (sconcat a (.name st) "'"))))
+                (parts-overlap? a (.parts st) path)
+                  (Err [i64 Diag]
+                       (derr-at-src (.source place)
+                                    (.lo place)
+                                    (.hi place)
+                                    (sconcat a
+                                             (sconcat3 a "in '" fname "': use of moved value '")
+                                             (sconcat a (part-name a st path) "'"))))
+                (ownership-part-has-own-drop? a cx place (.ty st))
+                  (Err [i64 Diag]
+                       (derr-at-src (.source place)
+                                    (.lo place)
+                                    (.hi place)
+                                    (sconcat a
+                                             (sconcat4 a
+                                                       "in '"
+                                                       fname
+                                                       "': cannot move '"
+                                                       (part-name a st path))
+                                             "' out: a value it is part of has a drop of its own, which would run without it")))
+                :else
+                  (do (set! (.parts st) (parts-with a (.parts st) path))
+                      (Ok [i64 Diag] 0))))))
+
+;;; Has a value the field PLACE is part of, below the binding, a drop of its own?
+(defn ownership-part-has-own-drop? [(a (dyn Allocator))
+                                    (cx (ptr Cx))
+                                    (place (ptr Expr))
+                                    (root-type (ptr Type))] (-> bool)
+  (match (.kind place)
+    (ELoad [inner] (ownership-part-has-own-drop? a cx inner root-type))
+    (ESpillRef [inner] (ownership-part-has-own-drop? a cx inner root-type))
+    (EMovePlace [inner] (ownership-part-has-own-drop? a cx inner root-type))
+    (EField [base _]
+            (or (match (ownership-place-type a cx base root-type)
+                  (Some [t]
+                        (let [tp (primitive/alloc-stack Type)]
+                          (set! tp t)
+                          (match (ownership-drop-call a cx base tp 0 0 0 0)
+                            (Some [_] true)
+                            (None [] false))))
+                  (None [] true))
+                (ownership-part-has-own-drop? a cx base root-type)))
+    (_ false)))
 
 ; ---- cleanups placed at exits: hygiene ------------------------------------------
 ; Elaboration copies a cleanup -- an owner's drop glue, a defer's cleanup -- to
@@ -25078,26 +25460,45 @@
                         (Ok [_]
                             (push! (mut out)
                                    (load (ownership-clone a (.cleanup st))))))
-                      (unless (or (.moved st)
-                                  (not (type-needs-drop a cx (.ty st))))
-                        (let [place
-                                (box-expr a
-                                          (mk-expr (EVar (.name st))
-                                                   (.lo st)
-                                                   (.hi st)
-                                                   (.source st)
-                                                   (.ctxt st)))]
-                          (ownership-append-drop-glue! a
-                                                       cx
-                                                       (mut out)
-                                                       place
-                                                       (.ty st)
+                      (if (.lent st)
+                          ; a part moved out through an exclusive reference
+                          ; belongs to the caller: it must be back by now
+                          (when (> (len (.parts st)) 0)
+                            (set! err
+                                  (Some (derr-at-src (.source st)
+                                                     (.lo st)
+                                                     (.hi st)
+                                                     (sconcat a
+                                                              (sconcat3 a
+                                                                        "in '"
+                                                                        fname
+                                                                        "': '")
+                                                              (sconcat a
+                                                                       (part-name a st (get (parts-each a (.parts st)) 0))
+                                                                       "' is moved out and not given a value again before the function returns; the caller owns it")))))
+                            (break))
+                          (unless (or (.moved st)
+                                      (not (type-needs-drop a cx (.ty st))))
+                            (let [place
+                                    (box-expr a
+                                              (mk-expr (EVar (.name st))
                                                        (.lo st)
                                                        (.hi st)
                                                        (.source st)
-                                                       (.ctxt st))
-                          0)
-                        0)))
+                                                       (.ctxt st)))]
+                              (ownership-append-partial-drop-glue! a
+                                                                   cx
+                                                                   (mut out)
+                                                                   place
+                                                                   (.ty st)
+                                                                   (.parts st)
+                                                                   ""
+                                                                   (.lo st)
+                                                                   (.hi st)
+                                                                   (.source st)
+                                                                   (.ctxt st))
+                              0)
+                            0))))
                 (set! i (primitive/isub (load i) 1)))))
     (match (load err)
       (Some [d] (Err [(ptr (ArrayList Expr)) Diag] d))
@@ -26074,6 +26475,92 @@
                 (ELet (box-al [Bind] a (.binds h)) (box-al [Expr] a (load body)))))))
     0))
 
+;;; `(set! P VALUE)` where P is a part of a binding with a part moved out: the
+;;; value is computed first; P must not be inside a part that was moved out; the
+;;; old value's parts that are still there are dropped; then P is whole again.
+(defn ownership-store-part! [(a (dyn Allocator))
+                             (cx (ptr Cx))
+                             (e (ptr Expr))
+                             (p (ptr Expr))
+                             (value (ptr Expr))
+                             (states (ptr (ArrayList MoveState)))
+                             (loops (ptr (ArrayList OwnershipLoop)))
+                             (fname (slice u8))] (-> (Result i64 Diag))
+  (try (do
+         (try! (ownership-walk-expr a cx value states loops fname true))
+         (ownership-load-direct-place! a value states)
+         (let [st (ownership-part-state p states)]
+           (if (= (primitive/cast i64 st) 0)
+               ; the value gave every part back (`(set! (.a x) (f (.a x)))` keeps
+               ; nothing moved): an ordinary store
+               (do (match (ownership-mut-borrow-place-type a cx p)
+                     (Some [target-type] (ownership-overwrite-drop! a cx e p value target-type))
+                     (None []
+                           (let [owner (ownership-root-state p states)]
+                             (unless (= (primitive/cast i64 owner) 0)
+                               (match (ownership-place-type a cx p (.ty owner))
+                                 (Some [target-type] (ownership-overwrite-drop! a cx e p value target-type))
+                                 (None [] 0))
+                               0)
+                             0)))
+                   (Ok [i64 Diag] 0))
+               (let [path (unwrap-or (ownership-part-path a p) "")]
+                 (match (parts-holding a (.parts st) path)
+                   (Some [holder]
+                         (Err [i64 Diag]
+                              (derr-at-src (.source e)
+                                           (.lo e)
+                                           (.hi e)
+                                           (sconcat a
+                                                    (sconcat3 a
+                                                              "in '"
+                                                              fname
+                                                              "': cannot give a value to a field of moved value '")
+                                                    (sconcat a (part-name a st holder) "'")))))
+                   (None []
+                         (do
+                           ; what is still there of the old value is dropped
+                           (match (ownership-place-type a cx p (.ty st))
+                             (Some [target-type]
+                                   (ownership-partial-overwrite! a cx e p value target-type (.parts st) path))
+                             (None [] 0))
+                           (set! (.parts st) (parts-without a (.parts st) path))
+                           (Ok [i64 Diag] 0))))))))))
+
+;;; The store E of VALUE to P, of type TARGET-TYPE, whose parts PARTS (paths from
+;;; the binding; P is at PATH) were moved out: drop what of the old value is
+;;; still there, then store.
+(defn ownership-partial-overwrite! [(a (dyn Allocator))
+                                    (cx (ptr Cx))
+                                    (e (ptr Expr))
+                                    (p (ptr Expr))
+                                    (value (ptr Expr))
+                                    (target-type Type)
+                                    (parts (slice u8))
+                                    (path (slice u8))] (-> i64)
+  (let [targetp (primitive/alloc-stack Type)
+        (mut drops) (ArrayList::new [Expr] a)]
+    (set! targetp target-type)
+    (ownership-append-partial-drop-glue! a cx (mut drops) p targetp parts path
+                                         (.lo e) (.hi e) (.source e) (.ctxt e))
+    (when (> (len drops) 0)
+      (let [value-name (sconcat a "$overwrite.value." (i64->str a (.node-id e)))
+            value-var (box-expr a (mk-expr (EVar value-name) (.lo e) (.hi e) (.source e) (.ctxt e)))
+            (mut binds) (ArrayList::new [Bind] a)
+            (mut body) (ArrayList::new [Expr] a)]
+        (push! (mut binds)
+               (mk-bind value-name
+                        false
+                        (mk-expr (ESpillRef (box-expr a (load value))) (.lo e) (.hi e) (.source e) (.ctxt e))))
+        (for d (iter drops) (push! (mut body) d))
+        (push! (mut body)
+               (mk-expr (EStore (box-expr a (load p))
+                                (box-expr a (mk-expr (ELoad value-var) (.lo e) (.hi e) (.source e) (.ctxt e))))
+                        (.lo e) (.hi e) (.source e) (.ctxt e)))
+        (set! (.kind e) (ELet (box-al [Bind] a (load binds)) (box-al [Expr] a (load body))))
+        0))
+    0))
+
 ; Replace the value in an initialized owning place: evaluate both operands once
 ; and in source order, run the old value's drop glue, then store. The replacement
 ; spill keeps the new value alive while the old value's glue runs.
@@ -26591,6 +27078,11 @@
       0)
     found))
 
+;;; Is ROOT an exclusive reference parameter?
+(defn ownership-lent-root? [(root (ptr Expr)) (states (ptr (ArrayList MoveState)))] (-> bool)
+  (let [st (ownership-var-state root states)]
+    (and (!= (primitive/cast i64 st) 0) (.lent st))))
+
 (defn ownership-require-movable-root [(a (dyn Allocator))
                                       (cx (ptr Cx))
                                       (e (ptr Expr))
@@ -26609,18 +27101,12 @@
           (and (!= (primitive/cast i64 owner) 0)
                (not (ownership-glue-reaches? a cx place (.ty owner))))
             (Ok [i64 Diag] 0)
-          (!= (primitive/cast i64 owner) 0)
-            (Err [i64 Diag]
-                 (derr-at-src (.source place)
-                              (.lo place)
-                              (.hi place)
-                              (sconcat a
-                                       (sconcat4 a
-                                                 "in '"
-                                                 fname
-                                                 "': cannot move an owned value out of a field or element of '"
-                                                 (.name owner))
-                                       "'; ownership is tracked per binding, so borrow or clone the part, or move the whole value")))
+          ; a part of an owner: moved out, until it is given a value again
+          (!= (primitive/cast i64 owner) 0) (ownership-move-part! a cx place owner fname)
+          ; what an exclusive reference parameter refers to, or a part of it:
+          ; the function must give it back before it returns
+          (ownership-lent-root? root states)
+            (ownership-move-part! a cx place (ownership-var-state root states) fname)
           :else
             (Err [i64 Diag]
                  (derr-at-src (.source place)
@@ -26692,6 +27178,8 @@
            (set! (.cleanup st) cleanup)
            (set! (.uses st) (box-al [i64] a (load uses)))
            (set! (.pinned st) (box-al [(slice u8)] a (load names)))
+           (set! (.parts st) "")
+           (set! (.lent st) false)
            (push! [MoveState] states (load st)))
          (try! (ownership-walk-body a cx body states loops fname consumes false))
          (ownership-wrap-tail-cleanup! a
@@ -26857,7 +27345,13 @@
                    (if (= (primitive/cast i64 init) 0)
                        (Ok [i64 Diag] 0)
                        (ownership-walk-expr a cx init states loops fname true)))
-           (EField [p _] (ownership-walk-expr a cx p states loops fname false))
+           ; With a part of its binding moved out, a field's base names a value
+           ; that is not all there: the field was checked as a part, above.
+           (EField [p _]
+                   (if (and (!= (primitive/cast i64 (ownership-part-state p states)) 0)
+                            (some? (ownership-part-path a p)))
+                       (Ok [i64 Diag] 0)
+                       (ownership-walk-expr a cx p states loops fname false)))
            (ELoad [inner]
                   (if (ownership-wrap-field-read-temporary! a cx e states)
                       (ownership-walk-expr a cx e states loops fname consumes)
@@ -26883,7 +27377,11 @@
                                                loops
                                                fname
                                                false))))
+           ; a store to a part that was moved out, or that holds one
            (EStore [p value]
+                   (if (and (!= (primitive/cast i64 (ownership-part-state p states)) 0)
+                            (some? (ownership-part-path a p)))
+                       (ownership-store-part! a cx e p value states loops fname)
                    (let [owner (ownership-root-state p states)
                          owner-bid
                            (if (= (primitive/cast i64 owner)
@@ -27009,7 +27507,7 @@
                                                                           value
                                                                           target-type))
                                          (None [] 0))
-                                       (Ok [i64 Diag] 0)))))))))
+                                       (Ok [i64 Diag] 0))))))))))
            (EInitStore [p value]
                        (do
                          (try! (ownership-walk-expr a
@@ -27338,6 +27836,14 @@
                                             false))
            (_ (Ok [i64 Diag] 0))))))
 
+;;; Parameter I of the function FP as its signature declares it: a reference
+;;; parameter is a pointer in the body by the time ownership is checked.
+(defn ownership-declared-param [(fp (ptr Func)) (cx (ptr Cx)) (i i64)] (-> Type)
+  (let [sig (sig-find cx (.name fp))]
+    (if (and (!= (primitive/cast i64 sig) 0) (< i (len (load (field sig params)))))
+        (get (load (field sig params)) i)
+        (.ty (elem (load (field fp params)) i)))))
+
 (defn ownership-check-func-work [(a (dyn Allocator))
                                  (work (dyn Allocator))
                                  (cx (ptr Cx))
@@ -27361,7 +27867,24 @@
                                               (.hi fp)
                                               (.source fp)
                                               (.ctxt fp))
-                         0))
+                         0)
+                       ; an exclusive reference: a part moved out through it is
+                       ; tracked until it is given back
+                       ; (the body sees it as a pointer by now; the signature
+                       ; keeps the reference it was declared as)
+                       (match (ownership-declared-param fp cx (load i))
+                         (TRef [mutable inner]
+                               (when mutable
+                                 (ownership-register-lent! (mut states)
+                                                           (.bid pp)
+                                                           (.name pp)
+                                                           inner
+                                                           (.lo fp)
+                                                           (.hi fp)
+                                                           (.source fp)
+                                                           (.ctxt fp))
+                                 0))
+                         (_ 0)))
                      (set! i (primitive/iadd (load i) 1)))))
          ; The parameter has transferred into `forget`; marking it moved is the
          ; intrinsic semantic operation that deliberately suppresses cleanup.
@@ -27371,8 +27894,10 @@
            (loop (if (>= (load i) (len (load states)))
                      (break)
                      (do
-                       (set! (.moved (elem (mut states) (load i)))
-                             true)
+                       (unless (.lent (elem (mut states) (load i)))
+                         (set! (.moved (elem (mut states) (load i)))
+                               true)
+                         0)
                        (set! i (primitive/iadd (load i) 1)))))
            0)
          (try! (ownership-walk-body a

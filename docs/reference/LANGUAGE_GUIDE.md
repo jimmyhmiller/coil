@@ -370,7 +370,8 @@ can't have it. A C function that does not return can be declared the same way,
 - `(fn [x] body)` is an anonymous function. Its parameter types come from the
   expected function-pointer type or `Callable` bound. It cannot capture locals; use
   `coil.closure/defclosure` when you need an environment.
-- `(fnptr-of name)` takes a named function's address. You call a value of `fnptr`
+- `(fnptr-of name)` takes a named function's address; `(fnptr-of Type::method)`
+  takes an inherent method's. You call a value of `fnptr`
   type like a function. For a generic function, write the type arguments as a call
   does, `(fnptr-of largest [i64])`, or take it where a function pointer type is
   expected and they are inferred from it. Inside a generic function the type
@@ -1192,6 +1193,15 @@ closing a.txt
 - `(set! x v)` gives a moved `x` a value again, and it can be used from there on.
   The value may be what moved it: `(set! x (f x))` moves `x` into `f` and keeps
   what `f` returns.
+- A field can be moved out of a struct on its own: `(consume (.a pair))` leaves
+  `pair` with `a` gone and the rest there. Until `(set! (.a pair) v)` gives it a
+  value again, `(.a pair)` and `pair` as a whole can't be used; `(.b pair)` can. A
+  struct with a part gone is dropped field by field, the gone part skipped. A
+  struct with a `Drop` of its own keeps its fields: its drop would run without the
+  part. What a `(mut T)` parameter refers to, or a field of it, can be moved out
+  too, and must be given a value again before the function returns: the caller
+  owns it. As with whole values, every way to a join must leave the same parts
+  moved.
 - `(mut x)` and `(ref x)` lend x without giving it up, so they can't fill a
   parameter that takes an owner by value. Pass `x` to move it, or `(clone x)`.
 - A generic parameter is an owner exactly when its instance is: `(o (Option T))`
@@ -1217,8 +1227,10 @@ closing a.txt
   generic function, at the instance whose element type owns) and names the form
   to use. `(at xs i)` and `(for (ref x) xs)` lend a `(ref T)` to the element where
   it lies, like `&items[i]` and `|*x|`; `(move-out! xs i)` takes it, leaving its
-  slot for `init!`. Moving an owner out of any reference is refused, whether a
-  parameter holds it or a call such as `at` returns it.
+  slot for `init!`. Moving an owner out of a reference is refused, unless it is a
+  `(mut T)` parameter that gets the part back before the function returns (see
+  above): a shared reference, or one a call such as `at` returns, never gives
+  ownership.
 
 ```coil
 (module example.lending)
