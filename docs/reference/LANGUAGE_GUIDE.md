@@ -538,6 +538,8 @@ parameters of a callable `def`.
 - It is checked where a construction takes it, against the field's type.
 - It cannot read the struct's other fields.
 - A positional construction, `(Particle 1 2 20 (Visible))`, gives every field.
+- A construction that names no field is the struct's name alone: `(Settings)`
+  when every field has a default, and `(Unit)` for a struct with no fields.
 - A field with a default is a field like any other: a pattern, `derive` and
   reflection see it.
 
@@ -1187,6 +1189,9 @@ closing a.txt
 
 - Using a moved value is a compile error. `(clone x)` duplicates through `Clone`,
   which `derive` can generate.
+- `(set! x v)` gives a moved `x` a value again, and it can be used from there on.
+  The value may be what moved it: `(set! x (f x))` moves `x` into `f` and keeps
+  what `f` returns.
 - `(mut x)` and `(ref x)` lend x without giving it up, so they can't fill a
   parameter that takes an owner by value. Pass `x` to move it, or `(clone x)`.
 - A generic parameter is an owner exactly when its instance is: `(o (Option T))`
