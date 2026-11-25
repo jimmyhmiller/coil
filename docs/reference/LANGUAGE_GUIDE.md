@@ -1202,6 +1202,12 @@ closing a.txt
   too, and must be given a value again before the function returns: the caller
   owns it. As with whole values, every way to a join must leave the same parts
   moved.
+- A parameter written `(out T)` is a `(mut T)` whose place holds nothing when
+  the function is called: the function must give it a value (`(set! slot v)`)
+  before reading it or returning. The caller passes `(mut place)` for a variable,
+  or a part of one, that holds nothing -- whose value was moved, or made with
+  `(let [x (uninit [T])] …)` -- and it holds a value once the call returns. A
+  variable made with `uninit` is not read, nor dropped, until it is given one.
 - `(mut x)` and `(ref x)` lend x without giving it up, so they can't fill a
   parameter that takes an owner by value. Pass `x` to move it, or `(clone x)`.
 - A generic parameter is an owner exactly when its instance is: `(o (Option T))`
