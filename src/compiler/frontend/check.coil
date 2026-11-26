@@ -160,7 +160,11 @@
 ;;; What `do-synth-cached` remembers a result under. RECOVERING is 1 under a
 ;;; provisional check: there a failure is recorded and typed TError, which is no
 ;;; answer for an attempt (`attempt-synth`) of the same expression.
-(defstruct SynthKey [(expr i64) (expected i64) (env_len i64) (recovering i64)])
+; `env_top` is the binding id of the env's innermost entry. Ids are never
+; reused and the env is a stack, so it and the length name the env exactly: a
+; `let` checked a second time binds its names under new ids, and what was checked
+; against the first ids does not answer for the second.
+(defstruct SynthKey [(expr i64) (expected i64) (env_len i64) (recovering i64) (env_top i64)])
 
 (defstruct FBox [(items (ArrayList Func))])
 
@@ -361,7 +365,10 @@
    (expand_in_body bool)
    ; What the constants after the first one that failed were rejected for, in a
    ; check of a metaprogram's closure (`setup-consts`). Appended field.
-   (more_const_diags (ArrayList Diag))])
+   (more_const_diags (ArrayList Diag))
+   ; The drop flags the function being ownership-checked needs: the names of
+   ; bool slots declared at the top of its body. Appended field.
+   (ownership_flags (ptr (ArrayList (slice u8))))])
 
 ;;; Where a call the checker judged a macro use is.
 (defstruct MacroUse [(source i64) (lo i64) (hi i64)])
@@ -8008,6 +8015,8 @@
           (store! (field key expected) (primitive/cast i64 expected))
           (store! (field key env_len) (len (load env)))
           (store! (field key recovering) (if (.recover_statements cx) 1 0))
+          (store! (field key env_top)
+                  (if (= (len (load env)) 0) 0 (.bid (elem env (- (len (load env)) 1)))))
           (match (get (.synth_cache cx) (load key))
             (Some [sp] (Ok [SynPair Diag] sp))
             (None []
@@ -23990,6 +23999,13 @@
 ; around a loop; projection-aware partial moves and conditional drop flags are a
 ; later extension. Binding identity comes from the authoritative checker side map,
 ; so shadowed names can never alias this state accidentally.
+; A part of an owner (`path`, empty for the whole) that is moved on some of the
+; ways that reached here and not on others. The checker treats it as moved; at an
+; exit, or when it is given a value again, what is left of it is dropped only if
+; the hidden bool slot `flag` says it is still there. `gone` are the parts inside
+; it that are moved on the ways it is there.
+(defstruct MaybeMove [(path (slice u8)) (flag (slice u8)) (gone (slice u8))])
+
 (defstruct MoveState
   [(bid i64)
    (moved bool)
@@ -24012,7 +24028,10 @@
    (parts (slice u8))
    ; An exclusive reference parameter, not an owner: never dropped, and a part
    ; moved out through it must be given a value again before the function returns.
-   (lent bool)])
+   (lent bool)
+   ; Its parts moved on only some ways here, or null. A list is never changed
+   ; once made, so states copied for branches share it.
+   (maybe (ptr (ArrayList MaybeMove)))])
 
 (defstruct OwnershipLoop
   [(label (Option (slice u8)))
@@ -24024,7 +24043,10 @@
    (exits (ptr (ArrayList (ptr (ArrayList MoveState)))))
    ; Those owners' states as the loop began, which every iteration must begin
    ; with again: a `continue` and the end of the body return there.
-   (entry (ptr (ArrayList MoveState)))])
+   (entry (ptr (ArrayList MoveState)))
+   ; The break each of `exits` was taken at, in the same order: where a drop
+   ; flag an exit sets is set.
+   (ends (ptr (ArrayList (ptr Expr))))])
 
 ;;; Is this checked loop a `block*`: a body that is one break to its own label,
 ;;; so it runs once and every way out of it is a break to it?
@@ -24082,6 +24104,7 @@
       (set! (.pinned st) (primitive/cast (ptr (ArrayList (slice u8))) 0))
       (set! (.parts st) "")
       (set! (.lent st) false)
+      (set! (.maybe st) (primitive/cast (ptr (ArrayList MaybeMove)) 0))
       (push! [MoveState] states (load st)))
     0)
   0)
@@ -24111,6 +24134,7 @@
     (set! (.pinned st) (primitive/cast (ptr (ArrayList (slice u8))) 0))
     (set! (.parts st) "")
     (set! (.lent st) true)
+    (set! (.maybe st) (primitive/cast (ptr (ArrayList MaybeMove)) 0))
     (push! [MoveState] states (load st)))
   0)
 
@@ -24302,6 +24326,19 @@
                     (set! i (primitive/isub (load i) 1))))))
     (load found)))
 
+(defn move-states-maybe-union [(a (dyn Allocator)) (to (ptr MoveState)) (from (ptr MoveState))]
+  (-> (ptr (ArrayList MaybeMove)))
+  (if (= (move-state-maybe-count to) 0)
+      (.maybe from)
+      (let [(mut out) (ArrayList::new [MaybeMove] a)]
+        (for [i 0 (move-state-maybe-count to)] (push! (mut out) (get (load (.maybe to)) i)))
+        (for [i 0 (move-state-maybe-count from)]
+          (let [m (get (load (.maybe from)) i)]
+            (match (move-state-maybe-at to (.path m))
+              (Some [_] 0)
+              (None [] (do (push! (mut out) m) 0)))))
+        (box-al [MaybeMove] a (load out)))))
+
 (defn move-states-merge! [(dst (ptr (ArrayList MoveState)))
                           (src (ptr (ArrayList MoveState)))] (-> i64)
   (let [n (len (load src))
@@ -24310,6 +24347,12 @@
               (break)
               (do
                 (let [from (elem src (load i))]
+                  ; a part moved on only some ways is so after any exit too
+                  (when (> (move-state-maybe-count from) 0)
+                    (let [to (move-state-find dst (.bid from))]
+                      (unless (= (primitive/cast i64 to) 0)
+                        (set! (.maybe to) (move-states-maybe-union (.alc dst) to from))
+                        0)))
                   ; a part moved on the way to any exit is moved after it
                   (when (> (len (.parts from)) 0)
                     (let [to (move-state-find dst (.bid from))]
@@ -24345,9 +24388,12 @@
         (mut mismatch) (primitive/cast (ptr MoveState) 0)]
     (loop (if (>= (load i) ln)
               (break)
-              (let [st (elem left (load i))]
+              (let [st (elem left (load i))
+                    other (move-state-find right (.bid st))]
                 (when (or (!= (.moved st) (move-state-moved? right (.bid st)))
-                          (not (parts-same? (.alc left) (.parts st) (move-state-parts right (.bid st)))))
+                          (not (parts-same? (.alc left) (.parts st) (move-state-parts right (.bid st))))
+                          (and (!= (primitive/cast i64 other) 0)
+                               (not (move-state-maybe-same? (.alc left) st other))))
                   (store! mismatch st)
                   (break))
                 (set! i (primitive/iadd (load i) 1)))))
@@ -24386,6 +24432,280 @@
                                                       " (owner type "
                                                       (ty-str a (.ty st))
                                                       ")"))))))))
+
+;; ---- drop flags ---------------------------------------------------------------
+;;
+;; An owner, or a part of one, moved on some of the ways that reach a join and not
+;; on others is moved after the join, as the checker sees it: nothing may use it.
+;; What it holds on the ways it was not moved is dropped where it would have been,
+;; at an exit or when it is given a value again, if a hidden bool slot says it is
+;; still there. Each way sets that slot at its end.
+
+;;; What of ST is moved: its parts, or the whole as the empty path.
+(defn move-state-gone [(a (dyn Allocator)) (st (ptr MoveState))] (-> (slice u8))
+  (if (.moved st) (parts-with a "" "") (.parts st)))
+
+(defn move-state-maybe-count [(st (ptr MoveState))] (-> i64)
+  (if (= (primitive/cast i64 (.maybe st)) 0) 0 (len (load (.maybe st)))))
+
+(defn move-state-maybe-at [(st (ptr MoveState)) (path (slice u8))] (-> (Option MaybeMove))
+  (block :found
+    (for [i 0 (move-state-maybe-count st)]
+      (let [m (get (load (.maybe st)) i)]
+        (when (= (.path m) path) (break :found (Some m)))))
+    (None [MaybeMove])))
+
+;;; Do X and Y have the same parts moved on only some ways, under the same flags?
+(defn move-state-maybe-same? [(a (dyn Allocator)) (x (ptr MoveState)) (y (ptr MoveState))] (-> bool)
+  (and (= (move-state-maybe-count x) (move-state-maybe-count y))
+       (block :all
+         (for [i 0 (move-state-maybe-count x)]
+           (let [m (get (load (.maybe x)) i)]
+             (match (move-state-maybe-at y (.path m))
+               (Some [n] (unless (and (= (.flag n) (.flag m)) (parts-same? a (.gone n) (.gone m)))
+                           (break :all false)))
+               (None [] (break :all false)))))
+         true)))
+
+;;; The type of the part at PATH of a value of type TY, or null.
+(defn ownership-path-type [(a (dyn Allocator)) (cx (ptr Cx)) (ty (ptr Type)) (path (slice u8))]
+  (-> (ptr Type))
+  (if (= (len path) 0)
+      ty
+      (let [dot (block :dot
+                  (for [i 0 (len path)]
+                    (when (= (primitive/cast i64 (get path i)) 46) (break :dot i)))
+                  (len path))
+            head (subslice path 0 dot)
+            rest (if (< dot (len path)) (subslice path (+ dot 1) (len path)) "")]
+        (match (struct-fields a ty cx)
+          (Ok [fields]
+              (block :found
+                (for [i 0 (len (load fields))]
+                  (let [fp (elem fields i)]
+                    (when (= (.name fp) head)
+                      (break :found (ownership-path-type a cx (field fp ty) rest)))))
+                (primitive/cast (ptr Type) 0)))
+          (Err [_] (primitive/cast (ptr Type) 0))))))
+
+;;; ROOT with the fields of PATH, from FROM on, read off it: the place of a part.
+(defn ownership-path-place [(a (dyn Allocator)) (root (ptr Expr)) (from (slice u8)) (path (slice u8))]
+  (-> (ptr Expr))
+  (let [rel (cond (= (len from) 0) path
+                  (= from path) ""
+                  :else (subslice path (+ (len from) 1) (len path)))
+        (mut place) root
+        (mut start) 0]
+    (for [i 0 (+ (len rel) 1)]
+      (when (or (= i (len rel)) (= (primitive/cast i64 (get rel i)) 46))
+        (when (> i start)
+          (set! place (box-expr a (mk-expr (EField place (subslice rel start i))
+                                           (.lo root) (.hi root) (.source root) (.ctxt root)))))
+        (set! start (+ i 1))))
+    place))
+
+;;; For each part of ST at or below WITHIN that is moved on only some ways, the
+;;; drop of what is left of it, run if its flag says it is there, appended to OUT.
+;;; ROOT is the place at WITHIN. The parts dropped are taken off ST.
+(defn ownership-take-maybe-drops! [(a (dyn Allocator))
+                                   (cx (ptr Cx))
+                                   (out (ptr (ArrayList Expr)))
+                                   (st (ptr MoveState))
+                                   (root (ptr Expr))
+                                   (within (slice u8))] (-> i64)
+  (let [(mut kept) (ArrayList::new [MaybeMove] a)
+        lo (.lo root) hi (.hi root) source (.source root) ctxt (.ctxt root)]
+    (for [i 0 (move-state-maybe-count st)]
+      (let [m (get (load (.maybe st)) i)]
+        (if (not (part-within? (.path m) within))
+            (push! (mut kept) m)
+            (let [ty (ownership-path-type a cx (.ty st) (.path m))
+                  (mut glue) (ArrayList::new [Expr] a)]
+              (unless (= (primitive/cast i64 ty) 0)
+                (ownership-append-partial-drop-glue! a cx (mut glue)
+                                                     (ownership-path-place a root within (.path m))
+                                                     ty (.gone m) (.path m) lo hi source ctxt)
+                0)
+              (when (> (len glue) 0)
+                (push! (mut glue) (mk-expr (EInt 0) lo hi source ctxt))
+                (push! [Expr] out
+                       (mk-expr (EIf (box-expr a (mk-expr (ELoad (box-expr a (mk-expr (EVar (.flag m)) lo hi source ctxt)))
+                                                          lo hi source ctxt))
+                                     (box-expr a (mk-expr (EDo (box-al [Expr] a (load glue))) lo hi source ctxt))
+                                     (box-expr a (mk-expr (EInt 0) lo hi source ctxt)))
+                                lo hi source ctxt)))
+              0))))
+    (set! (.maybe st) (if (= (len kept) 0)
+                          (primitive/cast (ptr (ArrayList MaybeMove)) 0)
+                          (box-al [MaybeMove] a (load kept))))
+    0))
+
+;;; Run DROPS before what E does.
+(defn ownership-prepend! [(a (dyn Allocator)) (e (ptr Expr)) (drops (ptr (ArrayList Expr)))] (-> i64)
+  (when (> (len (load drops)) 0)
+    (let [(mut items) (ArrayList::new [Expr] a)]
+      (for [i 0 (len (load drops))] (push! (mut items) (get (load drops) i)))
+      (push! (mut items) (load e))
+      (set! (.kind e) (EDo (box-al [Expr] a (load items))))
+      0))
+  0)
+
+(defn ownership-ways-differ [(a (dyn Allocator)) (st (ptr MoveState)) (fname (slice u8)) (reason (slice u8))]
+  (-> Diag)
+  (derr-at-src (.source st)
+               (.lo st)
+               (.hi st)
+               (sconcat a
+                        (sconcat3 a "in '" fname "': ownership of '")
+                        (sconcat a
+                                 (sconcat3 a (.name st) "' differs " reason)
+                                 (sconcat3 a " (owner type " (ty-str a (.ty st)) ")")))))
+
+(defn ownership-failed? [(err (Option Diag))] (-> bool)
+  (match err (Some [_] true) (None [] false)))
+
+;;; A part's state on one way into a join: moved (0), moved on only some of the
+;;; ways before (1, under FLAG), or there (2), with GONE moved out of it.
+(defstruct WayPart [(kind i64) (flag (slice u8)) (gone (slice u8))])
+
+(defn ownership-way-part [(a (dyn Allocator)) (st (ptr MoveState)) (seg (slice u8))]
+  (-> (Option WayPart))
+  (let [gone (move-state-gone a st)
+        covered (block :c
+                  (for g (iter (parts-each a gone))
+                    (when (part-within? seg g) (break :c true)))
+                  false)]
+    (if covered
+        (match (move-state-maybe-at st seg)
+          (Some [m] (Some (WayPart :kind 1 :flag (.flag m) :gone (.gone m))))
+          (None [] (Some (WayPart :kind 0 :flag "" :gone ""))))
+        ; there, with what was moved out of it; a part inside it moved on only
+        ; some ways before is not followed through a second join
+        (if (block :inner
+              (for [i 0 (move-state-maybe-count st)]
+                (when (part-within? (.path (get (load (.maybe st)) i)) seg) (break :inner true)))
+              false)
+            (None [WayPart])
+            (let [(mut inside) (ArrayList::new [(slice u8)] a)]
+              (for g (iter (parts-each a gone))
+                (when (part-within? g seg) (push! (mut inside) g)))
+              (Some (WayPart :kind 2 :flag "" :gone (parts-of-list a (mut inside)))))))))
+
+;;; The ways WAYS (the owners' states on each way that reaches the join, and END,
+;;; the expression each way finishes with, or with BEFORE the break it leaves by)
+;;; meet: STATES become what the owners are after the join.
+(defn ownership-join-ways! [(a (dyn Allocator))
+                            (cx (ptr Cx))
+                            (states (ptr (ArrayList MoveState)))
+                            (ways (ptr (ArrayList (ptr (ArrayList MoveState)))))
+                            (ends (ptr (ArrayList (ptr Expr))))
+                            (before bool)
+                            (fname (slice u8))
+                            (reason (slice u8))] (-> (Result i64 Diag))
+  (let [nw (len (load ways))
+        (mut stores) (ArrayList::new [(ptr (ArrayList Expr))] a)
+        (mut err) (None [Diag])]
+    (for [k 0 nw] (push! (mut stores) (box-al [Expr] a (ArrayList::new [Expr] a))))
+    (when (> nw 0)
+      (move-states-merge! states (get (load ways) 0))
+      (for [si 0 (len (load states))]
+        (when (not (ownership-failed? err))
+          (let [o (elem states si)]
+            (unless (move-state-cleanup? o)
+              (let [w0 (move-state-find (get (load ways) 0) (.bid o))
+                    agree (block :agree
+                            (for [k 1 nw]
+                              (let [wk (move-state-find (get (load ways) k) (.bid o))]
+                                (unless (and (= (.moved wk) (.moved w0))
+                                             (parts-same? a (.parts wk) (.parts w0))
+                                             (move-state-maybe-same? a wk w0))
+                                  (break :agree false))))
+                            true)]
+                (if agree
+                    (do (set! (.moved o) (.moved w0))
+                        (set! (.parts o) (.parts w0))
+                        (set! (.maybe o) (.maybe w0))
+                        0)
+                    (let [(mut all) ""
+                          (mut found) (ArrayList::new [MaybeMove] a)]
+                      (for [k 0 nw]
+                        (set! all (parts-union a all (move-state-gone a (move-state-find (get (load ways) k) (.bid o))))))
+                      (for seg (iter (parts-each a all))
+                        (when (not (ownership-failed? err))
+                          (let [(mut parts) (ArrayList::new [WayPart] a)]
+                            (for [k 0 nw]
+                              (match (ownership-way-part a (move-state-find (get (load ways) k) (.bid o)) seg)
+                                (Some [wp] (push! (mut parts) wp))
+                                (None [] (set! err (Some (ownership-ways-differ a o fname reason))))))
+                            (when (not (ownership-failed? err))
+                              (let [p0 (get parts 0)
+                                    all-moved (block :m
+                                                (for wp (iter parts) (unless (= (.kind wp) 0) (break :m false)))
+                                                true)
+                                    same-flag (block :f
+                                                (for wp (iter parts)
+                                                  (unless (and (= (.kind wp) 1) (= (.flag wp) (.flag p0))
+                                                               (parts-same? a (.gone wp) (.gone p0)))
+                                                    (break :f false)))
+                                                true)]
+                                (cond all-moved 0
+                                      same-flag (do (push! (mut found) (MaybeMove :path seg :flag (.flag p0) :gone (.gone p0))) 0)
+                                      :else
+                                        (let [there (block :t
+                                                      (for wp (iter parts) (unless (= (.kind wp) 0) (break :t wp)))
+                                                      p0)
+                                              counter (ownership-shadow-counter)]
+                                          (for wp (iter parts)
+                                            (unless (or (= (.kind wp) 0) (parts-same? a (.gone wp) (.gone there)))
+                                              (set! err (Some (ownership-ways-differ a o fname reason)))))
+                                          (when (= (primitive/cast i64 (.ownership_flags cx)) 0)
+                                            (set! err (Some (ownership-ways-differ a o fname reason))))
+                                          (when (not (ownership-failed? err))
+                                            (set! counter (+ (load counter) 1))
+                                            (let [flag (sconcat a "$drop.flag." (i64->str a (load counter)))
+                                                  lo (.lo o) hi (.hi o) source (.source o) ctxt (.ctxt o)]
+                                              (push! [(slice u8)] (.ownership_flags cx) flag)
+                                              (for [k 0 nw]
+                                                (let [wp (get parts k)
+                                                      value (cond (= (.kind wp) 0) (mk-expr (EBool false) lo hi source ctxt)
+                                                                  (= (.kind wp) 2) (mk-expr (EBool true) lo hi source ctxt)
+                                                                  :else (mk-expr (ELoad (box-expr a (mk-expr (EVar (.flag wp)) lo hi source ctxt)))
+                                                                                 lo hi source ctxt))]
+                                                  (push! [Expr] (get (load stores) k)
+                                                         (mk-expr (EStore (box-expr a (mk-expr (EVar flag) lo hi source ctxt))
+                                                                          (box-expr a value))
+                                                                  lo hi source ctxt))))
+                                              (push! (mut found) (MaybeMove :path seg :flag flag :gone (.gone there)))
+                                              0))
+                                          0)))))))
+                      (when (not (ownership-failed? err))
+                        (let [whole (and (not (.lent o))
+                                         (block :w
+                                           (for seg (iter (parts-each a all)) (when (= (len seg) 0) (break :w true)))
+                                           false))]
+                          (set! (.moved o) whole)
+                          (set! (.parts o) (if whole "" all))
+                          (set! (.maybe o) (if (= (len found) 0)
+                                               (primitive/cast (ptr (ArrayList MaybeMove)) 0)
+                                               (box-al [MaybeMove] a (load found))))
+                          0))
+                      0)))
+              0)))))
+    (match err
+      (Some [d] (Err [i64 Diag] d))
+      (None []
+            ; each way sets the flags at its end: after the form it ends with,
+            ; or before the break it leaves by
+            (for [k 0 nw]
+              (let [st (get (load stores) k)]
+                (when (> (len (load st)) 0)
+                  (let [end (get (load ends) k)]
+                    (if before
+                        (ownership-prepend! a end st)
+                        (let [saved (box-expr a (load end))]
+                          (set! (.kind end) (ECleanup saved st))
+                          0))))))
+            (Ok [i64 Diag] 0)))))
 
 ; The checker records each node's type once, in terms of the function it was
 ; written in. A generic body is ownership-checked per instance, after mono, when
@@ -24654,30 +24974,6 @@
     (EAlloc [_ _ init _] (and (!= (primitive/cast i64 init) 0) (ownership-uninit-init? init)))
     (EDo [body] (and (> (len (load body)) 0) (ownership-uninit-init? (elem body 0))))
     (_ false)))
-
-;;; The first `(uninit [T])` call in E, or null.
-(defn ownership-find-uninit [(a (dyn Allocator)) (e (ptr Expr))] (-> (ptr Expr))
-  (match (.kind e)
-    (ECall [callee _ _]
-           (if (or (core-name? callee "uninit") (core-name-prefix? callee "uninit__"))
-               e
-               (ownership-find-uninit-in a e)))
-    (_ (ownership-find-uninit-in a e))))
-
-(defn ownership-find-uninit-in [(a (dyn Allocator)) (e (ptr Expr))] (-> (ptr Expr))
-  (let [(mut kids) (ArrayList::new [(ptr Expr)] a)
-        (mut found) (primitive/cast (ptr Expr) 0)]
-    (expr-children! e (mut kids))
-    (for [i 0 (len kids)]
-      (when (= (primitive/cast i64 found) 0)
-        (set! found (ownership-find-uninit a (get kids i)))))
-    found))
-
-(defn ownership-uninit-refused [(a (dyn Allocator)) (e (ptr Expr)) (fname (slice u8))] (-> (Result i64 Diag))
-  (Err [i64 Diag]
-       (derr-at-src (.source e) (.lo e) (.hi e)
-                    (sconcat3 a "in '" fname
-                              "': (uninit [T]) makes a variable that holds nothing, so it is the initializer of a let of its own, whose variable is then given a value"))))
 
 (defn ownership-require-live-root [(a (dyn Allocator))
                                    (e (ptr Expr))
@@ -25570,6 +25866,7 @@
                                                                        (part-name a st (get (parts-each a (.parts st)) 0))
                                                                        "' holds no value when the function returns: what a (mut T) or (out T) parameter refers to belongs to the caller, so give it a value first")))))
                             (break))
+                          (do
                           (unless (or (.moved st)
                                       (not (type-needs-drop a cx (.ty st))))
                             (let [place
@@ -25591,6 +25888,17 @@
                                                                    (.source st)
                                                                    (.ctxt st))
                               0)
+                            0)
+                            ; what was moved on only some ways is dropped if
+                            ; its flag says it is still there
+                            (when (and (> (move-state-maybe-count st) 0)
+                                       (type-needs-drop a cx (.ty st)))
+                              (let [copy (primitive/alloc-stack MoveState)]
+                                (set! copy (load st))
+                                (ownership-take-maybe-drops! a cx (mut out) copy
+                                                             (box-expr a (mk-expr (EVar (.name st))
+                                                                                  (.lo st) (.hi st) (.source st) (.ctxt st)))
+                                                             "")))
                             0))))
                 (set! i (primitive/isub (load i) 1)))))
     (match (load err)
@@ -25638,20 +25946,15 @@
 ;;; After a loop or block the owners from outside it are as each break that left
 ;;; it left them, so the breaks must agree. With no break, nothing follows it.
 (defn ownership-join-exits! [(a (dyn Allocator))
+                             (cx (ptr Cx))
                              (states (ptr (ArrayList MoveState)))
                              (exits (ptr (ArrayList (ptr (ArrayList MoveState)))))
+                             (ends (ptr (ArrayList (ptr Expr))))
                              (fname (slice u8))
                              (reason (slice u8))] (-> (Result i64 Diag))
-  (try (do
-         (for [i 1 (len (load exits))]
-           (try! (ownership-require-same-states a
-                                                (get (load exits) 0)
-                                                (get (load exits) i)
-                                                fname
-                                                reason)))
-         (when (> (len (load exits)) 0)
-           (move-states-merge! states (get (load exits) 0)))
-         (Ok [i64 Diag] 0))))
+  (if (= (len (load exits)) 0)
+      (Ok [i64 Diag] 0)
+      (ownership-join-ways! a cx states exits ends true fname reason)))
 
 (defn ownership-wrap-exit! [(a (dyn Allocator))
                             (cx (ptr Cx))
@@ -25816,16 +26119,13 @@
          (try! (ownership-walk-expr a cx right rs loops fname consumes))
          ; A branch that does not finish never reaches the join; what it moved
          ; is settled at the exit it takes.
-         (cond (diverges? left) (move-states-merge! states rs)
-               (diverges? right) (move-states-merge! states ls)
-               :else
-                 (do
-                   (try! (ownership-require-same-states a
-                                                        ls
-                                                        rs
-                                                        fname
-                                                        "between branches"))
-                   (move-states-merge! states ls)))
+         (let [(mut ways) (ArrayList::new [(ptr (ArrayList MoveState))] a)
+               (mut ends) (ArrayList::new [(ptr Expr)] a)]
+           (unless (diverges? left) (push! (mut ways) ls) (push! (mut ends) left))
+           (unless (diverges? right) (push! (mut ways) rs) (push! (mut ends) right))
+           (if (= (len ways) 0)
+               (move-states-merge! states rs)
+               (try! (ownership-join-ways! a cx states (mut ways) (mut ends) false fname "between branches"))))
          (Ok [i64 Diag] 0))))
 
 ;;; The callee's parameter types at this call: its generic parameters replaced by
@@ -26152,6 +26452,91 @@
                     (_ none)))))
       (_ none))))
 
+;;; Is the value of E a place of an owner E binds itself, which ends with E: a
+;;; `let` yielding one of its owners, a `match` on a temporary yielding a payload
+;;; it bound, or an `if`, `do` or nested form whose every way that finishes does?
+(defn ownership-arm-tail [(body (ptr Expr))] (-> (ptr Expr))
+  (match (.kind body)
+    (EDo [items] (if (= (len (load items)) 0) (primitive/cast (ptr Expr) 0) (al-last-expr items)))
+    (_ body)))
+
+(defn ownership-yields-own-place? [(e (ptr Expr))] (-> bool)
+  (let [(mut owned) (ArrayList::new [(slice u8)] (malloc-allocator))
+        answer (ownership-yields-own-place-in? e (mut owned))]
+    (free! (mut owned))
+    answer))
+
+(defn ownership-name-in? [(names (ptr (ArrayList (slice u8)))) (n (slice u8))] (-> bool)
+  (block :b
+    (for [k 0 (len (load names))]
+      (when (= (get (load names) k) n) (break :b true)))
+    false))
+
+;;; OWNED are the owners bound inside the form being asked about, around E.
+(defn ownership-yields-own-place-in? [(e (ptr Expr)) (owned (ptr (ArrayList (slice u8))))] (-> bool)
+  (let [depth (len (load owned))
+        answer
+          (match (.kind e)
+            (EVar [n] (ownership-name-in? owned n))
+            (ELet [binds body]
+                  (let [tail (al-last-expr body)]
+                    (for [k 0 (len (load binds))]
+                      (let [bp (elem binds k)]
+                        (unless (= (primitive/cast i64 (.owned_type bp)) 0)
+                          (push! [(slice u8)] owned (.name bp))
+                          0)))
+                    (and (!= (primitive/cast i64 tail) 0)
+                         (ownership-yields-own-place-in? tail owned))))
+            (EDo [items]
+                 (and (> (len (load items)) 0) (ownership-yields-own-place-in? (al-last-expr items) owned)))
+            (EIf [_ t f]
+                 (let [tw (not (diverges? t))
+                       fw (not (diverges? f))]
+                   (and (or tw fw)
+                        (or (not tw) (ownership-yields-own-place-in? t owned))
+                        (or (not fw) (ownership-yields-own-place-in? f owned)))))
+            (EMatch [scrut arms]
+                    ; the payloads are the form's own when what is matched is: a
+                    ; temporary, or an owner bound inside the form; a match on any
+                    ; other place binds into the place, which lives on
+                    (let [own-scrut (match (.kind scrut)
+                                      (EVar [n] (ownership-name-in? owned n))
+                                      (EField [_ _] false)
+                                      (EIndex [_ _] false)
+                                      (EBorrow [_ _] false)
+                                      (_ true))]
+                      (and own-scrut
+                           (block :all
+                             (let [(mut any) false]
+                               (for [i 0 (len (load arms))]
+                                 (let [arm (elem arms i)
+                                       body (field arm body)]
+                                   (unless (diverges? body)
+                                     (set! any true)
+                                     (let [inner (len (load owned))
+                                           tail (ownership-arm-tail body)]
+                                       (for [k 0 (len (load (.binds arm)))]
+                                         (push! [(slice u8)] owned (get (load (.binds arm)) k)))
+                                       (unless (and (!= (primitive/cast i64 tail) 0)
+                                                    (ownership-yields-own-place-in? tail owned))
+                                         (break :all false))
+                                       (while (> (len (load owned)) inner) (pop! [(slice u8)] owned))
+                                       0))))
+                               any)))))
+            (_ false))]
+    (while (> (len (load owned)) depth) (pop! [(slice u8)] owned))
+    answer))
+
+(defn ownership-yield-owner-type [(a (dyn Allocator)) (cx (ptr Cx)) (e (ptr Expr))] (-> (ptr Type))
+  (let [owner (ownership-let-place-owner e)]
+    (if (!= (primitive/cast i64 owner) 0)
+        owner
+        (match (ownership-expr-type a cx e)
+          (Some [t] (match t
+                      (TRef [_ pointee] pointee)
+                      (_ (primitive/cast (ptr Type) 0))))
+          (None [] (primitive/cast (ptr Type) 0))))))
+
 ;;; The temporary a place expression `e` lends or reads through, or null: a spill,
 ;;; or an owner-building let whose place is borrowed or projected (`projected`).
 ;;; Such a let read whole is the owner's value moving out, which ends its scope.
@@ -26163,12 +26548,9 @@
     (EBorrow [_ p] (ownership-temporary-place p true))
     (ELoad [inner] (ownership-temporary-place inner projected))
     (ESpillRef [_] e)
-    (ELet [_ _]
-          (if (and projected
-                   (!= (primitive/cast i64 (ownership-let-place-owner e)) 0))
-              e
-              (primitive/cast (ptr Expr) 0)))
-    (_ (primitive/cast (ptr Expr) 0))))
+    (_ (if (and projected (ownership-yields-own-place? e))
+           e
+           (primitive/cast (ptr Expr) 0)))))
 
 ;;; Bind the temporary `temp` under `anchor` as an owned place in `binds`, and
 ;;; put that place where the temporary was. False when it owns nothing to drop.
@@ -26191,22 +26573,21 @@
                                (not (ownership-expr-needs-drop a cx inner)))
                            none
                            (Some inner)))
-            (ELet [_ _]
-                  (let [owner (ownership-let-place-owner temp)]
-                    (if (or (= (primitive/cast i64 owner) 0)
-                            (not (type-needs-drop a cx owner)))
-                        none
-                        (Some (box-expr a
-                                        (mk-expr (ELoad (box-expr a (load temp)))
-                                                 (.lo temp)
-                                                 (.hi temp)
-                                                 (.source temp)
-                                                 (.ctxt temp)))))))
-            (_ none))
+            (_ (let [owner (ownership-yield-owner-type a cx temp)]
+                 (if (or (= (primitive/cast i64 owner) 0)
+                         (not (ownership-yields-own-place? temp))
+                         (not (type-needs-drop a cx owner)))
+                     none
+                     (Some (box-expr a
+                                     (mk-expr (ELoad (box-expr a (load temp)))
+                                              (.lo temp)
+                                              (.hi temp)
+                                              (.source temp)
+                                              (.ctxt temp))))))))
         owner-type
           (match (.kind temp)
             (ESpillRef [inner] (ownership-expr-type a cx inner))
-            (_ (let [owner (ownership-let-place-owner temp)]
+            (_ (let [owner (ownership-yield-owner-type a cx temp)]
                  (if (= (primitive/cast i64 owner) 0)
                      (None [Type])
                      (Some (load owner))))))]
@@ -26314,6 +26695,31 @@
       (ownership-wrap-in-binds! a call (mut binds)))
     (load changed)))
 
+;;; A match on a form whose value is an owner the form binds itself (`(match (let
+;;; [w …] w) …)`, a `match` yielding a payload it took) reads that owner where it
+;;; lies, by reference: the owner moves into a slot around the match, so it is
+;;; there for the arms and dropped after them.
+(defn ownership-wrap-match-temporary! [(a (dyn Allocator))
+                                       (cx (ptr Cx))
+                                       (e (ptr Expr))
+                                       (scrut (ptr Expr))
+                                       (states (ptr (ArrayList MoveState)))]
+  (-> bool)
+  (if (match (.kind scrut)
+        (ELet [_ _] true)
+        (EMatch [_ _] true)
+        (EIf [_ _ _] true)
+        (EDo [_] true)
+        (_ false))
+      (let [temp (ownership-temporary-place scrut true)]
+        (if (= (primitive/cast i64 temp) 0)
+            false
+            (let [(mut binds) (ArrayList::new [Bind] a)]
+              (if (ownership-bind-temporary! a cx e temp 0 (mut binds) states)
+                  (do (ownership-wrap-in-binds! a e (mut binds)) true)
+                  false))))
+      false))
+
 ; A field read from a temporary gives the temporary a lexical owner, the same
 ; pair a borrowed call argument gets, so it is destroyed after the read.
 (defn ownership-wrap-field-read-temporary! [(a (dyn Allocator))
@@ -26378,22 +26784,21 @@
                                    (not (ownership-expr-needs-drop a cx inner))))
                            none
                            (Some inner)))
-            (ELet [_ _]
-                  (let [owner (ownership-let-place-owner temp)]
-                    (if (or (= (primitive/cast i64 owner) 0)
-                            (not (type-needs-drop a cx owner)))
-                        none
-                        (Some (box-expr a
-                                        (mk-expr (ELoad (box-expr a (load temp)))
-                                                 (.lo temp)
-                                                 (.hi temp)
-                                                 (.source temp)
-                                                 (.ctxt temp)))))))
-            (_ none))
+            (_ (let [owner (ownership-yield-owner-type a cx temp)]
+                 (if (or (= (primitive/cast i64 owner) 0)
+                         (not (ownership-yields-own-place? temp))
+                         (not (type-needs-drop a cx owner)))
+                     none
+                     (Some (box-expr a
+                                     (mk-expr (ELoad (box-expr a (load temp)))
+                                              (.lo temp)
+                                              (.hi temp)
+                                              (.source temp)
+                                              (.ctxt temp))))))))
         owner-type
           (match (.kind temp)
             (ESpillRef [inner] (ownership-expr-type a cx inner))
-            (_ (let [owner (ownership-let-place-owner temp)]
+            (_ (let [owner (ownership-yield-owner-type a cx temp)]
                  (if (= (primitive/cast i64 owner) 0)
                      (None [Type])
                      (Some (load owner))))))]
@@ -26674,11 +27079,15 @@
                                                     (sconcat a (part-name a st holder) "'")))))
                    (None []
                          (do
-                           ; what is still there of the old value is dropped
+                           ; what is still there of the old value is dropped,
+                           ; and what was moved on only some ways if it is there
                            (match (ownership-place-type a cx p (.ty st))
                              (Some [target-type]
                                    (ownership-partial-overwrite! a cx e p value target-type (.parts st) path))
                              (None [] 0))
+                           (let [(mut drops) (ArrayList::new [Expr] a)]
+                             (ownership-take-maybe-drops! a cx (mut drops) st (box-expr a (load p)) path)
+                             (ownership-prepend! a e (mut drops)))
                            (set! (.parts st) (parts-without a (.parts st) path))
                            (Ok [i64 Diag] 0))))))))))
 
@@ -27335,6 +27744,7 @@
            (set! (.pinned st) (box-al [(slice u8)] a (load names)))
            (set! (.parts st) "")
            (set! (.lent st) false)
+           (set! (.maybe st) (primitive/cast (ptr (ArrayList MaybeMove)) 0))
            (push! [MoveState] states (load st)))
          (try! (ownership-walk-body a cx body states loops fname consumes false))
          (ownership-wrap-tail-cleanup! a
@@ -27395,28 +27805,21 @@
                                  ; an initializer that is no reference is a
                                  ; statement; one that is belongs to the
                                  ; statement this `let` is in
-                                 (unless (or holds-nothing
-                                             (ownership-reference-typed? a
-                                                                         cx
-                                                                         (field bp value)))
+                                 (unless (ownership-reference-typed? a
+                                                                    cx
+                                                                    (field bp value))
                                    (ownership-hoist-statement! a
                                                                cx
                                                                (field bp value)
                                                                states)
                                    0)
-                                 ; `(uninit [T])` makes nothing to walk; its variable must be
-                                 ; one ownership tracks, or its reads would go unchecked
-                                 (if holds-nothing
-                                     (when (and (= (primitive/cast i64 (.owned_type bp)) 0)
-                                                (ownership-expr-needs-drop a cx (field bp value)))
-                                       (break :try (ownership-uninit-refused a (field bp value) fname)))
-                                     (try! (ownership-walk-expr a
-                                                                cx
-                                                                (field bp value)
-                                                                states
-                                                                loops
-                                                                fname
-                                                                true)))
+                                 (try! (ownership-walk-expr a
+                                                            cx
+                                                            (field bp value)
+                                                            states
+                                                            loops
+                                                            fname
+                                                            true))
                                  (unless (= (primitive/cast i64
                                                             (.owned_type bp))
                                             0)
@@ -27501,17 +27904,6 @@
                                      false))
            (ECall [func targs args]
                   (do
-                    ; a `let` of its own takes `(uninit [T])` without walking it;
-                    ; a `let` written as an argument is checked again with new
-                    ; binders when the call is a method's, so one made there could
-                    ; be read
-                    (when (and (or (core-name? func "uninit") (core-name-prefix? func "uninit__"))
-                               (ownership-expr-needs-drop a cx e))
-                      (break :try (ownership-uninit-refused a e fname)))
-                    (for [i 0 (len (load args))]
-                      (let [found (ownership-find-uninit a (elem args i))]
-                        (unless (= (primitive/cast i64 found) 0)
-                          (break :try (ownership-uninit-refused a found fname)))))
                     (try! (ownership-refuse-owner-copy a cx e func fname))
                     (if (ownership-wrap-borrowed-rvalues! a cx e args states)
                         (ownership-walk-expr a cx e states loops fname consumes)
@@ -27633,7 +28025,13 @@
                                                                 owner-bid)]
                                          (unless (= (primitive/cast i64 current)
                                                     0)
+                                           ; moved on only some ways: what it
+                                           ; still holds on the others goes first
+                                           (let [(mut drops) (ArrayList::new [Expr] a)]
+                                             (ownership-take-maybe-drops! a cx (mut drops) current (box-expr a (load p)) "")
+                                             (ownership-prepend! a e (mut drops)))
                                            (set! (.moved current) false)
+                                           (set! (.parts current) "")
                                            0))
                                        (Ok [i64 Diag] 0)))
                                (_ (Err [i64 Diag]
@@ -27739,6 +28137,10 @@
            (EErase [_ inner]
                    (ownership-walk-expr a cx inner states loops fname false))
            (EMatch [scrut arms]
+                   (if (ownership-wrap-match-temporary! a cx e scrut states)
+                     ; the owner a `let` yields is the arms' to read: it lives as
+                     ; long as the match does
+                     (ownership-walk-expr a cx e states loops fname consumes)
                    (do
                      ; A match on a named value binds its payload by reference. A match on
                      ; `(load …)` matches a copy, which is dropped after the arms: it moves the
@@ -27755,8 +28157,8 @@
                                                   (_ false))))
                      (let [n (len (load arms))
                            (mut i) 0
-                           (mut first)
-                             (primitive/cast (ptr (ArrayList MoveState)) 0)]
+                           (mut ways) (ArrayList::new [(ptr (ArrayList MoveState))] a)
+                           (mut ends) (ArrayList::new [(ptr Expr)] a)]
                        (loop (if (>= (load i) n)
                                  (break)
                                  (do
@@ -27776,20 +28178,13 @@
                                      ; an arm that does not finish never reaches
                                      ; the join
                                      (unless (diverges? arm-body)
-                                       (if (= (primitive/cast i64 (load first))
-                                              0)
-                                           (store! first branch)
-                                           (try! (ownership-require-same-states a
-                                                                                (load first)
-                                                                                branch
-                                                                                fname
-                                                                                "between match arms")))
+                                       (push! (mut ways) branch)
+                                       (push! (mut ends) arm-body)
                                        0))
                                    (store! i (primitive/iadd (load i) 1)))))
-                       (when (!= (primitive/cast i64 (load first))
-                                 0)
-                         (move-states-merge! states (load first)))
-                       (Ok [i64 Diag] 0))))
+                       (when (> (len ways) 0)
+                         (try! (ownership-join-ways! a cx states (mut ways) (mut ends) false fname "between match arms")))
+                       (Ok [i64 Diag] 0)))))
            (ECallPtr [fp args]
                      (do
                        (try! (ownership-walk-expr a
@@ -27832,6 +28227,7 @@
                         (set! (.owner_depth frame) (len (load states)))
                         (set! (.exits frame) exits)
                         (set! (.entry frame) states)
+                        (set! (.ends frame) (box-al [(ptr Expr)] (.alc loops) (ArrayList::new [(ptr Expr)] (.alc loops))))
                         (push! [OwnershipLoop] loops (load frame))
                         (try! (ownership-walk-body a
                                                    cx
@@ -27843,8 +28239,10 @@
                                                    true))
                         (pop! [OwnershipLoop] loops)
                         (try! (ownership-join-exits! a
+                                                     cx
                                                      states
                                                      exits
+                                                     (.ends frame)
                                                      fname
                                                      (sconcat3 a
                                                                "between the exits of block :"
@@ -27866,6 +28264,7 @@
                         (set! (.owner_depth frame) (len (load states)))
                         (set! (.exits frame) exits)
                         (set! (.entry frame) states)
+                        (set! (.ends frame) (box-al [(ptr Expr)] (.alc loops) (ArrayList::new [(ptr Expr)] (.alc loops))))
                         (push! [OwnershipLoop] loops (load frame))
                         (try! (ownership-walk-body a
                                                    cx
@@ -27884,8 +28283,10 @@
                                                                "across a loop iteration"))
                           0)
                         (try! (ownership-join-exits! a
+                                                     cx
                                                      states
                                                      exits
+                                                     (.ends frame)
                                                      fname
                                                      (match label
                                                        (Some [l]
@@ -27920,6 +28321,7 @@
                          (push! [(ptr (ArrayList MoveState))]
                                 (.exits frame)
                                 (move-states-prefix states (.owner_depth frame)))
+                         (push! [(ptr Expr)] (.ends frame) e)
                          0))
                      (Ok [i64 Diag] 0)))
            (EContinue [label]
@@ -27996,14 +28398,7 @@
                                                       loops
                                                       fname))
            (ETraitCall [_ _ _ args]
-                       (do
-                         ; an operand's own `let`s are checked again with new binders,
-                         ; so a variable made there with nothing in it could be read
-                         (for [i 0 (len (load args))]
-                           (let [found (ownership-find-uninit a (elem args i))]
-                             (unless (= (primitive/cast i64 found) 0)
-                               (break :try (ownership-uninit-refused a found fname)))))
-                         (ownership-walk-list a cx args states loops fname false)))
+                       (ownership-walk-list a cx args states loops fname false))
            (EDynDispatch [dc]
                          (let [recv (.recv dc)
                                args (.args dc)]
@@ -28136,9 +28531,38 @@
           (scratch/ScratchArena::init-with-capacity work
                                                     (large-pages/compiler-scratch-parent)
                                                     4096)
+        saved-flags (.ownership_flags cx)
+        _flags (do (set! (.ownership_flags cx)
+                         (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a)))
+                   0)
         result (ownership-check-func-work a (allocator work) cx fp)]
     (close! work)
+    (when (ok? result)
+      (ownership-declare-flags! a fp (load (.ownership_flags cx))))
+    (set! (.ownership_flags cx) saved-flags)
     result))
+
+;;; The drop flags FLAGS the function's joins made are bool slots its body is
+;;; inside of.
+(defn ownership-declare-flags! [(a (dyn Allocator)) (fp (ptr Func)) (flags (ArrayList (slice u8)))] (-> i64)
+  (when (> (len flags) 0)
+    (let [lo (.lo fp) hi (.hi fp) source (.source fp) ctxt (.ctxt fp)
+          (mut binds) (ArrayList::new [Bind] a)
+          (mut body) (ArrayList::new [Expr] a)]
+      (for name (iter flags)
+        (push! (mut binds)
+               (mk-bind name false (mk-expr (EAlloc :symbol (None) :storage 3 :ty (TBool)
+                                                    :init (primitive/cast (ptr Expr) 0))
+                                            lo hi source ctxt))))
+      ; the list is shared with the caller's copy of the function: change it in
+      ; place
+      (let [old (.body fp)]
+        (for [i 0 (len (load old))] (push! (mut body) (get (load old) i)))
+        (clear! [Expr] old)
+        (push! [Expr] old (mk-expr (ELet (box-al [Bind] a (load binds)) (box-al [Expr] a (load body)))
+                                   lo hi source ctxt)))
+      0))
+  0)
 
 (defn check-all-funcs [(a (dyn Allocator))
                        (cx (ptr Cx))
