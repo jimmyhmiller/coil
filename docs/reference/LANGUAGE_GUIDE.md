@@ -1258,8 +1258,9 @@ closing later.txt
   …))`, `(len bag)` leaves `bag` alive, called directly or through a `Len` bound.
 - Formatting with `{}` or `{:?}`, and comparing with `!=`, lend their operands, so an
   owner whose `Display`, `Debug` or `Eq` impl borrows is still alive afterwards. A
-  field of a name, `(.name x)`, is lent where it prints too, even when `x` is a
-  reference.
+  field, `(.name x)`, is lent where it prints too, even when `x` is a reference;
+  of what a call gives, `(.name (f))`, the call runs in its turn and the field is
+  then lent.
   Derived `Eq`, `Hash` and `Debug` borrow.
 - Structs, sums and arrays that contain owners get generated drop code, run in
   reverse field order. Drops run on every exit path: fall-through, `break`,
