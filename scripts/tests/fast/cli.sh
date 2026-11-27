@@ -539,6 +539,18 @@ EOF
   out=$(cd "$T/no-stdlib" && "$COIL" run 2>&1); rc=$?
   [ "$rc" = 42 ] && ok "a transform runs in a program with no bundled library" \
     || bad "a transform runs in a program with no bundled library" "exit $rc: $out"
+  # A transform's own error is the one reported, though the program it reads does
+  # not check yet (markers the transform would have rewritten are undefined).
+  mkdir -p "$T/tx-error/src"
+  printf '[package]\nname = "txe"\nentry = "src/main.coil"\n' > "$T/tx-error/Coil.toml"
+  printf '(module txe.xf)\n(import "coil.primitive" :as primitive)\n(defn rewrite [(modules Code)] (-> Code) (primitive/error "the transform gave up") modules)\n(transform rewrite)\n' > "$T/tx-error/src/xf.coil"
+  printf '(module txe.main)\n(import "txe.xf")\n(defn main [] (-> i64) (marker-one) (marker-two))\n' > "$T/tx-error/src/main.coil"
+  out=$(cd "$T/tx-error" && "$COIL" check 2>&1); rc=$?
+  case "$out" in
+    *"in transform 'txe.xf.rewrite': the transform gave up"*) [ "$rc" = 1 ] && ok "a transform's error is reported over the partial program's" \
+                                                                || bad "a transform's error is reported over the partial program's" "exit $rc: $out" ;;
+    *) bad "a transform's error is reported over the partial program's" "exit $rc: $out" ;;
+  esac
   # A prelude that re-exports coil.primitive makes its primitives every module's.
   printf '(module tiny.core)\n(import "coil.primitive" :use * :reexport)\n(defn* answer [] (-> i64) 42)\n' > "$T/no-stdlib/src/tiny.coil"
   printf '(module nostd.a)\n(defn* main [] (-> i64) (let* [cell (alloc-static i64)] (store! cell 40) (iadd (load cell) 2)))\n' > "$T/no-stdlib/src/a.coil"

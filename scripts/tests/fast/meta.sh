@@ -88,6 +88,13 @@ expect_stdout "run: a method's declaration record names its type's module, gener
   '((coil.arraylist coil.arraylist.new) (coil.alloc coil.alloc.malloc-allocator) (coil.arraylist coil.arraylist.push!) (mt_runcmmethods mt_runcmmethods.peek) (coil.arraylist coil.arraylist.free!) (mt_runcmmethods mt_runcmmethods.use-pipe) (mt_runcmmethods mt_runcmmethods.value))' \
   "$COIL" run $M/run_code_main_decls.coil $M/run_code_main_methods.coil
 
+# Source text spells an identifier as written: a macro's template made the
+# trait's `Self` hygienic, and `code-source` still gives `Self`. A bound's trait
+# is the one in scope where it is written, though coil.core has one of its name.
+expect_stdout "run: code-source spells a template's identifier as written; code-decl resolves a bound's trait in its module" \
+  '(mt_runcmspelled.Get "(ptr Self)")' \
+  "$COIL" run $M/run_code_main_spelled.coil $M/run_code_main_spelled_target.coil
+
 # What a definition depends on is what the checker looked up while checking it:
 # the functions and methods it calls (a method under its function's name), the
 # types it names and where, the fields it reads; and the other way round.
