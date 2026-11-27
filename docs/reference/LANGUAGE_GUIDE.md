@@ -1467,7 +1467,10 @@ evens=3 total=10
   pointer to the value where it lies, valid until the map is next edited.
   `(for-entries [k v (mut m)] …)` lends each key and value.
 - `HashMap` keys that are strings need key operations: coil.str's `(keyops)` copies
-  keys into the map, while `(keyops-borrowed)` borrows them.
+  keys into the map, while `(keyops-borrowed)` borrows them. Key operations are
+  typed by their key, `(KeyOps K)`, so `(keyops)` is a `(KeyOps (slice u8))` and
+  giving it to a `HashMap[i64 V]` is a type error; integer keys take coil.hashmap's
+  `(i64-keyops)` or `(scalar-keyops [K])`.
 - A collection's own operations are methods. A list has `(cap xs)`,
   `(elem xs i)` (a pointer to the live element), `(reserve! (mut xs) n)`,
   `(extend! (mut xs) p n)`, `(slice xs)`, `(into-slice (mut xs))`, `(clear! (mut xs))`
