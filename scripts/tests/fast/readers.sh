@@ -66,6 +66,14 @@ case "$out" in
   *) bad "project: readers that do not reflect release their compilation" "$(printf '%s\n' "$out" | grep 'reader\.')" ;;
 esac
 
+# A program built with --emit-state is compiled as a session's first submission,
+# which reads its imports with the project's readers as a build does: the state
+# build's program sums the same 48.
+out=$(cd $R/json_project && "$COIL" build -o "$WORK/json-state" --emit-state "$WORK/json.state" 2>&1); rc=$?
+if [ "$rc" = 0 ]; then "$WORK/json-state"; rc=$?; out="the program exits $rc"; fi
+[ "$rc" = 48 ] && ok "project: a state build reads its imports with the project's readers" \
+  || bad "project: a state build reads its imports with the project's readers" "exit $rc, want 48: $out"
+
 # A reader's code runs in the compiler, so a cross build compiles it for the host:
 # rd.kv uses coil.meta, which only compiler code has.
 out=$(cd $R/json_project && "$COIL" check --target wasm32-unknown-unknown 2>&1); rc=$?
