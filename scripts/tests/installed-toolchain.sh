@@ -137,6 +137,14 @@ EOF
   expect_rc 0 "a coil.jit program declaring libc functions with their C prototypes builds and runs" \
     bash -c 'cd "$1" && "$2" build c-externs.coil -o c-externs "${@:3}" && ./c-externs' \
     _ "$T/sdk" "$COIL" ${link[@]+"${link[@]}"}
+  # A package whose JIT is the native backend reaches the SDK's declarative
+  # backend sources through coil.jit; lint reads them with the toolchain's reader,
+  # as a build does. (It compiles the backend, so it is no FAST check.)
+  mkdir -p "$T/lint-native-jit/src"
+  printf '[package]\nname = "lint-native-jit"\nentry = "src/main.coil"\n[build]\njit = "native"\n' > "$T/lint-native-jit/Coil.toml"
+  printf '(module lint-native-jit)\n(import "coil.jit" :as jit)\n(defn main [] (-> i64) 0)\n' > "$T/lint-native-jit/src/main.coil"
+  expect_rc 0 "lint reads the SDK backend sources a native-JIT package reaches" \
+    bash -c 'cd "$1" && "$2" lint' _ "$T/lint-native-jit" "$COIL"
   # The in-process JIT never shells out to a C compiler.
   printf '#!/bin/sh\necho "FAIL: an in-process JIT session invoked cc: $*" >&2\nexit 97\n' > "$T/no-cc/cc"
   chmod +x "$T/no-cc/cc"
