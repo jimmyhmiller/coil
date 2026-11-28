@@ -237,7 +237,9 @@ New API this project added (all shipped):
 
 - **`(primitive/report NODE MSG)`** — a located compile-time **error** at `NODE`. It **collects**:
   a checker keeps running and surfaces EVERY error in one pass; the build fails after
-  printing them all.
+  printing them all. A transform runs once per fixpoint round, and what it reports in
+  any round is printed, a report repeated by later rounds once; it is printed too, before
+  the check's errors, when the program it gives does not check.
 - **`(primitive/warn NODE MSG)`** — a located, **non-fatal** warning at `NODE`; collects and all
   print, the build succeeds. What a *linter* wants.
 - **`(primitive/suggest NODE MSG REPLACEMENT)`** — a `warn` that also proposes a **rewrite**.

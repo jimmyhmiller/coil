@@ -19,8 +19,9 @@
 #   * transforms and checkers: macros inside macro bodies, a transform that adds
 #     a definition running beside the identity transform (and checks the model
 #     status and check errors it reads before and after), the same code run at
-#     compile time and at run time, a checker keyed on binding identity, and the
-#     drops ownership elaboration inserts (`code-drops-in`);
+#     compile time and at run time, a checker keyed on binding identity, a transform's
+#     reports over several rounds and over a program that does not check, and
+#     the drops ownership elaboration inserts (`code-drops-in`);
 #   * lint --fix against a concurrent editor: a checker that edits its target
 #     mid-analysis, whose edit must survive the run.
 #
@@ -187,6 +188,17 @@ if [ "$rc" != 0 ] && [ "$uses" = 2 ]; then
 else
   bad "checker: binding identity tells a shadowed local from its namesake" "exit $rc, $uses errors (want 2): $out"
 fi
+# A transform reports in every round: a report each round repeats is printed
+# once, and a transform's reports are printed when its program does not check.
+out=$("$COIL" check $M/report_rounds_ok.coil 2>&1); rc=$?
+n=$(printf '%s\n' "$out" | grep -c "flagged is reported")
+if [ "$rc" != 0 ] && [ "$n" = 1 ]; then ok "transform: a report is printed once over every round"
+else bad "transform: a report is printed once over every round" "exit $rc, $n reports (want 1): $out"; fi
+out=$("$COIL" check $M/report_rounds_broken.coil 2>&1); rc=$?
+n=$(printf '%s\n' "$out" | grep -c "flagged is reported")
+case "$out" in *"argument 2 to '+'"*) seen=1 ;; *) seen=0 ;; esac
+if [ "$rc" != 0 ] && [ "$n" = 1 ] && [ "$seen" = 1 ]; then ok "transform: a report is printed beside the error of a program that does not check"
+else bad "transform: a report is printed beside the error of a program that does not check" "exit $rc, $n reports (want 1), check error seen $seen: $out"; fi
 expect_stdout "checker: the drops elaboration inserts, by form and by name, a generic's abstract" \
   "mk:
 eat: mt_drops_target.Res-0
