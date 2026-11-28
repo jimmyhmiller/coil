@@ -170,6 +170,7 @@ def pair_with_checkout(prefix, compiler):
     library.mkdir(parents=True)
     (library / "stdlib").symlink_to(ROOT / "src/stdlib", target_is_directory=True)
     (library / "compiler").symlink_to(ROOT / "src/compiler", target_is_directory=True)
+    (library / "declarative").symlink_to(ROOT / "src/declarative", target_is_directory=True)
     (library / "prelude.coil").symlink_to(ROOT / "src/compiler/prelude.coil")
     native = ROOT / "build/bin/native"
     if native.is_dir():

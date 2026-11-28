@@ -179,6 +179,16 @@ fi
 # ---- transforms and checkers --------------------------------------------------
 expect "transform: macros in macro bodies; one transform adds a definition beside the identity transform" \
   42 '' "$COIL" run $M/transforms_test.coil
+# A checked or mono dump runs the program's `--use` metaprograms, as a build does: the
+# `(gen-answer)` marker checks only once mt_addforms has defined `the-answer`.
+printf '(module dump-use)\n(defn main [] (-> i64) (gen-answer))\n' > "$WORK/dump-use.coil"
+for dump in dump-checked dump-mono; do
+  out=$(COIL_NAMESPACE_ROOTS="$PWD/$M" "$COIL" $dump "$WORK/dump-use.coil" --use mt_addforms 2>&1); rc=$?
+  case "$rc|$out" in
+    "0|"*the-answer*) ok "$dump runs the --use metaprograms" ;;
+    *) bad "$dump runs the --use metaprograms" "exit $rc: $(printf '%s\n' "$out" | grep -m3 'error')" ;;
+  esac
+done
 expect "metaprogram: the same code at compile time and at run time" 0 'ALL IDENTICAL' \
   "$COIL" run $M/samecode_test.coil
 out=$("$COIL" run $M/borrowlike_bad.coil 2>&1); rc=$?
