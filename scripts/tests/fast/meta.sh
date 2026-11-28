@@ -19,7 +19,8 @@
 #   * transforms and checkers: macros inside macro bodies, a transform that adds
 #     a definition running beside the identity transform (and checks the model
 #     status and check errors it reads before and after), the same code run at
-#     compile time and at run time, and a checker keyed on binding identity;
+#     compile time and at run time, a checker keyed on binding identity, and the
+#     drops ownership elaboration inserts (`code-drops-in`);
 #   * lint --fix against a concurrent editor: a checker that edits its target
 #     mid-analysis, whose edit must survive the run.
 #
@@ -186,6 +187,17 @@ if [ "$rc" != 0 ] && [ "$uses" = 2 ]; then
 else
   bad "checker: binding identity tells a shadowed local from its namesake" "exit $rc, $uses errors (want 2): $out"
 fi
+expect_stdout "checker: the drops elaboration inserts, by form and by name, a generic's abstract" \
+  "mk:
+eat: mt_drops_target.Res-0
+toss: T-0
+keep:
+hand: T-0-given
+part: mt_drops_target.Two-1
+some: mt_drops_target.Res-0
+main: mt_drops_target.Res-0 mt_drops_target.Res-0 mt_drops_target.Res-0
+by-name: mt_drops_target.Two-1
+nowhere: unknown" "$COIL" check $M/drops_target.coil
 
 # A file edited while lint --fix analyses it is the editor's. The rule appends a
 # line to its target during the analysis (tests/meta/concurrent_edit_rule.coil), and

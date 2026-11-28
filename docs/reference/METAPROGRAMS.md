@@ -431,6 +431,25 @@ New API this project added (all shipped):
   expressions that do not check yet, and why, and rewrite exactly those; together with
   `type-of` on their subexpressions it can make type-directed rewrites of code that is
   not valid Coil until rewritten.
+- **`(primitive/code-drops-in DEF)` → the drops ownership elaboration inserts**, a
+  `primitive/DropsAnswer` (`meta/drops-in` in `coil.meta`). DEF is a function's
+  qualified name, or a form that defines functions (a `defn`, an impl's method, a
+  macro call that expands to them), whose functions are answered together. `(DropsAre
+  DROPS)`: each value that stops being held without being moved anywhere -- at the
+  end of its binding's scope, when its place is assigned over, when nothing uses it,
+  on a way to a join where it was not moved -- as `(TYPE AT (MOVED ...) GIVEN)`.
+  TYPE is its type as `type-of` reports one, AT a node located where it is
+  dropped, MOVED the paths (`a.b`) of the parts moved out of it before, which are
+  not dropped, and GIVEN `given` when on every way there the value was given by
+  value to a trait method called through a bound: an impl may take such a value
+  or borrow it, so the drop is the caller's only in an instance whose impl
+  borrows. Otherwise GIVEN is `held`. A function literal's drops are the drops of the function it is written
+  in. A generic function is elaborated for the answer over a copy of its checked
+  body with its type parameters abstract: a value whose ownership waits for their
+  substitution counts as dropped. `(DropsUnknown WHY)` when the compilation
+  elaborated no such function (one that did not check). A checker that gives some
+  types a rule of their own -- never dropped implicitly, say -- reads it instead of
+  redoing the ownership analysis. `tests/meta/drops.coil` prints a program's.
 - **`(primitive/type-of NODE)` → the expression's inferred type**, a
   `primitive/TypeAnswer`: `(TypeIs TYPE)` with TYPE as `Code` (e.g. `i64`,
   `(ptr i64)`), or `(TypeUnknown)`. This is the type the real type-checker inferred, not
