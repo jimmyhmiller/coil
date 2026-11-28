@@ -605,6 +605,28 @@ EOF
   printf '(module gen-import)\n(defn generate [] (-> Code) (quote (import "defs" :use [answer])))\n(generate)\n(defn main [] (-> i64) (answer))\n' > "$T/gen-import/main.coil"
   expect_rc 42 "a macro-generated import loads a module nothing had loaded" \
     "$COIL" run "$T/gen-import/main.coil"
+  # A macro's closure is checked under the bounds of the impls it keeps: a
+  # blanket impl of a trait with no methods, which only such a bound asks for, is
+  # kept with them, also when the method that reaches the impl is named as a
+  # core trait's (`push!`) and is reached as that trait's head. Seen with the
+  # closure computed afresh, without the library state.
+  cat > "$T/closure-bounds.coil" <<'COIL'
+(deftrait Counted [Self])
+(impl [T] Counted T)
+(defstruct Tally [T] [(n i64)])
+(impl [(T Counted)] (Tally T)
+  (new [] (-> (Tally T)) (Tally :n 0))
+  (push! [(t (mut (Tally T))) (x T)] (-> void) (set! (.n t) (+ (.n t) 1))))
+(defstruct Bag [(t (Tally u8))])
+(impl Bag
+  (new [] (-> Bag) (Bag :t (Tally::new [u8])))
+  (push! [(b (mut Bag)) (x u8)] (-> void) (Tally::push! (mut (.t b)) x))
+  (of [(x u8)] (-> Bag) (let [(mut b) (Bag::new)] (Bag::push! (mut b) x) b)))
+(defn bag-of [] (-> Code) `(Bag::of 1))
+(defn main [] (-> i64) (+ 6 (.n (.t (bag-of)))))
+COIL
+  expect_rc 7 "a macro's closure keeps the blanket impl an impl's bound needs" \
+    env COIL_LIBRARY_STATE=0 "$COIL" run "$T/closure-bounds.coil"
   # A register's :access is a coil.mmio.Access, decided by what its constructor
   # names, not by how it is spelled.
   printf '(module mmio-case)\n(import "coil.mmio" :as mmio)\n(defsum Mine (ReadOnly))\n(mmio/defmmio-reg R :address 0 :type u32 :access (ReadOnly) [])\n(defn main [] (-> i64) 0)\n' > "$T/mmio-own.coil"
