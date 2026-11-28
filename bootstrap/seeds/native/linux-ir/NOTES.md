@@ -48,11 +48,12 @@ one: an IR written by LLVM 22 carries `nocreateundeforpoison` on intrinsic
 declarations, which LLVM 21 rejects as an "unterminated attribute group", and that is
 exactly how the Linux CI job's IR fallback broke after the seeds went stale.
 
-Current artifact: emitted at commit `331db88a` (2026-10-13) by a compiler built from
-that commit and linked against LLVM 21.1.8; parsed by LLVM 21 `llvm-as` and compiled
-by LLVM 21 clang for x86_64-unknown-linux-gnu. It was linked on an x86_64 Ubuntu 24.04
-host with LLVM 21's clang, as above, and used there as the STAGE0 that refreshed both
-Linux ELF seeds at that commit.
+Current artifact: emitted at commit `a0b22467` (2026-11-28) by a compiler built from
+that commit and linked against LLVM 21.1.8 (Homebrew `llvm@21` on macOS arm64);
+parsed by LLVM 21 `llvm-as` and compiled by LLVM 21 clang for
+x86_64-unknown-linux-gnu. It was refreshed while the x86_64 host was unreachable,
+so the ELF seeds still name `9bd4719b` and cannot compile this tree: the Linux CI
+job links this IR and runs it as its stage0, which is its first test on Linux.
 
 ## Rebuilding a stage0 from this IR
 
